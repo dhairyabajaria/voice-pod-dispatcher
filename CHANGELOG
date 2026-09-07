@@ -2155,3 +2155,40 @@ false positive gets "fixed" by deleting the explanation.
   NOT LIVE YET, and it is a config line, not code: roster.json pins CODEX-1 to muse-go-1 and CODEX-2
   to muse-go-2. Pinned slots do not rotate and muse-go-3 is never selected. Rotation needs
   `codex_routes: {CODEX-1: rotate, CODEX-2: rotate}`. roster.json is not mine to edit.
+
+2026-09-08 05:5x  Ten-slot prerequisites: stagger, REFUSED, and the restart path (WORKER-2)
+  dispatcher.py, dispatcherctl.sh, tests/test_codexroute.py (28), tests/test_ctlself.py (NEW, 7),
+  tests/run_all.sh. Suite 64 files, ALL GREEN.
+
+  STAGGER. The owner has chosen 2 Astra + 8-10+ Muse slots, speed first. Every spawn does a
+  `git worktree add` AND a `uv sync --frozen` before the model is ever called, so ten simultaneous
+  spawns make SETUP the bottleneck and all ten pay for each other. codex_spawn now DEFERS a spawn
+  that arrives within codex_spawn_stagger_seconds (default 20) of the last successful one — defers,
+  not refuses: the item stays exactly where it was and the next tick takes it. A stagger that broke
+  items would be worse than none. The clock starts when a spawn SUCCEEDS, so a failing spawn cannot
+  hold the queue behind it. 0 disables it.
+
+  REFUSED IS NOT FAILED. A quota or auth refusal now gets its own board kind instead of rendering as
+  TURN_ENDED or ERROR. Nothing about the item, the worktree or the work is wrong — the provider
+  declined to run, and a rework or an auto-continue would just be refused again. BOSS: until now a
+  quota refusal was invisible on the board and showed only in the provider's own log.
+
+  RESTART. `zsh dispatcherctl.sh restart` died with `command not found`: line 156 called "$0", which
+  is a bare relative name when the script is invoked that way. SELF=${0:A} resolves a relative name
+  AND a symlink; the action and the refusal message both use it.
+
+  WHY IT SURVIVED, which is the more useful half: the --dry-run branch exits BEFORE the
+  re-invocation, so the only branch anyone could exercise without stopping the daemon was the one
+  that never reaches the bug. The guard was tested and the action was not — the same class ruled on
+  tonight, in the form where the proof set simply never enters the room. The fix therefore carries a
+  seam: `selfpath` prints exactly the path restart would re-invoke, and the new test runs it the way
+  BOSS ran it (bare relative name, unrelated cwd) and requires a real file back.
+
+  Mutations 6 of 6 CAUGHT, sources restored and md5-verified: drop the stagger; mark a deferred item
+  broken; start the stagger clock on attempt; let a refusal render as a turn end; revert restart to a
+  bare $0; fix only the message and leave the action broken.
+
+  A FIXTURE DEFECT CAUGHT BY THE STAGGER ITSELF: the rotation checks dispatch several times in the
+  same second, so with staggering on they were deferred and passed for the wrong reason — proving
+  the stagger rather than the route. Staggering is now off in the base config and exercised on its
+  own.

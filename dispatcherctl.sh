@@ -2,6 +2,14 @@
 # dispatcherctl — install | start | stop | restart | status | pause | resume | tail | once | dry | run
 # The Dispatcher itself is dispatcher.py (see README.md). This is the owner's switchboard.
 set -u
+
+# THE SCRIPT'S OWN ABSOLUTE PATH. `restart` re-invokes this file, and `$0` is a bare relative name
+# when it is called as `zsh dispatcherctl.sh` — which is how BOSS called it on 2026-09-08, and it
+# died with `command not found` after the guard had already passed. `${0:A}` resolves symlinks and
+# relative names both. The `--dry-run` branch exits before the re-invocation, so the guard was tested
+# and the ACTION never was: a proof set that exercises only the safe path is the same shape as a
+# fixture that builds the condition it should observe.
+SELF=${0:A}
 # CN is overridable so this script can be exercised against a temp tree by the tests. Nothing else
 # about its behaviour changes; the default is the real checkout.
 CN="${CN:-/Users/dhairyabajaria/Claude Code/Calling New}"
@@ -150,10 +158,16 @@ case "${1:-status}" in
       print -u2 "  They are spawned detached (own session and pgid, measured), so a process-group"
       print -u2 "  kill does not reach them — but launchd attributes by JOB and that is untested,"
       print -u2 "  because testing it means destroying the jobs in question."
-      print -u2 "  Wait for them, or: $0 restart --force"
+      print -u2 "  Wait for them, or: $SELF restart --force"
       exit 1
     fi
-    "$0" stop; sleep 1; "$0" start ;;
+    "$SELF" stop; sleep 1; "$SELF" start ;;
+  selfpath)
+    # Prints the path `restart` would re-invoke. Exists so the re-invocation can be PROVEN from a
+    # different working directory without stopping the daemon to find out — the failure was that
+    # `restart` passed its guard and then died on a bare relative `$0`, and the only branch anyone
+    # could test was the one that exits first.
+    print "$SELF" ;;
   pause)
     touch "$STATE/STOP"
     echo "PAUSED: STOP present — EVERYTHING off, observation included. No polling, no"

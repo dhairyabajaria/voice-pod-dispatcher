@@ -79,7 +79,11 @@ def daemon(cfg, env, spawned):
     return DP, dp
 
 
-BASE_CFG = {"codex_bin": "/x/bin/codex", "codex_model": "gpt-6-astra", "codex_effort": "medium"}
+# Staggering is OFF in the base config and exercised on its own below. Every routing check here
+# dispatches several times in the same second, and a stagger left on would defer them — every one of
+# those checks would then pass for the wrong reason, proving the stagger rather than the route.
+BASE_CFG = {"codex_bin": "/x/bin/codex", "codex_model": "gpt-6-astra", "codex_effort": "medium",
+            "codex_spawn_stagger_seconds": 0}
 
 def spawn(cfg_extra=None, item_extra=None, env=None):
     global logs, events
@@ -220,6 +224,66 @@ finally:
 ok(it["status"] == "broken" and "muse-go-1" in dp.state["muse"].get("unhealthy", {}),
    "MUST BITE: a credential the launcher cannot find HOLDS the profile, so the next tick steps over "
    "it instead of repeating the same refusal forever")
+
+
+# ------------------------------------------------------ staggering, because SETUP is the bottleneck
+# The owner has chosen 8-10+ Muse slots. Every spawn does a `git worktree add` AND a `uv sync
+# --frozen` before the model is called, so ten simultaneous spawns pay for each other.
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"}, codex_spawn_stagger_seconds=20),
+                ENV3, spawned)
+dp.state["muse"] = {"last_spawn_at": time.time() - 2}
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    it = {"id": "C1", "worktree": WT, "lane": "l", "title": "t"}
+    rc = dp.codex_spawn("CODEX-1", it)
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(rc is False and not spawned and it.get("status") != "broken",
+   "MUST BITE: a spawn 2s after the last one is DEFERRED, and the item is NOT marked broken — it "
+   "stays exactly where it was for the next tick. A stagger that breaks items is worse than none")
+ok(any("deferring" in str(x) and "bottleneck" in str(x) for x in logs),
+   "the deferral says why, so a quiet queue does not read as a stalled one")
+
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"}, codex_spawn_stagger_seconds=20),
+                ENV3, spawned)
+dp.state["muse"] = {"last_spawn_at": time.time() - 60}
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    dp.codex_spawn("CODEX-1", {"id": "C1", "worktree": WT, "lane": "l", "title": "t"})
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(bool(spawned) and dp.state["muse"]["last_spawn_at"] > time.time() - 5,
+   "once the gap has passed the spawn proceeds, and the clock restarts from THIS spawn")
+ok('mstate["last_spawn_at"] = time.time()' in src.split("self.state[\"codex\"][slot]")[0]
+   or 'mstate["last_spawn_at"] = time.time()' in src,
+   "the stagger clock starts when a spawn SUCCEEDS, not when one is attempted — a failing spawn "
+   "must not hold the queue behind it")
+
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"}, codex_spawn_stagger_seconds=0),
+                ENV3, spawned)
+dp.state["muse"] = {"last_spawn_at": time.time()}
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    dp.codex_spawn("CODEX-1", {"id": "C1", "worktree": WT, "lane": "l", "title": "t"})
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(bool(spawned), "a stagger of 0 disables it rather than blocking every spawn forever")
+
+# ------------------------------------------------------------- REFUSED is not FAILED, on the board
+ok('kind = "REFUSED"' in src,
+   "MUST BITE: a quota or auth refusal gets its OWN board kind. It is not a failure of the item, "
+   "the worktree or the work — the provider declined to run, and a rework or auto-continue would "
+   "just be refused again. Until now it showed only in the provider's own log")
+i_ref = src.index('kind = "REFUSED"')
+ok(src.index('pending[key] = {', i_ref) > i_ref,
+   "and the REFUSED kind is set BEFORE the row is written, so the board sees it rather than the "
+   "TURN_ENDED it would otherwise have been given")
 
 
 print(f"\n{P} passed, {len(FAILED)} failed")

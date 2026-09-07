@@ -2186,6 +2186,17 @@ class Dispatcher:
             # An actuator, and the most expensive one: it creates a worktree and starts a paid run.
             self.log(f"OBSERVE-ONLY: would spawn codex {slot} for {item['id']}")
             return False
+        # STAGGER. Every spawn does a `git worktree add` AND a `uv sync --frozen` before the model
+        # is ever called, so ten simultaneous spawns make SETUP the bottleneck and all ten pay for
+        # each other. This defers rather than refuses: the item stays exactly where it was and the
+        # next tick takes it. Zero disables it.
+        gap = float(self.c("codex_spawn_stagger_seconds", 20))
+        mstate = self.state.setdefault("muse", {})
+        since = time.time() - float(mstate.get("last_spawn_at", 0))
+        if gap > 0 and since < gap:
+            self.log(f"{slot}: deferring {item['id']} for {gap - since:.0f}s — a spawn started "
+                     f"{since:.0f}s ago and setup (worktree add + uv sync) is the bottleneck")
+            return False
         wt = item.get("worktree", "")
         trunk = os.path.join(CN, "voicepod-plan010-rebuild")
         if not os.path.isdir(wt) and not self.dry:
@@ -2240,7 +2251,6 @@ class Dispatcher:
         # profiles, steps over a held one, and falls back to zen only when every Go key is held.
         # `last` lives in self.state so the rotation survives a tick: kept in a local, it would
         # restart at the head every time and hand every dispatch to muse-go-1.
-        mstate = self.state.setdefault("muse", {})
         profile, pnote = museadapter.select_profile(slot, item, self.cfg, mstate)
         if profile is None:
             self.log(f"{slot}: no usable profile for {item['id']}: {pnote}")
@@ -2287,6 +2297,7 @@ class Dispatcher:
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"codex spawn failed: {e}")
             return False
         mstate["last"] = profile      # so the next dispatch rotates onward rather than repeating
+        mstate["last_spawn_at"] = time.time()   # the stagger clock starts when a spawn SUCCEEDS
         self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000),
                                      "profile_note": pnote,
                                      "profile": rspec["profile"], "model_intended": rspec["model"],
@@ -2354,6 +2365,14 @@ class Dispatcher:
                 # dispatch steps over it. AUTH waits for a human, QUOTA waits for a clock, and
                 # TRANSPORT is not held at all — mark_unhealthy keeps that distinction.
                 failed = museadapter.classify_failure(whole)
+                if failed in (museadapter.AUTH, museadapter.QUOTA):
+                    # A REFUSAL IS NOT A FAILURE, and the board must not read it as one. The provider
+                    # declined to run: nothing about the item, the worktree or the work is wrong, and
+                    # a rework or an auto-continue would just be refused again. Until now a quota
+                    # refusal was invisible here and showed only in the provider's own log — BOSS,
+                    # 2026-09-08. The distinct kind is what makes "the key is spent" legible next to
+                    # "the code is broken".
+                    kind = "REFUSED"
                 if failed in (museadapter.AUTH, museadapter.QUOTA) and run.get("profile"):
                     museadapter.mark_unhealthy(
                         self.state.setdefault("muse", {}), run["profile"], failed,
