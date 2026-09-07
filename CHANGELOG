@@ -2262,3 +2262,56 @@ false positive gets "fixed" by deleting the explanation.
   two-line change pointing that branch at child_env. Stripping a socket from workers I introduced is
   not a behaviour change to anything that was working; changing what the owner's reviewer slots
   receive is.
+
+
+2026-09-08 06:5x  THE DEGRADED TICK — codex unblocked, and the do-nothing path made to say so
+  dispatcher.py, tests/test_serverdown.py (NEW, 11), tests/run_all.sh. Suite 65 files, ALL GREEN.
+
+  BOSS found why ZERO Muse workers have ever run under the daemon, and it was none of the things we
+  had been fixing. The tick pings /global/health on the opencode server and returns early on any
+  exception — before codex_tick and before every dispatch path. The opencode server has been down
+  since 2026-09-07 13:13:42, so the tick has returned early on every iteration for ~16 hours.
+
+  Codex and Muse workers have NO functional dependency on that server. They are `codex exec`
+  subprocesses on another provider. They were blocked by a health check for a service they never
+  use, which means the routing, the wiring, the restarts and the config were all correct and all
+  irrelevant.
+
+  1. DECOUPLED. codex_only_pass() runs the codex half on a tick that is returning early for
+     opencode's sake: load the queue, run codex_tick, write it back if it changed. Deliberately
+     minimal, and wrapped so a failure in the degraded path cannot take the daemon with it.
+
+  2. THE CONDITION IS RE-ASSERTED EVERY TICK. SERVER_DOWN stays one-shot — an event is a statement
+     about a moment — but state["degraded"] now carries reason, since, for_s, effect and as_of, and
+     is rewritten on every degraded tick and CLEARED on the first healthy one. Sixteen hours of
+     outage had been announced once, yesterday, and were silent afterwards: a recurring condition
+     rendered as a single historical event.
+
+  3. THREE STATES, NOT ONE STRING. "idle: no eligible CODEX item" was covering an empty queue, a
+     refused/deferred spawn, and a tick that never reached the code. refuse_spawn() now records a
+     reason at all nine non-spawning exits from codex_spawn, so the slot's line says which.
+
+  AND THE LIVENESS SIGNALS THEMSELVES. save_state() ran before the return and the heartbeat was
+  written at the TOP of the tick, so state.json was fresh, the heartbeat was seconds old, and every
+  signal on the board was being written BY THE CODE PATH THAT DOES NOTHING — a daemon that could do
+  no work was indistinguishable from a healthy idle one, for sixteen hours. write_heartbeat(degraded)
+  now stamps the reason into the heartbeat itself, which both readers already print.
+
+  Mutations 6 of 6 CAUGHT (sources restored and md5-verified): restore the original early return;
+  write a clean heartbeat on the degraded path; freeze the duration after the first assertion; never
+  clear the mark on recovery; collapse the three idle states. One attempt produced a KeyError rather
+  than a verdict — the checks now read state defensively so a removed field fails a CHECK instead of
+  raising, and it was re-scored as a valid mutation.
+
+  A FIXTURE DEFECT, the sixth tonight: `spawned = []` between ticks REBOUND the name while the
+  daemon's stub still held the old list, so the second tick's dispatch landed where the check could
+  not see it and failed for a reason unrelated to the daemon. Cleared in place now.
+
+  I did NOT start the opencode server, per BOSS: it would revive fourteen EXEC sessions dead for
+  sixteen hours, mid-task, with stale state — a large side effect to route around a small bug.
+
+  Addendum, same change: two fixtures build a Dispatcher without running __init__ (test_codexroute
+  via __new__, test_observe via a Stub that overrides it), so `_spawn_refusal` had to be created in
+  each of them. Deliberately NOT defaulted defensively in the product — making codex_spawn tolerate
+  a half-built object would hide exactly the missing initialisation a test exists to find. The whole
+  suite caught both; my own new file did not, because it had set the field itself.

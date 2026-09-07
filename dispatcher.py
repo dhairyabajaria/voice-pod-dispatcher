@@ -312,6 +312,7 @@ class Dispatcher:
         self.state.setdefault("auto", {})
         self.state.setdefault("pending", {})
         self.state.setdefault("server_down_emitted", False)
+        self._spawn_refusal = {}
         self.state.setdefault("codex", {})
         self.state.setdefault("parks", {})
         self.started_ms = int(time.time() * 1000)
@@ -2189,11 +2190,23 @@ class Dispatcher:
     def codex_slots(self):
         return [f"CODEX-{i + 1}" for i in range(int(self.c("codex_slots", 0)))]
 
+    def refuse_spawn(self, slot, why):
+        """Record WHY a spawn did not happen, and return False. -> False.
+
+        The board showed "idle: no eligible CODEX item" for a refusal, a deferral and a queue that
+        was never read. Every path out of codex_spawn that does not start a worker comes through
+        here, so the reason exists at the moment the slot's status line is written rather than being
+        reconstructed from a log afterwards.
+        """
+        self._spawn_refusal[slot] = why
+        return False
+
     def codex_spawn(self, slot, item):
+        self._spawn_refusal.pop(slot, None)
         if getattr(self, "observing", False):
             # An actuator, and the most expensive one: it creates a worktree and starts a paid run.
             self.log(f"OBSERVE-ONLY: would spawn codex {slot} for {item['id']}")
-            return False
+            return self.refuse_spawn(slot, "OBSERVE-ONLY: actuators held")
         # STAGGER. Every spawn does a `git worktree add` AND a `uv sync --frozen` before the model
         # is ever called, so ten simultaneous spawns make SETUP the bottleneck and all ten pay for
         # each other. This defers rather than refuses: the item stays exactly where it was and the
@@ -2204,7 +2217,7 @@ class Dispatcher:
         if gap > 0 and since < gap:
             self.log(f"{slot}: deferring {item['id']} for {gap - since:.0f}s — a spawn started "
                      f"{since:.0f}s ago and setup (worktree add + uv sync) is the bottleneck")
-            return False
+            return self.refuse_spawn(slot, f"staggered: waiting {gap - since:.0f}s behind the last spawn")
         wt = item.get("worktree", "")
         trunk = os.path.join(CN, "voicepod-plan010-rebuild")
         if not os.path.isdir(wt) and not self.dry:
@@ -2217,7 +2230,7 @@ class Dispatcher:
             if r.returncode != 0:
                 self.log(f"{slot}: worktree add failed for {item['id']}: {r.stderr.strip()[:200]}")
                 item["status"] = "broken"; item["error"] = r.stderr.strip()[:200]
-                return False
+                return self.refuse_spawn(slot, f"worktree add failed: {r.stderr.strip()[:120]}")
         venv_py = os.path.join(wt, "platform", ".venv", "bin", "python")
         venv_ok = os.path.exists(venv_py) and subprocess.run([venv_py, "-c", "import pytest, pgserver"], capture_output=True).returncode == 0
         if not venv_ok:  # a venv Codex half-built offline exists but cannot import pytest (2026-09-05)
@@ -2228,12 +2241,12 @@ class Dispatcher:
             if r.returncode != 0:
                 self.log(f"{slot}: uv sync failed for {item['id']}: {r.stderr.strip()[-200:]}")
                 item["status"] = "broken"; item["error"] = "uv sync failed: " + r.stderr.strip()[-200:]
-                return False
+                return self.refuse_spawn(slot, "uv sync --frozen failed")
         try:
             body = open(os.path.join(ITEMS_DIR, item.get("prompt_file") or f"{item['id']}.md")).read()
         except Exception as e:
             item["status"] = "broken"; item["error"] = str(e)
-            return False
+            return self.refuse_spawn(slot, f"prompt file unreadable: {e}")
         resume = ""
         if item.get("codex_continue"):
             resume = (f"RESUME (continue {item['codex_continue']} of {self.c('max_auto_continue', 3)}): your previous run on this item "
@@ -2266,12 +2279,12 @@ class Dispatcher:
             # behind a rolling wall, and its cached prefix is worth more than the wait. The item is
             # left exactly as it was for a later tick.
             self.log(f"{slot}: {item['id']} waits — {pnote}")
-            return False
+            return self.refuse_spawn(slot, f"waiting for its own key — {pnote}")
         if profile is None:
             self.log(f"{slot}: no usable profile for {item['id']}: {pnote}")
             item["status"] = "broken"; item["error"] = f"no usable profile: {pnote}"[:200]
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"no usable profile: {pnote}")
-            return False
+            return self.refuse_spawn(slot, f"no usable profile: {pnote}")
         if profile != (self.cfg.get("codex_routes") or {}).get(slot):
             # A substitution nobody can see is the failure this layer exists to prevent.
             self.log(f"{slot}: profile {profile} — {pnote}")
@@ -2289,7 +2302,7 @@ class Dispatcher:
             self.log(f"{slot}: route refused for {item['id']} ({profile}): {rwhy}")
             item["status"] = "broken"; item["error"] = f"route {profile}: {rwhy}"[:200]
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"route {profile} refused: {rwhy}")
-            return False
+            return self.refuse_spawn(slot, f"route {profile} refused: {rwhy}")
         cmd = [self.c("codex_bin", "codex"), "exec", "-s", "workspace-write", "-c", f"sandbox_workspace_write.writable_roots={roots}",
                *rflags, "--skip-git-repo-check", prompt]
         if self.dry:
@@ -2310,7 +2323,7 @@ class Dispatcher:
             self.log(f"{slot}: spawn failed for {item['id']}: {e}")
             item["status"] = "broken"; item["error"] = f"codex spawn failed: {e}"
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"codex spawn failed: {e}")
-            return False
+            return self.refuse_spawn(slot, f"launch failed: {type(e).__name__}: {e}")
         # AFFINITY IS WRITTEN ON THE ITEM, which is what makes it survive. Until now the chosen
         # profile lived only in self.state["codex"][slot] — slot-keyed RUN state — so a resume or a
         # re-spawn of the same item re-entered selection with nothing, was placed again, and landed
@@ -2469,15 +2482,69 @@ class Dispatcher:
                         self.emit("CLEARED", slot, f"codex:{slot}", "-", "new item spawned")
                     exec_status[slot] = f"dispatched {nxt['id']}"
                 elif not run:
-                    exec_status[slot] = "idle: no eligible CODEX item"
+                    # THREE STATES, NOT ONE. "idle: no eligible CODEX item" was covering three
+                    # different situations that need three different responses: nothing is queued
+                    # (fine), something was queued and the spawn refused or deferred it (act on the
+                    # reason), and the tick never reached this code at all (the daemon is degraded).
+                    # A single string for all three is how sixteen hours of never-evaluated read as
+                    # an empty queue.
+                    if nxt:
+                        exec_status[slot] = (f"REFUSED {nxt['id']}: "
+                                             + (self._spawn_refusal.get(slot) or "no reason recorded"))
+                    else:
+                        exec_status[slot] = "idle: no CODEX item queued"
         return fed_this_tick
+
+    def write_heartbeat(self, degraded=""):
+        """The heartbeat, carrying the reason when this tick did nothing. Both readers print it."""
+        if self.dry:
+            return
+        try:
+            with open(HEARTBEAT, "w") as f:
+                f.write(now_local() + (f" — DEGRADED: {degraded}" if degraded else "") + "\n")
+        except OSError:
+            pass
+
+    def codex_only_pass(self):
+        """Dispatch to the CODEX slots on a tick that is returning early for opencode's sake.
+
+        CODEX WORKERS DO NOT USE THE OPENCODE SERVER. They are `codex exec` subprocesses on another
+        provider entirely, and they were blocked for roughly sixteen hours by a health check for a
+        service they never touch (BOSS, 2026-09-08 — no Muse worker has ever run under the daemon,
+        and none of the wiring, routing or config we fixed was the reason).
+
+        This is deliberately the minimum: load the queue, run the codex half, write the queue back if
+        it changed. It shares no state with the opencode half, so there is nothing here to keep in
+        step with it.
+        """
+        try:
+            qlock = self.queue_lock()
+            q = self.load_queue()
+            before = json.dumps(q, sort_keys=True)
+            status = {}
+            self.codex_tick(q, self.state["pending"], status, 0,
+                            int(self.c("max_dispatch_per_tick", 2)))
+            if json.dumps(q, sort_keys=True) != before:
+                self.save_queue(q)
+            return status
+        except Exception as e:  # noqa: BLE001 — the degraded path must not take the daemon with it
+            self.log(f"codex-only pass failed: {type(e).__name__}: {e}")
+            return {}
+        finally:
+            try:
+                qlock.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- one tick
     def tick(self):
         self.reload_cfg()   # roster.json is authoritative every tick, not just at startup
-        if not self.dry:
-            with open(HEARTBEAT, "w") as f:
-                f.write(now_local() + "\n")
+        # Written at the top and REWRITTEN by any path that returns early, because the heartbeat is
+        # the signal everything else trusts. A fresh heartbeat plus a fresh state.json written on the
+        # way OUT of a do-nothing tick is how a daemon that can do no work reads as a healthy idle
+        # one — sixteen hours of it, measured 2026-09-07/08. A liveness signal written before the
+        # work must not be allowed to stand in for the work.
+        self.write_heartbeat()
 
         if os.path.exists(STOP) and not (self.dry and "--ignore-stop" in sys.argv):
             if not self.paused_logged:
@@ -2535,8 +2602,22 @@ class Dispatcher:
                 self.state["server_down_emitted"] = True
                 if self.c("auto_restart_server", False) and not self.dry:
                     subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.voicepod.opencode-serve"], timeout=10, capture_output=True)
+            # RENDERED EVERY TICK, not once. SERVER_DOWN is one-shot by design (an event should not
+            # repeat), but a one-shot event is a statement about a MOMENT, and this is a CONDITION.
+            # Sixteen hours of outage were announced once, yesterday, and silent since. The state
+            # field and the heartbeat suffix are re-asserted on every degraded tick so the board
+            # shows what is true now rather than what happened when it started.
+            self.state["degraded"] = {
+                "reason": f"opencode server unreachable at {BASE}",
+                "since": self.server_down_since, "for_s": int(down_for),
+                "effect": "opencode executors are NOT observed and NOT fed; CODEX slots continue",
+                "as_of": now_local()}
+            # CODEX HAS NO DEPENDENCY ON THAT SERVER and must not be held by its health.
+            self.state["degraded"]["codex"] = self.codex_only_pass()
+            self.write_heartbeat(f"opencode unreachable {int(down_for)}s — CODEX dispatch only")
             self.save_state()
             return
+        self.state.pop("degraded", None)
 
         if not self.roster or time.time() - self.last_resync > self.c("resync_seconds", 60):
             self.roster_refresh()

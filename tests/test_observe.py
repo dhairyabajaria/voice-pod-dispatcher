@@ -47,6 +47,9 @@ class Stub(DSP.Dispatcher):
         self.paused_logged = False; self.observe_logged = False
         self.observing = observing
         self.logged = []
+        # This Stub overrides __init__ entirely, so anything the real one creates must be created
+        # here too. Added 2026-09-08 with refuse_spawn, which records WHY a spawn did not happen.
+        self._spawn_refusal = {}
     def log(self, m, *a, **k): self.logged.append(m)
     def reload_cfg(self): pass
     def load_queue(self): return {"items": []}

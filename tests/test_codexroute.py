@@ -72,6 +72,11 @@ def daemon(cfg, env, spawned):
     dp.dry = False; dp.observing = False
     dp.cfg = cfg
     dp.state = {"codex": {}}
+    # Set here rather than defaulted in the product: these fixtures build a Dispatcher with
+    # __new__, so anything __init__ would have created has to be created BY THE FIXTURE. Making the
+    # product tolerate a half-built object instead would hide exactly the kind of missing
+    # initialisation a test exists to find.
+    dp._spawn_refusal = {}
     dp.log = lambda *a, **k: logs.append(a[0] if a else "")
     dp.emit = lambda *a: events.append(a)
     dp.escalate = lambda *a: None
