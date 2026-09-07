@@ -1972,7 +1972,16 @@ class Dispatcher:
             n, err = len(verdict.get("gaps") or []), verdict.get("error")
             self.emit("PLAN_REVIEWED", name, sid, "-", f"item={item_id} gaps={n} {'error=' + str(err) if err else ''}",
                       clean_excerpt(msg))
-            self.post_prompt(sid, msg)
+            # PLAN_REVIEWED says the review RAN, which is true whatever the post does. But the
+            # executor is stopped waiting for exactly this message, so a lost post leaves it idle
+            # for as long as nobody looks, under a log line that reads as if it had been told.
+            if not self.post_prompt(sid, msg):
+                why = getattr(self, "_last_post_error", "") or "post_prompt returned False"
+                self.emit("PLAN_REVIEW_UNDELIVERED", name, sid, "-", f"item={item_id}",
+                          f"the review ran and its feedback did NOT reach {name}: {why}. The "
+                          f"executor is stopped waiting for it and will not resume on its own.")
+                self.escalate(f"PLAN REVIEW {item_id}: the feedback could not be delivered to {name} "
+                              f"({why}). The executor is waiting on a message it never got.")
         if self.dry:
             self.log(f"[dry] would plan-review {item_id}")
             return
@@ -2022,6 +2031,11 @@ class Dispatcher:
                        f"the report is not gated again; the verdict is coming")
                 self._report_verdict = (msg_id, GATE_RUNNING, why)
                 if self.skip_gate(name, sid, msg_id, f"item={mid_gate['id']}", why):
+                    # BEST-EFFORT BY DECISION (BOSS's rule, 2026-09-08): honour the result only where
+                    # a lost post changes what a person or the daemon later believes. This one moves
+                    # no state and writes no record — AUTO_GATE_SKIPPED is already emitted above and
+                    # is true whether or not the courtesy note lands. The worst case is an executor
+                    # that resends a report the gate then ignores. Decided, not missed.
                     self.post_prompt(sid, f"Your report for {mid_gate['id']} arrived while its merge "
                                           f"gate is still running. Do NOT resend it and do NOT reply "
                                           f"to this note — wait; if the gate fails, a rework reaches "
@@ -2045,6 +2059,8 @@ class Dispatcher:
                 self._report_verdict = (msg_id, UNGATEABLE, why)
                 self.emit("REPORT_ON_PARKED_ROW", name, sid, msg_id, f"item={parked_row['id']}", why)
                 self.escalate(f"REPORT ON A PARKED ROW: {why}")
+                # BEST-EFFORT BY DECISION: the event and the escalation above carry the whole fact to
+                # BOSS, who is the one who must act. This note only spares the executor a resend.
                 self.post_prompt(sid, f"Your report for {parked_row['id']} arrived. Its queue row is "
                                       f"parked pending an answer to your QUESTION, so nothing has "
                                       f"gated it yet — that is on us, not you. Do NOT resend and do "
@@ -2100,6 +2116,9 @@ class Dispatcher:
                             # when the skip is NEW — the tick re-feeds an idle executor every 5s, and
                             # the same correction repeated forever is noise the executor cannot act on.
                             if spoke:
+                                # BEST-EFFORT BY DECISION: the row and the skip event already say the
+                                # report was not gated and why. This is the courtesy copy to the
+                                # executor so it can fix the paperwork without redoing work.
                                 self.post_prompt(sid, f"Your REPORT READY for {cur['id']} was NOT gated: "
                                                       f"{iwhy}. {autogate.INTERRUPT_FIX}")
                             # The row STAYS: this is a real report BOSS should see waiting, unlike an
@@ -2487,9 +2506,15 @@ class Dispatcher:
                 cur = self.current_item(q, name)
                 if kind == "ACK" and cur and self.state.setdefault("nudged", {}).get(sid) != msg_id:
                     # an ACK handled by an older daemon build (2026-09-05, EXEC-E) left the executor idle mid-item
-                    self.state["nudged"][sid] = msg_id
-                    self.post_prompt(sid, f"REOPEN acknowledged. Continue item {cur['id']} now from where the disk says you are; end at REPORT READY or a QUESTION block.")
-                    exec_status[name] = f"building {cur['id']} (nudged after ACK)"
+                    # The marker is set only on a DELIVERED nudge: it suppresses every later attempt
+                    # for this message, so setting it on a failed post retires the nudge for good and
+                    # leaves the executor idle under a label that says it is building.
+                    if self.post_prompt(sid, f"REOPEN acknowledged. Continue item {cur['id']} now from where the disk says you are; end at REPORT READY or a QUESTION block."):
+                        self.state["nudged"][sid] = msg_id
+                        exec_status[name] = f"building {cur['id']} (nudged after ACK)"
+                    else:
+                        exec_status[name] = (f"{cur['id']} — the ACK nudge did NOT reach it: "
+                                             f"{getattr(self, '_last_post_error', '') or 'post refused'}")
                     continue
                 # already-handled idle executor (e.g. stood down last night): feed it if the queue has work
                 if self.feed_when_idle(q, name, kind, cur) and fed_this_tick < max_feed:
@@ -2508,9 +2533,13 @@ class Dispatcher:
                     # feature off (or no item to review): the executor is mid-build and stopped for
                     # nothing — push it on rather than leaving it idle waiting on a review that
                     # will never come.
-                    self.post_prompt(sid, f"Plan review is not active{' for this item' if cur else ''}. "
-                                          f"Continue the build now and end at REPORT READY or a QUESTION block.")
-                    exec_status[name] = (f"building {cur['id']} " if cur else "") + "(plan review off — continued)"
+                    if self.post_prompt(sid, f"Plan review is not active{' for this item' if cur else ''}. "
+                                             f"Continue the build now and end at REPORT READY or a QUESTION block."):
+                        exec_status[name] = (f"building {cur['id']} " if cur else "") + "(plan review off — continued)"
+                    else:
+                        exec_status[name] = ((f"{cur['id']} " if cur else "")
+                                             + f"— plan review is off and the CONTINUE did NOT reach "
+                                               f"it: {getattr(self, '_last_post_error', '') or 'post refused'}")
                     continue
                 self.emit("PLAN_READY", name, sid, msg_id, f"item={cur['id']} — reviewing before build", exc)
                 exec_status[name] = f"plan review {cur['id']}"
@@ -2549,10 +2578,31 @@ class Dispatcher:
                     continue
                 n = int(self.state["auto"].get(sid, 0))
                 if n < max_auto:
-                    self.state["auto"][sid] = n + 1
-                    self.emit("AUTO-CONTINUE", name, sid, msg_id, f"{n + 1}/{max_auto} since={ms_local(when_ms)} finish={finish}", exc)
-                    self.post_prompt(sid, CONTINUE_PROMPT.format(n=n + 1, max=max_auto))
-                    exec_status[name] = f"auto-continued {n + 1}/{max_auto}"
+                    # A1b (BOSS, 2026-09-08). This used to emit AUTO-CONTINUE and increment the
+                    # counter BEFORE posting, and post_prompt reports failure by returning False.
+                    # So three lost posts walked the counter to max and escalated STUCK for an
+                    # executor that was never prompted, with three log lines saying it had been.
+                    # That is the board reporting what it SENT rather than what happened — the same
+                    # shape that hid two dead executors for 7.3 and 5.7 hours.
+                    # The post happens first and the record follows it. A failed post does NOT
+                    # consume an attempt: the next tick tries again, and a session that stays
+                    # unreachable is caught by check_session_idle and check_dead, which measure the
+                    # SESSION rather than our own send count.
+                    if self.post_prompt(sid, CONTINUE_PROMPT.format(n=n + 1, max=max_auto)):
+                        self.state["auto"][sid] = n + 1
+                        self.emit("AUTO-CONTINUE", name, sid, msg_id, f"{n + 1}/{max_auto} since={ms_local(when_ms)} finish={finish}", exc)
+                        exec_status[name] = f"auto-continued {n + 1}/{max_auto}"
+                    else:
+                        err = getattr(self, "_last_post_error", "") or "post_prompt returned False"
+                        # Once per message: the tick revisits an idle executor every 5s and a
+                        # failure repeated forever is one nobody reads.
+                        seen = self.state.setdefault("auto_failed", {})
+                        if seen.get(sid) != msg_id:
+                            seen[sid] = msg_id
+                            self.emit("AUTO_CONTINUE_FAILED", name, sid, msg_id,
+                                      f"attempt {n + 1}/{max_auto} NOT sent", err)
+                        exec_status[name] = (f"auto-continue {n + 1}/{max_auto} NOT DELIVERED — {err}; "
+                                             f"the attempt was not counted")
                     continue
                 kind = "STUCK"
             else:
@@ -2562,8 +2612,11 @@ class Dispatcher:
             if kind == "ACK":
                 cur = self.current_item(q, name)
                 if cur:  # it acknowledged mid-item and ended its turn: nudge it back onto the item, do not re-feed
-                    self.post_prompt(sid, f"REOPEN acknowledged. Continue item {cur['id']} now from where the disk says you are; end at REPORT READY or a QUESTION block.")
-                    exec_status[name] = f"building {cur['id']} (nudged after ACK)"
+                    if self.post_prompt(sid, f"REOPEN acknowledged. Continue item {cur['id']} now from where the disk says you are; end at REPORT READY or a QUESTION block."):
+                        exec_status[name] = f"building {cur['id']} (nudged after ACK)"
+                    else:
+                        exec_status[name] = (f"{cur['id']} — the ACK nudge did NOT reach it: "
+                                             f"{getattr(self, '_last_post_error', '') or 'post refused'}")
                 elif fed_this_tick < max_feed:
                     lab = self.feed(q, name, sid, kind, msg_id, text_of(m))
                     if lab:

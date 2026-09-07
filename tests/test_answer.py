@@ -492,7 +492,17 @@ unchecked.sort()
 # moves a queue row, which is why A1's acceptance did not cover them. The loudest is the
 # auto-continue at ~2511: it emits AUTO-CONTINUE and increments the counter BEFORE posting, so three
 # lost posts escalate STUCK for an executor that was never prompted, with three events saying it was.
-KNOWN_UNCHECKED = 8
+# A1b (BOSS's ruling, 2026-09-08): "a call site must honour the result if its failure changes what a
+# person or the daemon later believes. A best-effort notification that moves no state and writes no
+# event may drop it — and must say so in a comment."
+# FIXED, because a lost post changed a belief: the auto-continue (it emitted AUTO-CONTINUE and
+# incremented the counter before posting, so three lost posts escalated STUCK for an executor nobody
+# had prompted); both ACK nudges (one sets the `nudged` marker that suppresses every later attempt,
+# and both set a label reading `building`); the plan-review-off continue (same label problem); and
+# the plan review's own feedback (the executor is stopped waiting for exactly that message).
+# LEFT AS BEST-EFFORT, each with a comment at the call site saying it was decided: three courtesy
+# notes to an executor whose fact is already carried by an event, an escalation or a gate row.
+KNOWN_UNCHECKED = 3
 check("MUST-BITE  the count of call sites that DROP post_prompt's result is the measured one — a "
       "new unchecked call site is a new instance of the A1 defect and must not appear quietly",
       len(unchecked) == KNOWN_UNCHECKED,
@@ -500,6 +510,70 @@ check("MUST-BITE  the count of call sites that DROP post_prompt's result is the 
 check("MUST-BITE  and the answer path is NOT among them — the fix is measured in the source, not "
       "only in the behaviour above",
       not any(1200 < n < 1240 for n in unchecked), unchecked)
+SRC_LINES = open(os.path.join(HERE, os.pardir, "dispatcher.py"), errors="ignore").read().splitlines()
+undocumented = [n for n in unchecked
+                if not any("BEST-EFFORT BY DECISION" in ln for ln in SRC_LINES[max(0, n - 8):n])]
+check("MUST-BITE  every remaining dropped result is DOCUMENTED as a decision at its own call site — "
+      "otherwise the count alone cannot tell a considered best-effort from one nobody looked at",
+      not undocumented, undocumented)
+
+# --- A1b: the auto-continue counted an attempt it never sent ------------------------------------
+# It emitted AUTO-CONTINUE and incremented the counter BEFORE posting. Three lost posts therefore
+# walked the counter to max and escalated STUCK for an executor that was never prompted, with three
+# log lines saying it had been — the board reporting what it SENT rather than what happened.
+root, D = tree()
+DP, dp = daemon(root, D)
+dp.state = {"pending": {}, "parks": {}, "auto": {}, "handled": {}, "nudged": {}}
+dp.c = lambda k, default=None: {"max_auto_continue": 3}.get(k, default)
+events.clear()
+sent = []
+dp.post_prompt = lambda sid, text: (sent.append(text), False)[1]   # the transport is down
+dp._last_post_error = "ConnectionRefusedError: Connection refused"
+labels = {}
+q = loadq(D)
+# HONEST LABEL: the loop below is a MODEL of the branch, not the branch — the real one sits deep in
+# tick() behind a roster, a queue lock and three classifications. So the property it demonstrates is
+# pinned twice: here as behaviour, and below as the ORDER OF THE REAL STATEMENTS in the source. The
+# source check is the one that would survive me rewriting this model to match a broken fix.
+for _ in range(3):
+    # drive the same branch three times, exactly as three ticks would
+    n = int(dp.state["auto"].get("ses_j", 0))
+    if n < 3:
+        if dp.post_prompt("ses_j", "CONTINUE"):
+            dp.state["auto"]["ses_j"] = n + 1
+            dp.emit("AUTO-CONTINUE", "EXEC-J", "ses_j", "m1", f"{n + 1}/3", "")
+        else:
+            seen = dp.state.setdefault("auto_failed", {})
+            if seen.get("ses_j") != "m1":
+                seen["ses_j"] = "m1"
+                dp.emit("AUTO_CONTINUE_FAILED", "EXEC-J", "ses_j", "m1", f"attempt {n + 1}/3 NOT sent", "x")
+check("MUST-BITE  three FAILED auto-continues consume NO attempts — the counter is a record of what "
+      "was sent, and a counter that walks to max on lost posts escalates STUCK for an executor "
+      "nobody prompted",
+      dp.state["auto"].get("ses_j", 0) == 0, dp.state["auto"])
+check("MUST-BITE  ...and no AUTO-CONTINUE event claims a prompt that never left",
+      not any(k == "AUTO-CONTINUE" for k, _a in events), [k for k, _a in events])
+check("  the failure is announced ONCE per message, not once per 5-second tick",
+      [k for k, _a in events].count("AUTO_CONTINUE_FAILED") == 1, [k for k, _a in events])
+# CONTROL: a DELIVERED continue still counts, or the fix is "never auto-continue" wearing a new name.
+dp.state["auto"] = {}
+events.clear()
+dp.post_prompt = lambda sid, text: True
+n = int(dp.state["auto"].get("ses_j", 0))
+if dp.post_prompt("ses_j", "CONTINUE"):
+    dp.state["auto"]["ses_j"] = n + 1
+    dp.emit("AUTO-CONTINUE", "EXEC-J", "ses_j", "m1", f"{n + 1}/3", "")
+check("CONTROL  a DELIVERED auto-continue still counts and still emits — the fix must not be "
+      "`never auto-continue` under a new name",
+      dp.state["auto"]["ses_j"] == 1 and any(k == "AUTO-CONTINUE" for k, _a in events),
+      (dp.state["auto"], [k for k, _a in events]))
+# and the source really has the post BEFORE the record, which is the whole property
+SRC = "\n".join(SRC_LINES)
+i = SRC.find("if self.post_prompt(sid, CONTINUE_PROMPT.format(")
+check("MUST-BITE  in the SOURCE the post comes first and the counter follows it — a test that only "
+      "drove a copy of the branch would pass over the original order",
+      i != -1 and SRC.find('self.state["auto"][sid] = n + 1', i) > i
+      and SRC.find('self.emit("AUTO-CONTINUE"', i) > i, i)
 
 print(("\nFAILED: " + ", ".join(fails)) if fails else "\nall green")
 sys.exit(1 if fails else 0)

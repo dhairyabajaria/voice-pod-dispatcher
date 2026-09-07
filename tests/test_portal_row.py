@@ -11,12 +11,43 @@ root = tempfile.mkdtemp(prefix="portalrow-")
 MG.CN = root
 wt = os.path.join(root, "lane"); os.makedirs(os.path.join(wt, "portal", "node_modules"))
 os.makedirs(os.path.join(root, "test-logs"), exist_ok=True)
+# A REAL git worktree, because the portal proofs now run in a frozen checkout at the candidate sha
+# (Plan 003 A2) — the lane worktree is one in production, and a fixture that is a plain directory
+# would make the checkout fail and this file would be measuring the failure path instead.
+import subprocess as _sp
+_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+def _git(*a):
+    return _sp.run(("git",) + a, cwd=wt, capture_output=True, text=True, env=_ENV)
+_git("init", "-q", "-b", "main")
+open(os.path.join(wt, "seed"), "w").write("x\n")
+# portal/ must be COMMITTED: a frozen checkout carries tracked files only, which is the point of it
+# — node_modules stays untracked and is symlinked in by frozen_checkout, exactly as in production.
+os.makedirs(os.path.join(wt, "portal", "src", "lib"), exist_ok=True)
+open(os.path.join(wt, "portal", "package.json"), "w").write("{}\n")
+open(os.path.join(wt, "portal", "src", "lib", "permissions.test.ts"), "w").write("// test\n")
+_git("add", "seed", "portal/package.json", "portal/src/lib/permissions.test.ts")
+_git("commit", "-qm", "candidate")
+CAND = _git("rev-parse", "HEAD").stdout.strip()
 calls = []
 def fake_run(cmd, **kw):
     calls.append(cmd)
     kw["stdout"].write("Test Files  42 passed (42)\nTests  511 passed (511)\n")
     return types.SimpleNamespace(returncode=0)
-MG.subprocess.run = fake_run
+_REAL_RUN = MG.subprocess.run
+
+
+def run_or_real(cmd, **kw):
+    """The portal proofs now run in a FROZEN CHECKOUT at the candidate sha (Plan 003 A2), so this
+    module's stub also sees the `git worktree` calls that build it. Those are real git commands on a
+    real temp repo and must run for real; only the vitest/npm calls are faked. Before this, the stub
+    answered every command and raised KeyError('stdout') on the first git one."""
+    if cmd and str(cmd[0]).endswith("git"):
+        return _REAL_RUN(cmd, **kw)
+    return fake_run(cmd, **kw)
+
+
+MG.subprocess.run = run_or_real
 
 fails = []
 def check(name, cond, detail=""):
@@ -39,7 +70,7 @@ check("  row says WHOLE SUITE and carries the counts",
 
 # a portal file in the diff promotes the row even when the item names no .tsx proof
 calls.clear(); rows.clear()
-MG.run_proofs({"proof_files": []}, wt, "sha", "head", "I3", lambda n, ok, d: rows.append((n, ok, d)),
+MG.run_proofs({"proof_files": []}, wt, CAND, "head", "I3", lambda n, ok, d: rows.append((n, ok, d)),
               portal_touched=["portal/src/routes/Integrations.tsx"])
 check("a portal/** file in the diff runs the suite with no named .tsx proof",
       calls and calls[0] == ["npx", "vitest", "run"], str(calls[:1]))

@@ -25,6 +25,7 @@ touches `state["ok"]`. That is the whole mechanism keeping them advisory: giving
 rec() call would make an advisory reviewer a veto and break the 16:15 ruling.
 """
 import fnmatch
+import glob
 import hashlib
 import json
 import os
@@ -262,6 +263,296 @@ def codex_env():
     return env
 
 
+# --- the primary adversarial reviewer's ROUTE, pinned in the INVOCATION ------------------------
+#
+# Plan 003 §3 requires the primary gate reviewer to be Astra on an explicit native route, recording
+# model, provider, effort and actual session identity. The plugin wrapper cannot do it, and the
+# reason is in its own option surface, not in a suspicion:
+#
+#   codex-companion.mjs handleReviewCommand -> valueOptions ["base","scope","model","cwd"]
+#     — `model` is accepted, `effort` IS NOT.
+#   its adversarial branch calls runAppServerTurn({prompt, model, sandbox, outputSchema, onProgress})
+#     — no effort, while the sibling task path passes `effort: request.effort`.
+#   lib/codex.mjs runAppServerTurn sends `model: options.model ?? null, effort: options.effort ?? null`.
+#
+# So through the wrapper the model can be pinned and the effort cannot. Pinning half of it would let
+# a gate record "Astra route" while the effort still came from ~/.codex/config.toml — a guard
+# excluded from its own proof set. We therefore call the Codex CLI directly and both values come
+# from the invocation.
+#
+# WHAT THE ROLLOUTS SAY, measured 2026-09-08 rather than inferred: of five sessions under
+# ~/.codex/sessions carrying our "Merge gate for" prompt, FOUR ran gpt-6-astra at medium and ONE ran
+# gpt-5.6-luna at xhigh. The honest statement about history is that the route was UNPINNED AND
+# DRIFTED between at least two model/effort pairs — not that it was always the config default.
+# Worse, only 5 of ~146 gate runs left a rollout at all: the wrapper's review path starts its thread
+# with `ephemeral: true`, so the other ~141 reviews have no session record and their identity is
+# unrecoverable. `codex exec` persists unless asked not to, so from here every review has one.
+#
+# medium is DECIDED, not open (Plan 003 §3 + BOSS 2026-09-08): preserve an existing explicitly
+# configured Astra effort, else pin medium as the documented baseline. The four measured Astra gate
+# reviews all ran medium, so medium IS the observed baseline. Do not raise it here.
+ASTRA_MODEL = "gpt-6-astra"
+ASTRA_EFFORT = "medium"
+# The wrapper's own review schema. Reused deliberately: the companion renders THIS structure into
+# the markdown every existing parser in this file was built against, so keeping the schema keeps one
+# output contract instead of inventing a second one.
+REVIEW_SCHEMA = os.path.expanduser(
+    "~/.claude/plugins/marketplaces/openai-codex/plugins/codex/schemas/review-output.schema.json")
+SESSIONS_ROOT = os.path.expanduser("~/.codex/sessions")
+
+
+REVIEW_PROMPT = (
+    "Adversarial merge-gate review. Review ONLY the changes the candidate commit `{sha}` "
+    "introduces on top of `{base}`: run `git diff {base}...{sha}` yourself and read the files it "
+    "names. Do not review pre-existing code that this candidate did not touch, and do not review "
+    "anything outside that diff — the working tree may hold later work that is not this "
+    "candidate.\n\n"
+    "{focus}\n\n"
+    "Answer with the JSON object required by the output schema and nothing else: `verdict` is "
+    "`approve` only if you would merge this as it stands, otherwise `needs-attention`; every "
+    "finding carries a severity, the file and the line range you actually read."
+)
+
+
+def codex_review_argv(base, sha, focus, schema, last_msg, model=ASTRA_MODEL, effort=ASTRA_EFFORT):
+    """The exact argv for one pinned gate review. Pure, so the pins are testable without a call.
+
+    WHY `exec` AND NOT `exec review`, both measured 2026-09-08 rather than assumed:
+      * `codex exec review --base X "<prompt>"` is refused by the CLI itself — "the argument
+        '--base <BRANCH>' cannot be used with '[PROMPT]'". Native scoping and our adversarial focus
+        are mutually exclusive there.
+      * and its `--output-schema` is accepted but NOT honoured: the run returned prose with `[P2]`
+        markers and NO `Verdict:` line at all. Fed to this file's fail-closed parser that is a FAIL
+        on every candidate, and `[P2]` is not one of the severity markers severity_hits() counts.
+    So the scoping moves into the prompt, where the base is named explicitly, and the answer shape
+    stays the schema every parser here already reads.
+
+    The cwd is passed by the caller (sh(..., cwd=wt)) rather than -C: Plan 003 §5 warns that parent
+    options must precede a subcommand, and not needing the flag beats needing it in the right place.
+    """
+    return [codex_bin(), "exec",
+            "--strict-config",              # an unrecognised config KEY becomes an error, not a
+                                            # silently ignored flag: measured 2026-09-08, a run with
+                                            # this flag exits 0, so `model_reasoning_effort` is a key
+                                            # this CLI version knows. Without it, a renamed setting
+                                            # would leave the effort inherited and the row cheerful.
+            "-m", model,
+            "-c", f"model_reasoning_effort={effort}",
+            "-s", "read-only",
+            "--output-schema", schema,
+            "-o", last_msg,
+            "--json",
+            REVIEW_PROMPT.format(base=base, sha=sha, focus=focus)]
+
+
+def session_id_from_jsonl(text):
+    """The session/thread id the CLI reported on stdout, or None. NEVER a newest-file guess.
+
+    Plan 003 §5 ("wrong model self-report"): identity comes from metadata tied to the ACTUAL session
+    id, "not from report prose or a loose latest-file search". A run whose id we cannot read is
+    NOT MEASURED — which is a row BOSS can act on, unlike a plausible id belonging to somebody
+    else's session.
+
+    Shapes are accepted defensively because the event names belong to the CLI, not to us, and a
+    version bump that renames them must degrade to NOT MEASURED rather than to a wrong id.
+    """
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        pay = d.get("payload") if isinstance(d.get("payload"), dict) else d
+        for key in ("session_id", "thread_id", "conversation_id"):
+            v = pay.get(key) or d.get(key)
+            if isinstance(v, str) and len(v) >= 8:
+                return v
+        if str(d.get("type") or "").split(".")[0] in ("thread", "session") and isinstance(pay.get("id"), str):
+            return pay["id"]
+    return None
+
+
+def rollout_for_session(session_id, root=SESSIONS_ROOT):
+    """The rollout file for THIS session id. -> (path, "") or (None, why).
+
+    Refuses on 0 and on more than 1, for the same reason the lane resolver does: a review whose
+    provenance we cannot pin to exactly one file has no provenance, and picking one of two is how a
+    record acquires somebody else's identity.
+    """
+    if not session_id:
+        return None, (
+            "the CLI reported NO SESSION ID on stdout. What was looked for, so the next reader has a "
+            "thread to pull rather than a blocked merge: a JSONL line from `codex exec --json` "
+            "carrying `thread_id`, `session_id` or `conversation_id` — measured 2026-09-08 on cli "
+            "0.153.2, the first line is `{\"type\": \"thread.started\", \"thread_id\": \"...\"}`. "
+            "If the CLI renamed that event, this is a one-line fix in session_id_from_jsonl(); if it "
+            "printed nothing, the run itself did not start")
+    hits = sorted(glob.glob(os.path.join(root, "*", "*", "*", f"*{session_id}*.jsonl")))
+    if not hits:
+        return None, (f"no rollout file under {root} carries session id {session_id} — the run may "
+                      f"have been ephemeral, in which case its identity is unrecoverable")
+    if len(hits) > 1:
+        return None, (f"{len(hits)} rollout files carry session id {session_id}; refusing to choose "
+                      f"between them: {', '.join(os.path.basename(h) for h in hits[:3])}")
+    return hits[0], ""
+
+
+def provenance_from_rollout(path):
+    """model / provider / effort / cli_version / session id, read from the rollout. -> dict.
+
+    Measured field locations (2026-09-08, cli 0.153.4): `session_meta.payload` carries session_id,
+    model_provider and cli_version but NOT the model; the model and effort are on `turn_context`.
+    Both are read, and anything missing stays absent rather than being filled in with a default —
+    a provenance record that quietly supplies the value it failed to find is worse than none.
+    """
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                pay = d.get("payload") or {}
+                if d.get("type") == "session_meta":
+                    for src, dst in (("session_id", "session_id"), ("model_provider", "provider"),
+                                     ("cli_version", "cli_version"), ("cwd", "cwd")):
+                        if pay.get(src) and dst not in out:
+                            out[dst] = pay[src]
+                elif d.get("type") == "turn_context":
+                    for src, dst in (("model", "model"), ("effort", "effort")):
+                        if pay.get(src) and dst not in out:
+                            out[dst] = pay[src]
+                if {"model", "effort", "provider", "session_id"} <= set(out):
+                    break
+    except OSError as e:
+        out["read_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def route_row(prov, why="", model=ASTRA_MODEL, effort=ASTRA_EFFORT):
+    """Is this review's identity what we pinned? -> (True | False | None, text).
+
+    MEASURED END TO END, 2026-09-08, cli 0.153.2. A `codex exec` run writes a `turn_context` event
+    carrying `model` and `effort`, and a `session_meta` event carrying session_id, model_provider,
+    cli_version and cwd. So Plan 003 §5's requirement — identity from session metadata tied to the
+    actual session id — IS satisfiable, and both pins are demonstrably honoured: a probe run with
+    `-m gpt-5.6-luna -c model_reasoning_effort=medium` recorded luna/MEDIUM, while the config default
+    is low. The flags reach the session, and the session says so.
+
+    One correction to my own first reading, because it was in this docstring as a measured fact and
+    it was wrong: I concluded that exec sessions carry no turn_context at all. They do. The rollout
+    I had checked came from `codex exec review`, the SUBCOMMAND, which records none — I attributed a
+    subcommand's gap to exec in general after looking at exactly one file. The fallback branch below
+    survives that correction on its own merits: a CLI version that stops recording the model must
+    degrade to a stated limitation, never to a confident label.
+
+    `model_context_window` is NOT a substitute discriminator and was checked before being trusted:
+    gpt-6-astra and gpt-5.6-luna both report 258400.
+
+    Three outcomes. None (INCOMPLETE) is for a run we cannot tie to a session at all — the ~141
+    ephemeral wrapper reviews' situation, which must never read as a pass. False is route DRIFT and
+    is loud. True is a pinned, identified run.
+    """
+    if not prov or not prov.get("session_id"):
+        return None, (
+            f"route NOT MEASURED — {why or 'no session metadata was found for this run'}. "
+            f"The review may be fine; nothing ties it to a session, so its identity is unverified, "
+            f"and an unverified identity is not an Astra review. This blocks the merge ON PURPOSE: "
+            f"the alternative is what we found on 2026-09-08, ~141 gate reviews whose identity is "
+            f"unrecoverable and every one of them reading as a pass. Where to look, in order: the "
+            f"`thread.started` line on the CLI's stdout (session_id_from_jsonl), then a rollout file "
+            f"named after that id under {SESSIONS_ROOT} (rollout_for_session), then `session_meta` "
+            f"and `turn_context` inside it (provenance_from_rollout).")
+    got_m, got_e = prov.get("model"), prov.get("effort")
+    ident = (f"session={prov['session_id']} provider={prov.get('provider', 'unrecorded')} "
+             f"cli={prov.get('cli_version', 'unrecorded')}")
+    if got_m or got_e:
+        if got_m != model or got_e != effort:
+            return False, (f"ROUTE DRIFT — pinned {model}/{effort} in the invocation, the session "
+                           f"metadata records model={got_m} effort={got_e}. {ident}")
+        return True, f"model={got_m} effort={got_e} (from session metadata) {ident}"
+    # No model/effort in the metadata: a CLI change, not a normal run. Say exactly that.
+    return True, (f"model={model} effort={effort} PINNED IN THE INVOCATION and accepted under "
+                  f"--strict-config, but NOT confirmed from metadata — this run's session records "
+                  f"no model or effort, which is a change from cli 0.153.2 and worth looking at. "
+                  f"{ident}")
+
+
+def render_review(last_message):
+    """The schema's JSON rendered into the markdown shape every parser here already reads.
+
+    The companion did this rendering and we are no longer calling the companion. Doing it ourselves
+    keeps ONE output contract: `Verdict: <v>` and `- [severity] title (file:lines)`, which is what
+    codex_verdict() and severity_hits() were built against and what the stored .codex.txt files look
+    like. Feeding raw JSON to those parsers instead would keep the verdict working and silently
+    score every finding at zero, because `"severity": "high"` does not match the bracketed marker —
+    a review that reported four [high] findings would have printed `blockers=0`.
+
+    Unparseable input is returned VERBATIM: the fail-closed verdict check must see whatever actually
+    came back, not an empty string that hides it.
+    """
+    txt = (last_message or "").strip()
+    try:
+        d = json.loads(txt)
+        assert isinstance(d, dict) and "verdict" in d
+    except Exception:  # noqa: BLE001 — any unparseable answer is passed through untouched
+        return last_message or ""
+    lines = ["# Codex Adversarial Review", "", f"Verdict: {d.get('verdict')}", ""]
+    if d.get("summary"):
+        lines += [str(d["summary"]), ""]
+    findings = d.get("findings") or []
+    lines.append("Findings:" if findings else "Findings: none reported.")
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        where = f.get("file") or "?"
+        if f.get("line_start"):
+            where += f":{f['line_start']}" + (f"-{f['line_end']}" if f.get("line_end") else "")
+        lines.append(f"- [{f.get('severity', 'unspecified')}] {f.get('title', '(no title)')} ({where})")
+        for extra in ("body", "recommendation"):
+            if f.get(extra):
+                lines.append(f"  {f[extra]}")
+    if d.get("next_steps"):
+        lines += ["", "Next steps:"] + [f"- {s}" for s in d["next_steps"]]
+    return "\n".join(lines) + "\n"
+
+
+def frozen_checkout(wt, sha, tag, deps=()):
+    """A detached worktree at the PINNED candidate sha. -> (path, "") or (None, why).
+
+    Plan 003 §4 A2: "Python, portal and reviewers inspect the pinned candidate/base, not a moving
+    worktree." The Python proofs already did (they build their own scratch checkout at `sha`, and
+    the reason is on that code: the daemon dispatches the lane's NEXT item into the lane worktree,
+    so it is dirty for the whole of the next build). The reviewer and the portal proofs did not —
+    both were handed `wt`, the live lane worktree.
+
+    A failure here RETURNS A REASON and never falls back silently: reviewing the wrong tree while
+    reporting the right sha is the exact confusion this exists to remove.
+    """
+    swt = os.path.join(CN, f"voicepod-{tag}-{os.path.basename(wt)}")
+    sh(["git", "-C", wt, "worktree", "remove", "--force", swt], timeout=180)
+    rc, out = sh(["git", "-C", wt, "worktree", "add", "--detach", swt, sha], timeout=300)
+    if rc != 0:
+        return None, f"could not build a detached checkout at {sha[:10]}: {out.strip()[-160:]}"
+    for rel in deps:
+        src, dst = os.path.join(wt, rel), os.path.join(swt, rel)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                os.symlink(os.path.realpath(src), dst)
+            except OSError:
+                pass          # a missing dep is the runner's problem to report, not this helper's
+    return swt, ""
+
+
+def drop_checkout(wt, path):
+    """Remove a frozen checkout. Never raises: cleanup must not turn a verdict into a crash."""
+    if path:
+        sh(["git", "-C", wt, "worktree", "remove", "--force", path], timeout=180)
+
+
 def dispatched_at_of(item_id):
     """The item's dispatched_at, read fresh. Used by the crash path, which has no `it` in hand."""
     try:
@@ -297,7 +588,14 @@ def sh(cmd, cwd=None, timeout=600, env=None):
     non-zero rc; none of them can handle an exception. 127 is the shell's own "command not found".
     """
     try:
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        # stdin=DEVNULL, added 2026-09-08. Measured: `codex exec` with a prompt ARGUMENT still
+        # prints "Reading additional input from stdin..." — Plan 003 §5's third pilot finding, now
+        # in our own reviewer call. subprocess.run INHERITS stdin, so a gate started from a terminal
+        # hands the CLI a live tty and it can block forever on input nobody will type. Every command
+        # this runner launches is non-interactive; a closed stdin makes that explicit rather than
+        # depending on how the gate happened to be started.
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except OSError as e:
         return 127, f"{type(e).__name__}: {e}"
@@ -1236,8 +1534,26 @@ def _run_proofs(it, wt, sha, head, item_id, rec, warn=None, report_rel=None, art
     proofs = [p for p in proofs if p.endswith(".py")]
     if portal_proofs or portal_touched:
         # any portal/** file in the diff promotes this row to the whole suite, named .tsx proofs or not
-        run_portal_proofs(portal_proofs, wt, item_id, rec, whole=bool(portal_touched),
-                          warn=warn)
+        #
+        # IN A FROZEN CHECKOUT AT THE CANDIDATE SHA (Plan 003 §4 A2). The Python proofs below have
+        # always built one; portal's ran in the LANE worktree, which the daemon dispatches the
+        # lane's next item into — so a portal row could measure later commits and uncommitted work
+        # and report them under this candidate's sha. Vitest is box-free and needs nothing scarce,
+        # so the checkout costs a `worktree add` and nothing else.
+        pwt, pwhy = frozen_checkout(wt, sha, f"portal-{item_id}", deps=("portal/node_modules",))
+        if not pwt:
+            # Never a quiet fallback to the moving tree: a result measured somewhere other than the
+            # sha it is filed under is worse than a missing result, because it looks like evidence.
+            rec("portal proofs", False,
+                f"NOT RUN: {pwhy}. The lane worktree was NOT used as a substitute — a portal result "
+                f"measured on a tree that is not {sha[:10]} would be filed under a sha it never ran "
+                f"against.")
+        else:
+            try:
+                run_portal_proofs(portal_proofs, pwt, item_id, rec, whole=bool(portal_touched),
+                                  warn=warn)
+            finally:
+                drop_checkout(wt, pwt)
     if not proofs:
         # a portal-only item is fully measured without ever taking the box
         if not portal_proofs and not portal_touched:
@@ -1681,10 +1997,21 @@ def _main(ctx):
             if pre:
                 codex_box.update(rc=pre[0], out=pre[1])
                 return
-            argv = [NODE, CODEX, "adversarial-review", "--wait", "--base", "plan010/rebuild", "--scope", "branch",
-                    f"Merge gate for {item_id} ({it.get('artifact', '')}): find authority gaps, tenancy leaks, "
-                    f"money errors, fail-open paths."]
-            rc, out = sh(argv, cwd=wt, timeout=1500, env=codex_env())
+            focus = (f"Merge gate for {item_id} ({it.get('artifact', '')}): find authority gaps, "
+                     f"tenancy leaks, money errors, fail-open paths.")
+            last_msg = os.path.join(GATES, f"{item_id}.codex.json")
+            argv = codex_review_argv("plan010/rebuild", sha, focus, REVIEW_SCHEMA, last_msg)
+            # The reviewer reads the PINNED CANDIDATE, not the lane worktree: the daemon dispatches
+            # the lane's next item into that tree, so by the time a review runs it can hold later
+            # commits and uncommitted work that are not this candidate (Plan 003 §4 A2). A checkout
+            # that cannot be built is a FAIL row, never a quiet fallback to the moving tree —
+            # reviewing one tree while reporting another sha is the confusion being removed.
+            rwt, rwhy = frozen_checkout(wt, sha, f"review-{item_id}")
+            if not rwt:
+                codex_box["error"] = f"frozen checkout for the review: {rwhy}"
+                return
+            codex_box["reviewed_in"] = rwt
+            rc, out = sh(argv, cwd=rwt, timeout=1500, env=codex_env())
             # BOSS 2026-09-06: never SKIP the call while walled — the wall costs about a second to
             # discover and it may have lifted early, whereas a skip is a decision made on stale
             # information. But retry it exactly ONCE: a wall that is still up a second later is up,
@@ -1692,12 +2019,28 @@ def _main(ctx):
             # is for the wall alone.
             if codex_failure_kind(rc, out)[0] == "WALLED":
                 codex_box["retried"] = True
-                rc2, out2 = sh(argv, cwd=wt, timeout=1500, env=codex_env())
+                rc2, out2 = sh(argv, cwd=rwt, timeout=1500, env=codex_env())
                 if codex_failure_kind(rc2, out2)[0] != "WALLED":
                     rc, out = rc2, out2          # the wall lifted between the two calls
-            codex_box.update(rc=rc, out=out)
+            # IDENTITY BEFORE CONTENT. The review body is what the model said; the rollout is what
+            # the CLI recorded. Plan 003 §5 takes model/provider/effort from metadata tied to the
+            # ACTUAL session id, never from the review's own prose — a report claiming a model does
+            # not make it the model.
+            sid_run = session_id_from_jsonl(out)
+            roll, roll_why = rollout_for_session(sid_run)
+            codex_box["prov"] = provenance_from_rollout(roll) if roll else {}
+            codex_box["prov_why"] = roll_why
+            # The structured answer goes through OUR renderer into the one markdown contract every
+            # parser in this file reads. `out` is JSONL events, not the review.
+            body = ""
+            try:
+                body = open(last_msg).read()
+            except OSError as e:
+                codex_box["body_why"] = f"{type(e).__name__}: {e}"
+            rendered = render_review(body)
+            codex_box.update(rc=rc, out=rendered or out, events=out)
             # written as soon as it finishes, so a later crash still leaves the review on disk
-            open(os.path.join(GATES, f"{item_id}.codex.txt"), "w").write(out)
+            open(os.path.join(GATES, f"{item_id}.codex.txt"), "w").write(rendered or out)
         except Exception as e:  # noqa: BLE001 — a review that cannot run is a FAIL, never a pass
             codex_box["error"] = f"{type(e).__name__}: {e}"
 
@@ -1777,6 +2120,24 @@ def _main(ctx):
                 rec("codex adversarial review", rc == 0 and ok_review,
                     f"rc={rc} verdict={verdict or 'NONE FOUND (fail-closed)'}{retried} "
                     f"blockers={len(blockers)}{sorted(set(b.lower() for b in blockers))[:4]} ({len(out)} chars)")
+            # The reviewer's IDENTITY is its own row whenever a call was ATTEMPTED — including the
+            # outage branch above, where the call happened and produced nothing readable. It is a
+            # separate question from what the review said, Plan 003 §6.3 accepts on it, and a row
+            # that only appears when something is wrong is a row nobody learns to read.
+            # NOT --no-codex and not a recorded wall: no call was made, so there is no identity to
+            # record and the review row already says the check did not run.
+            # A NOT MEASURED identity records as INCOMPLETE, which cannot merge. That is deliberate
+            # and it is the fail-closed direction Plan 003 §8 asks for ("do not accept ... wrong
+            # model identity"), but it means an unreadable session id stops merges rather than
+            # quietly labelling the route — the loudest possible way to find out that this parsing
+            # is wrong, which is what it should be while it is new.
+            ok_route, route_why = route_row(codex_box.get("prov"), codex_box.get("prov_why", ""))
+            rec("codex reviewer route", ok_route,
+                f"pinned {ASTRA_MODEL}/{ASTRA_EFFORT} in the invocation; reviewed a detached "
+                f"checkout at {sha[:10]}, not the lane worktree; {route_why}")
+    # The review's frozen checkout is removed once, HERE — after the join, so it survives the wall
+    # retry, and outside the thread, so a thread that died still gets its tree cleaned up.
+    drop_checkout(wt, codex_box.get("reviewed_in"))
 
     # (4b cont.) collect the second opinion and compare it with Codex. Joined AFTER the Codex block
     # so the two reviews overlap; the join is bounded because a hung reviewer must not hold the gate.

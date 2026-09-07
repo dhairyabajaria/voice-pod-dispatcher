@@ -77,7 +77,7 @@ def run_gate(tag, proof_files, argv_extra, scope=("**",), stub_proofs=None, code
         walled = open(os.path.join(HERE, "fixtures", "codex_walled.txt"), errors="ignore").read()
         real_sh0 = MG.sh
         MG.sh = lambda argv, **k: ((1, walled)
-                                   if any("adversarial-review" in str(a) for a in argv)
+                                   if any("Adversarial merge-gate review" in str(a) for a in argv)
                                    else real_sh0(argv, **k))
         MG.codex_precheck = lambda: None
     elif codex_mode == "timeout":
@@ -95,10 +95,37 @@ def run_gate(tag, proof_files, argv_extra, scope=("**",), stub_proofs=None, code
         # the reviewer must really PASS for the merge control below, and a real call is out of the
         # question in a hermetic test: intercept at the process boundary, leaving the gate's own
         # verdict parsing (fail-CLOSED) in the path.
+        #
+        # THE FAKE NOW MODELS THE CLI'S WHOLE CONTRACT, not just its verdict (Plan 003 A2). The gate
+        # reads the session id from the JSONL the CLI prints, resolves the rollout BY THAT ID and
+        # records model/provider/effort from it — so a fake that returns only a verdict leaves the
+        # identity unmeasured, the route row INCOMPLETE and nothing merges. That is the gate working
+        # as designed; it is this harness that was modelling a reviewer the product cannot have.
+        _sid = "01a07df8-9da0-7ef2-b5b6-55d536c53731"
+        _sroot = os.path.join(root, "sessions", "2026", "09", "08")
+        os.makedirs(_sroot, exist_ok=True)
+        with open(os.path.join(_sroot, f"rollout-2026-09-08T03-54-00-{_sid}.jsonl"), "w") as _fh:
+            _fh.write(json.dumps({"type": "session_meta", "payload": {
+                "session_id": _sid, "model_provider": "openai", "cli_version": "0.153.2"}}) + "\n")
+            _fh.write(json.dumps({"type": "turn_context", "payload": {
+                "model": MG.ASTRA_MODEL, "effort": MG.ASTRA_EFFORT}}) + "\n")
+        MG.SESSIONS_ROOT = os.path.join(root, "sessions")
+        _events = json.dumps({"type": "thread.started", "thread_id": _sid})
         real_sh = MG.sh
-        MG.sh = lambda argv, **k: ((0, '{"verdict": "approve", "blockers": []}')
-                                   if any("adversarial-review" in str(a) for a in argv)
+        MG.sh = lambda argv, **k: ((0, _events)
+                                   if any("Adversarial merge-gate review" in str(a) for a in argv)
                                    else real_sh(argv, **k))
+        # the answer itself lands in the -o file, exactly as the CLI writes it
+        _real_open = open
+        def _fake_call(argv, **k):
+            if any("Adversarial merge-gate review" in str(a) for a in argv):
+                for i, a in enumerate(argv):
+                    if a == "-o":
+                        _real_open(argv[i + 1], "w").write(
+                            '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}')
+                return 0, _events
+            return real_sh(argv, **k)
+        MG.sh = _fake_call
         MG.codex_precheck = lambda: None
     sys.argv = ["mergegate.py", "ITEM", *argv_extra]
     with FL.prefixed(f"gate run [{tag}]"):

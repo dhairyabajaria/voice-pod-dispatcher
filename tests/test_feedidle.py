@@ -69,7 +69,12 @@ check("MUST-BITE  CONTROL: PROGRESS_STOP is genuinely absent from FEED_KINDS —
 # the call site must actually use it: a predicate nobody calls is the same shape as the bug — a fix
 # that exists and a path that never reaches it.
 src = open(os.path.join(HERE, os.pardir, "dispatcher.py")).read()
-blk = src[src.index('if self.state["handled"].get(sid) == msg_id:'):][:1200]
+# Bounded by the STATEMENT THAT ENDS THE BLOCK, not by a character count. It was `[:1200]`, and on
+# 2026-09-08 an unrelated edit inside the block (honouring post_prompt's result on the ACK nudge)
+# pushed `feed_when_idle(` past 1200 characters — the check went red while the property it guards was
+# untouched. A window measured in characters is a window that closes for the wrong reason.
+_start = src.index('if self.state["handled"].get(sid) == msg_id:')
+blk = src[_start:src.index('self.state["handled"][sid] = msg_id', _start)]
 check("MUST-BITE  the ALREADY-HANDLED block calls the predicate — the bug was a correct fix in a "
       "branch this block shadows, so the fix has to live where the shadowing happens",
       "self.feed_when_idle(q, name, kind, cur)" in blk, blk[:80])

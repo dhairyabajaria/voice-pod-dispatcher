@@ -91,7 +91,9 @@ MG._run_proofs = lambda *a, **k: None
 calls = []
 real_sh = MG.sh
 def fake_sh(argv, **kw):
-    if "adversarial-review" in argv:
+    if any("Adversarial merge-gate review" in str(a) for a in argv):   # the review argv no longer
+                                                    # names the plugin subcommand
+                                                    # (Plan 003 A2: it is `codex exec`)
         calls.append(argv)
         return 1, WALLED
     return real_sh(argv, **kw)
@@ -143,7 +145,9 @@ MG.EVENTS = os.path.join(state, "events.log"); MG.D = state
 calls2 = []
 UNREADABLE = "# Codex Adversarial Review\n\nProse with no verdict line at all.\n"
 def fake_sh2(argv, **kw):
-    if "adversarial-review" in argv:
+    if any("Adversarial merge-gate review" in str(a) for a in argv):   # the review argv no longer
+                                                    # names the plugin subcommand
+                                                    # (Plan 003 A2: it is `codex exec`)
         calls2.append(argv)
         return 1, UNREADABLE
     return real_sh(argv, **kw)

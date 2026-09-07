@@ -1827,3 +1827,106 @@ false positive gets "fixed" by deleting the explanation.
   Verified: python3 tests/test_answer.py exit=0; zsh tests/run_all.sh exit=0, 63 files, 0 reds.
   No git commit exists for this: dispatcher/ is not inside any git repository (measured — no .git at
   the dispatcher dir or the CN root). md5 + this entry are the provenance.
+
+2026-09-08 04:03  A2 (Plan 003 §4/§5/§6.3 + the owner's condition of approval) — the primary gate
+                  reviewer's route is pinned in the INVOCATION, and every checker reads the pinned
+                  candidate.
+                  mergegate.py 1ff20af6 -> 77d06a47   tests/test_astraroute.py NEW 81d60d7c
+                  tests/test_codexwall.py 91ac7abf -> cecfd932  tests/test_notrun.py 74420da7 -> 22dbf5c6
+                  tests/test_portal_row.py 3b57cc6d -> 24452d18
+                  tests/run_all.sh 3b68b94a -> 068ce338  tests/README.md a8f9c30e -> 94e2e217
+  WHY THE WRAPPER IS BYPASSED, from its own option surface: handleReviewCommand's valueOptions are
+  ["base","scope","model","cwd"] — effort is not among them — and its adversarial branch omits
+  effort from runAppServerTurn while the sibling task path passes it. The model could be pinned and
+  the effort could not; recording "Astra route" with an inherited effort is a guard excluded from
+  its own proof set. Confirmed independently in the file before building.
+  MEASURED WHILE BUILDING, each one changing the design:
+   * `codex exec review --base X "<prompt>"` is REFUSED by the CLI — base and a custom prompt are
+     mutually exclusive — so native scoping and our adversarial focus cannot both be used.
+   * that subcommand ACCEPTS --output-schema and does not honour it: the run returned prose with
+     [P2] markers and no Verdict line. Fed to this file's fail-closed parser that is a FAIL on every
+     candidate, and [P2] is not a severity marker severity_hits() counts.
+   * so the invocation is plain `codex exec` with the wrapper's own review schema, and the answer is
+     rendered back into the one markdown contract every parser here reads. The raw JSON is asserted
+     to score ZERO blockers, so the renderer is load-bearing, not decoration.
+   * --strict-config is passed: a run with it exits 0, so `model_reasoning_effort` is a key this CLI
+     knows. Without it a renamed setting would leave the effort inherited and the row cheerful.
+   * stdin is now DEVNULL for every sh() call: `codex exec` with a prompt ARGUMENT still prints
+     "Reading additional input from stdin...", which is Plan 003 §5's third pilot finding arriving in
+     our own reviewer call. subprocess.run inherits stdin; a gate started from a terminal could block.
+  A CORRECTION I MADE TO MYSELF: I first recorded that exec sessions carry no model/effort metadata.
+  They do — `turn_context` holds both. The rollout I had checked came from `codex exec review`, the
+  SUBCOMMAND, which records none; I attributed a subcommand's gap to exec in general after reading
+  exactly one file. Both pins are demonstrably honoured: a probe with `-m gpt-5.6-luna -c
+  model_reasoning_effort=medium` recorded luna/MEDIUM while the config default is low.
+  `model_context_window` was checked as an independent discriminator before being trusted and is not
+  one: astra and luna both report 258400.
+  IDENTITY: session id from the CLI's own stdout events -> rollout resolved BY THAT ID (refusing on
+  0 and on >1 matches) -> model/provider/effort/cli from that session's metadata. Never a
+  newest-file search, never the review's own prose. Three outcomes: PASS (pinned and identified),
+  FAIL (route drift — luna/xhigh, the other pair the rollouts actually show, is loud), INCOMPLETE
+  (no session at all — the ~141 ephemeral wrapper reviews' situation, which must never read as a
+  pass and now blocks a merge).
+  FROZEN CANDIDATE (§4 A2's other half). Measured first: the PYTHON proofs already built a detached
+  checkout at the sha. The REVIEWER and the PORTAL proofs both ran in the lane worktree, which the
+  daemon dispatches the lane's next item into. Both now run in a frozen checkout at the candidate,
+  the review prompt names the SHA rather than HEAD, and neither falls back to the moving tree when
+  the checkout cannot be built — a result filed under a sha it never ran against looks like evidence.
+  LIVE ACCEPTANCE (§6.3), one pinned review of a two-commit scratch repo, 03:54, cli 0.153.2:
+  rc=0 in 21s; answer {"verdict":"needs-attention","findings":[{"severity":"high","title":"Refund
+  amount is doubled"...}]}; parsed as needs-attention with 1 blocker; route session=01a07df8-9da0-
+  7ef2-b5b6-55d536c53731 model=gpt-6-astra effort=medium provider=openai cli=0.153.2, all from that
+  session's own metadata. That answer is pinned in the proof set as a fixture.
+  THREE FIXTURES WERE MODELLING THE OLD CALL and are updated, not weakened: two matched the argv on
+  "adversarial-review" (a string the invocation no longer contains); test_notrun's reviewer returned
+  a verdict and nothing else, so the identity was unmeasurable and the gate correctly refused to
+  merge — the fake now emits the CLI's JSONL and writes its -o file; test_portal_row's lane was a
+  plain directory, and a frozen checkout needs a real repo with portal/ COMMITTED.
+  Mutation-scored, restores verified: dropping the effort pin CAUGHT; dropping --strict-config
+  CAUGHT; rendering findings without the severity marker CAUGHT.
+  Verified: zsh tests/run_all.sh exit=0, 64 files, 0 reds. No gate was running at the write.
+
+2026-09-08 04:14  A1b + BOSS's INCOMPLETE addition (rulings 1 and 2, 2026-09-08).
+                  dispatcher.py 29af0ba9 -> 04709832   mergegate.py 77d06a47 -> 3a99afa4
+                  tests/test_answer.py c624b4c6 -> 87cb6ad3  tests/test_astraroute.py 81d60d7c -> b89be248
+                  tests/test_feedidle.py 0f070d23 -> da584ec5
+  RULING 1 — the auto-continue was the defect, and it is fixed. It emitted AUTO-CONTINUE and
+  incremented the counter BEFORE posting, so three lost posts walked the counter to max and
+  escalated STUCK for an executor nobody had prompted, with three log lines saying otherwise. The
+  post now happens first and the record follows it; a failed post does NOT consume an attempt (the
+  next tick retries, and an unreachable session is caught by check_session_idle / check_dead, which
+  measure the session rather than our own send count), and AUTO_CONTINUE_FAILED is emitted once per
+  message rather than once per 5-second tick.
+  The other seven, triaged by BOSS's rule — honour the result where its failure changes what a
+  person or the daemon later believes:
+    HONOURED (4): both ACK nudges (one sets the `nudged` marker that suppresses every later attempt,
+      and both set a label reading `building`); the plan-review-off continue (same label problem);
+      and the plan review's own feedback — the executor is stopped waiting for exactly that message,
+      so a lost post leaves it idle under a PLAN_REVIEWED line that reads as if it had been told.
+      That one now emits PLAN_REVIEW_UNDELIVERED and escalates.
+    BEST-EFFORT BY DECISION (3): courtesy notes to an executor whose fact is already carried by an
+      event, an escalation or a gate row. Each says so in a comment at its own call site, and a test
+      now requires that comment — the count alone cannot tell a considered best-effort from one
+      nobody looked at.
+  Count test kept and updated: 8 -> 3.
+  RULING 2 — INCOMPLETE stays loud and is now self-diagnosing. The no-session-id refusal names the
+  exact stdout event it looked for (`{"type": "thread.started", "thread_id": ...}` from
+  `codex exec --json`, measured on cli 0.153.2) and says a rename is a one-line fix in
+  session_id_from_jsonl(). The route row's NOT MEASURED text says the block is deliberate, names
+  what it replaces (~141 reviews reading as passes), and lists the three places to look in order.
+  BOSS's effort correction CHECKED, no change needed: this resolver already reads model and effort
+  from `turn_context` and only session/provider/cli from `session_meta` (mergegate.py:413-420). ★'s
+  conclusion — that effort cannot be recovered after the fact — does not apply to this code.
+  git init at 96596f1 CHECKED for behaviour change: the suite is byte-identical in outcome inside
+  the new repository (64 files, exit 0, same PASS count). The only repo-sensitive line in these
+  modules is `--skip-git-repo-check` on a Codex launch, which is unaffected. NOTE: that commit
+  (04:00:45) captured A1 but predates A2 by three minutes, so mergegate.py, five test/doc files and
+  the UNTRACKED tests/test_astraroute.py are the delta — a `git clean` there would delete A2's
+  proof set.
+  A test-window defect of my own, found by this change: test_feedidle sliced the already-handled
+  block as `src[...][:1200]`, and the ACK-nudge edit pushed `feed_when_idle(` past 1200 characters.
+  The check went red while the property it guards was untouched. It is now bounded by the statement
+  that ends the block. A window measured in characters closes for the wrong reason.
+  Mutation-scored, restores verified: putting the counter back in front of the post CAUGHT.
+  Verified: python3 tests/test_answer.py exit=0; zsh tests/run_all.sh exit=0, 64 files, 1145 PASS
+  lines, 0 reds.

@@ -152,6 +152,9 @@ true, and it was true for a reason that had nothing to do with the behaviour it 
                         the daemon's own cwd. No worktree is CANNOT CHECK, never `the report
                         does not exist`; and such a row is refused at dispatch, keyed on the
                         FIELD because a prose grep for `worktree` passes every item file.
+- `test_astraroute.py`  mergegate.py — the primary reviewer's route is pinned in the INVOCATION
+                        (model AND effort), its identity is read from session metadata tied to
+                        the session id, and it reviews a frozen checkout at the candidate sha.
 - `test_preflight.py`   mergegate.py — run_merge_preflight against real temp git repos.
 - `test_portal_row.py`  mergegate.py — portal row: whole suite vs selected files (subprocess stubbed).
 - `test_reportclock.py` mergegate.py — the report header time vs the wall clock at REPORT READY
@@ -315,6 +318,25 @@ passes because the pattern missed it), a report naming no tests must adopt nothi
 proofs from either source the row must still be NOT DECLARED. The fixture holds SIX files because a
 two-file one let `sorted(out)` -> `list(out)` score MISSED: order is the pytest argv and the row
 text, and set-iteration order is not stable between runs.
+
+test_astraroute.py — Plan 003 §3/§5/§6.3 and the owner's condition of approval: the gate review
+bypasses the plugin wrapper. The reason is the wrapper's own option surface — its review command
+accepts `model` and NOT `effort`, and its adversarial branch omits effort from the app-server turn
+while the sibling task path passes it. Pinning only the model would record an Astra route with an
+inherited effort: a guard excluded from its own proof set.
+Measured while building it, and each measurement changed the design: `codex exec review --base X
+"<prompt>"` is refused by the CLI (base and a custom prompt are mutually exclusive) and its
+--output-schema is accepted but not honoured — that run returned prose with [P2] markers and no
+Verdict line, which this file's fail-closed parser would score as a FAIL on every candidate. So the
+invocation is plain `codex exec` with the wrapper's own review schema, and the answer is rendered
+back into the one markdown contract every parser here reads; the raw JSON is asserted to score ZERO
+blockers, so the renderer is load-bearing rather than decorative.
+One correction is recorded in the code because it was wrong in a docstring first: exec sessions DO
+record model and effort in a `turn_context` event. I concluded otherwise from a single rollout that
+came from `codex exec review`, the subcommand, which records none — a subcommand's gap attributed to
+exec in general after looking at exactly one file.
+`model_context_window` was checked as an independent discriminator before being trusted, and is not
+one: gpt-6-astra and gpt-5.6-luna both report 258400.
 
 test_nullwt.py — `os.path.join(item.get("worktree") or "", rel)` with no worktree is
 `os.path.join("", rel)`, which is `rel`, which os.path resolves against the daemon's own cwd. The
