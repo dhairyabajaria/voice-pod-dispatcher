@@ -297,17 +297,58 @@ ok("resume" in cap2["argv"] and cap2["argv"][cap2["argv"].index("resume") + 1] =
 # ------------------------------------------------------- source-order guards the behaviour cannot see
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "museadapter.py")).read()
-body = src[src.index("def run_attempt("):src.index("def subprocess_runner(")]
+body = src[src.index("def run_attempt("):src.index("def verify_finish(")]
+vbody = src[src.index("def verify_finish("):src.index("def subprocess_runner(")]
 ok(body.index("child_env(") < body.index("= runner(argv"),
    "the credential check happens BEFORE the launch, not after it")
-ok(body.index("classify_failure(") < body.index("read_result("),
+ok("verify_finish(" in body,
+   "run_attempt does not carry its own copy of the completion checks: it CALLS verify_finish, so "
+   "the daemon's fire-and-forget path and this one run the same guards")
+ok(vbody.index("classify_failure(") < vbody.index("read_result("),
    "failure events are read BEFORE a result is believed")
-ok(body.index("route_matches(") < body.index("outcome = OK"),
+ok(vbody.index("route_matches(") < vbody.index("if ok_ is False"),
    "the route is verified before any attempt can be called OK")
 ok(re.search(r"except Exception[^\n]*\n\s*return rec\(", body),
    "no worker failure escapes as an exception")
 ok('"--last"' not in src and "'--last'" not in src,
    "--last never appears as a string literal: it can only reach an argv as one, and it never does")
+
+# --------------------------------------------------------- the daemon's two routes, one builder
+ok(M.slot_route("CODEX-1") == M.LEGACY,
+   "MUST BITE: with nothing configured a slot keeps the OLD Astra route — wiring does not silently "
+   "re-route every existing dispatch")
+ok(M.slot_route("CODEX-1", cfg={"codex_routes": {"CODEX-1": "muse-go-1"}}) == "muse-go-1",
+   "a codex_routes entry selects a profile per slot")
+ok(M.slot_route("CODEX-1", item={"profile": "muse-go-2"},
+                cfg={"codex_routes": {"CODEX-1": "muse-go-1"}}) == "muse-go-2",
+   "an item's own profile beats the slot default")
+f, e, sp, why = M.route_flags(M.LEGACY, legacy_model="gpt-6-astra", legacy_effort="medium")
+ok(f == ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=medium"] and sp["tier"] == "legacy",
+   "the legacy route keeps the historic pair exactly as it was")
+f, e, sp, why = M.route_flags("muse-go-1", home=HOME, env=dict(ENV_OK))
+ok(f == ["-p", "muse-go-1"] and not any("effort" in x for x in f) and "-m" not in f,
+   "MUST BITE: a profile route passes -p and NOTHING else — no -m, no effort flag to downgrade it")
+ok(e.get("OPENCODE_GO_KEY_1") == "sk-live-value" and "OPENCODE_GO_KEY_2" not in e,
+   "route_flags returns the child env with only the selected account's credential")
+f, e, sp, why = M.route_flags("muse-go-1", home=HOME, env={"NOTHING": "1"})
+ok(f is None and "missing or empty" in why,
+   "MUST BITE: no credential -> no flags and no launch, before a worktree is paid for")
+rollout(SID)
+VF = os.path.join(STATE, "vf.json")
+open(VF, "w").write(json.dumps(GOOD))   # NOT inline: write() returns a byte count, and `... or VF`
+                                        # then hands verify_finish the integer 166 as a path
+o, d, fl = M.verify_finish(M.profile_spec("muse-go-1", home=HOME)[0], STARTED, VF, "C1", 1,
+                           sessions_root=SESS)
+ok(o == M.OK and fl["route_verified"] is True and fl["session_id"] == SID,
+   "verify_finish accepts a correlated result on the intended route")
+o, d, fl = M.verify_finish({"profile": M.LEGACY}, STARTED, VF, "C1", 1,
+                           sessions_root=SESS)
+ok(o == M.OK and fl["route_verified"] is None and "unverified" in d,
+   "MUST BITE: the legacy route reports its route as UNVERIFIED, never as confirmed — there is no "
+   "profile to read back, and an unchecked route must not render as a checked one")
+o, d, fl = M.verify_finish(M.profile_spec("muse-go-1", home=HOME)[0], "HTTP 401 Unauthorized",
+                           VF, "C1", 1, sessions_root=SESS)
+ok(o == M.AUTH, "verify_finish reads failure text even with a complete result file on disk")
 
 print(f"\n{P} passed, {len(F)} failed")
 for f in F:

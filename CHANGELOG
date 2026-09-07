@@ -2013,3 +2013,53 @@ false positive gets "fixed" by deleting the explanation.
   so one profile per slot IS the three-key distribution. No key logic in the dispatcher, no secret in
   roster.json. The presence-and-non-empty check before launch stays; the alias map stays as a guard
   against the file regressing, not because the file is wrong today.
+
+2026-09-08 05:0x  WIRING — codex_spawn routes through museadapter (WORKER-2)
+  museadapter.py, dispatcher.py, tests/test_muse.py (94), tests/test_codexroute.py (NEW, 17),
+  tests/run_all.sh. Suite 63 files, ALL GREEN.
+
+  BOSS checked rather than assumed and found `grep -c "museadapter\|run_attempt" dispatcher.py` = 0:
+  the adapter was proved and the daemon could not reach it. A component that exists and is proved,
+  on a path that does not reach it, is the same shape as the board reporting what it sent. That grep
+  is now a test.
+
+  slot_route(slot, item, cfg): item["profile"], then cfg["codex_routes"][slot], then LEGACY. THE
+  DEFAULT IS THE OLD BEHAVIOUR — with nothing configured a slot keeps the historic `-m gpt-6-astra`
+  pair, because defaulting slots to muse profiles would re-route every existing dispatch as a side
+  effect of wiring. Muse is opted into, one line per slot or per item. roster.json is not written
+  here; codex_routes is read if someone adds it and absent harmlessly if nobody has.
+
+  route_flags(): ONE argv builder for both routes, shared with run_attempt so the two cannot drift.
+  A profile route passes `-p <profile>` and nothing else — no -m, and no effort flag, since the
+  profile carries xhigh and the daemon's global default is Astra's medium.
+
+  The refusal moved EARLIER than the brief asked: a missing key or unreadable profile now refuses
+  before the worktree add and the uv sync. The old order paid for both and then died at launch with
+  the board reading DISPATCHED — which is gap 2's failure and would have survived the routing fix.
+
+  The log header and the run record are written from the RESOLVED pair. A global header logs a Muse
+  run as Astra and every attribution taken from it afterwards is wrong: not a broken run, a run that
+  succeeds under a false name.
+
+  The reap reads the route BACK from session metadata and emits ROUTE_MISMATCH when the flags did not
+  take, carrying the note into the excerpt. UNMEASURED is reported and the run's own verdict stands:
+  a rollout we cannot read says nothing about the work.
+
+  WHAT IS DELIBERATELY NOT WIRED, with a test asserting it so "wired" is never read as "all of it":
+  the result-correlation half (read_result) needs the worker to write a schema-shaped file, and these
+  workers report by writing REPORT READY into a log. Changing the worker protocol belongs with §6.2.
+  Also: run_attempt could not be called from codex_spawn at all — it blocks until the worker exits and
+  the spawn path launches and reaps a tick later, so calling it would freeze the tick for up to three
+  hours. The completion checks were SPLIT into verify_finish() instead, which both callers use. Same
+  code, both paths, no second weaker copy.
+
+  Mutations at dispatcher.py call sites, 5 of 5 CAUGHT, source restored and md5-verified: reverting
+  the argv to the global pair; passing the global effort flag alongside --profile; writing the header
+  from the globals; spawning anyway after a refused route; dropping the intended-route fields so the
+  reap can no longer check.
+
+  ONE DEFECT MY OWN PROOF SET MISSED, caught only by running the whole suite: `import museadapter`
+  raised ModuleNotFoundError in eleven existing test files, because they load dispatcher.py by path
+  and its directory is not on sys.path. My wiring test passed throughout — it had put that directory
+  on the path itself. A fixture that repairs the very condition it exists to observe. dispatcher.py
+  now inserts its own directory, and the test asserts that line rather than supplying it.

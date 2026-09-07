@@ -166,6 +166,53 @@ def child_env(spec, base=None):
 
 
 # ------------------------------------------------------------------------------ argv, launch/resume
+LEGACY = "legacy-astra"      # the route the daemon has always taken: -m <model> plus a global effort
+
+
+def slot_route(slot, item=None, cfg=None):
+    """Which profile a slot should run. -> profile name, or LEGACY for the historic Astra pair.
+
+    Three sources, most specific first: the item's own `profile`, then a `codex_routes` map in
+    roster.json, then LEGACY.
+
+    THE DEFAULT IS DELIBERATELY THE OLD BEHAVIOUR. Every slot runs Astra today via `-m gpt-6-astra`
+    with no profile at all. Defaulting the slots to muse profiles here would re-route every existing
+    dispatch as a side effect of wiring, which is a change nobody asked for arriving inside a change
+    somebody did. Muse is opted INTO, per item or per slot, and the opt-in is one line of config.
+
+    I do not write roster.json (it is not mine to edit), so `codex_routes` is read if someone adds it
+    and absent harmlessly if nobody has.
+    """
+    if item and str(item.get("profile") or "").strip():
+        return item["profile"].strip()
+    routes = (cfg or {}).get("codex_routes") or {}
+    return routes.get(slot) or LEGACY
+
+
+def route_flags(profile, home=CODEX_HOME, env=None, legacy_model=None, legacy_effort=None):
+    """The routing half of an argv, plus the child env. -> (flags, env, spec, "") or (…, why).
+
+    ONE BUILDER FOR BOTH ROUTES, so the daemon cannot drift from the adapter. A profile route passes
+    `-p <profile>` and NOTHING ELSE: no `-m`, and above all no `-c model_reasoning_effort=`, because
+    the profile already carries `xhigh` and the daemon's global default is Astra's `medium` — passing
+    it would downgrade every Muse worker silently. The legacy route keeps the historic pair exactly
+    as it was.
+    """
+    if profile == LEGACY:
+        return (["-m", legacy_model or "gpt-6-astra",
+                 "-c", f"model_reasoning_effort={legacy_effort or 'medium'}"],
+                dict(env or os.environ),
+                {"profile": LEGACY, "model": legacy_model or "gpt-6-astra", "provider": None,
+                 "effort": legacy_effort or "medium", "env_key": None, "tier": "legacy"}, "")
+    spec, why = profile_spec(profile, home=home)
+    if not spec:
+        return None, None, None, why
+    cenv, why = child_env(spec, base=env)
+    if not cenv:
+        return None, None, spec, why
+    return ["-p", profile], cenv, spec, ""
+
+
 def launch_argv(profile, result_path, schema=None, sandbox="workspace-write"):
     """A NEW worker. The brief arrives on stdin and the caller closes it (see brief_stdin).
 
@@ -506,39 +553,59 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
                 fh.write("\n----- stderr -----\n" + err)
     except OSError:
         log_path = None
-    base = dict(pid=pid, session_id=sid, result_path=result_path, event_log=log_path)
 
-    # Failure text is read BEFORE the exit code is consulted, because "parse failure events even if
-    # the exit code is zero" is a finding, not a preference: the pilot's worker exited 0 having done
-    # nothing.
-    cls = classify_failure((err or "") + "\n" + (out or ""))
+    # ONE completion path, shared with the daemon. codex_spawn cannot call run_attempt (it launches
+    # and reaps a tick later, where this blocks), so the checks live in verify_finish and BOTH
+    # callers run exactly those. A second, weaker copy for the daemon is how a proved guard ends up
+    # off the path it was built for.
+    outcome, detail, fields = verify_finish(spec, (err or "") + "\n" + (out or ""), result_path,
+                                            item, attempt, sessions_root=sessions_root)
+    fields.setdefault("session_id", sid)
+    if not fields.get("session_id"):
+        fields["session_id"] = sid
+    return rec(outcome=outcome, detail=detail if outcome == OK else f"exit {rc}: {detail}", pid=pid, result_path=result_path,
+               event_log=log_path, **{k: v for k, v in fields.items() if k != "session_id"},
+               session_id=fields.get("session_id") or sid)
+
+
+def verify_finish(spec, log_text, result_path, item, attempt, sessions_root=None):
+    """What a FINISHED process proved. -> (outcome, detail, fields).
+
+    The completion half of run_attempt, split out so the daemon runs the SAME guards. codex_spawn is
+    fire-and-forget — it starts a process, records a pid and reaps it a tick later — so it cannot
+    call run_attempt, which blocks until the worker exits. Left unsplit, the daemon would have grown
+    a second, weaker copy of these checks, and a guard that is not on the path is not a guard.
+    """
+    sessions_root = sessions_root or SESSIONS_ROOT
+    fields = {}
+    cls = classify_failure(log_text or "")
+    sid = session_id_from_jsonl(log_text or "")
+    fields["session_id"] = sid
     if cls:
-        return rec(outcome=cls, detail=f"the worker reported a {cls} failure (exit {rc}). "
-                                       f"See {log_path or 'the event log (unwritten)'}", **base)
-
-    # The route is checked even on a clean exit AND even on a failure-free result: an attempt that
-    # did the work on a route nobody asked for is not a smaller problem than one that crashed.
+        return cls, f"the worker reported a {cls} failure", fields
+    if spec.get("profile") == LEGACY:
+        # The legacy route has no profile to read back, so there is nothing to assert against. Say
+        # that, rather than reporting an unchecked route as a verified one.
+        fields["route_verified"] = None
+        result, why = read_result(result_path, item, attempt, sid)
+        if not result:
+            return INCOMPLETE, f"{why} (legacy route: no profile to verify against)", fields
+        fields["candidate_sha"] = result.get("candidate_sha")
+        return (OK if result.get("outcome") == "done" else BLOCKED), "legacy route, unverified", fields
     rollout, why = rollout_for_session(sid, root=sessions_root)
     actual = resolved_route(rollout) if rollout else {}
-    ok, note = route_matches(spec, actual)
-    base.update(model_actual=actual.get("model"), provider_actual=actual.get("provider"),
-                effort_actual=actual.get("effort"), route_verified=ok)
-    if ok is False:
-        return rec(outcome=ROUTE_MISMATCH, detail=note, **base)
-
+    ok_, note = route_matches(spec, actual)
+    fields.update(model_actual=actual.get("model"), provider_actual=actual.get("provider"),
+                  effort_actual=actual.get("effort"), route_verified=ok_)
+    if ok_ is False:
+        return ROUTE_MISMATCH, note, fields
     result, why2 = read_result(result_path, item, attempt, sid)
     if not result:
-        return rec(outcome=INCOMPLETE, detail=f"exit {rc}; {why2}"
-                   + ("" if ok else f" (also: {note or why})"), **base)
-    if ok is None:
-        # A completed result on an UNVERIFIED route is still not evidence for the route. The work may
-        # be fine; the claim "this ran on <profile>" is what cannot be made.
-        return rec(outcome=INCOMPLETE, detail=f"the worker produced a terminal result, but {note}",
-                   candidate_sha=result.get("candidate_sha"), **base)
-    outcome = OK if result.get("outcome") == "done" else BLOCKED
-    return rec(outcome=outcome, candidate_sha=result.get("candidate_sha"),
-               detail=f"{note}. worker outcome={result.get('outcome')}: "
-                      f"{str(result.get('summary') or '')[:400]}", **base)
+        return INCOMPLETE, f"{why2}" + ("" if ok_ else f" (also: {note or why})"), fields
+    if ok_ is None:
+        return INCOMPLETE, f"the worker produced a terminal result, but {note}", fields
+    fields["candidate_sha"] = result.get("candidate_sha")
+    return (OK if result.get("outcome") == "done" else BLOCKED), note, fields
 
 
 def subprocess_runner(argv, env, stdin_text, timeout):

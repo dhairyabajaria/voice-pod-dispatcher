@@ -20,6 +20,14 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+
+# Its own directory, so `import museadapter` works when this file is loaded BY PATH rather than as a
+# module on sys.path — which is how every test in tests/ loads it (spec_from_file_location). Without
+# this the wiring imported fine for the daemon and raised ModuleNotFoundError in eleven existing
+# test files at once. My own wiring test passed throughout, because it put the directory on the path
+# itself: a fixture that repairs the condition it is meant to observe.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import museadapter
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2221,16 +2229,38 @@ class Dispatcher:
             proof=", ".join(item.get("proof_files", [])) or "(declare in your PLAN block)", body=body)
         log = os.path.join(CODEX_DIR, f"{datetime.now():%Y%m%d-%H%M}-{slot}-{item['id']}.log")
         roots = json.dumps([self.c("codex_git_dir", os.path.join(CN, "voice-pod", ".git")), os.path.join(CN, "test-logs")])
+        # ROUTING (2026-09-08, wiring D). One builder for both routes, in museadapter, so this path
+        # and run_attempt cannot drift apart. A profile route passes `-p <profile>` and NOTHING else:
+        # the profile carries its own model, provider AND `model_reasoning_effort = xhigh`, and the
+        # global `codex_effort` default is Astra's `medium` — passing it here would downgrade every
+        # Muse worker with no error and a dispatch that looks correct. Nothing is re-routed by
+        # default: with no `codex_routes` and no item `profile`, a slot keeps the historic Astra pair.
+        profile = museadapter.slot_route(slot, item, self.cfg)
+        rflags, renv, rspec, rwhy = museadapter.route_flags(
+            profile, env=dict(os.environ),
+            legacy_model=self.c("codex_model", "gpt-6-astra"),
+            legacy_effort=self.c("codex_effort", "medium"))
+        if rflags is None:
+            # Refused BEFORE the paid work. A missing key or an unreadable profile discovered after
+            # the worktree add and the uv sync costs both of them and shows DISPATCHED on the board.
+            self.log(f"{slot}: route refused for {item['id']} ({profile}): {rwhy}")
+            item["status"] = "broken"; item["error"] = f"route {profile}: {rwhy}"[:200]
+            self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"route {profile} refused: {rwhy}")
+            return False
         cmd = [self.c("codex_bin", "codex"), "exec", "-s", "workspace-write", "-c", f"sandbox_workspace_write.writable_roots={roots}",
-               "-m", self.c("codex_model", "gpt-6-astra"), "-c", f"model_reasoning_effort={self.c('codex_effort', 'medium')}",
-               "--skip-git-repo-check", prompt]
+               *rflags, "--skip-git-repo-check", prompt]
         if self.dry:
             self.log(f"DRY-RUN would spawn codex for {item['id']} in {wt} (log {os.path.basename(log)})")
             return True
         try:
             with open(log, "w") as f:
-                f.write(f"# {slot} {item['id']} start={now_local()} cwd={wt} model={self.c('codex_model', 'gpt-6-astra')}/{self.c('codex_effort', 'medium')}\n")
-                env = dict(os.environ)
+                # The header is written from the RESOLVED per-slot values, not the globals. With a
+                # global header a Muse run is logged as Astra, and every later attribution taken
+                # from these headers is wrong — a run that succeeds under a false name.
+                f.write(f"# {slot} {item['id']} start={now_local()} cwd={wt} "
+                        f"profile={rspec['profile']} model={rspec['model']}/"
+                        f"{rspec.get('effort') or 'profile-supplied'}\n")
+                env = dict(renv)
                 env["PATH"] = os.path.dirname(self.c("codex_bin", "codex")) + ":" + env.get("PATH", "/usr/bin:/bin")  # launchd PATH has no node
                 proc = subprocess.Popen(cmd, cwd=wt, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         except Exception as e:  # a spawn failure (2026-09-05: launchd PATH had no `codex`) must not abort the tick
@@ -2238,7 +2268,9 @@ class Dispatcher:
             item["status"] = "broken"; item["error"] = f"codex spawn failed: {e}"
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"codex spawn failed: {e}")
             return False
-        self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000)}
+        self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000),
+                                     "profile": rspec["profile"], "model_intended": rspec["model"],
+                                     "provider_intended": rspec.get("provider"), "effort_intended": rspec.get("effort")}
         item.update({"status": "dispatched", "dispatched_to": slot, "session": f"codex:{proc.pid}", "dispatched_at": now_local()})
         self.emit("DISPATCHED", slot, f"codex:{proc.pid}", "-", f"item={item['id']}", item.get("title", ""))
         return True
@@ -2292,7 +2324,28 @@ class Dispatcher:
                     kind = "ERROR"
                 else:
                     kind = "TURN_ENDED"
-                exc = clean_excerpt(text[-1500:])
+                # THE ROUTE IS READ BACK, not assumed from the flags we passed. The flags are what we
+                # asked for; session metadata is what ran. A worker that did the work on a route
+                # nobody asked for is not a smaller problem than one that crashed, and a mismatch
+                # here is the difference between passing the right flags and knowing they took.
+                # UNMEASURED is not a pass and is not a failure either: it is reported and the run's
+                # own verdict stands, because a rollout we cannot read says nothing about the work.
+                route_note = ""
+                if run.get("provider_intended"):
+                    spec = {"profile": run.get("profile"), "model": run.get("model_intended"),
+                            "provider": run.get("provider_intended"), "effort": run.get("effort_intended")}
+                    sid = museadapter.session_id_from_jsonl(whole)
+                    roll, rwhy = museadapter.rollout_for_session(sid)
+                    verdict, note = museadapter.route_matches(
+                        spec, museadapter.resolved_route(roll) if roll else {})
+                    if verdict is False:
+                        kind = "ROUTE_MISMATCH"
+                        route_note = note
+                    elif verdict is None:
+                        route_note = f"route unverified: {note or rwhy}"
+                    if route_note:
+                        self.log(f"{slot}: {route_note}")
+                exc = clean_excerpt(((route_note + "\n\n") if route_note else "") + text[-1500:])
                 key = f"codex:{slot}"
                 self.emit(kind, slot, key, "-", f"item={run['item']} log={os.path.basename(run['log'])}", exc)
                 pending[key] = {"executor": slot, "session": key, "kind": kind, "msg_id": os.path.basename(run["log"]),
