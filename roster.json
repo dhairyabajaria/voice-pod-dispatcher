@@ -1,0 +1,46 @@
+{
+ "_comment": "Executor sessions the Dispatcher drives. Explicit entries win; any opencode session whose title starts with auto_discover_prefix is added automatically (name = first word of the title). BOSS edits this file when it adds or retires an executor.",
+ "executors": {
+  "EXEC-B": "ses_f8d0831b1ffeiwstfvZfOIBSw9",
+  "EXEC-C": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+  "EXEC-D": "ses_f92c5cfedffeYU6iVctg0oiskT",
+  "EXEC-E": "ses_f8dfc8d41ffeHVWHqAYJSUDlI9",
+  "EXEC-F": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+  "EXEC-G": "ses_f8fb0be32ffezkK6OJwxWeeSh0",
+  "EXEC-H": "ses_f8fb0bc85ffei7Ev4fSGf8JSeo",
+  "EXEC-A2": "ses_f8c2e96b6ffe0xCjNpLJiauFD4"
+ },
+ "auto_discover_prefix": "EXEC-",
+ "poll_seconds": 5,
+ "resync_seconds": 60,
+ "max_auto_continue": 3,
+ "escalate_after_minutes": [
+  10,
+  20
+ ],
+ "escalation_repeat_minutes": 20,
+ "auto_restart_server": false,
+ "feed_queue": true,
+ "feed_over_question": true,
+ "max_dispatch_per_tick": 2,
+ "dep_ok_prefixes": [
+  "LANDED",
+  "MERGED"
+ ],
+ "codex_slots": 2,
+ "codex_model": "gpt-6-astra",
+ "codex_effort": "medium",
+ "codex_max_minutes": 180,
+ "codex_git_dir": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/.git",
+ "opencode_model": {
+  "providerID": "opencode-go",
+  "modelID": "muse-spark-1.3-contributor"
+ },
+ "max_parks_per_hour": 2,
+ "codex_bin": "/Users/dhairyabajaria/.local/node-v22.11.0-darwin-arm64/bin/codex",
+ "_retired": {
+  "EXEC-A": "ses_f9500b146ffeuGdDP8eu9FBrZm (retired 2026-09-06 04:36: non-retryable 400 invalid_request_error from Console Go on every prompt, including a one-line probe -- session state, not load. Replaced by EXEC-A2.)"
+ },
+ "auto_gate": true,
+ "stall_after_seconds": 90
+}

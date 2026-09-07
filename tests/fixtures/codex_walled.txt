@@ -1,0 +1,10 @@
+# Codex Adversarial Review
+
+Codex did not return valid structured JSON.
+
+- Parse error: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 9th, 2026 10:40 PM.
+[codex] Starting Codex task thread.
+[codex] Thread ready (01a07784-e1c0-7373-96b2-80f15ae96f19).
+[codex] Turn started (01a07784-e2fb-78c2-9aae-d87915bd8dbf).
+[codex] Codex error: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 9th, 2026 10:40 PM.
+[codex] Turn failed.

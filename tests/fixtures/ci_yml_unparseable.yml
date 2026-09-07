@@ -1,0 +1,1005 @@
+name: ci
+
+# Phase 6.4. The platform, agent and portal gates ran on nobody's automation
+# before this file existed — the class of bug that shipped because of that
+# (Phase 0.1, the reply route that never decrypted a connection's secret) is
+# exactly what
+# platform/tests/test_e2e_reply_path.py exists to catch on every push.
+#
+# Branch protection (GitHub UI, not expressible here): require the stable
+# `required / integration` context below on `main` before merge. It aggregates
+# `required / platform`, `required / agent`, `required / portal`,
+# `required / deploy-contracts`, every `required / supply-chain / …` matrix
+# leg, and `required / deploy`. See docs/SUPPLY_CHAIN.md. This workflow defines
+# and tests those contexts, but cannot prove that an administrator configured
+# the external repository policy. The dedicated contract job id remains
+# `deploy-contracts` for repository-policy automation and local validation.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Fresh advisories can affect an unchanged release.  The `supply-chain` job
+  # therefore re-audits the immutable source locks weekly, while the dedicated
+  # job below scans the three digests actually configured for production.
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+# A newer revision supersedes validation of the same ref. Keep manual provider
+# evaluations and scheduled scans separate from push/PR cancellation groups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kb-real-provider-eval:
+    # Manual, protected-environment gate. It needs a disposable
+    # production-shaped DB clone plus real provider credentials, so it must
+    # never be faked on pull requests with the hash embedder.
+    if: github.event_name == 'workflow_dispatch' && vars.KB_REAL_PROVIDER_EVAL == 'true'
+    runs-on: ubuntu-latest
+    environment: kb-real-provider-evaluation
+    env:
+      KB_REAL_PROVIDER_EVAL: "1"
+      KB_REAL_PROVIDER_RECALL_THRESHOLD: ${{ vars.KB_REAL_PROVIDER_RECALL_THRESHOLD || '0.90' }}
+      DATABASE_URL: ${{ secrets.KB_EVAL_DATABASE_URL }}
+      DATABASE_PLATFORM_URL: ${{ secrets.KB_EVAL_DATABASE_PLATFORM_URL }}
+      EMBEDDING_PROVIDER: ${{ vars.KB_EVAL_EMBEDDING_PROVIDER }}
+      EMBEDDING_MODEL: ${{ vars.KB_EVAL_EMBEDDING_MODEL }}
+      EMBEDDING_API_KEY: ${{ secrets.KB_EVAL_EMBEDDING_API_KEY }}
+      EMBEDDING_ALLOW_HASH: "false"
+      VOICE_POD_ENV: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.11.26"
+      - name: Run encrypted golden retrieval recall gate
+        working-directory: platform
+        run: |
+          uv sync --locked
+          uv run python scripts/kb_real_provider_eval.py
+
+  platform:
+    name: required / platform
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # Full history: the collection-baseline freshness check counts
+          # merges since the baseline commit (fetch-depth 1 cannot).
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.11.26"
+      # The platform test suite provisions its own throwaway Postgres via
+      # the `pgserver` dev dependency (platform/tests/conftest.py) — real
+      # migrations, real RLS, no Docker daemon needed on the runner. If
+      # pgserver ever misbehaves here (it bundles a Postgres binary, which
+      # occasionally does not have a wheel for a given runner image), fall
+      # back to a pgvector service container instead:
+      #
+      #   services:
+      #     postgres:
+      #       image: pgvector/pgvector:pg16
+      #       env: { POSTGRES_PASSWORD: test, POSTGRES_DB: voicepod }
+      #       ports: ["5432:5432"]
+      #       options: >-
+      #         --health-cmd "pg_isready -U postgres" --health-interval 5s
+      #         --health-timeout 5s --health-retries 10
+      #
+      # and point DATABASE_ADMIN_URL/DATABASE_URL at it — conftest.py would
+      # need a second fixture path since it currently always builds its own
+      # pgserver instance rather than reading a URL from the environment.
+      - name: Lint (P5-2 baseline — narrow rule set, must stay green)
+        working-directory: platform
+        run: |
+          uv sync --locked
+          uv run ruff check .
+      - name: Typecheck the configured high-risk module baseline (P5-2)
+        working-directory: platform
+        run: uv run mypy
+      # A collected-test floor is a RATCHET, and its negative control only
+      # works while the floor sits inside the band
+      #     (collected - the ignored file's own tests) < floor <= collected.
+      # Below that band the control cannot fail; above it the floor leg itself
+      # cannot pass. BOTH have happened here: the floors once sat far below the
+      # band and all three controls were vacuous, and then platform collection
+      # grew past a stale 8153 so the floor leg could not pass at all.
+      # Fixed integers rot, so the floor lives in
+      # platform/tests/collection_baseline.json (measured count, source
+      # commit, merge-age limit, growth band, negative-control file): any
+      # drop fails the floor leg, growth beyond the band fails and forces a
+      # re-baseline commit, and a baseline older than max_age_merges fails
+      # the freshness leg. Re-measure ALL numbers in the JSON whenever the
+      # suite grows; never widen a band here to make red green.
+      # Baselines (all three suites in the JSON, measured at ccae4375):
+      # platform 9612 (9546 without tests/test_admin.py: 9612 - 66, the 66
+      # measured as the ignore delta); agent 1449 (1421 without
+      # tests/test_config.py); portal 828 (818 without src/App.test.tsx).
+      # The agent and portal legs below use the same JSON mechanism.
+      - name: Enforce platform collected-test floor
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          uv run pytest --collect-only -q > /tmp/platform-collected-tests.txt
+          collected="$(grep -Eo '[0-9]+ tests collected' /tmp/platform-collected-tests.txt | tail -1 | awk '{print $1}')"
+          test -n "$collected"
+          baseline="$(python3 -c "import json; print(json.load(open('tests/collection_baseline.json'))['suites']['platform']['collected'])")"
+          band_pct="$(python3 -c "import json; print(json.load(open('tests/collection_baseline.json'))['growth_band_percent'])")"
+          test "$collected" -ge "$baseline"
+          ceiling=$(( baseline + baseline * band_pct / 100 ))
+          test "$collected" -le "$ceiling"
+          echo "platform collected ${collected} tests (baseline: ${baseline}, ceiling: ${ceiling})"
+      - name: "Negative control: platform collection falls below floor when tests/test_admin.py is ignored"
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          # A reviewed, non-empty suite file must lower the count. This makes
+          # the floor meaningful without deleting or changing any test source.
+          test -s tests/test_admin.py
+          ignore="$(python3 -c "import json; print(json.load(open('tests/collection_baseline.json'))['suites']['platform']['negative_control']['ignore'])")"
+          uv run pytest --collect-only -q --ignore="$ignore" > /tmp/platform-negative-collected-tests.txt
+          reduced="$(grep -Eo '[0-9]+ tests collected' /tmp/platform-negative-collected-tests.txt | tail -1 | awk '{print $1}')"
+          test -n "$reduced"
+          baseline="$(python3 -c "import json; print(json.load(open('tests/collection_baseline.json'))['suites']['platform']['collected'])")"
+          test "$reduced" -lt "$baseline"
+          echo "platform negative-control collection ${reduced} tests (below baseline: ${baseline})"
+      - name: "Baseline freshness: collection baseline must track recent merges"
+        run: |
+          set -euo pipefail
+          # An old baseline describes a different suite. Re-measure the JSON
+          # and commit it; do not bump max_age_merges to silence this.
+          # Every suite in the JSON is checked: a stale agent or portal count
+          # rots exactly the way the platform 8153 floor did.
+          max_age="$(python3 -c "import json; print(json.load(open('platform/tests/collection_baseline.json'))['max_age_merges'])")"
+          for suite in platform agent portal; do
+            base="$(python3 -c "import json,sys; print(json.load(open('platform/tests/collection_baseline.json'))['suites'][sys.argv[1]]['measured_commit'])" "$suite")"
+            git cat-file -e "$base^{commit}" || { echo "$suite baseline commit $base unknown: re-baseline"; exit 1; }
+            age="$(git rev-list --count --merges "$base..HEAD")"
+            test "$age" -le "$max_age"
+            echo "$suite baseline ${base} is ${age} merges old (max: ${max_age})"
+          done
+      - name: Run platform tests with coverage
+        working-directory: platform
+        run: |
+          uv run pytest -q --cov=core --cov=api --cov=channels \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80
+          uv run python ../deploy/check_module_coverage.py \
+            /tmp/platform-coverage.json \
+            core/dnc/service.py=80 \
+            core/metering.py=80 \
+            core/erasure.py=80 \
+            core/admission.py=80
+ (fix(ci): collection floor as ratchet vs checked-in baseline (no fixed ints))
+      - name: Run platform tests in a rotating deterministic order
+        working-directory: platform
+        env:
+          # Every workflow run explores another order. The runner prints this
+          # value, so a failure is replayable locally with the same variable.
+          VOICEPOD_PYTEST_SHUFFLE_SEED: ${{ github.run_id }}
+        # Deliberately SERIAL (no -n): the point of this invocation is catching
+        # order-dependence with a replayable seed. Under xdist the tests still
+        # run in shuffled order per worker, but inter-worker interleaving is
+        # scheduler-dependent, so a failure would no longer replay with the
+        # same seed. Parallelism lives in platform-shards below; the coverage
+        # run there carries no ordering promise.
+        run: uv run python -m tests.shuffled_runner -q
+
+  platform-shards:
+    name: required / platform (shard ${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.11.26"
+      - name: Install locked deps
+        working-directory: platform
+        run: uv sync --locked
+      - name: Run this shard with coverage
+        working-directory: platform
+        env:
+          COVERAGE_FILE: .coverage.shard-${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          # Deterministic partition, no plugin: md5(repo-relative path) mod 8.
+          # Sorted input and path-only hashing make a shard the same file set
+          # on every runner; the union of all shards is exactly the collected
+          # file set (proven in the lane report). --dist loadfile keeps each
+          # file's tests in collected order on one worker (repo xdist policy).
+          files="$(SHARD='${{ matrix.shard }}' python3 - <<'EOF'
+          import hashlib, glob, os
+          shard = int(os.environ['SHARD'])
+          paths = sorted(glob.glob('tests/**/test_*.py', recursive=True))
+          sel = [p for p in paths if int(hashlib.md5(p.encode()).hexdigest(), 16) % 8 == shard]
+          assert sel, 'empty shard selection'
+          print(' '.join(sel))
+          EOF
+          )"
+          test -n "$files"
+          echo "shard ${{ matrix.shard }}: $(echo "$files" | wc -w) files"
+          # shellcheck disable=SC2086 (intentional word-splitting of the file list)
+          uv run pytest -q -n auto --dist loadfile $files \
+            --cov=core --cov=api --cov=channels --cov-report=
+          # --cov-report= (empty) records coverage data without printing a
+          # per-shard report: a shard's percentage is meaningless, and the
+          # gates below run ONLY on the combined result in platform-coverage.
+      - name: Upload shard coverage data
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # Exact path, NOT a glob: pytest-cov writes exactly $COVERAGE_FILE,
+          # and neither shell globs nor upload-artifact's minimatch match
+          # leading-dot files with `*` — a glob here would match nothing and
+          # every shard upload would fail.
+          name: platform-coverage-shard-${{ matrix.shard }}
+          path: platform/.coverage.shard-${{ matrix.shard }}
+          # Belt and braces with the exact path above: the action excludes
+          # hidden files by default, and this file IS hidden. Either pin
+          # alone should suffice; both are asserted by
+          # deploy/tests/test_ci_shard_coverage.py so a future edit that
+          # drops one of them reds instead of silently uploading nothing.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  platform-coverage:
+    name: required / platform-coverage
+    runs-on: ubuntu-latest
+    needs: [platform-shards]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.11.26"
+      - name: Install locked deps (coverage tooling)
+        working-directory: platform
+        run: uv sync --locked
+      - name: Download all shard coverage data
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4 (SHA = upstream tag, resolved via git ls-remote; see lane report)
+        with:
+          pattern: platform-coverage-shard-*
+          path: platform/.coverage-shards/
+          merge-multiple: true
+      - name: Combine and enforce coverage gates on the combined result
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          # Gates apply to the COMBINED result of all shards — never to a
+          # shard's partial data. needs:[platform-shards] plus the per-shard
+          # upload guarantee (if-no-files-found: error) means every shard
+          # contributed at least one data file here.
+          # ls -A (not bare ls): the data files are dot-prefixed and bare ls
+          # hides them, which would make the count below read 0 forever.
+          ls -A .coverage-shards/
+          test "$(ls -A .coverage-shards/ | wc -l)" -ge 8
+          ( cd .coverage-shards && uv run coverage combine )
+          uv run coverage json --data-file=.coverage-shards/.coverage -o /tmp/platform-coverage.json
+          uv run coverage report --data-file=.coverage-shards/.coverage --fail-under=80
+          uv run python ../deploy/check_module_coverage.py \
+            /tmp/platform-coverage.json \
+            core/dnc/service.py=80 \
+            core/metering.py=80 \
+            core/erasure.py=80 \
+            core/admission.py=80
+
+  agent:
+    name: required / agent
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.11.26"
+      - name: Lint (same rule set as platform)
+        working-directory: agent
+        run: |
+          uv sync --locked
+          uv run ruff check .
+      - name: Verify trap-battery expected-guard scoring
+        working-directory: agent
+        run: uv run pytest ../evals/test_trap_battery.py -q
+      - name: Run agent tests with coverage
+        working-directory: agent
+        run: |
+          uv run pytest -q tests ../evals/test_trap_battery.py --cov=. \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=json:/tmp/agent-coverage.json --cov-fail-under=80
+          uv run python ../deploy/check_module_coverage.py \
+            /tmp/agent-coverage.json guards.py=80
+      - name: Enforce agent collected-test floor
+        working-directory: agent
+        run: |
+          set -euo pipefail
+          # Ratchet against ../platform/tests/collection_baseline.json (same
+          # mechanism as the platform floor): any drop fails, growth beyond
+          # the band fails and forces a re-baseline commit. Fixed integers
+          # rot — 1422 passed with exactly one test to spare.
+          uv run pytest --collect-only -q > /tmp/agent-collected-tests.txt
+          collected="$(grep -Eo '[0-9]+ tests collected' /tmp/agent-collected-tests.txt | tail -1 | awk '{print $1}')"
+          test -n "$collected"
+          baseline="$(python3 -c "import json; print(json.load(open('../platform/tests/collection_baseline.json'))['suites']['agent']['collected'])")"
+          band_pct="$(python3 -c "import json; print(json.load(open('../platform/tests/collection_baseline.json'))['growth_band_percent'])")"
+          test "$collected" -ge "$baseline"
+          ceiling=$(( baseline + baseline * band_pct / 100 ))
+          test "$collected" -le "$ceiling"
+          echo "agent collected ${collected} tests (baseline: ${baseline}, ceiling: ${ceiling})"
+      - name: "Negative control: agent collection falls below floor when tests/test_config.py is ignored"
+        working-directory: agent
+        run: |
+          set -euo pipefail
+          # Keep this distinct from the normal collection so a no-op ignore
+          # flag or an accidentally empty reviewed test file cannot pass.
+          test -s tests/test_config.py
+          ignore="$(python3 -c "import json; print(json.load(open('../platform/tests/collection_baseline.json'))['suites']['agent']['negative_control']['ignore'])")"
+          uv run pytest --collect-only -q --ignore="$ignore" > /tmp/agent-negative-collected-tests.txt
+          reduced="$(grep -Eo '[0-9]+ tests collected' /tmp/agent-negative-collected-tests.txt | tail -1 | awk '{print $1}')"
+          test -n "$reduced"
+          baseline="$(python3 -c "import json; print(json.load(open('../platform/tests/collection_baseline.json'))['suites']['agent']['collected'])")"
+          test "$reduced" -lt "$baseline"
+          echo "agent negative-control collection ${reduced} tests (below baseline: ${baseline})"
+
+  deploy-contracts:
+    name: required / deploy-contracts
+    # These contracts exercise the deployment artifacts themselves. Keeping
+    # them in a dedicated, unconditional job gives branch protection one
+    # stable check to require without coupling fast contract feedback to image
+    # builds or registry access in the heavier `deploy` job.
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.11.26"
+      - name: Run deployment and recovery contracts
+        working-directory: platform
+        run: |
+          uv sync --locked
+          uv run pytest ../deploy/tests ../deploy/test_recovery_manifest_contract.py ../deploy/test_restore_drill_contract.py -q
+
+  portal:
+    name: required / portal
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+      - name: Typecheck, unit tests and build
+        working-directory: portal
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run typecheck
+          npm run test -- --reporter=json --outputFile=/tmp/portal-test-results.json
+          collected="$(node -e "const report = require('/tmp/portal-test-results.json'); process.stdout.write(String(report.numTotalTests))")"
+          # IR-L8-1: portal coverage floor is an active release gate.
+          # Ratchet against ../platform/tests/collection_baseline.json (same
+          # mechanism as the platform floor): any drop fails, growth beyond
+          # the band fails and forces a re-baseline commit.
+          test -n "$collected"
+          baseline="$(node -e "const b = require('../platform/tests/collection_baseline.json'); process.stdout.write(String(b.suites.portal.collected))")"
+          band_pct="$(node -e "const b = require('../platform/tests/collection_baseline.json'); process.stdout.write(String(b.growth_band_percent))")"
+          test "$collected" -ge "$baseline"
+          ceiling=$(( baseline + baseline * band_pct / 100 ))
+          test "$collected" -le "$ceiling"
+          echo "portal collected ${collected} tests (baseline: ${baseline}, ceiling: ${ceiling})"
+          # Excluding this reviewed, non-empty test file must make the floor
+          # fail. It prevents a test-discovery regression from silently
+          # turning the count floor into a no-op without mutating test source.
+          test -s src/App.test.tsx
+          exclude="$(node -e "const b = require('../platform/tests/collection_baseline.json'); process.stdout.write(b.suites.portal.negative_control.exclude)")"
+          npm run test -- --reporter=json --outputFile=/tmp/portal-negative-test-results.json --exclude "$exclude"
+          reduced="$(node -e "const report = require('/tmp/portal-negative-test-results.json'); process.stdout.write(String(report.numTotalTests))")"
+          test -n "$reduced"
+          test "$reduced" -lt "$baseline"
+          echo "portal negative-control collection ${reduced} tests (below baseline: ${baseline})"
+          npm run build
+          if find dist -type f -name '*.map' -print -quit | grep -q .; then
+            echo "production portal contains public source maps" >&2
+            exit 1
+          fi
+          if find dist/assets -type f -name 'index-*.js' -size +350k -print -quit | grep -q .; then
+            echo "production entry bundle exceeds the 350 kB budget" >&2
+            exit 1
+          fi
+
+      - name: Retain portal test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portal-tests-${{ github.sha }}
+          path: |
+            /tmp/portal-test-results.json
+            /tmp/portal-negative-test-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce portal line-coverage floor
+        working-directory: portal
+        run: npm run test -- --coverage.enabled --coverage.reporter=json-summary
+
+      - name: Install browser used by the accessibility smoke gate
+        working-directory: portal
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser, mobile and accessibility smoke tests
+        working-directory: portal
+        run: npm run test:e2e
+
+  supply-chain:
+    name: required / supply-chain / ${{ matrix.component }}
+    # Source dependency evidence is split by component so one failing advisory
+    # cannot prevent the other components from producing retained reports.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: platform
+            ecosystem: python
+            path: platform
+            root_package: voice-pod-platform
+          - component: agent
+            ecosystem: python
+            path: agent
+            root_package: voice-pod-agent
+          - component: portal
+            ecosystem: node
+            path: portal
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        if: matrix.ecosystem == 'python'
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5.4.1
+        with:
+          version: "0.11.26"
+
+      - name: Set up Node
+        if: matrix.ecosystem == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+
+      - name: Verify the supply-chain policy tooling
+        if: matrix.component == 'platform'
+        run: python -m unittest scripts/test_supply_chain.py
+
+      - name: Generate reproducible Python CycloneDX SBOM
+        if: matrix.ecosystem == 'python'
+        run: >-
+          python scripts/supply_chain.py uv-sbom
+          --lock ${{ matrix.path }}/uv.lock
+          --root ${{ matrix.root_package }}
+          --output artifacts/${{ matrix.component }}.cdx.json
+
+      - name: Generate reproducible portal CycloneDX SBOM
+        if: matrix.ecosystem == 'node'
+        run: |
+          python scripts/supply_chain.py npm-sbom \
+            --lock portal/package-lock.json \
+            --output artifacts/portal.cdx.json
+          python scripts/supply_chain.py npm-license-report \
+            --lock portal/package-lock.json \
+            --output artifacts/portal-licenses.json
+
+      - name: Generate Python production-license evidence
+        if: matrix.ecosystem == 'python'
+        working-directory: ${{ matrix.path }}
+        run: |
+          uv sync --locked --no-dev
+          uv export --locked --no-dev --no-emit-project \
+            --format requirements-txt \
+            --output-file "../artifacts/${{ matrix.component }}-requirements.txt"
+          uv run --locked --no-dev python ../scripts/supply_chain.py \
+            python-license-report \
+            --project "${{ matrix.component }}" \
+            --requirements "../artifacts/${{ matrix.component }}-requirements.txt" \
+            --output "../artifacts/${{ matrix.component }}-licenses.json"
+
+      - name: Audit Python production dependencies
+        if: matrix.ecosystem == 'python'
+        id: python_audit
+        continue-on-error: true
+        working-directory: ${{ matrix.path }}
+        run: |
+          # `ci/requirements/pip-audit.txt` pins pip-audit==2.10.0, every
+          # scanner dependency, and every wheel hash. Do not replace this with
+          # a transient tool environment: it is not reviewed supply-chain evidence.
+          uv venv --python 3.12 .ci-pip-audit
+          uv pip install --python .ci-pip-audit/bin/python --require-hashes \
+            -r ../ci/requirements/pip-audit.txt
+          python ../scripts/supply_chain.py hashed-requirements-policy \
+            ../ci/requirements/pip-audit.txt
+          python ../scripts/supply_chain.py requirements-sbom \
+            --requirements ../ci/requirements/pip-audit.txt \
+            --root voicepod-ci-pip-audit \
+            --output "../artifacts/${{ matrix.component }}-pip-audit-scanner.cdx.json"
+          cp ../ci/requirements/pip-audit.txt \
+            "../artifacts/${{ matrix.component }}-pip-audit-scanner-requirements.txt"
+          .ci-pip-audit/bin/pip-audit \
+            --requirement "../artifacts/${{ matrix.component }}-requirements.txt" \
+            --disable-pip \
+            --format json \
+            --output "../artifacts/${{ matrix.component }}-pip-audit.json"
+
+      - name: Audit portal production and development dependencies
+        if: matrix.ecosystem == 'node'
+        id: npm_audit
+        continue-on-error: true
+        working-directory: portal
+        run: npm audit --audit-level=high --json > ../artifacts/portal-npm-audit.json
+
+      - name: Enforce dependency-license policy
+        run: >-
+          python scripts/supply_chain.py license-policy
+          artifacts/${{ matrix.component }}.cdx.json
+          artifacts/${{ matrix.component }}-licenses.json
+
+      - name: Retain component SBOM, advisory and license evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: supply-chain-${{ matrix.component }}-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce dependency vulnerability result
+        if: >-
+          always() &&
+          (steps.python_audit.outcome == 'failure' || steps.npm_audit.outcome == 'failure')
+        run: |
+          echo "The component dependency audit violated policy or could not complete." >&2
+          exit 1
+
+  scheduled-deployed-image-scan:
+    # Source-lock scans are provided by the scheduled supply-chain matrix above.
+    # This separate job scans the immutable images currently declared as deployed,
+    # not a freshly-built substitute.  The repository variables are intentionally
+    # split so changing a tag cannot make this scan follow a mutable reference.
+    # The deployment-promotion operator updates these four repository-variable
+    # pairs after each verified production rollout; they are the CI source of
+    # truth for deployed-image scanning and must never contain a tag.
+    if: github.event_name == 'schedule'
+    name: scheduled deployed image scan (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: platform
+            repository: ${{ vars.VOICEPOD_PLATFORM_IMAGE_REPOSITORY }}
+            digest: ${{ vars.VOICEPOD_PLATFORM_IMAGE_DIGEST }}
+          - component: agent
+            repository: ${{ vars.VOICEPOD_AGENT_IMAGE_REPOSITORY }}
+            digest: ${{ vars.VOICEPOD_AGENT_IMAGE_DIGEST }}
+          - component: caddy
+            repository: ${{ vars.VOICEPOD_CADDY_IMAGE_REPOSITORY }}
+            digest: ${{ vars.VOICEPOD_CADDY_IMAGE_DIGEST }}
+          # PostgreSQL holds production tenant data too; scan the pgvector image
+          # actually deployed by Compose, rather than only application images.
+          - component: pgvector
+            repository: ${{ vars.VOICEPOD_PGVECTOR_IMAGE_REPOSITORY }}
+            digest: ${{ vars.VOICEPOD_PGVECTOR_IMAGE_DIGEST }}
+    steps:
+      - name: Refuse mutable or missing deployed-image references
+        env:
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          IMAGE_DIGEST: ${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$IMAGE_REPOSITORY"
+          test "${IMAGE_REPOSITORY#*@}" = "$IMAGE_REPOSITORY"
+          # Repositories are paths only: no tag, digest, uppercase aliases, or
+          # shell-like characters. A registry port is allowed only on its host.
+          printf '%s' "$IMAGE_REPOSITORY" | grep -Eq '^[a-z0-9][a-z0-9._-]*(\:[0-9]{1,5})?(/[a-z0-9][a-z0-9._-]*)+$'
+          printf '%s' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+
+      # Optional credentials are a three-value all-or-nothing contract. They
+      # stay GitHub secrets, are used only for an exactly matching registry,
+      # and are removed after the scan. Leave all three blank for public-only
+      # deployments (including Docker Hub's pgvector image).
+      - name: Authenticate optional private deployed-image registry
+        env:
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          DEPLOYED_IMAGE_REGISTRY_HOST: ${{ vars.VOICEPOD_DEPLOYED_IMAGE_REGISTRY_HOST }}
+          TRIVY_REGISTRY_USERNAME: ${{ secrets.VOICEPOD_DEPLOYED_IMAGE_REGISTRY_USERNAME }}
+          TRIVY_REGISTRY_PASSWORD: ${{ secrets.VOICEPOD_DEPLOYED_IMAGE_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          first_segment="${IMAGE_REPOSITORY%%/*}"
+          case "$first_segment" in
+            *.*|*:*|localhost) image_registry="$first_segment" ;;
+            *) image_registry="docker.io" ;;
+          esac
+          if test -z "$DEPLOYED_IMAGE_REGISTRY_HOST" && test -z "$TRIVY_REGISTRY_USERNAME" && test -z "$TRIVY_REGISTRY_PASSWORD"; then
+            echo "No private deployed-image registry credentials configured."
+            exit 0
+          fi
+          test -n "$DEPLOYED_IMAGE_REGISTRY_HOST"
+          test -n "$TRIVY_REGISTRY_USERNAME"
+          test -n "$TRIVY_REGISTRY_PASSWORD"
+          printf '%s' "$DEPLOYED_IMAGE_REGISTRY_HOST" | grep -Eq '^[a-z0-9][a-z0-9.-]*(\:[0-9]{1,5})?$'
+          if test "$image_registry" = "$DEPLOYED_IMAGE_REGISTRY_HOST"; then
+            printf '%s' "$TRIVY_REGISTRY_PASSWORD" | docker login "$DEPLOYED_IMAGE_REGISTRY_HOST" --username "$TRIVY_REGISTRY_USERNAME" --password-stdin
+          else
+            echo "Configured private registry does not own this image; scanning without registry credentials."
+          fi
+
+      - name: Scan deployed ${{ matrix.component }} image by digest
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.repository }}@${{ matrix.digest }}
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          version: v0.65.0
+
+      - name: Remove temporary deployed-image registry credentials
+        if: always()
+        env:
+          DEPLOYED_IMAGE_REGISTRY_HOST: ${{ vars.VOICEPOD_DEPLOYED_IMAGE_REGISTRY_HOST }}
+          TRIVY_REGISTRY_USERNAME: ${{ secrets.VOICEPOD_DEPLOYED_IMAGE_REGISTRY_USERNAME }}
+          TRIVY_REGISTRY_PASSWORD: ${{ secrets.VOICEPOD_DEPLOYED_IMAGE_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if test -n "$DEPLOYED_IMAGE_REGISTRY_HOST" && test -n "$TRIVY_REGISTRY_USERNAME" && test -n "$TRIVY_REGISTRY_PASSWORD"; then
+            docker logout "$DEPLOYED_IMAGE_REGISTRY_HOST" || true
+          fi
+
+  security-triage:
+    # Alert destination and accountable triage queue for scheduled failures.
+    # This job is deliberately schedule-only: PR-controlled workflow code never
+    # receives an issues:write token.
+    if: >-
+      always() &&
+      github.event_name == 'schedule' &&
+      (needs.supply-chain.result == 'failure' || needs.scheduled-deployed-image-scan.result == 'failure')
+    needs: [supply-chain, scheduled-deployed-image-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or refresh the security-triage issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TRIAGE_TITLE: "[security-triage] scheduled dependency or deployed-image scan failed"
+        run: |
+          set -euo pipefail
+          gh label create security-triage --color B60205 --description "Scheduled security-scan triage required" --force
+          existing="$(gh issue list --state open --label security-triage --search "$TRIAGE_TITLE in:title" --json number --jq '.[0].number')"
+          body="Scheduled security scan failed in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Triage this issue before the next release; review the retained supply-chain artifacts and deployed digest scan results."
+          if test -n "$existing"; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TRIAGE_TITLE" --label security-triage --body "$body"
+          fi
+
+  deploy:
+    name: required / deploy
+    # Phase P0-8. Three of this project's ship blockers were "compose and
+    # the code disagree about the environment", and all three test suites
+    # were green throughout. Nothing here runs the product — it checks the
+    # artefacts a deploy consumes, which is the only place these bugs are
+    # visible.
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: The documented .env.example actually parses
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null
+          docker compose --profile tools config >/dev/null
+          docker compose --profile recordings config >/dev/null
+
+      - name: Both images build
+        run: |
+          docker build -f deploy/Dockerfile.platform -t voicepod-platform:ci .
+          docker build -f agent/Dockerfile -t voicepod-agent:ci agent
+
+      - name: "Negative control: changed agent model manifest cannot build"
+        # Deliberately build a copied context: the control must prove the Dockerfile
+        # pin rejects both revision and artifact-digest changes, without mutating the
+        # checkout used by later SBOM, provenance, or deployment checks.
+        run: |
+          set -euo pipefail
+          mkdir -p deploy-artifacts/model-manifest-negative
+          negative_context="$(mktemp -d "${RUNNER_TEMP}/voicepod-agent-negative.XXXXXX")"
+          revision_image="voicepod-agent-model-manifest-revision-negative:${GITHUB_RUN_ID}"
+          hash_image="voicepod-agent-model-manifest-hash-negative:${GITHUB_RUN_ID}"
+          cleanup() {
+            docker image rm --force "$revision_image" >/dev/null 2>&1 || true
+            docker image rm --force "$hash_image" >/dev/null 2>&1 || true
+            rm -rf "$negative_context"
+          }
+          trap cleanup EXIT
+
+          reject_mutated_manifest() {
+            local context="$1"
+            local image="$2"
+            local log="$3"
+            # A network-disabled build can only reach this exact checksum error if
+            # the Dockerfile rejects the copied manifest before the first download.
+            if docker build --network=none --progress=plain \
+              -f "$context/Dockerfile" \
+              -t "$image" \
+              "$context" >"$log" 2>&1; then
+              echo "agent build accepted a mutated reviewed model manifest" >&2
+              exit 1
+            fi
+            # Keep the actual failure visible even when the expected refusal is absent.
+            cat "$log"
+            grep -F "model manifest checksum does not match the reviewed Dockerfile pin" "$log"
+          }
+
+          revision_context="$negative_context/revision/agent"
+          mkdir -p "$(dirname "$revision_context")"
+          cp -a agent "$revision_context"
+          revision_manifest="$revision_context/artifacts/turn-detector-en.json"
+          test "$(grep -Fxc '  "runtime_revision": "v1.2.2-en",' "$revision_manifest")" -eq 1
+          sed -i 's/"runtime_revision": "v1\.2\.2-en"/"runtime_revision": "v1.2.2-en-ci-negative"/' "$revision_manifest"
+          test "$(grep -Fxc '  "runtime_revision": "v1.2.2-en-ci-negative",' "$revision_manifest")" -eq 1
+          reject_mutated_manifest "$revision_context" "$revision_image" "deploy-artifacts/model-manifest-negative/revision-build.log"
+
+          hash_context="$negative_context/sha256/agent"
+          mkdir -p "$(dirname "$hash_context")"
+          cp -a agent "$hash_context"
+          hash_manifest="$hash_context/artifacts/turn-detector-en.json"
+          test "$(grep -Fxc '    {"path": "onnx/model_q8.onnx", "sha256": "fdd695a99bda01155fb0b5ce71d34cb9fd3902c62496db7a6c2c7bdeac310ac7", "size": 65712276},' "$hash_manifest")" -eq 1
+          sed -i 's/"sha256": "fdd695a99bda01155fb0b5ce71d34cb9fd3902c62496db7a6c2c7bdeac310ac7"/"sha256": "0000000000000000000000000000000000000000000000000000000000000000"/' "$hash_manifest"
+          test "$(grep -Fxc '    {"path": "onnx/model_q8.onnx", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size": 65712276},' "$hash_manifest")" -eq 1
+          reject_mutated_manifest "$hash_context" "$hash_image" "deploy-artifacts/model-manifest-negative/hash-build.log"
+
+      - name: Verify the final agent image excludes development tooling
+        run: >-
+          docker run --rm --entrypoint /bin/sh voicepod-agent:ci -c
+          'test ! -e /app/.venv/bin/pytest && test ! -e /app/.venv/bin/py.test &&
+          test ! -e /app/.venv/bin/ruff && ! find /app/.venv/bin -maxdepth 1
+          -name "coverage*" -print -quit | grep -q .'
+
+      - name: Caddy image builds
+        run: docker build -f deploy/Dockerfile.caddy -t voicepod-caddy:ci .
+
+      - name: Deployment security invariants hold
+        run: |
+          deploy/validate-security.sh
+          docker run --rm \
+            -e PLATFORM_DOMAIN=portal.example.test \
+            -e ACME_EMAIL=ops@example.test \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            voicepod-caddy:ci caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Generate platform image CycloneDX SBOM
+        uses: anchore/sbom-action@f8bdd1d8ac5e901a77a92f111440fdb1b593736b # v0.20.6
+        with:
+          image: voicepod-platform:ci
+          format: cyclonedx-json
+          output-file: deploy-artifacts/voicepod-platform-image.cdx.json
+          syft-version: v1.33.0
+          upload-artifact: false
+          dependency-snapshot: false
+
+      - name: Generate agent image CycloneDX SBOM
+        uses: anchore/sbom-action@f8bdd1d8ac5e901a77a92f111440fdb1b593736b # v0.20.6
+        with:
+          image: voicepod-agent:ci
+          format: cyclonedx-json
+          output-file: deploy-artifacts/voicepod-agent-image.cdx.json
+          syft-version: v1.33.0
+          upload-artifact: false
+          dependency-snapshot: false
+
+      - name: Add the reviewed agent model artifact to its SBOM
+        run: |
+          python scripts/supply_chain.py model-artifact-sbom \
+            --manifest agent/artifacts/turn-detector-en.json \
+            --output deploy-artifacts/voicepod-agent-model-artifacts.cdx.json
+          python scripts/supply_chain.py merge-cyclonedx \
+            --base deploy-artifacts/voicepod-agent-image.cdx.json \
+            --addition deploy-artifacts/voicepod-agent-model-artifacts.cdx.json \
+            --output deploy-artifacts/voicepod-agent-image-with-model.cdx.json
+
+      - name: Generate Caddy image CycloneDX SBOM
+        uses: anchore/sbom-action@f8bdd1d8ac5e901a77a92f111440fdb1b593736b # v0.20.6
+        with:
+          image: voicepod-caddy:ci
+          format: cyclonedx-json
+          output-file: deploy-artifacts/voicepod-caddy-image.cdx.json
+          syft-version: v1.33.0
+          upload-artifact: false
+          dependency-snapshot: false
+
+      - name: Scan platform image
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: voicepod-platform:ci
+          format: json
+          output: deploy-artifacts/trivy-platform-image.json
+          exit-code: "0"
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          version: v0.65.0
+
+      - name: Scan agent image
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: voicepod-agent:ci
+          format: json
+          output: deploy-artifacts/trivy-agent-image.json
+          exit-code: "0"
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          version: v0.65.0
+
+      - name: Scan Caddy image
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: voicepod-caddy:ci
+          format: json
+          output: deploy-artifacts/trivy-caddy-image.json
+          exit-code: "0"
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          version: v0.65.0
+
+      - name: Scan platform image licenses
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: voicepod-platform:ci
+          scanners: license
+          trivy-config: .trivy.yaml
+          format: json
+          output: deploy-artifacts/trivy-platform-image-licenses.json
+          exit-code: "0"
+          version: v0.65.0
+
+      - name: Scan agent image licenses
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: voicepod-agent:ci
+          scanners: license
+          trivy-config: .trivy.yaml
+          format: json
+          output: deploy-artifacts/trivy-agent-image-licenses.json
+          exit-code: "0"
+          version: v0.65.0
+
+      - name: Scan Caddy image licenses
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: image
+          image-ref: voicepod-caddy:ci
+          scanners: license
+          trivy-config: .trivy.yaml
+          format: json
+          output: deploy-artifacts/trivy-caddy-image-licenses.json
+          exit-code: "0"
+          version: v0.65.0
+
+      - name: Record secret-free local image provenance
+        run: |
+          python scripts/supply_chain.py image-provenance \
+            --image voicepod-platform:ci \
+            --image voicepod-agent:ci \
+            --image voicepod-caddy:ci \
+            --output deploy-artifacts/image-provenance.json
+
+      - name: Enforce built-image license policy
+        run: |
+          python scripts/supply_chain.py license-policy \
+            deploy-artifacts/voicepod-platform-image.cdx.json \
+            deploy-artifacts/voicepod-agent-image-with-model.cdx.json \
+            deploy-artifacts/voicepod-caddy-image.cdx.json
+          python scripts/supply_chain.py trivy-license-policy \
+            deploy-artifacts/trivy-platform-image-licenses.json \
+            deploy-artifacts/trivy-agent-image-licenses.json \
+            deploy-artifacts/trivy-caddy-image-licenses.json
+
+      - name: Enforce built-image vulnerability policy
+        run: >-
+          python scripts/supply_chain.py vulnerability-policy
+          deploy-artifacts/trivy-platform-image.json
+          deploy-artifacts/trivy-agent-image.json
+          deploy-artifacts/trivy-caddy-image.json
+
+      - name: Retain image SBOM, scan and provenance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-supply-chain-${{ github.sha }}
+          path: deploy-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  required-checks:
+    name: required / integration
+    if: always()
+    # RULE: every gate job must be listed here — matrix shard parents cover
+    # ALL of their children, and aggregation jobs alone are not enough (a
+    # shard that never uploads must still fail the gate via its parent).
+    # When adding a sharded suite, add its shard parent AND its aggregation
+    # job; a red shard then fails required-checks through both paths.
+    needs: [platform, platform-shards, platform-coverage, agent, portal, deploy-contracts, supply-chain, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every integrated release-assurance result
+        env:
+          PLATFORM_RESULT: ${{ needs.platform.result }}
+          PLATFORM_SHARDS_RESULT: ${{ needs.platform-shards.result }}
+          PLATFORM_COVERAGE_RESULT: ${{ needs.platform-coverage.result }}
+          AGENT_RESULT: ${{ needs.agent.result }}
+          PORTAL_RESULT: ${{ needs.portal.result }}
+          DEPLOY_CONTRACTS_RESULT: ${{ needs.deploy-contracts.result }}
+          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          set -eu
+          for result in \
+            "$PLATFORM_RESULT" "$PLATFORM_SHARDS_RESULT" "$PLATFORM_COVERAGE_RESULT" \
+            "$AGENT_RESULT" "$PORTAL_RESULT" \
+            "$DEPLOY_CONTRACTS_RESULT" "$SUPPLY_CHAIN_RESULT" "$DEPLOY_RESULT"
+          do
+            test "$result" = success
+          done

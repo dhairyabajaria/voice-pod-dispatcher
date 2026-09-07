@@ -1,0 +1,69 @@
+{
+ "_what": "EXEC-D 2026-09-06 21:03-21:05. STALL_ESCALATED fired at 21:03:59 on a turn that was compacting, not cut. The middle message is the auto-compaction (user role, `compaction` part, 21:04:52); the last is the post-compaction assistant turn as a poll sees it at 21:04:53 \u2014 created, no parts, not completed, i.e. the exact shape the stall detector calls a provider cut. A RESUME posted here is the failure.",
+ "messages": [
+  {
+   "info": {
+    "id": "msg_07758f5d5001tf5WrreeZVYv6S",
+    "role": "assistant",
+    "time": {
+     "created": 1788708713941,
+     "completed": 1788708892537
+    },
+    "finish": "tool-calls"
+   },
+   "parts": [
+    {
+     "type": "step-start",
+     "id": "prt_0775b9224001aEXsKP4u2IbBSZ"
+    },
+    {
+     "type": "reasoning",
+     "id": "prt_0775b92260013zEAk9HUq1537g"
+    },
+    {
+     "type": "tool",
+     "id": "prt_0775ba6cb001I6Xmc5pzSXk7Ii"
+    },
+    {
+     "type": "step-finish",
+     "id": "prt_0775baf19001EvxtzO6Vv10dI2"
+    },
+    {
+     "type": "patch",
+     "id": "prt_0775baf77001DT4nbGlqJrESc4"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "msg_0775baf7a00134pdR6OvPaiVbk",
+    "role": "user",
+    "time": {
+     "created": 1788708892539
+    },
+    "finish": null
+   },
+   "parts": [
+    {
+     "type": "compaction",
+     "id": "prt_0775baf7b0017E5dXGFP2GPRYx",
+     "auto": true,
+     "overflow": false,
+     "tail_start_id": "msg_0775084e3001XqqXwDBCOHyfH1"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "msg_0775bb4f1001h34S2dIynZw4AX",
+    "role": "assistant",
+    "time": {
+     "created": 1788708893937,
+     "completed": null
+    },
+    "finish": null
+   },
+   "parts": []
+  }
+ ]
+}

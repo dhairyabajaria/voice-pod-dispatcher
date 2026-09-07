@@ -1,0 +1,3201 @@
+{
+ "note": "BOSS-owned. status: queued|dispatched|reported|parked|gated|merged|done|broken. executor='' = any idle executor. Items are handed out in file order; deps are artifact ids that must read LANDED/MERGED in plans/EXECUTION_LEDGER.md.",
+ "items": [
+  {
+   "id": "Q4",
+   "title": "orphan sha repair (mechanical, box-free)",
+   "executor": "",
+   "lane": "lane/orphan-repair",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-orphan-repair",
+   "deps": [],
+   "scope": [
+    "plans/EXECUTION_LEDGER.md"
+   ],
+   "proof_files": [],
+   "prompt_file": "Q4.orphan-repair.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 12:06:44",
+   "report_msg_id": "msg_0704c7a4a001q6Na7WQ5a2s2LD",
+   "reported_at": "2026-09-05 12:11:11",
+   "gate": "FAIL",
+   "gate_sha": "c9a829d7e1ea939d3d9a769cdc5e57d2902e6e34",
+   "gated_at": "2026-09-05 12:49:59",
+   "merge_sha": "b8e9842a",
+   "merged_at": "2026-09-05 12:56",
+   "merged_by": "BOSS (gate proofs N/A: text-only)"
+  },
+  {
+   "id": "Q3",
+   "title": "two phantom PROOFs",
+   "executor": "",
+   "lane": "lane/011-pipelines or lane/013-agents",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-011",
+   "deps": [],
+   "scope": [
+    "platform/tests/**",
+    "plans/EXECUTION_LEDGER.md"
+   ],
+   "proof_files": [
+    "tests/test_resolution_state_model.py",
+    "tests/test_agent_release_aggregate.py"
+   ],
+   "prompt_file": "Q3.phantom-proofs.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-B",
+   "session": "ses_f931fa3ffffeTFMwDdCW0ijpUu",
+   "dispatched_at": "2026-09-05 12:06:45",
+   "report_msg_id": "msg_0709d046d001Yi23okyOap70H6",
+   "reported_at": "2026-09-05 13:38:59",
+   "merge_sha": "a3363ac8",
+   "merged_by": "BOSS-hand",
+   "edited_at": "2026-09-05 13:41:18"
+  },
+  {
+   "id": "Q2",
+   "title": "analytics rollup time bomb",
+   "executor": "",
+   "lane": "lane/rollup-time-bomb",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-rollup-time-bomb",
+   "deps": [],
+   "scope": [
+    "platform/tests/test_analytics_rollups.py"
+   ],
+   "proof_files": [
+    "tests/test_analytics_rollups.py"
+   ],
+   "prompt_file": "Q2.rollup-time-bomb.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-05 12:06:50",
+   "report_msg_id": "msg_070aaafdd001TMNRAaXghYhsOW",
+   "reported_at": "2026-09-05 13:53:55",
+   "edited_at": "2026-09-05 14:19:36",
+   "gate": "PASS",
+   "gate_sha": "46fc7298da155c7d7f0b4f1af7fd2306263aa1fd",
+   "gated_at": "2026-09-05 14:18:06",
+   "merged_at": "14:19",
+   "merge_sha": "ee57139d"
+  },
+  {
+   "id": "Q1",
+   "title": "measure fsync-off test cluster",
+   "executor": "",
+   "lane": "lane/test-speed",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-test-speed",
+   "deps": [],
+   "scope": [
+    "platform/tests/conftest.py"
+   ],
+   "proof_files": [
+    "tests/test_customer_work_domain.py"
+   ],
+   "prompt_file": "Q1.test-speed-measure.md",
+   "status": "parked",
+   "dispatched_to": "EXEC-D",
+   "session": "ses_f92c5cfedffeYU6iVctg0oiskT",
+   "dispatched_at": "2026-09-05 12:06:50",
+   "report_msg_id": "msg_07097e10e001ostJDnJ8Bt7XsH",
+   "reported_at": "2026-09-05 13:33:22",
+   "parked_reason": "CLOSED by BOSS 13:40: measured 1.13x (45.56s -> 40.32s, 88/88 same tests) < the owner's 1.5x bar; fsync-off patch NOT merged; the teardown cost is in TRUNCATE itself. Report preserved on trunk (reports/Q1-test-speed.md).",
+   "edited_at": "2026-09-05 13:35:16"
+  },
+  {
+   "id": "Q5.erasure-register-sequence-enrollments",
+   "kind": "quickfix",
+   "artifact": "",
+   "title": "declare sequence_enrollments in the erasure register (trunk red under the full gate)",
+   "executor": "",
+   "lane": "lane/q5-erasure-register",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-q5-erasure-register",
+   "deps": [],
+   "scope": [
+    "platform/core/erasure.py",
+    "platform/tests/test_erasure_dispositions.py"
+   ],
+   "proof_files": [
+    "tests/test_erasure_dispositions.py"
+   ],
+   "prompt_file": "Q5.erasure-register-sequence-enrollments.md",
+   "status": "merged",
+   "added_by": "BOSS 13:45 (\u2605 -n 4 gate red, class c for every erasure lane)",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 13:31:40",
+   "report_msg_id": "msg_070a94f7c0016bvdHQIDf0nKZ1",
+   "reported_at": "2026-09-05 13:52:24",
+   "gate": "PASS",
+   "gate_sha": "2414d2736c6238f2a4e53dd5e03f704c6cbee512",
+   "gated_at": "2026-09-05 14:18:32",
+   "merged_at": "14:19",
+   "merge_sha": "5549644d",
+   "edited_at": "2026-09-05 14:19:37"
+  },
+  {
+   "id": "Q8.sequence-schema-null-pin-proof",
+   "kind": "build",
+   "artifact": "012.sequence-schema",
+   "title": "Q8: test the *_template_version_reserved NULL-pin CHECKs (audit F1)",
+   "executor": "",
+   "dispatched_to": "EXEC-A",
+   "lane": "lane/q8-null-pin",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-q8-null-pin",
+   "deps": [],
+   "scope": [
+    "platform/tests/**",
+    "plans/EXECUTION_LEDGER.md",
+    "plans/resume/**",
+    "audit/plan-execution-2026-09-04/**"
+   ],
+   "proof_files": [
+    "tests/test_sequence_schema.py"
+   ],
+   "prompt_file": "Q8.sequence-schema-null-pin-proof.md",
+   "status": "merged",
+   "boss_note": "02:56 EXEC-A measured the proof on the box before releasing; gate is a short single-file re-run, allowed under the amended order",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 14:43:14",
+   "question_msg_id": "msg_073448bf1001QNDiLM29CgG5x4",
+   "parked_at": "2026-09-06 02:01:19",
+   "gate": "PASS",
+   "gate_sha": "0d5b505f13da76d222e7010a38ae3ff523cd9be1",
+   "gated_at": "2026-09-06 03:49:02",
+   "merged_sha": "0d5b505f",
+   "note_boss": "status was stale 'gated'; sha 0d5b505f verified ancestor of plan010/rebuild 2026-09-06 20:2x"
+  },
+  {
+   "id": "Q6.gap-answer-route-binds-source-message",
+   "kind": "quickfix",
+   "artifact": "",
+   "title": "gap-answer route binds source_message_id; flip the \u00a71.5(b) pin",
+   "executor": "EXEC-C",
+   "lane": "lane/q6-gap-answer-binding",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-q6-gap-answer-binding",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_source_ownership.py"
+   ],
+   "prompt_file": "Q6.gap-answer-route-binds-source-message.md",
+   "status": "merged",
+   "added_by": "BOSS 13:45 (\u2605 -n 4 gate red, obligation pin)",
+   "note": "pinned EXEC-C (owner of the gapbind lane, per \u2605)",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-05 13:53:55",
+   "report_msg_id": "msg_0731d1cfd001AKnvot1hlFBRuv",
+   "reported_at": "2026-09-06 01:18:11",
+   "gate": "PASS",
+   "gate_sha": "4def152b0bb7e2ee21f8e36483b3616b42db8d1f",
+   "edited_at": "2026-09-06 01:34:09",
+   "gated_at": "2026-09-06 01:32:59",
+   "boss_note": "01:34 MERGED to trunk f80a0a26; no post-merge run needed (no drift, no guards)"
+  },
+  {
+   "id": "B.011-014a.portal-permission-mirror",
+   "kind": "build",
+   "artifact": "011.approval-queue+014a.assets",
+   "title": "Portal role table lacks approval:decide + five asset.* permissions the server grants (mirror test red on trunk)",
+   "executor": "EXEC-F",
+   "lane": "lane/011-014a-portal-permission-mirror",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-011-014a-perm-mirror",
+   "deps": [],
+   "scope": [
+    "portal/**"
+   ],
+   "proof_files": [
+    "portal/src/lib/permissions.test.ts"
+   ],
+   "prompt_file": "B.011-014a.portal-permission-mirror.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-06 01:10 (WORKER-1 finding)",
+   "boss_note": "01:26 REWORK 1: approval:decide leaks into machine-key defaults via KEY_ROLE_SCOPES copy \u2192 403; five requirements in item file",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+   "dispatched_at": "2026-09-06 01:14:18",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": "PASS",
+   "gate_sha": "5ed4ecbbe98ab80f1b6f1b6723021a1d205a1c33",
+   "edited_at": "2026-09-06 01:26:30",
+   "log": null,
+   "sha": null,
+   "report_msg_id": "msg_07320dc05001LR4VYwC8kWNUTN",
+   "reported_at": "2026-09-06 01:22:11",
+   "gated_at": "2026-09-06 03:27:51",
+   "merged_sha": "99757a28",
+   "note_boss": "status was stale 'gated'; sha 99757a28 verified ancestor of plan010/rebuild 2026-09-06 20:2x"
+  },
+  {
+   "id": "B.010.ci-required-green",
+   "kind": "build",
+   "artifact": "010.ci",
+   "title": "required has never been green: six independent CI reds + add a concurrency group",
+   "executor": "CODEX-1",
+   "lane": "lane/010-ci-required-green",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-ci-required-green",
+   "deps": [],
+   "scope": [
+    ".github/**",
+    "agent/**",
+    "portal/**",
+    "deploy/**",
+    "ci/**"
+   ],
+   "proof_files": [
+    "../deploy/tests/test_ci_required_gates.py",
+    "../deploy/tests/test_ci_required_green.py"
+   ],
+   "prompt_file": "B.010.ci-required-green.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-06 02:10 (\u2605 measured the first real CI runs)",
+   "boss_note": "02:42 BOSS pre-verified box-free: 12 passed (both deploy contract files), ruff clean on agent_tools.py, typing-extensions==4.16.0 pinned at pip-audit.txt:364",
+   "dispatched_to": "CODEX-1",
+   "session": "codex:96894",
+   "dispatched_at": "2026-09-06 02:29:10",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": "FAIL",
+   "gate_sha": "ec56a1159765f7bffca4d45d7e8cbdfd9ae2d428",
+   "edited_at": "2026-09-06 02:22:22",
+   "log": null,
+   "sha": null,
+   "question_msg_id": "msg_0734d50c3001dAY8IHSnLsB0wN",
+   "parked_at": "2026-09-06 02:10:57",
+   "reported_at": "2026-09-06 02:40:42",
+   "gated_at": "2026-09-06 03:43:39",
+   "merged_sha": "ec56a115",
+   "note_boss": "status was stale 'gated'; sha ec56a115 verified ancestor of plan010/rebuild 2026-09-06 20:2x"
+  },
+  {
+   "id": "Q7.internal-dispatch-safety-matrix",
+   "kind": "quickfix",
+   "artifact": "",
+   "title": "discharge the internal-dispatch obligation for 011's two commands",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-011",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_internal_dispatch_invariant.py"
+   ],
+   "prompt_file": "Q7.internal-dispatch-safety-matrix.md",
+   "status": "dispatched",
+   "added_by": "BOSS 13:45 (\u2605 -n 4 gate red \u00d72, obligation pin)",
+   "dispatched_to": "EXEC-E",
+   "session": "ses_f8dfc8d41ffeHVWHqAYJSUDlI9",
+   "dispatched_at": "2026-09-06 20:24:28",
+   "report_msg_id": "msg_07200bf5b001WjM2Kp3rUwe87Y",
+   "reported_at": "2026-09-05 20:07:35",
+   "gate": null,
+   "gate_sha": null,
+   "gated_at": "2026-09-05 21:11:43",
+   "rework": "REWORK (21:2x): report sha must contain the change (ab319f05 not 73eb2469); depends on B.011.port-row-decoding (ports TypeError on tuple rows); add a production-shaped dispatch of each command to the proof set",
+   "edited_at": "2026-09-05 21:18:15",
+   "note_boss": "dep B.011.port-row-decoding was an ITEM id; dep_ok keys on ledger ARTIFACT names so it could never satisfy. The merge it names is on trunk at 892d4888 (verified ancestor 20:2x). Dep cleared by BOSS."
+  },
+  {
+   "id": "A.011.state-machine-schema",
+   "kind": "audit",
+   "artifact": "011.state-machine-schema",
+   "title": "audit 011.state-machine-schema",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-011",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_business_state_machine_schema.py",
+    "tests/test_customer_work_domain.py"
+   ],
+   "prompt_file": "A.011.state-machine-schema.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-E",
+   "session": "ses_f92c5cfd3ffeESIg02aCSfi144",
+   "dispatched_at": "2026-09-05 12:06:56",
+   "report_msg_id": "msg_0709b9649001P3iHeO76LXBVPW",
+   "reported_at": "2026-09-05 13:37:28",
+   "merge_sha": "2c1915b9",
+   "merged_by": "BOSS (audit docs committed; row LANDED)",
+   "edited_at": "2026-09-05 13:39:32"
+  },
+  {
+   "id": "A.011.resolution-state-model",
+   "kind": "audit",
+   "artifact": "011.resolution-state-model",
+   "title": "audit 011.resolution-state-model",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": null,
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_resolution_state_model.py"
+   ],
+   "prompt_file": "A.011.resolution-state-model.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-E",
+   "session": "ses_f92c5cfd3ffeESIg02aCSfi144",
+   "dispatched_at": "2026-09-05 13:37:28",
+   "report_msg_id": "msg_070ac5c54001dtY8sdi4l1vaNM",
+   "reported_at": "2026-09-05 13:55:47",
+   "merged_at": "13:57",
+   "merge_note": "AUDIT PASSED; row LANDED",
+   "edited_at": "2026-09-05 13:57:26",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.011.transition-command",
+   "kind": "audit",
+   "artifact": "011.transition-command",
+   "title": "audit 011.transition-command",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": null,
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_business_transition_contract.py"
+   ],
+   "prompt_file": "A.011.transition-command.md",
+   "status": "queued",
+   "dispatched_to": "",
+   "session": "ses_f92c5cfd3ffeESIg02aCSfi144",
+   "dispatched_at": "2026-09-05 20:07:35",
+   "edited_at": "2026-09-05 20:10:35",
+   "boss_note": " | 21:18 BOSS: audit only after B.011.port-row-decoding lands (row-decoding defect confirmed) BOSS 06:20: reassigned from EXEC-E to EXEC-D, dispatched 06:15 together with A.011.business-events \u2014 both rows share merge 9723d75d and the proof file test_business_transition_contract.py, so ONE measured pass covers both.",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)",
+   "assignee": "EXEC-D",
+   "note_boss": "dep B.011.port-row-decoding was an ITEM id; dep_ok keys on ledger ARTIFACT names so it could never satisfy. The merge it names is on trunk at 892d4888 (verified ancestor 20:2x). Dep cleared by BOSS."
+  },
+  {
+   "id": "A.011.business-events",
+   "kind": "audit",
+   "artifact": "011.business-events",
+   "title": "audit 011.business-events",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": null,
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_business_transition_contract.py"
+   ],
+   "prompt_file": "A.011.business-events.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-E",
+   "session": "ses_f8dfc8d41ffeHVWHqAYJSUDlI9",
+   "dispatched_at": "2026-09-06 02:50:20",
+   "report_msg_id": "msg_073780cea001nvKQlulkn6IagE",
+   "reported_at": "2026-09-06 02:57:31",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)",
+   "assignee": "EXEC-D",
+   "boss_note": " BOSS 06:20: EXEC-D is auditing this together with A.011.transition-command in one pass (shared merge + proof file)."
+  },
+  {
+   "id": "A.011.approval-queue",
+   "kind": "audit",
+   "artifact": "011.approval-queue",
+   "title": "audit 011.approval-queue",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": null,
+   "deps": [
+    "B.011.port-row-decoding"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_approval_queue.py",
+    "tests/test_permission_matrix.py",
+    "tests/test_auth.py",
+    "tests/test_machine_identity_auth_mail.py",
+    "tests/test_approval_decisions.py"
+   ],
+   "prompt_file": "A.011.approval-queue.md",
+   "status": "landed",
+   "boss_note": " | 21:18 BOSS: audit only after B.011.port-row-decoding lands (row-decoding defect confirmed) BOSS 06:20: COMPLETED by EXEC-A2 (report 9097a3e4), verdict PASSED (capped), row LANDED on trunk 6e75c128. Was still 'queued' against EXEC-E \u2014 closed so the dispatcher does not feed an executor work that is already done.",
+   "blocked_on": [
+    "B.011.port-row-decoding"
+   ],
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.012.ruleset-versions",
+   "kind": "audit",
+   "artifact": "012.ruleset-versions",
+   "title": "audit 012.ruleset-versions",
+   "executor": "EXEC-F",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [
+    "011.stage-authority-fields"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_automation_rulesets.py"
+   ],
+   "prompt_file": "A.012.ruleset-versions.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f92c5cfbdffegVYqEbQqkKLUor",
+   "dispatched_at": "2026-09-05 12:06:57",
+   "report_msg_id": "msg_070882efc001KKiA7kyf3smJcH",
+   "reported_at": "2026-09-05 13:16:19",
+   "merge_sha": "49d81bcd",
+   "merged_at": "2026-09-05 13:55",
+   "merged_by": "BOSS (audit docs; row flipped LANDED)"
+  },
+  {
+   "id": "A.012.sequence-schema",
+   "kind": "audit",
+   "artifact": "012.sequence-schema",
+   "title": "audit 012.sequence-schema",
+   "executor": "EXEC-F",
+   "lane": "lane/012-sequences",
+   "worktree": null,
+   "deps": [
+    "011.approval-queue"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_sequence_ended_producer_exists.py",
+    "tests/test_sequence_supersession.py"
+   ],
+   "prompt_file": "A.012.sequence-schema.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f92c5cfbdffegVYqEbQqkKLUor",
+   "dispatched_at": "2026-09-05 13:16:19",
+   "report_msg_id": "msg_0709a52f8001yLGm8jiBAnAo7T",
+   "reported_at": "2026-09-05 13:36:06",
+   "merge_sha": "3dde5616",
+   "merged_by": "BOSS (audit docs; supersession half-row LANDED; schema half still needs its own proof re-run + audit)",
+   "edited_at": "2026-09-05 13:38:16",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.012.sequence-schema.schema-half",
+   "kind": "audit",
+   "artifact": "012.sequence-schema",
+   "title": "audit 012.sequence-schema \u2014 the SCHEMA half (test_sequence_schema.py), not the supersession half",
+   "executor": "EXEC-F",
+   "lane": "lane/012-sequences",
+   "worktree": null,
+   "deps": [
+    "011.approval-queue"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_sequence_ended_producer_exists.py",
+    "tests/test_sequence_supersession.py"
+   ],
+   "prompt_file": "A.012.sequence-schema.schema-half.md",
+   "status": "merged",
+   "edited_at": "2026-09-05 13:38:16",
+   "added_by": "BOSS 13:45 (the A.012.sequence-schema audit covered \u00a73.1 supersession only)",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f92c5cfbdffegVYqEbQqkKLUor",
+   "dispatched_at": "2026-09-05 14:20:12",
+   "report_msg_id": "msg_070c8bc500019BR5qpnvB3gHNm",
+   "reported_at": "2026-09-05 14:26:48",
+   "merged_at": "2026-09-05 14:27",
+   "merge_note": "AUDIT PASSED with F1; row LANDED; F1 \u2192 Q8",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.012.whatsapp-step-reference",
+   "kind": "audit",
+   "artifact": "012.whatsapp-step-reference",
+   "title": "audit 012.whatsapp-step-reference",
+   "executor": "EXEC-F",
+   "lane": "lane/012-sequences",
+   "worktree": null,
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_whatsapp_sequence_readiness.py"
+   ],
+   "prompt_file": "A.012.whatsapp-step-reference.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f92c5cfbdffegVYqEbQqkKLUor",
+   "dispatched_at": "2026-09-05 13:36:06",
+   "report_msg_id": "msg_070c29150001PT8kQ08Gn8xt3l",
+   "reported_at": "2026-09-05 14:20:12",
+   "merged_at": "14:21",
+   "merge_note": "AUDIT PASSED; row LANDED",
+   "edited_at": "2026-09-05 14:21:21",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.013.agent-release-aggregate",
+   "kind": "audit",
+   "artifact": "013.agent-release-aggregate",
+   "title": "audit 013.agent-release-aggregate",
+   "executor": "EXEC-C",
+   "lane": "lane/013-agents",
+   "worktree": null,
+   "deps": [
+    "013.knowledge-access-version",
+    "013.knowledge-content-pack"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_agent_release_versions.py"
+   ],
+   "prompt_file": "A.013.agent-release-aggregate.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-06 01:18:12",
+   "report_msg_id": "msg_07378c703001aJfwh3NzmMlI1Y",
+   "reported_at": "2026-09-06 02:58:18",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.013.release-resolver-binding",
+   "kind": "audit",
+   "artifact": "013.release-resolver-binding",
+   "title": "audit 013.release-resolver-binding",
+   "executor": "EXEC-C",
+   "lane": "lane/013-agents",
+   "worktree": null,
+   "deps": [
+    "013.agent-release-aggregate"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_agent_release_versions.py"
+   ],
+   "prompt_file": "A.013.release-resolver-binding.md",
+   "status": "queued",
+   "blocked_on": [
+    "013.agent-release-aggregate"
+   ],
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.013.config-bundle",
+   "kind": "audit",
+   "artifact": "013.config-bundle",
+   "title": "audit 013.config-bundle",
+   "executor": "EXEC-C",
+   "lane": "lane/013-agents",
+   "worktree": null,
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_config_bundles.py"
+   ],
+   "prompt_file": "A.013.config-bundle.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-06 02:58:18",
+   "report_msg_id": "msg_0737b7969001VFgbSy7xbw7Uez",
+   "reported_at": "2026-09-06 03:01:14",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "A.015a.source-identity-contract",
+   "kind": "audit",
+   "artifact": "015a.source-identity-contract",
+   "title": "audit 015a.source-identity-contract",
+   "executor": "EXEC-F",
+   "lane": "lane/015a-sources",
+   "worktree": null,
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_source_reconciliation.py"
+   ],
+   "prompt_file": "A.015a.source-identity-contract.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f92c5cfbdffegVYqEbQqkKLUor",
+   "dispatched_at": "2026-09-05 14:26:48",
+   "report_msg_id": "msg_070f04e42001RXSVEmD2NP2Tp7",
+   "reported_at": "2026-09-05 15:09:58",
+   "merged_at": "15:12",
+   "merge_note": "AUDIT PASSED; row LANDED (trunk twin 53791b9a)",
+   "edited_at": "2026-09-05 15:12:25",
+   "worktree_note": "(detached worktree at the row's COMMIT sha \u2014 create it: `git -C $TRUNK worktree add --detach $CN/voicepod-audit-<artifact> <sha>` then `cd platform && uv sync --frozen`; never audit inside the builder's lane worktree)"
+  },
+  {
+   "id": "B.011.pipeline-editors",
+   "kind": "build",
+   "artifact": "011.pipeline-editors",
+   "title": "build 011.pipeline-editors",
+   "executor": "EXEC-C",
+   "lane": "lane/011-pipelines",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-011",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.011.pipeline-editors.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.012.sequence-commands",
+   "kind": "build",
+   "artifact": "012.sequence-commands",
+   "title": "build 012.sequence-commands",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [
+    "011.agent-tool-registry",
+    "013.release-resolver-binding"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_sequence_release_authority.py"
+   ],
+   "prompt_file": "B.012.sequence-commands.md",
+   "status": "parked",
+   "blocked_on": [
+    "013.release-resolver-binding"
+   ],
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.012.sequence-ended-event",
+   "kind": "build",
+   "artifact": "012.sequence-ended-event",
+   "title": "build 012.sequence-ended-event",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_sequence_ended_event.py"
+   ],
+   "prompt_file": "B.012.sequence-ended-event.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-D",
+   "session": "ses_f92c5cfedffeYU6iVctg0oiskT",
+   "dispatched_at": "2026-09-05 13:33:22",
+   "report_msg_id": "msg_071f2b6e5001fFoIufF1DSPvET",
+   "reported_at": "2026-09-05 19:52:12",
+   "gate": "PASS",
+   "gate_sha": "f0fac91c566eee00979096ed40f9417e4a00f1ae",
+   "gated_at": "2026-09-05 20:16:14",
+   "boss_note": "20:19 docs merged 1b40f6b9; product pre-existing on trunk; non-builder audit A.012.sequence-ended-event to queue",
+   "edited_at": "2026-09-05 20:19:31"
+  },
+  {
+   "id": "B.012.stop-coordination",
+   "kind": "build",
+   "artifact": "012.stop-coordination",
+   "title": "build 012.stop-coordination",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_queue_integrity.py"
+   ],
+   "prompt_file": "B.012.stop-coordination.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-D",
+   "session": "ses_f92c5cfedffeYU6iVctg0oiskT",
+   "dispatched_at": "2026-09-05 19:52:12",
+   "report_msg_id": "msg_0737990e2001sAgjDMMoEypuF6",
+   "reported_at": "2026-09-06 02:59:12"
+  },
+  {
+   "id": "B.012.conflict-loop-analysis",
+   "kind": "build",
+   "artifact": "012.conflict-loop-analysis",
+   "title": "build 012.conflict-loop-analysis",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_automation_rulesets.py"
+   ],
+   "prompt_file": "B.012.conflict-loop-analysis.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.012.sequence-editor",
+   "kind": "build",
+   "artifact": "012.sequence-editor",
+   "title": "build 012.sequence-editor",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.012.sequence-editor.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.012.trigger-builder",
+   "kind": "build",
+   "artifact": "012.trigger-builder",
+   "title": "build 012.trigger-builder",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.012.trigger-builder.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.012.playbooks",
+   "kind": "build",
+   "artifact": "012.playbooks",
+   "title": "build 012.playbooks",
+   "executor": "EXEC-D",
+   "lane": "lane/012-sequences",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-012",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.012.playbooks.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.013.agent-editor",
+   "kind": "build",
+   "artifact": "013.agent-editor",
+   "title": "build 013.agent-editor",
+   "executor": "EXEC-F",
+   "lane": "lane/013-agents",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-013",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.013.agent-editor.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f92c5cfbdffegVYqEbQqkKLUor",
+   "dispatched_at": "2026-09-05 17:04:02",
+   "report_msg_id": "msg_071a684eb001s5OGur2G3K0TYc",
+   "reported_at": "2026-09-05 18:29:09",
+   "boss_note": "00:39 rides the 013 re-apply 9f8431b0; post-merge run pending",
+   "edited_at": "2026-09-06 00:39:00",
+   "question_msg_id": "msg_0713446ac0019TIWg3q0yROp28",
+   "parked_at": "2026-09-05 16:24:17",
+   "gate": "PASS",
+   "gate_sha": "f3382c0d91"
+  },
+  {
+   "id": "B.013.knowledge-workspace",
+   "kind": "build",
+   "artifact": "013.knowledge-workspace",
+   "title": "build 013.knowledge-workspace",
+   "executor": "EXEC-F",
+   "lane": "lane/013-agents",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-013",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_agent_config_schema.py",
+    "tests/test_agent_editor.py",
+    "tests/test_agent_editor_permissions.py",
+    "tests/test_config_bundles.py",
+    "tests/test_environment_registry.py",
+    "tests/test_docs_truth.py",
+    "portal/src/routes/Agents.test.tsx",
+    "portal/src/routes/SchemaFields.test.tsx",
+    "portal/src/routes/Knowledge.test.tsx",
+    "portal/src/routes/KnowledgeWorkspace.test.tsx",
+    "portal/src/kb/Documents.test.tsx"
+   ],
+   "prompt_file": "B.013.knowledge-workspace.md",
+   "status": "merged",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+   "dispatched_at": "2026-09-05 20:07:09",
+   "report_msg_id": "msg_072bdf2070011trT1m1nRNFc7T",
+   "reported_at": "2026-09-05 23:34:14",
+   "boss_note": "00:39 merged 9f8431b0 after revert-of-revert 9fe73ec9; BOSS post-merge 7-file run queued for the box; audits after green",
+   "edited_at": "2026-09-06 00:39:00",
+   "gate": "PASS",
+   "gate_sha": "e99035cd0c141ed21a76c78475caa9e5d2a89c2d",
+   "gated_at": "2026-09-06 00:34:39",
+   "rework": "REWORK 2 (19:5x): merge reverted \u2014 environment registry red (agent_config_schema reachable but excluded); registry fix + regenerate + registry test in proof set; r3 then gate"
+  },
+  {
+   "id": "B.013.agent-editor-proof-honesty",
+   "kind": "build",
+   "artifact": "013.agent-editor-proof-honesty",
+   "title": "build 013.knowledge-workspace",
+   "executor": "EXEC-F",
+   "lane": "lane/013-agents",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-013",
+   "deps": [],
+   "scope": [
+    "platform/tests/**",
+    "portal/src/**"
+   ],
+   "proof_files": [
+    "tests/test_agent_editor_permissions.py",
+    "portal/src/routes/KnowledgeWorkspace.test.tsx"
+   ],
+   "prompt_file": "B.013.knowledge-workspace.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+   "dispatched_at": "2026-09-05 19:43:47",
+   "report_msg_id": "msg_072005bbd001j9ulIW7mpujnlf",
+   "reported_at": "2026-09-05 20:07:09",
+   "boss_note": "follow-up to lane/013-agents merge; disclosed in both 013 rows",
+   "edited_at": "",
+   "gate": "",
+   "gate_sha": "",
+   "gated_at": "2026-09-05 19:01:36",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "added_by": "BOSS 2026-09-05 19:0x (agy findings on gate 77635, verified; tests only)",
+   "rework": ""
+  },
+  {
+   "id": "B.014a.capability-descriptor",
+   "kind": "build",
+   "artifact": "014a.capability-descriptor",
+   "title": "build 014a.capability-descriptor",
+   "executor": "EXEC-G",
+   "lane": "lane/014a-assets",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-014a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**",
+    "agent/providers/**",
+    "agent/tests/**"
+   ],
+   "proof_files": [
+    "tests/test_voice_stack.py",
+    "tests/test_call_session_asset_source.py",
+    "tests/test_journey_effect_admission.py",
+    "tests/test_environment_registry.py",
+    "tests/test_tenant_graph_integrity.py",
+    "tests/test_voice_wiring.py"
+   ],
+   "prompt_file": "B.014a.capability-descriptor.md",
+   "status": "queued",
+   "dispatched_to": "EXEC-G",
+   "session": "ses_f8fb0be32ffezkK6OJwxWeeSh0",
+   "dispatched_at": "2026-09-05 15:59:41",
+   "question_msg_id": "msg_07081eb2f00107ZVwipD6igxeZ",
+   "parked_at": "2026-09-05 13:09:39",
+   "answered_at": "2026-09-05 13:22",
+   "answer": "BOSS answer appended to items/B.014a.capability-descriptor.md",
+   "report_msg_id": "msg_0737cd66d001EdK46FeLxW3Vld",
+   "reported_at": "2026-09-06 03:02:44",
+   "proof_note": "BOSS 13:52: ac6c9c79 contains call-session-source (ee6caa1d) too - one gate for both; environment_registry rider because voice_capabilities.py is a new module",
+   "edited_at": "2026-09-05 16:29:03",
+   "gate": "FAIL",
+   "gate_sha": "d2b2abc2d6bd8a010532d3023ef8ea67c57734bd",
+   "gated_at": "2026-09-06 05:15:52",
+   "rework": "REWORK 1 (14:26): tenant projection ignores routing + refusal helper unused (review [high]x2); proofs unrun (dirty worktree); r2 then gate",
+   "boss_note": "REWORK 2 (BOSS 05:19): 3 Codex blockers. [high] erasure.py:1266 contact erasure deletes EVERY asset in the org (contact_id unused; VERIFIED BY BOSS; asset_versions has no contact linkage per migration 240:76 - remove the branch, NAME the Article 17 gap). [high] asset_custody.py:211-219 expired claims stranded on delete failure (downstream of BOSS instruction). [medium] voice_catalog.py:1010-1021 saved speed locks out baseline voice edits. TRUNK IS CLEAN - defect confined to the lane.",
+   "note_boss": "REWORK 1 (04:30) in item file. Re-queued; will wait behind EXEC-G busy worktree (artifact-custody-r3) by eligible_item."
+  },
+  {
+   "id": "B.014a.call-session-source",
+   "kind": "build",
+   "artifact": "014a.call-session-source",
+   "title": "build 014a.call-session-source",
+   "executor": "EXEC-G",
+   "lane": "lane/014a-assets",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-014a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_journey_source_manifests.py",
+    "tests/test_call_session_asset_source.py",
+    "tests/test_environment_registry.py",
+    "tests/test_journey_effect_admission.py",
+    "tests/test_voice_stack.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.014a.call-session-source.md",
+   "status": "held",
+   "dispatched_to": "EXEC-G",
+   "session": "ses_f8fb0be32ffezkK6OJwxWeeSh0",
+   "dispatched_at": "2026-09-05 13:09:39",
+   "report_msg_id": "msg_070989804001YvUk0R9UifP4Z7",
+   "reported_at": "2026-09-05 13:34:08",
+   "proof_note": "BOSS 13:45: row's 2 files + riders: environment registry (new module core/voice_capabilities.py), effect_admission + voice_stack (both edited), tenant-graph guard",
+   "boss_note": "16:02 BOSS: never gated alone \u2014 capability-descriptor's product commits fac77cff/1eb60470 are ancestors of its candidate ac6c9c79, and artifact-custody's 242 migration now sits on top. lane/014a-assets is ONE merge unit: gate once when capability-descriptor REWORK 1 reports AND 250 is on trunk (rebase-only turn renumbers 242\u2192251); proof set = union of the three items",
+   "edited_at": "2026-09-05 16:02:44",
+   "hold_reason": "gate 2026-09-06 08:26:26 on lane/014a-assets @ 27fb1790 with the 12-file UNION of both items' proofs: proofs PASS 1337 passed in 1274.23s (closes the lane's NOT-YET-RUN set). HELD on three grounds: (1) sha-on-lane FAIL \u2014 report names 8db76f0b, head 27fb1790, and the 16 commits between include 6 PRODUCT files incl. core/erasure.py (the REWORK 2 fix); EXEC-G must re-report at head. (2) hand-merge required: deploy/environment_registry.generated.json is denylisted. (3) codex [high] CONFIRMED by BOSS reading: api/media_routes.py serves storage bytes with no digest/length check against the approved version and then audits detail={'content_digest': digest} as if it described them; storage.open_object is a plain get_object. storage.inspect_exact_object already exists and hashes exactly \u2014 the path just does not call it. agy said approve, 0 findings (DISAGREE)."
+  },
+  {
+   "id": "B.014a.artifact-custody",
+   "kind": "build",
+   "artifact": "014a.artifact-custody",
+   "title": "build 014a.artifact-custody",
+   "executor": "EXEC-G",
+   "lane": "lane/014a-assets",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-014a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**",
+    "agent/**",
+    "audit/**",
+    "plans/**",
+    "deploy/**",
+    "TECHNICAL.md"
+   ],
+   "proof_files": [
+    "tests/test_erasure_media.py",
+    "tests/test_permission_matrix.py",
+    "tests/test_media_workload_api.py",
+    "tests/test_docs_truth.py",
+    "tests/test_migration_runner.py",
+    "tests/test_erasure_dispositions.py",
+    "tests/test_environment_registry.py",
+    "tests/test_journey_source_manifests.py",
+    "tests/test_call_session_asset_source.py",
+    "tests/test_journey_effect_admission.py",
+    "tests/test_voice_stack.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.014a.artifact-custody.md",
+   "status": "held",
+   "dispatched_to": "EXEC-G",
+   "session": "ses_f8fb0be32ffezkK6OJwxWeeSh0",
+   "dispatched_at": "2026-09-05 13:48:07",
+   "report_msg_id": "msg_0711dc80d0013F0lKMqp3SXrbk",
+   "reported_at": "2026-09-05 15:59:41",
+   "boss_note": "17:40 BOSS: ladder re-cut #2 \u2014 audit-residuals 248, portal-guard 249, YOUR migration 250; rebase-only r2 when 249 is on trunk",
+   "edited_at": "2026-09-05 17:40:56",
+   "note_boss": "gated with the UNION of both 014a items' proofs: both artifacts sit on lane/014a-assets, so any merge of that lane lands BOTH. Gating one item's narrower set would make the GATE weaker than what the merge actually delivers. deploy/environment_registry.generated.json is on the mergegate denylist -> hand_merge expected, so no mechanical merge.",
+   "gate": "FAIL",
+   "gate_sha": "27fb179093f85dc3ef9586e3921177843d3b7194",
+   "gated_at": "2026-09-06 08:26:26",
+   "hold_reason": "gate 2026-09-06 08:26:26 on lane/014a-assets @ 27fb1790 with the 12-file UNION of both items' proofs: proofs PASS 1337 passed in 1274.23s (closes the lane's NOT-YET-RUN set). HELD on three grounds: (1) sha-on-lane FAIL \u2014 report names 8db76f0b, head 27fb1790, and the 16 commits between include 6 PRODUCT files incl. core/erasure.py (the REWORK 2 fix); EXEC-G must re-report at head. (2) hand-merge required: deploy/environment_registry.generated.json is denylisted. (3) codex [high] CONFIRMED by BOSS reading: api/media_routes.py serves storage bytes with no digest/length check against the approved version and then audits detail={'content_digest': digest} as if it described them; storage.open_object is a plain get_object. storage.inspect_exact_object already exists and hashes exactly \u2014 the path just does not call it. agy said approve, 0 findings (DISAGREE)."
+  },
+  {
+   "id": "B.014a.assets-workspace",
+   "kind": "build",
+   "artifact": "014a.assets-workspace",
+   "title": "build 014a.assets-workspace",
+   "executor": "EXEC-G",
+   "lane": "lane/014a-assets",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-014a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.014a.assets-workspace.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.014a.voice-workspace",
+   "kind": "build",
+   "artifact": "014a.voice-workspace",
+   "title": "build 014a.voice-workspace",
+   "executor": "EXEC-G",
+   "lane": "lane/014a-assets",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-014a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.014a.voice-workspace.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.015a.quarantine-replay",
+   "kind": "build",
+   "artifact": "015a.quarantine-replay",
+   "title": "build 015a.quarantine-replay",
+   "executor": "EXEC-A",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_source_campaign_privacy.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_environment_registry.py",
+    "tests/test_tenant_graph_integrity.py",
+    "tests/test_erasure_dispositions.py"
+   ],
+   "prompt_file": "B.015a.quarantine-replay.md",
+   "status": "parked",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 13:52:24",
+   "question_msg_id": "msg_0704e8a76001nssnvGAz24P7GW",
+   "parked_at": "2026-09-05 12:13:24",
+   "report_msg_id": "msg_070b2dcdf001XYI3S7kP3srZeq",
+   "reported_at": "2026-09-05 14:02:53",
+   "edited_at": "2026-09-05 21:58:56",
+   "gate": "FAIL",
+   "gate_sha": "1e987e68f8f6f10cd416e9d9297417e47639d75e",
+   "gated_at": "2026-09-05 14:18:29",
+   "rework": "REWORK 2 (14:18): envelope erasure unwired + audit-failure fails open (review [high]x2, verified); r3 then gate",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only"
+  },
+  {
+   "id": "B.015a.channel-template-inventory",
+   "kind": "build",
+   "artifact": "015a.channel-template-inventory",
+   "title": "build 015a.channel-template-inventory",
+   "executor": "EXEC-A",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "deps": [
+    "012.whatsapp-step-reference"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_channel_template_inventory.py"
+   ],
+   "prompt_file": "B.015a.channel-template-inventory.md",
+   "status": "parked",
+   "blocked_on": [
+    "012.whatsapp-step-reference"
+   ],
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.015a.journey-sole-scheduler",
+   "kind": "build",
+   "artifact": "015a.journey-sole-scheduler",
+   "title": "build 015a.journey-sole-scheduler \u2014 SLICE 1: run linkage + generation ownership + issuance uniqueness",
+   "executor": "EXEC-A",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_campaign_journey_scheduler_ownership.py",
+    "tests/test_tenant_graph_integrity.py",
+    "tests/test_migration_runner.py",
+    "tests/test_campaign_planner_crud.py",
+    "tests/test_campaign_engine_egress.py",
+    "tests/test_erasure.py",
+    "tests/test_erasure_dispositions.py"
+   ],
+   "prompt_file": "B.015a.journey-sole-scheduler.md",
+   "status": "parked",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 14:14:01",
+   "question_msg_id": "msg_070c44eec0017toHQORLOZU27G",
+   "parked_at": "2026-09-05 14:21:58",
+   "answered_at": "14:25",
+   "answer": "BOSS ANSWER B.JSS.1 revised: RESTRICT stays; erasure deletes the per-subject linked campaign_run (+dependents) explicitly before journey_runs; register the dispositions",
+   "edited_at": "2026-09-05 21:58:56",
+   "boss_note": "16:23 BOSS: D1 design review adopted (R1\u2013R8) \u2014 rules appended to the item file; read the memo on trunk first",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only"
+  },
+  {
+   "kind": "build",
+   "artifact": "015a.journey-sole-scheduler",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "id": "B.015a.journey-sole-scheduler.planner-tripwire",
+   "title": "build 015a.journey-sole-scheduler \u2014 SLICE 2: disable legacy planner create/schedule for non-grandfathered runs + closed-registry tripwire",
+   "executor": "EXEC-A",
+   "dispatched_to": "EXEC-A",
+   "deps": [],
+   "proof_files": [
+    "tests/test_campaign_journey_scheduler_ownership.py"
+   ],
+   "prompt_file": "B.015a.journey-sole-scheduler.planner-tripwire.md",
+   "status": "parked",
+   "boss_note": "16:23 BOSS: D1 design review adopted (R1\u2013R8) \u2014 rules appended to the item file; read the memo on trunk first",
+   "edited_at": "2026-09-05 21:58:56",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only"
+  },
+  {
+   "kind": "build",
+   "artifact": "015a.journey-sole-scheduler",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "id": "B.015a.journey-sole-scheduler.reconciliation",
+   "title": "build 015a.journey-sole-scheduler \u2014 SLICE 3: one tenant-locked legacy\u2192action_executions reconciliation with immutable mapping receipts",
+   "executor": "EXEC-A",
+   "dispatched_to": "EXEC-A",
+   "deps": [],
+   "proof_files": [
+    "tests/test_campaign_journey_scheduler_ownership.py"
+   ],
+   "prompt_file": "B.015a.journey-sole-scheduler.reconciliation.md",
+   "status": "parked",
+   "boss_note": "16:23 BOSS: D1 design review adopted (R1\u2013R8) \u2014 rules appended to the item file; read the memo on trunk first",
+   "edited_at": "2026-09-05 21:58:56",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only"
+  },
+  {
+   "id": "B.015a.operational-raw-views",
+   "kind": "build",
+   "artifact": "015a.operational-raw-views",
+   "title": "build 015a.operational-raw-views",
+   "executor": "EXEC-A",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "portal/src/routes/Campaigns.test.tsx"
+   ],
+   "prompt_file": "B.015a.operational-raw-views.md",
+   "status": "parked",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 14:03:54",
+   "question_msg_id": "msg_0704eebd20018QCKklEmyOTs5M",
+   "parked_at": "2026-09-05 12:14:37",
+   "report_msg_id": "msg_070bd143c00164aHp3ceOoWxes",
+   "reported_at": "2026-09-05 14:14:01",
+   "proof_note": "BOSS 14:14: portal-only (vitest+typecheck via the gate's portal runner, no box). 8e5b4ed0 is a descendant of quarantine-replay's 1e987e68 on the same branch: merge 8e5b4ed0 once for both after BOTH gates pass and the 246 rule is settled",
+   "edited_at": "2026-09-05 21:58:56",
+   "gate": "PASS",
+   "gate_sha": "cb4d19af9da9c88d91c71d7879035ad11242ea82",
+   "gated_at": "2026-09-05 14:16:40",
+   "rework": "REWORK 1 (14:18): drill-down ignores disposition (review [medium], verified); r2 then gate",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only"
+  },
+  {
+   "id": "B.015a.connect-ia",
+   "kind": "build",
+   "artifact": "015a.connect-ia",
+   "title": "build 015a.connect-ia",
+   "executor": "EXEC-A",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.015a.connect-ia.md",
+   "status": "parked",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 12:14:37",
+   "question_msg_id": "msg_0704fdd4e001Bs1ob5KErYGNHb",
+   "parked_at": "2026-09-05 12:14:47",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.015a.campaign-wizard",
+   "kind": "build",
+   "artifact": "015a.campaign-wizard",
+   "title": "build 015a.campaign-wizard",
+   "executor": "EXEC-A",
+   "lane": "lane/015a-sources",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-015a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.015a.campaign-wizard.md",
+   "status": "parked",
+   "dispatched_to": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "dispatched_at": "2026-09-05 12:14:47",
+   "question_msg_id": "msg_070500758001ZqMbTB9cdOgyLx",
+   "parked_at": "2026-09-05 12:15:08",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.016a.use-case-vocabulary",
+   "kind": "build",
+   "artifact": "016a.use-case-vocabulary",
+   "title": "build 016a.use-case-vocabulary",
+   "executor": "EXEC-E",
+   "lane": "lane/016-analytics",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-016",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_notify.py"
+   ],
+   "prompt_file": "B.016a.use-case-vocabulary.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.016a.query-and-drilldown",
+   "kind": "build",
+   "artifact": "016a.query-and-drilldown",
+   "title": "build 016a.query-and-drilldown",
+   "executor": "EXEC-E",
+   "lane": "lane/016-analytics",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-016",
+   "deps": [
+    "011.workspace-column-adapter"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_analytics_rollups.py"
+   ],
+   "prompt_file": "B.016a.query-and-drilldown.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.016a.report-definitions-and-csv",
+   "kind": "build",
+   "artifact": "016a.report-definitions-and-csv",
+   "title": "build 016a.report-definitions-and-csv",
+   "executor": "EXEC-E",
+   "lane": "lane/016-analytics",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-016",
+   "deps": [
+    "014a.artifact-custody"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_reporting_export_control.py"
+   ],
+   "prompt_file": "B.016a.report-definitions-and-csv.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.016a.analytics-ui",
+   "kind": "build",
+   "artifact": "016a.analytics-ui",
+   "title": "build 016a.analytics-ui",
+   "executor": "EXEC-E",
+   "lane": "lane/016-analytics",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-016",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.016a.analytics-ui.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.017a.rollout-inventory",
+   "kind": "build",
+   "artifact": "017a.rollout-inventory",
+   "title": "build 017a.rollout-inventory",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_rollout_inventory.py",
+    "tests/test_environment_registry.py"
+   ],
+   "prompt_file": "B.017a.rollout-inventory.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-H",
+   "session": "ses_f8fb0bc85ffei7Ev4fSGf8JSeo",
+   "dispatched_at": "2026-09-05 16:09:30",
+   "question_msg_id": "msg_0706c4755001fhauhFDzmKO4ho",
+   "parked_at": "2026-09-05 12:46:19",
+   "answered_at": "2026-09-05 12:52",
+   "answer": "BOSS answer appended to items/B.017a.rollout-inventory.md",
+   "report_msg_id": "msg_071bafa1f0015dhbFz2AMn3BNz",
+   "reported_at": "2026-09-05 18:51:47",
+   "proof_note": "BOSS 14:06: row's file + environment_registry rider (new module core/rollout_inventory.py)",
+   "edited_at": "2026-09-05 20:11:32",
+   "gate": "FAIL",
+   "gate_sha": "619c000cdb99b38883ac8f5104524f5cebcc71e9",
+   "gated_at": "2026-09-05 14:19:26",
+   "rework": "REWORK 1 (14:25): registry undeclared module (class a; 3 others class c fixed by rebase) + review [high] evidence sources; r2 then gate",
+   "boss_note": "20:11 BOSS: union gate 87514 FAIL on settings-help-ia's tsc + [medium]; this artifact's own proofs passed (43) \u2014 rides REWORK 3's union gate"
+  },
+  {
+   "id": "B.017a.settings-help-ia",
+   "kind": "build",
+   "artifact": "017a.settings-help-ia",
+   "title": "build 017a.settings-help-ia",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_rollout_inventory.py",
+    "tests/test_environment_registry.py",
+    "portal/src/routes/Help.test.tsx",
+    "portal/src/routes/SettingsIA.test.tsx",
+    "portal/src/help/helpRegistry.test.ts"
+   ],
+   "prompt_file": "B.017a.settings-help-ia.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-H",
+   "session": "ses_f8fb0bc85ffei7Ev4fSGf8JSeo",
+   "dispatched_at": "2026-09-06 02:59:02",
+   "report_msg_id": "msg_0739a62b80019KC2J4lzyjWJ3F",
+   "reported_at": "2026-09-06 03:34:57",
+   "edited_at": "2026-09-05 20:11:32",
+   "boss_note": "19:08 BOSS: UNION gate for lane/017-rollout (rollout-inventory r2 + settings-help-ia r2) at lane head 334c7690 \u2014 one mergegate run, one Codex review",
+   "gate": "FAIL",
+   "gate_sha": "334c7690a3f27b75d207634013d05da35dcb5c3f",
+   "gated_at": "2026-09-05 20:08:59",
+   "rework": "REWORK 3 (20:1x): tsc rc=2 in own test files (report claimed exit 0) + Help.tsx evidence fall-through for nodes without invalidation keys (Codex [medium], verified); r3 then union gate"
+  },
+  {
+   "id": "B.017a.backfills",
+   "kind": "build",
+   "artifact": "017a.backfills",
+   "title": "build 017a.backfills",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [
+    "015a.source-subscription-schema"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_recovery_contract.py"
+   ],
+   "prompt_file": "B.017a.backfills.md",
+   "status": "reported",
+   "dispatched_to": "EXEC-H",
+   "session": "ses_f8fb0bc85ffei7Ev4fSGf8JSeo",
+   "dispatched_at": "2026-09-05 19:05:47",
+   "report_msg_id": "msg_074052f54001BlB5gujdabncF2",
+   "reported_at": "2026-09-06 05:31:54",
+   "assignee": "EXEC-H"
+  },
+  {
+   "id": "B.017a.shadow-comparison",
+   "kind": "build",
+   "artifact": "017a.shadow-comparison",
+   "title": "build 017a.shadow-comparison",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [
+    "016a.hour-fact-store"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.017a.shadow-comparison.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.017a.coexistence-state-machine",
+   "kind": "build",
+   "artifact": "017a.coexistence-state-machine",
+   "title": "build 017a.coexistence-state-machine",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [
+    "015a.journey-sole-scheduler"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.017a.coexistence-state-machine.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.017a.deprecation-telemetry",
+   "kind": "build",
+   "artifact": "017a.deprecation-telemetry",
+   "title": "build 017a.deprecation-telemetry",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.017a.deprecation-telemetry.md",
+   "status": "parked",
+   "parked_reason": "budget: second opencode-go account is the last OpenCode capacity until the first resets (~1 day); BOSS 21:58 \u2014 in-flight items, REWORKs, the 011 defect fix and all A.* audits keep priority; unpark by BOSS only",
+   "edited_at": "2026-09-05 21:58:56"
+  },
+  {
+   "id": "B.010.recording-lane-repair",
+   "kind": "build",
+   "artifact": "010.recording-lane-repair",
+   "title": "build 010.recording-lane-repair",
+   "executor": "CODEX",
+   "lane": "lane/010-recording-lane-repair",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-recording-lane-repair",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure.py",
+    "tests/test_retention_erasure.py",
+    "tests/test_retention_conversation_legacy.py",
+    "tests/test_recording_source_effect_functions.py",
+    "tests/test_live_pytest_census.py",
+    "tests/test_projection_pipeline.py",
+    "tests/test_home_routes.py",
+    "tests/test_embedding_control.py",
+    "tests/test_api_key_rotation.py"
+   ],
+   "prompt_file": "B.010.recording-lane-repair.md",
+   "status": "merged",
+   "dispatched_to": "CODEX-2",
+   "session": "codex:87607",
+   "dispatched_at": "2026-09-05 13:07:05",
+   "reported_at": "2026-09-05 13:13:25",
+   "note": "13:15 BOSS: box-free build; gate runs proofs",
+   "proof_note": "BOSS 13:25: \u00a715's one file + 3 riders on trunk that exercise the legacy/recording custody the item claims already works (guard-exclusion insurance) + 4 class-(d) suspects from the -n 4 gate for their one serial measurement (riders cost runtime only) + tests/test_api_key_rotation.py (\u2605's class-(a) suspect: one serial run settles real vs parallel artefact)",
+   "boss_note": "merged by BOSS at cd16d7a1",
+   "gate": "FAIL",
+   "gate_sha": "39eaf405a2d23fecbfd12820108d0f65c132b5aa",
+   "gated_at": "2026-09-05 13:51:46",
+   "edited_at": "2026-09-05 14:05:06",
+   "merged_at": "14:05",
+   "merge_sha": "cd16d7a1"
+  },
+  {
+   "id": "B.010.org-deletion-api-key-trigger",
+   "kind": "build",
+   "artifact": "010.org-deletion-api-key-trigger",
+   "title": "build 010.org-deletion-api-key-trigger",
+   "executor": "CODEX",
+   "lane": "lane/010-org-deletion-api-key-trigger",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-org-deletion-api-key-trigger",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_api_key_rotation.py",
+    "tests/test_business_state_machine_schema.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_approval_decisions.py",
+    "tests/test_business_transition_contract.py",
+    "tests/test_capture_identity.py",
+    "tests/test_resolution_state_model.py",
+    "tests/test_rls_completeness.py"
+   ],
+   "prompt_file": "B.010.org-deletion-api-key-trigger.md",
+   "status": "merged",
+   "dispatched_to": "CODEX-2",
+   "session": "codex:85462",
+   "dispatched_at": "2026-09-05 14:41:11",
+   "reported_at": "2026-09-05 14:46:19",
+   "note": "re-queued 12:47: its QUESTION was the missing platform/.venv (Codex sandbox has no network); the daemon now provisions it",
+   "edited_at": "2026-09-05 15:19:59",
+   "proof_note": "BOSS 13:45: row's 2 files + runner/docs guards + riders on trunk that name the three replaced trigger functions",
+   "rework": "REWORK 2 (14:36): new immutability proof runs as voicepod_platform and dies at 233's ACL before the trigger (2 red; review [medium] same); r3 then gate",
+   "gate": "FAIL",
+   "gate_sha": "7fafae466457c14e8e63be4e86857d2e8b812732",
+   "gated_at": "2026-09-05 14:35:41",
+   "merged_at": "15:19",
+   "merge_sha": "3e955ee3"
+  },
+  {
+   "id": "B.010.erasure-gap-recording-tasks",
+   "kind": "build",
+   "artifact": "010.erasure-gap-recording-tasks",
+   "title": "build 010.erasure-gap-recording-tasks",
+   "executor": "CODEX",
+   "lane": "lane/010-erasure-gap-recording-tasks",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-erasure-gap-recording-tasks",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure_recording_source_tasks.py",
+    "tests/test_erasure_dispositions.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_retention_erasure.py",
+    "tests/test_erasure.py"
+   ],
+   "prompt_file": "B.010.erasure-gap-recording-tasks.md",
+   "status": "merged",
+   "dispatched_to": "CODEX-2",
+   "session": "codex:79612",
+   "dispatched_at": "2026-09-05 12:59:44",
+   "reported_at": "2026-09-05 13:07:02",
+   "answered_at": "2026-09-05 12:52",
+   "answer": "BOSS answer appended to items/B.010.erasure-gap-recording-tasks.md",
+   "note": "13:12 BOSS: requeued; worktree holds uncommitted WIP (migration 245 + erasure.py + tests) from the 12:51 run \u2014 resume it, do not restart from scratch",
+   "proof_note": "BOSS 13:20: the 4 files \u00a715 names + 2 free riders already on trunk that touch recording_source_effect_tasks (guard-exclusion insurance)",
+   "gate": "FAIL",
+   "gate_sha": "21948d2ba382a2587b159dc318f795d6afd157cd",
+   "gated_at": "2026-09-05 13:13:50",
+   "merge_sha": "aab41585",
+   "merged_at": "2026-09-05 13:24",
+   "merged_by": "BOSS (hand: proofs run by BOSS, 227 passed / 1 inherited red)"
+  },
+  {
+   "id": "B.010.erasure-gap-historical-repair",
+   "kind": "build",
+   "artifact": "010.erasure-gap-historical-repair",
+   "title": "build 010.erasure-gap-historical-repair \u2014 unlink recording-source links of subjects erased before migration 245 (Codex review [high])",
+   "executor": "CODEX",
+   "dispatched_to": "CODEX-2",
+   "lane": "lane/010-erasure-gap-historical-repair",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-erasure-gap-historical-repair",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure_recording_source_historical_repair.py",
+    "tests/test_erasure_recording_source_tasks.py",
+    "tests/test_erasure.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_tenant_graph_integrity.py",
+    "tests/test_erasure_dispositions.py",
+    "tests/test_plan010_function_acls.py"
+   ],
+   "prompt_file": "B.010.erasure-gap-historical-repair.md",
+   "status": "merged",
+   "boss_note": "16:17 BOSS: MERGED to trunk 16416af5 from 6e868e24 (247); Codex [medium] \u2192 follow-up item B.010.erasure-gap-family-residual-count (WORKER-1)",
+   "session": "codex:19462",
+   "dispatched_at": "2026-09-05 15:20:45",
+   "reported_at": "2026-09-05 15:25:28",
+   "answered_at": "14:49",
+   "answer": "BOSS ANSWER .3: yes \u2014 read-only SECURITY DEFINER count function in 245's authority envelope; add test_plan010_function_acls to proofs",
+   "edited_at": "2026-09-05 16:16:01",
+   "rework": "REWORK 1 (15:20): renumber 246\u2192trunk-max+1 (org-deletion took 246); first in line; r2 then gate",
+   "gate": "FAIL",
+   "gate_sha": "6e868e24ba06efb3aa6b89c59e2a356952d8163f",
+   "gated_at": "2026-09-05 16:12:57"
+  },
+  {
+   "id": "B.010.member-egress-fence",
+   "kind": "build",
+   "artifact": "010.member-egress-fence",
+   "title": "build 010.member-egress-fence",
+   "executor": "WORKER-1",
+   "lane": "lane/010-member-egress-fence",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-member-egress-fence",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_campaign_contact_budget_admission.py",
+    "tests/test_channel_remediation.py",
+    "tests/test_connection_secrets.py",
+    "tests/test_core_egress_inventory.py",
+    "tests/test_delivery_and_knowledge.py",
+    "tests/test_docs_truth.py",
+    "tests/test_journey_blueprints.py",
+    "tests/test_journey_runtime_fence.py",
+    "tests/test_journey_shadow.py",
+    "tests/test_lane4_connection_readiness.py",
+    "tests/test_member_egress_fence.py",
+    "tests/test_migration_runner.py",
+    "tests/test_notify.py",
+    "tests/test_suppression_send_path.py",
+    "tests/test_sweep_fairness.py"
+   ],
+   "prompt_file": "B.010.member-egress-fence.md",
+   "status": "held",
+   "dispatched_to": "",
+   "session": "codex:18866",
+   "dispatched_at": "2026-09-05 15:20:04",
+   "reported_at": "2026-09-05 15:32:51",
+   "answered_at": "2026-09-05 13:40",
+   "answer": "BOSS answers .1 and .2 appended to items/B.010.member-egress-fence.md",
+   "note": "re-queued 12:57 after killing the run started under the pre-box-free Codex prompt",
+   "proof_note": "BOSS 14:42: the r2 report's \u00a715 set (8 files) \u2014 replaces my guessed set, which named files that may not exist",
+   "gate": "FAIL",
+   "gate_sha": "416163843f5723b05c6e0f58b43d52a48f90de93",
+   "gated_at": "2026-09-06 07:50:41",
+   "rework": "REWORK 4 (19:5x): connection authority revision includes status+updated_at, so a concurrent successful send cancels a valid delivery as \"connection changed\" (Codex [high], verified); exclude operational status from the revision, keep edit-and-restore + revocation detection; r5 then gate",
+   "edited_at": "2026-09-06 01:07:39",
+   "boss_note": "01:07 REWORK 6: revocation erasable by set_connection_status after snapshot (Codex [high] confirmed); five requirements in item file BOSS 07:2x: r7 GATED FAIL (proofs 225 passed, scope/citations clean; Codex [high] lease TOCTOU CONFIRMED by BOSS reading). r8c running under a total box freeze. Defect REPRODUCED: real provider POST on a dead claim, delivery 'succeeded', slot 10 EXECUTION_FRESHNESS written as member.delivery_authority_verified. Fix = post-lock clock_timestamp() for the lease comparison (fence) + CAS predicate; both halves now have DISJOINT proofs (W1 reds T2 on the fence verdict, W3 reds T1 on the provider call). BUILT-NOT-MERGED is an accepted outcome. PROOF SET WIDENED 8 -> 15 by BOSS 07:45 before gating r8. The item declared 8 files; WORKER-1's S0/S9 measured 15 (453 collected) \u2014 read from the S0 log's own cmd line, not inferred. Gating the narrower set would have made the GATE weaker than the evidence behind it, which is the proof-set-too-narrow error in its most embarrassing form: measuring less than the executor already measured. Added: tests/test_channel_remediation.py, tests/test_connection_secrets.py, tests/test_delivery_and_knowledge.py, tests/test_docs_truth.py, tests/test_lane4_connection_readiness.py, tests/test_migration_runner.py, tests/test_sweep_fairness.py.",
+   "sha": "37094245b1042d70357d53e93a9d5855a8f1867c",
+   "report": "audit/plan-execution-2026-09-04/reports/B.010.member-egress-fence-010.member-egress-fence-r5b.md",
+   "hold_reason": "r8 GATE FAIL: codex [high] gate.global advisory lock held across tenant webhook I/O (verified; class pre-exists on trunk via _lock_service_gate + provider_io) and agy [high] held deliveries never finalize the parent notification (test:559 asserts != [\"pending\"], which a stuck sending row satisfies). BUILT-NOT-MERGED; 453 green + independence proof stand."
+  },
+  {
+   "id": "B.010.route-authority-clock",
+   "kind": "build",
+   "artifact": "010.route-authority-clock",
+   "title": "build 010.erasure-gap-family-residual-count \u2014 sum retained recording links across the erased family on the already-erased path (Codex [medium], historical-repair r2)",
+   "executor": "WORKER-1",
+   "lane": "lane/010-route-authority-clock",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-worker1-route-authority-clock",
+   "deps": [
+    "010.member-egress-fence"
+   ],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_journey_runtime_fence.py",
+    "tests/test_journey_adapters.py",
+    "tests/test_journey_dispatcher.py",
+    "tests/test_journey_effect_admission.py",
+    "tests/test_campaign_sms_route_authority_clock.py",
+    "tests/test_campaign_engine_egress.py",
+    "tests/test_campaign_sms_budget_authority.py",
+    "tests/test_suppression_send_path.py",
+    "tests/test_whatsapp_sequence_readiness.py",
+    "tests/test_typing_effect.py",
+    "tests/test_member_egress_fence.py",
+    "tests/test_docs_truth.py"
+   ],
+   "prompt_file": "B.010.erasure-gap-family-residual-count.md",
+   "status": "reported",
+   "added_by": "BOSS 2026-09-05 19:5x (same defect class as egress Codex [high], found by WORKER-1 reader enumeration)",
+   "boss_note": "01:36 r1b REPORT READY accepted; GATE DEFERRED: lane is stacked on lane/010-member-egress-fence (carries 247, repo.py, member-fence tests) \u2014 gate+merge only after egress r6 MERGES and this lane REBASES onto trunk (drop egress commits; S0 rerun on rebased tree). Fixed stale lane field + empty worktree.",
+   "edited_at": "",
+   "gate": "",
+   "gate_sha": "",
+   "depends_on": [
+    "010.member-egress-fence"
+   ],
+   "rework": "",
+   "report": "B.010.route-authority-clock-010.route-authority-clock-r1b.md @ 7be054d4 (product 131e54bc)",
+   "branch": null
+  },
+  {
+   "id": "B.010.rls-completeness-anomalies-shape",
+   "kind": "build",
+   "artifact": "010.rls-completeness-anomalies-shape",
+   "title": "build 010.erasure-gap-family-residual-count \u2014 sum retained recording links across the erased family on the already-erased path (Codex [medium], historical-repair r2)",
+   "executor": "WORKER-1",
+   "lane": "lane/010-rls-completeness-anomalies-shape",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-worker1-rls-anomalies",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_rls_completeness.py",
+    "tests/test_erasure_recording_source_historical_repair.py",
+    "tests/test_plan010_function_acls.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.010.erasure-gap-family-residual-count.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-05 18:36 (inherited red found by gate 47599)",
+   "boss_note": "20:16 merged 86d35a50; post-merge RLS run pending; audit A.010.rls-completeness-anomalies-shape to queue",
+   "edited_at": "2026-09-05 20:16:48",
+   "gate": "PASS",
+   "gate_sha": "fe6ea5803106c0bef91ffa1110ec8bd9bf7f6185",
+   "depends_on": [],
+   "rework": "",
+   "report": null,
+   "branch": "lane/010-rls-completeness-anomalies-shape",
+   "gated_at": "2026-09-05 20:14:57"
+  },
+  {
+   "id": "B.010.audit-residuals",
+   "kind": "build",
+   "artifact": "010.audit-residuals",
+   "title": "build 010.audit-residuals",
+   "executor": "CODEX",
+   "lane": "lane/010-audit-residuals",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-audit-residuals",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_audit_residual_migration.py",
+    "tests/test_retention_authority_gate_logging.py",
+    "tests/test_retention_proof_honesty.py",
+    "tests/test_erasure.py",
+    "tests/test_journey_action_call_settlement_reconciler.py",
+    "tests/test_retention_sweep_recovery_order_independence.py",
+    "tests/test_rls_completeness.py",
+    "tests/contract/test_outbound_voice_contract.py",
+    "tests/test_voice_provisioning.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_plan010_function_acls.py",
+    "tests/test_retention_erasure.py"
+   ],
+   "prompt_file": "B.010.audit-residuals.md",
+   "status": "merged",
+   "dispatched_to": "CODEX-1",
+   "session": "codex:32071",
+   "dispatched_at": "2026-09-05 17:41:01",
+   "reported_at": "2026-09-05 17:45:42",
+   "answered_at": "2026-09-05 13:02",
+   "answer": "BOSS answer appended to items/B.010.audit-residuals.md (V-2 deferred to B.010.audit-residuals.V-2)",
+   "proof_note": "BOSS 13:25: \u00a715's 11 files + 2 riders on trunk that name app_confirm_retention_effect_task (function ACL/owner guard-exclusion insurance)",
+   "rework": "REWORK 2 (14:18): retry undercounts prefix deletions as 0 (review [medium], verified); r3 then gate",
+   "gate": "PASS",
+   "gate_sha": "6d408a745c6908534c733301866050b7a42b5093",
+   "gated_at": "2026-09-05 18:32:09",
+   "edited_at": "2026-09-05 19:04:23",
+   "boss_note": "19:04 BOSS: MERGED 48aabde9 (migration 248); 3 inherited test_rls_completeness reds disclosed (trunk 247 table) \u2014 fix item B.010.rls-completeness-anomalies-shape; audit item queued"
+  },
+  {
+   "id": "B.010.reaper-ambiguous-holds",
+   "kind": "build",
+   "artifact": "010.reaper-ambiguous-holds",
+   "title": "build 010.reaper-ambiguous-holds",
+   "executor": "WORKER-1",
+   "lane": "lane/010-reaper-ambiguous-holds",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-reaper-ambiguous-holds",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_stuck_path_money.py",
+    "tests/test_migration_runner.py",
+    "tests/test_one_live_intent_per_message.py",
+    "tests/test_permission_matrix.py",
+    "tests/test_retention.py",
+    "tests/test_docs_truth.py",
+    "tests/test_gap_answer_ambiguity.py",
+    "tests/test_gap_answer_settlement_disposition.py",
+    "tests/test_messaging_durability.py",
+    "tests/test_messaging_fencing.py",
+    "tests/test_commercial_contract.py",
+    "tests/test_reply_path.py",
+    "tests/test_bound_settlement_send_seam.py",
+    "tests/test_queue_integrity.py"
+   ],
+   "prompt_file": "B.010.reaper-ambiguous-holds.md",
+   "status": "gated",
+   "dispatched_to": "CODEX-2",
+   "session": "codex:97020",
+   "dispatched_at": "2026-09-05 17:04:17",
+   "answered_at": "15:09",
+   "answer": "BOSS ANSWER .4: writer stays tenant-only; operator path provider-evidence-only, refuses accepted-prefix not_sent",
+   "boss_note": "17:42 BOSS: REWORK 6 \u2192 WORKER-1 (route count; two Codex [high] money paths confirmed); number assigned at rebase BOSS 07:2x: r6c GATE FAIL. proofs PASS 1452 in 34:41 zero reds on the FULL 14-file set (retires the class-(c) starvation red a 2-file run could not see). Fails on \u00a71 (report attests 09d5bf91, head bb167ea2, 9 intervening files include the money test) and Codex [high] messaging.py:3079-3082 \u2014 confirmed sends with incomplete Action evidence reach manual_review without settling OR releasing, and release_expired_reservations then excludes them. NO MERGE: B.010.post-commit-repair-leaves-hold-reserved must be RESOLVED, not witnessed.",
+   "reported_at": "2026-09-05 17:10:17",
+   "edited_at": "2026-09-05 17:42:21",
+   "proof_note": "BOSS 13:50: row's 2 + the 3 edited tests + docs_truth (TECHNICAL.md) + 5 riders on trunk that name release_expired_reservations/mark_intent_ambiguous (money path)",
+   "rework": "REWORK 2 (14:57): route count 496\u2192497 (red) + operator reconciliation skips source lifecycle and releases the whole hold on an unsent suffix (review [high]x2, confirmed); r3 then gate",
+   "gate": "FAIL",
+   "gate_sha": "bb167ea213a916e4181996ecafb0397528d178dd",
+   "gated_at": "2026-09-06 06:42:45"
+  },
+  {
+   "id": "B.010.gap-answer-auxiliary-retry",
+   "kind": "build",
+   "artifact": "010.gap-answer-auxiliary-retry",
+   "title": "build 010.gap-answer-auxiliary-retry",
+   "executor": "EXEC-B",
+   "lane": "lane/010-gap-answer-auxiliary-retry",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-gap-answer-auxiliary-retry",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_settlement_disposition.py",
+    "tests/test_reply_path.py",
+    "tests/test_one_live_intent_per_message.py",
+    "tests/test_messaging_fencing.py",
+    "tests/test_gap_answer_stuck_path_money.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.010.gap-answer-auxiliary-retry.md",
+   "status": "held",
+   "dispatched_to": "EXEC-B",
+   "session": "ses_f931fa3ffffeTFMwDdCW0ijpUu",
+   "dispatched_at": "2026-09-05 15:29:58",
+   "reported_at": "2026-09-05 14:18:35",
+   "answered_at": "13:56",
+   "answer": "BOSS answer .1 appended to items/B.010.gap-answer-auxiliary-retry.md (reading 1: rotate source claim_generation, status stays deferred)",
+   "edited_at": "2026-09-06 01:14:12",
+   "proof_note": "BOSS 14:19: the 3 declared + the 3 riders named in ANSWER .1",
+   "gate": "",
+   "gate_sha": "",
+   "gated_at": "2026-09-06 01:10:59",
+   "rework": "REWORK 1 (15:10): 20 reds in never-executed tests (fixture issues no predecessor Action; claim/lease shape; gaps.create source_message_id trips Q6's sentinel \u2014 revert); UNPINNED to any OpenCode executor for box iteration",
+   "question_msg_id": "msg_072e2689b001xdqWLwZ546Vczn",
+   "parked_at": "2026-09-06 00:14:03",
+   "sha": "488c73dc0e0291fd077b547549fa7d09751b6cf7",
+   "report": "audit/plan-execution-2026-09-04/reports/B.010.gap-answer-auxiliary-retry-r2.md",
+   "parked_reason": null,
+   "boss_note": "01:14 REWORK 3: failed-Action/ambiguous-intent pair unreconcilable (Codex [high] confirmed); five requirements in item file; 247 stays, 253 at merge BOSS 07:2x: REWORK 3 measured by EXEC-B. Precheck caught a break redding on the WRONG line (outcome vocabulary keyed off intent) \u2014 test FIXED not smoothed. Valid break rc=1 exactly at _auxiliary_reconcile raising action_mismatch, old-pair control green. S0 256P, S9 256P. 4 box acquisitions all released, yielded once to WORKER-1. GATE HELD behind egress r8c by box priority; migration stays 247 in-lane (trunk-max 248 -> assigns 249 at merge).",
+   "hold_reason": "migration collision: lane carries 247_auxiliary_not_sent_authority.sql; trunk already has 247_recording_source_historical_erasure_repair.sql and 248_audit_residuals.sql. Renumber to trunk-max+1 AT MERGE TIME (not reserved). Only 4 files name it, none source/test: plans/EXECUTION_LEDGER.md:656 (live) and 3 historical reports (keep their numbers). NOT gated deliberately: mergegate measures the lane worktree, where there is one 247 and the suite is green."
+  },
+  {
+   "id": "B.010.gap-answer-portal-guard",
+   "kind": "build",
+   "artifact": "010.gap-answer-portal-guard",
+   "title": "build 010.gap-answer-portal-guard",
+   "executor": "WORKER-1",
+   "lane": "lane/010-gap-answer-portal-guard",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-gap-answer-portal-guard",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "portal/src/routes/Knowledge.test.tsx",
+    "tests/test_gap_answer_idempotency.py",
+    "tests/test_knowledge_proposal_apply_pool_route.py",
+    "tests/test_learning_loop.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.010.gap-answer-portal-guard.md",
+   "status": "parked",
+   "dispatched_to": "",
+   "session": "codex:59056",
+   "dispatched_at": "2026-09-05 16:16:04",
+   "reported_at": "2026-09-05 16:20:48",
+   "rework": "REWORK 5 (00:4x): per-branch durable completion + portal finalize action (two confirmed Codex [high]); amend 249 in place",
+   "edited_at": "2026-09-06 00:39:24",
+   "boss_note": "17:04 BOSS: gate FAIL @ aa735aea \u2014 REWORK 4 (db.py BLOCKING entry on a table the file creates \u2192 29 runner reds; Codex [high] stranded pre-effect failures; [medium] 100-row reconciliation) \u2192 WORKER-1; 248 released to reaper",
+   "proof_note": "BOSS 14:45: r4 \u00a715 set (portal + 5 py) + tenant_graph rider (new table gap_answer_operations with uuid FKs)",
+   "gate": "",
+   "gate_sha": "",
+   "gated_at": "2026-09-06 00:36:18",
+   "sha": "03b6a2270a2a4bd6bcb42f1ab08a0b1e51824578",
+   "report": "audit/plan-execution-2026-09-04/reports/B.010.gap-answer-portal-guard-010.gap-answer-portal-guard-r7b.md",
+   "note_boss": "WORKER-1 down; lane taken over by B.010.gap-answer-portal-guard-r8 on EXEC-D (20:3x)."
+  },
+  {
+   "id": "B.010.conftest-legacy-ledger-truncate",
+   "kind": "build",
+   "artifact": "010.conftest-legacy-ledger-truncate",
+   "title": "build 010.conftest-legacy-ledger-truncate",
+   "executor": "CODEX",
+   "lane": "lane/010-conftest-legacy-ledger-truncate",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-conftest-legacy-ledger-truncate",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_conftest_legacy_ledger_truncate.py",
+    "tests/test_retention_conversation_legacy.py",
+    "tests/test_retention_effect_tasks.py",
+    "tests/test_retention_sweep_recovery_order_independence.py"
+   ],
+   "prompt_file": "B.010.conftest-legacy-ledger-truncate.md",
+   "status": "merged",
+   "dispatched_to": "CODEX-1",
+   "session": "codex:31090",
+   "dispatched_at": "2026-09-05 13:51:23",
+   "reported_at": "2026-09-05 13:56:58",
+   "proof_note": "BOSS 13:58: row's file + the leak victim (retention_conversation_legacy) + the two files the builder's discovery named; break-test (drop legacy ledger from the shared TRUNCATE) belongs to the non-builder audit",
+   "edited_at": "2026-09-05 14:20:18",
+   "gate": "PASS",
+   "gate_sha": "bd57ba3d1365cf79a88b8393de0e49ae1c1de8aa",
+   "gated_at": "2026-09-05 14:18:50",
+   "merged_at": "14:20",
+   "merge_sha": "9e9a9f88"
+  },
+  {
+   "id": "B.010.audit-residuals.V-2",
+   "kind": "build",
+   "artifact": "010.audit-residuals",
+   "title": "build 010.audit-residuals V-2 (unset voice speed, platform+agent)",
+   "executor": "WORKER-1",
+   "lane": "lane/010-audit-residuals-v2",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-010-audit-residuals-v2",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "agent/**",
+    "plans/contracts/**"
+   ],
+   "proof_files": [
+    "tests/test_voice_catalog.py",
+    "tests/test_voice_wiring.py",
+    "tests/test_voice_provisioning.py",
+    "tests/test_campaign_settings.py"
+   ],
+   "prompt_file": "B.010.audit-residuals.V-2.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-05 13:10 (split from B.010.audit-residuals.1)",
+   "dispatched_to": "",
+   "session": "ses_f931fa3ffffeTFMwDdCW0ijpUu",
+   "dispatched_at": "2026-09-05 13:38:59",
+   "report_msg_id": "msg_0710294fa001wQ2153veG8ZJEa",
+   "reported_at": "2026-09-05 15:29:58",
+   "edited_at": "2026-09-05 23:37:08",
+   "gate": "PASS",
+   "gate_sha": "8c5b1a7ac9bb9a2e2cc225d3fa40dcc01a2111d5",
+   "gated_at": "2026-09-05 23:33:26",
+   "boss_note": "23:37 merged at trunk bae09e49 (ledger conflict resolved by hand: trunk row kept + lane V-2 block appended); audit via A.010.audit-residuals (extended)",
+   "rework": "REWORK 4 (20:0x): dict bound with a sentinel value member drops its min/max clamp + provenance (Codex [medium], verified); bounds and selection decided separately; r5 then gate",
+   "sha": "8c5b1a7a76bf95ed573521016fc5ccde3ed8ddfd",
+   "report": "audit/plan-execution-2026-09-04/reports/B.010.audit-residuals.V-2-010.audit-residuals-r5.md"
+  },
+  {
+   "id": "A.010.erasure-dispositions",
+   "kind": "audit",
+   "artifact": "010.erasure-dispositions",
+   "title": "audit 010.erasure-dispositions",
+   "executor": "EXEC-B",
+   "lane": "lane/010-erasure-dispositions",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-erasure-dispositions",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "A.010.erasure-dispositions.md",
+   "status": "parked",
+   "parked_reason": "BLOCKED:owner \u2014 sequence_enrollments Article 17 question (HANDOFF_2026-09-05 \u00a70 item 1)"
+  },
+  {
+   "id": "A.010.gap-answer-settlement",
+   "kind": "audit",
+   "artifact": "010.gap-answer-settlement",
+   "title": "audit 010.gap-answer-settlement",
+   "executor": "EXEC-B",
+   "lane": "lane/010-gap-answer-settlement",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-gap-answer-settlement",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_settlement_disposition.py",
+    "tests/test_gap_answer_ambiguity.py"
+   ],
+   "prompt_file": "A.010.gap-answer-settlement.md",
+   "status": "landed",
+   "dispatched_to": "EXEC-B",
+   "session": "ses_f931fa3ffffeTFMwDdCW0ijpUu",
+   "dispatched_at": "2026-09-06 00:14:03",
+   "report_msg_id": "msg_072f4d839001ijVdRxk69eyy17",
+   "reported_at": "2026-09-06 00:34:38",
+   "boss_note": "00:35 AUDIT PASSED, merged, row LANDED",
+   "edited_at": "2026-09-06 00:35:43"
+  },
+  {
+   "id": "A.010.erasure-gap-recording-tasks",
+   "kind": "audit",
+   "artifact": "010.erasure-gap-recording-tasks",
+   "title": "audit 010.erasure-gap-recording-tasks",
+   "executor": "WORKER-1",
+   "lane": "lane/010-erasure-gap-recording-tasks",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-erasure-gap-recording-tasks",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure_recording_source_tasks.py"
+   ],
+   "prompt_file": "A.010.erasure-gap-recording-tasks.md",
+   "status": "merged",
+   "dispatched_to": "WORKER-1",
+   "boss_note": "16:30 BOSS: AUDIT PASSED (WORKER-1); row LANDED at ledger commit",
+   "edited_at": "2026-09-05 16:20:44"
+  },
+  {
+   "id": "A.010.recording-lane-repair",
+   "kind": "audit",
+   "artifact": "010.recording-lane-repair",
+   "title": "audit 010.recording-lane-repair",
+   "executor": "WORKER-1",
+   "lane": "lane/010-recording-lane-repair",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-recording-lane-repair",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure.py"
+   ],
+   "prompt_file": "A.010.recording-lane-repair.md",
+   "status": "merged",
+   "dispatched_to": "WORKER-1",
+   "boss_note": "17:12 BOSS: AUDIT PASSED WITH ONE FINDING; row LANDED",
+   "edited_at": "2026-09-05 17:07:32"
+  },
+  {
+   "id": "A.010.conftest-legacy-ledger-truncate",
+   "kind": "audit",
+   "artifact": "010.conftest-legacy-ledger-truncate",
+   "title": "audit 010.conftest-legacy-ledger-truncate",
+   "executor": "WORKER-1",
+   "lane": "lane/010-conftest-legacy-ledger-truncate",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-conftest-legacy-ledger-truncate",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "A.010.conftest-legacy-ledger-truncate.md",
+   "status": "merged",
+   "dispatched_to": "WORKER-1",
+   "boss_note": "17:22 BOSS: AUDIT PASSED; row LANDED",
+   "edited_at": "2026-09-05 17:17:24"
+  },
+  {
+   "id": "A.010.org-deletion-api-key-trigger",
+   "kind": "audit",
+   "artifact": "010.org-deletion-api-key-trigger",
+   "title": "audit 010.org-deletion-api-key-trigger",
+   "executor": "EXEC-B",
+   "lane": "lane/010-org-deletion-api-key-trigger",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-org-deletion-api-key-trigger",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "A.010.org-deletion-api-key-trigger.md",
+   "status": "landed",
+   "dispatched_to": "EXEC-B",
+   "session": "ses_f931fa3ffffeTFMwDdCW0ijpUu",
+   "dispatched_at": "2026-09-06 00:34:38",
+   "report_msg_id": "msg_0730d9b0e001AWVGxcpqM5s1Vu",
+   "reported_at": "2026-09-06 01:01:13",
+   "boss_note": "01:03 AUDIT PASSED verified by BOSS: proof log head f1bcf7de, 822 collected, 819 passed/3 skipped, 0 FAILED; 6 break cycles red\u2192green; product files identical on trunk; non-builder (EXEC-B vs CODEX-2). LANDED.",
+   "edited_at": "2026-09-06 01:03:43"
+  },
+  {
+   "id": "B.010.erasure-gap-family-residual-count",
+   "kind": "build",
+   "artifact": "010.erasure-gap-family-residual-count",
+   "title": "build 010.erasure-gap-family-residual-count \u2014 sum retained recording links across the erased family on the already-erased path (Codex [medium], historical-repair r2)",
+   "executor": "WORKER-1",
+   "lane": "lane/010-erasure-gap-family-residual-count",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-worker1-erasure-gap-family-residual-count",
+   "deps": [
+    "010.erasure-gap-historical-repair"
+   ],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure_recording_source_historical_repair.py",
+    "tests/test_erasure_recording_source_tasks.py",
+    "tests/test_erasure.py",
+    "tests/test_erasure_dispositions.py"
+   ],
+   "prompt_file": "B.010.erasure-gap-family-residual-count.md",
+   "status": "landed",
+   "added_by": "BOSS 2026-09-05 16:19 (follow-up from historical-repair r2 Codex [medium])",
+   "boss_note": "19:45 BOSS: LANDED \u2014 audit PASSED",
+   "edited_at": "2026-09-05 19:45:34",
+   "gate": "PASS",
+   "gate_sha": "473ffa4b323157f66f0d82a2b7b4d3a0c062c001",
+   "gated_at": "2026-09-05 17:19:22"
+  },
+  {
+   "id": "A.010.erasure-gap-family-residual-count",
+   "kind": "audit",
+   "artifact": "010.erasure-gap-family-residual-count",
+   "title": "audit 010.erasure-gap-family-residual-count \u2014 non-builder break-tests (builder WORKER-1)",
+   "executor": "",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "audit/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure_recording_source_historical_repair.py",
+    "tests/test_erasure_recording_source_tasks.py",
+    "tests/test_erasure.py",
+    "tests/test_erasure_dispositions.py"
+   ],
+   "prompt_file": "A.010.erasure-gap-family-residual-count.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-05 17:2x",
+   "boss_note": "19:45 BOSS: AUDIT PASSED (EXEC-F) merged 290032e5; artifact LANDED",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+   "dispatched_at": "2026-09-05 18:53:49",
+   "report_msg_id": "msg_071eaff54001I42iBbh6bUcdfZ",
+   "reported_at": "2026-09-05 19:43:47",
+   "edited_at": "2026-09-05 19:45:34"
+  },
+  {
+   "id": "A.010.audit-residuals",
+   "kind": "audit",
+   "artifact": "010.audit-residuals",
+   "title": "audit 010.erasure-gap-family-residual-count \u2014 non-builder break-tests (builder WORKER-1)",
+   "executor": "EXEC-D",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "audit/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure_recording_source_historical_repair.py",
+    "tests/test_erasure_recording_source_tasks.py",
+    "tests/test_erasure.py",
+    "tests/test_erasure_dispositions.py",
+    "tests/test_voice_catalog.py",
+    "tests/test_campaign_settings.py"
+   ],
+   "prompt_file": "A.010.erasure-gap-family-residual-count.md",
+   "status": "reported",
+   "added_by": "BOSS 2026-09-05 19:0x (non-builder audit after MERGE 48aabde9; builder was CODEX-1 \u2014 any EXEC, not CODEX)",
+   "boss_note": "audit of migration 248 + erasure prefix-evidence accounting + reconciler divergence + retention alarm logging; the 3 inherited test_rls_completeness reds are trunk 247's, covered by B.010.rls-completeness-anomalies-shape | 23:3x BOSS: extended to cover the V-2 voice-speed fix merged @ 8c5b1a7a (item file EXTENSION section)",
+   "dispatched_to": "EXEC-D",
+   "session": "ses_f92c5cfedffeYU6iVctg0oiskT",
+   "dispatched_at": "2026-09-06 02:59:12",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-05 19:16:36",
+   "log": null,
+   "sha": null,
+   "report_msg_id": "msg_073b2978c001oT8fnIawymf3b7",
+   "reported_at": "2026-09-06 04:01:25"
+  },
+  {
+   "id": "A.013.knowledge-workspace",
+   "kind": "audit",
+   "artifact": "013.knowledge-workspace",
+   "title": "audit 010.erasure-gap-family-residual-count \u2014 non-builder break-tests (builder WORKER-1)",
+   "executor": "EXEC-C",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "audit/**"
+   ],
+   "proof_files": [
+    "portal/src/routes/Knowledge.test.tsx",
+    "portal/src/routes/KnowledgeWorkspace.test.tsx",
+    "portal/src/kb/Documents.test.tsx"
+   ],
+   "prompt_file": "A.010.erasure-gap-family-residual-count.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-05 19:1x (non-builder audit after MERGE a67bbc2f; builder was EXEC-F \u2014 any EXEC except EXEC-F, not CODEX)",
+   "boss_note": "audit on trunk a67bbc2f; agy test-honesty findings are disclosed in the ledger row and owned by B.013.agent-editor-proof-honesty \u2014 the audit must still judge whether the merged behaviour matches the artifact",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-06 03:01:14",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": "",
+   "gate_sha": "",
+   "edited_at": "2026-09-05 19:16:36",
+   "log": "",
+   "sha": "",
+   "question_msg_id": "msg_0737beb730010vS5JCWPXrIVrq",
+   "parked_at": "2026-09-06 03:01:47"
+  },
+  {
+   "id": "A.013.agent-editor",
+   "kind": "audit",
+   "artifact": "013.agent-editor",
+   "title": "audit 010.erasure-gap-family-residual-count \u2014 non-builder break-tests (builder WORKER-1)",
+   "executor": "EXEC-C",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "audit/**"
+   ],
+   "proof_files": [
+    "tests/test_agent_config_schema.py",
+    "tests/test_agent_editor.py",
+    "tests/test_agent_editor_permissions.py",
+    "tests/test_config_bundles.py",
+    "portal/src/routes/Agents.test.tsx",
+    "portal/src/routes/SchemaFields.test.tsx"
+   ],
+   "prompt_file": "A.010.erasure-gap-family-residual-count.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-05 19:1x (non-builder audit after MERGE a67bbc2f; builder was EXEC-F \u2014 any EXEC except EXEC-F, not CODEX)",
+   "boss_note": "audit on trunk a67bbc2f; agy test-honesty findings are disclosed in the ledger row and owned by B.013.agent-editor-proof-honesty \u2014 the audit must still judge whether the merged behaviour matches the artifact",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-06 03:01:47",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": "",
+   "gate_sha": "",
+   "edited_at": "2026-09-05 19:16:36",
+   "log": "",
+   "sha": "",
+   "question_msg_id": "msg_0737c37220018smvpCAjWUW3Vr",
+   "parked_at": "2026-09-06 03:02:08"
+  },
+  {
+   "id": "A.010.rls-completeness-anomalies-shape",
+   "kind": "audit",
+   "artifact": "010.rls-completeness-anomalies-shape",
+   "title": "audit 010.rls-completeness-anomalies-shape \u2014 non-builder break-tests (builder WORKER-1)",
+   "executor": "EXEC-C",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "audit/**"
+   ],
+   "proof_files": [
+    "tests/test_rls_completeness.py",
+    "tests/test_erasure_recording_source_historical_repair.py",
+    "tests/test_plan010_function_acls.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "A.010.rls-completeness-anomalies-shape.md",
+   "status": "dispatched",
+   "added_by": "BOSS 2026-09-05 20:18 (non-builder audit after MERGE 86d35a50; builder WORKER-1)",
+   "boss_note": "test-only fix; audit must prove the new seeding path cannot hide a cross-tenant leak (own mutation: drop the tenant policy \u2192 probe must red)",
+   "dispatched_to": "EXEC-C",
+   "session": "ses_f931e4cd2ffeFldPGf7b9Gyibm",
+   "dispatched_at": "2026-09-06 20:26:41",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-05 20:18:51",
+   "log": null,
+   "sha": null
+  },
+  {
+   "id": "A.012.sequence-ended-event",
+   "kind": "audit",
+   "artifact": "012.sequence-ended-event",
+   "title": "audit 012.sequence-ended-event \u2014 non-builder break-tests incl. ACL pin (builder EXEC-D)",
+   "executor": "EXEC-B",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "audit/**"
+   ],
+   "proof_files": [
+    "tests/test_sequence_ended_event.py"
+   ],
+   "prompt_file": "A.012.sequence-ended-event.md",
+   "status": "reported",
+   "added_by": "BOSS 2026-09-05 20:20 (non-builder audit after docs MERGE 1b40f6b9; product on trunk at d5c509c5; builder EXEC-D)",
+   "boss_note": "own mutation = scratch-transaction GRANT UPDATE to voicepod_app \u2192 'neither role rewrites' must red",
+   "dispatched_to": "EXEC-B",
+   "session": "ses_f8d0831b1ffeiwstfvZfOIBSw9",
+   "dispatched_at": "2026-09-06 01:01:13",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-05 20:20:25",
+   "log": null,
+   "sha": null,
+   "report_msg_id": "msg_0737aba7e001VvWsEm3nZI6VJJ",
+   "reported_at": "2026-09-06 03:00:25"
+  },
+  {
+   "id": "B.011.port-row-decoding",
+   "kind": "build",
+   "artifact": "011.transition-command",
+   "title": "fix 011 ports: decode tuple rows via tenancy.one + production-shaped tests (Codex gate 37893 [high], confirmed)",
+   "executor": "EXEC-E",
+   "lane": "lane/011-pipelines",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-011-port-row-decoding",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_approval_queue.py"
+   ],
+   "prompt_file": "B.011.port-row-decoding.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-05 21:18 (product defect from Q7 gate; blocks Q7 + A.011.transition-command + A.011.approval-queue)",
+   "boss_note": "@ 892d4888 (EXEC-D): 3 tuple-cursor sites -> tenancy.one() (approvals.py own idiom); verified the other 17 fetchone() sites use positional. Unblocks 011.approval-queue -> LANDED.",
+   "dispatched_to": "EXEC-E",
+   "session": "ses_f8dfc8d41ffeHVWHqAYJSUDlI9",
+   "dispatched_at": "2026-09-05 22:27:28",
+   "depends_on": [],
+   "report": null,
+   "branch": "lane/011-port-row-decoding",
+   "gate": "PASS",
+   "gate_sha": "892d48883460ce4e8e5f782c451f14caaacdfdac",
+   "edited_at": "2026-09-05 22:27:28",
+   "log": null,
+   "sha": null,
+   "report_msg_id": "msg_073715e1c0018fkaNBvaD5pwBk",
+   "reported_at": "2026-09-06 02:50:19",
+   "gated_at": "2026-09-06 05:38:32",
+   "merged_sha": "892d4888",
+   "note_boss": "status was stale 'gated'; sha 892d4888 verified ancestor of plan010/rebuild 2026-09-06 20:2x"
+  },
+  {
+   "id": "B.010.erasure-register-array-columns",
+   "kind": "build",
+   "artifact": "010.erasure-register",
+   "title": "erasure register: uuid[] contact columns (subject_contact_ids) are never walked \u2014 register the class + tree-wide array sweep proof",
+   "executor": "WORKER-1",
+   "lane": "",
+   "worktree": "",
+   "deps": [
+    "B.010.route-authority-clock"
+   ],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_erasure.py",
+    "tests/test_erasure_dispositions.py",
+    "tests/test_retention_effect_tasks.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.010.erasure-register-array-columns.md",
+   "status": "queued",
+   "added_by": "BOSS 2026-09-05 22:46 (re-derived on trunk: identity.py:891 literal contact_id discovery; 202:1327 subject_contact_ids uuid[])",
+   "boss_note": "QUESTION first on live-task semantics; fix the class not the column",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [
+    "B.010.route-authority-clock"
+   ],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-05 22:46:05",
+   "log": null,
+   "sha": null
+  },
+  {
+   "id": "B.010.migrations-non-superuser-replay",
+   "kind": "build",
+   "artifact": "010.migrations",
+   "title": "migration chain replay as a non-superuser (132 OWNER TO never privilege-checked; 146/192 refuse) \u2014 guard test + owner-decided fix scope",
+   "executor": "",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_migration_runner.py",
+    "tests/test_plan010_function_acls.py",
+    "tests/test_docs_truth.py"
+   ],
+   "prompt_file": "B.010.migrations-non-superuser-replay.md",
+   "status": "parked",
+   "parked_reason": "BLOCKED:owner \u2014 production deploy identity + whether 192's property rests on superuser deploys (BOSS_DECISIONS 23:4x 2026-09-05); also budget",
+   "added_by": "BOSS 2026-09-06 00:09 (finding from \u2605 / TEMPLATE-DB-SCOPING.md \u00a78)",
+   "boss_note": "not tonight; owner decision first",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 00:09:23",
+   "log": null,
+   "sha": null
+  },
+  {
+   "id": "B.010.trunk-ruff-clean",
+   "kind": "build",
+   "artifact": "010.ci",
+   "title": "ruff check . exits 1 on trunk (4 errors) \u2014 fix",
+   "executor": "",
+   "lane": "lane/010.trunk-ruff-clean",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-010-ruff-clean",
+   "deps": [],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [
+    "tests/test_business_transition_contract.py",
+    "tests/test_docs_truth.py",
+    "tests/test_admin_llm_routes.py"
+   ],
+   "prompt_file": "B.010.trunk-ruff-clean.md",
+   "status": "merged",
+   "added_by": "BOSS 2026-09-06 00:39 (\u2605 GitHub Actions measurement)",
+   "boss_note": "01:35 MERGED to trunk bf8e3160; post-merge ruff check clean on merged tree; AUDIT pending",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+   "dispatched_at": "2026-09-06 00:39:54",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": "PASS",
+   "gate_sha": "a9527b5a3f0ec16c8ea92ea1c69a9448d4428f84",
+   "edited_at": "2026-09-06 01:35:01",
+   "log": null,
+   "sha": null,
+   "report_msg_id": "msg_073199d6c001xqd6vqeO9CXkkK",
+   "reported_at": "2026-09-06 01:14:18",
+   "gated_at": "2026-09-06 01:33:28"
+  },
+  {
+   "id": "B.010.ci-collection-floor",
+   "kind": "build",
+   "artifact": "010.ci",
+   "title": "CI collected-test floor negative control fails (9,607 vs floor 8,153) \u2014 re-baseline + anti-rot mechanism",
+   "executor": "EXEC-F",
+   "lane": "lane/010.ci-collection-floor",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-010-ci-floor",
+   "deps": [],
+   "scope": [
+    "scripts/**",
+    ".github/**",
+    "platform/tests/collection_baseline.json",
+    "audit/**",
+    "plans/**"
+   ],
+   "proof_files": [
+    "../scripts/test_supply_chain.py"
+   ],
+   "prompt_file": "B.010.ci-collection-floor.md",
+   "status": "dispatched",
+   "added_by": "BOSS 2026-09-06 00:39 (\u2605 GitHub Actions measurement)",
+   "boss_note": "r3 @ dea5a18a. proof_files WAS STALE (tests/test_docs_truth.py) - real proof is scripts/test_supply_chain.py at repo root, BOX-FREE (no conftest above it). BOSS measured box-free: 12 passed, 22 subtests in 0.82s. .github/** denylisted -> HAND-MERGE.",
+   "dispatched_to": "EXEC-F",
+   "session": "ses_f8e93ab74ffeD7GUzOjO7HYI4u",
+   "dispatched_at": "2026-09-06 20:26:41",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": "FAIL",
+   "gate_sha": "dea5a18a6a933753c5ead63804556714b5ea4bd3",
+   "edited_at": "2026-09-06 02:10:10",
+   "log": null,
+   "sha": null,
+   "report_msg_id": "msg_0732e0b360012wx8WpReaUdLmV",
+   "reported_at": "2026-09-06 01:36:44",
+   "gated_at": "2026-09-06 05:23:43",
+   "assignee": "EXEC-G",
+   "note_boss": "REWORK 3 appended to item file 20:2x (had only reached CAPTAIN_VERDICTS). Re-queued."
+  },
+  {
+   "id": "B.010.reply-writeoff-refusal-text",
+   "kind": "build",
+   "artifact": "010.reaper-ambiguous-holds",
+   "title": "written-off reply: 409 text says 'reload and retry' but only an operator can reopen \u2014 distinct error code + honest text",
+   "executor": "",
+   "lane": "lane/010-reply-writeoff-refusal-text",
+   "worktree": "",
+   "deps": [
+    "B.010.reaper-ambiguous-holds"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_stuck_path_money.py"
+   ],
+   "prompt_file": "B.010.reply-writeoff-refusal-text.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-06 00:41 (finding from reaper r6b QUESTION)",
+   "boss_note": "small; message only, no money/authority change; after the reaper lands",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [
+    "B.010.reaper-ambiguous-holds"
+   ],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 00:41:54",
+   "log": null,
+   "sha": null,
+   "blocked_on": [
+    "B.010.reaper-ambiguous-holds"
+   ],
+   "park_reason": "BOSS 2026-09-06 03:1x wind-down: unassigned build with no executor; would never dispatch. Item file present and intact; resume by assigning an executor and setting status=queued."
+  },
+  {
+   "id": "B.010.ci-parallel-sharding",
+   "kind": "build",
+   "artifact": "010.ci",
+   "title": "CI: -n auto + matrix sharding for the platform job (coverage combined, order-run semantics, required-checks needs every shard)",
+   "executor": "EXEC-F",
+   "lane": "lane/010-ci-parallel-sharding",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-010-ci-sharding",
+   "deps": [
+    "B.010.trunk-ruff-clean"
+   ],
+   "scope": [
+    "deploy/**",
+    ".github/**"
+   ],
+   "proof_files": [
+    "../deploy/tests/test_ci_shard_coverage.py",
+    "../deploy/tests/test_ci_required_gates.py"
+   ],
+   "prompt_file": "B.010.ci-parallel-sharding.md",
+   "status": "gated",
+   "added_by": "BOSS 2026-09-06 00:51 (owner-authorised via \u2605)",
+   "boss_note": "r4 @ aee88466 (EXEC-B): gates test made shard-aware, trunk-verbatim branch-protection fn. Proof set widened by BOSS to include deploy/tests/test_ci_required_gates.py - the file the r3 branch broke. Both proof files BOX-FREE.",
+   "dispatched_to": "EXEC-F",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [
+    "B.010.trunk-ruff-clean"
+   ],
+   "report": null,
+   "branch": "lane/010-ci-parallel-sharding",
+   "gate": "FAIL",
+   "gate_sha": "60ab7ff93d21b06ac3076a4517ee53e59bfc439e",
+   "edited_at": "2026-09-06 01:49:46",
+   "log": null,
+   "sha": null,
+   "blocked_on": [
+    "B.010.trunk-ruff-clean"
+   ],
+   "report_msg_id": "msg_07341d137001A2F1G8SWgCI6dY",
+   "reported_at": "2026-09-06 01:58:25",
+   "gated_at": "2026-09-06 05:41:01",
+   "assignee": "EXEC-B"
+  },
+  {
+   "id": "B.010.conftest-admin-connection-hoist",
+   "kind": "build",
+   "artifact": "010.test-speed",
+   "title": "Hoist conftest admin connection to session scope \u2014 measure first with the staged rig (test-logs/rigs/), build only if connections are a meaningful share",
+   "executor": "",
+   "lane": "lane/010-conftest-admin-hoist",
+   "worktree": "",
+   "deps": [],
+   "scope": [
+    "platform/tests/conftest.py"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.010.conftest-admin-connection-hoist.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-06 01:01 (\u2605 finding)",
+   "boss_note": "PARKED: step 1 is a BOSS-fired \u226410-min measurement in a quiet box window; rank below ci-parallel-sharding",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 01:01:15",
+   "log": null,
+   "sha": null
+  },
+  {
+   "id": "B.010.definitive-rejection-intent-disposition",
+   "kind": "build",
+   "artifact": "010.gap-answer",
+   "title": "Reply route marks a definitively FAILED receipt's intent ambiguous (slot held); classify from the receipt disposition",
+   "executor": "",
+   "lane": "lane/010-definitive-rejection-disposition",
+   "worktree": "",
+   "deps": [
+    "B.010.gap-answer-auxiliary-retry",
+    "B.010.reaper-ambiguous-holds"
+   ],
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.010.definitive-rejection-intent-disposition.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-06 01:14 (Codex finding on aux-retry gate)",
+   "boss_note": "medium; after aux-retry + reaper merge",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [
+    "B.010.gap-answer-auxiliary-retry",
+    "B.010.reaper-ambiguous-holds"
+   ],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 01:14:12",
+   "log": null,
+   "sha": null,
+   "blocked_on": [
+    "B.010.gap-answer-auxiliary-retry",
+    "B.010.reaper-ambiguous-holds"
+   ],
+   "park_reason": "BOSS 2026-09-06 03:1x wind-down: unassigned build with no executor; would never dispatch. Item file present and intact; resume by assigning an executor and setting status=queued."
+  },
+  {
+   "id": "B.010.connection-soft-revoke",
+   "kind": "build",
+   "artifact": "010.connections",
+   "title": "Nothing writes connections.status='revoked'; portal Revoke deletes \u2014 decide soft-revoke route vs retire the state",
+   "executor": "",
+   "lane": "",
+   "worktree": "",
+   "deps": [
+    "B.010.member-egress-fence"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.010.connection-soft-revoke.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-06 01:23 (WORKER-1 \u00a74b finding)",
+   "boss_note": "PARKED product decision; after egress lands",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [
+    "B.010.member-egress-fence"
+   ],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 01:23:15",
+   "log": null,
+   "sha": null
+  },
+  {
+   "id": "A.010.trunk-ruff-clean",
+   "kind": "audit",
+   "artifact": "010.trunk-ruff-clean",
+   "title": "Audit ruff-clean merge: SIM102 truth table, collections.abc equivalence, import-order side effects",
+   "executor": "EXEC-D",
+   "lane": "",
+   "worktree": "",
+   "deps": [],
+   "scope": [],
+   "proof_files": [
+    "tests/test_business_transition_contract.py"
+   ],
+   "prompt_file": "A.010.trunk-ruff-clean.md",
+   "status": "reported",
+   "added_by": "BOSS 2026-09-06 01:35",
+   "boss_note": "01:38 EXEC-F correctly DECLINED (builder); requeued pinned to EXEC-D (non-builder). Dispatcher fed a builder-excluded audit to the builder \u2014 Worker 2 ask.",
+   "dispatched_to": "EXEC-D",
+   "session": "ses_f92c5cfedffeYU6iVctg0oiskT",
+   "dispatched_at": "2026-09-06 04:01:25",
+   "depends_on": [],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 01:35:32",
+   "log": null,
+   "sha": null,
+   "question_msg_id": "msg_0732e3a50001ciVwwEe6ApX2Ic",
+   "parked_at": "2026-09-06 01:36:55",
+   "report_msg_id": "msg_073b7b9a7001hggQE2tFm9gDz3",
+   "reported_at": "2026-09-06 04:07:01"
+  },
+  {
+   "id": "B.010.ci-order-run-cadence",
+   "kind": "build",
+   "artifact": "010.ci",
+   "title": "Order-dependence run is the billed-minutes floor after sharding \u2014 move it off per-push (owner decides cadence)",
+   "executor": "",
+   "lane": "lane/010-ci-order-run-cadence",
+   "worktree": "",
+   "deps": [
+    "B.010.ci-parallel-sharding"
+   ],
+   "scope": [
+    ".github/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.010.ci-order-run-cadence.md",
+   "status": "parked",
+   "added_by": "BOSS 2026-09-06 02:01 (BOSS measurement on the sharding lane)",
+   "boss_note": "02:10 DE-PRIORITISED: measured CI runs never reach pytest (~25 billed min for both pushes, 1.25% of allowance), so cadence is not cost-urgent; revisit once `required` is green and a run actually executes the suite",
+   "dispatched_to": "",
+   "session": "",
+   "dispatched_at": "",
+   "depends_on": [
+    "B.010.ci-parallel-sharding"
+   ],
+   "report": null,
+   "branch": null,
+   "gate": null,
+   "gate_sha": null,
+   "edited_at": "2026-09-06 02:01:31",
+   "log": null,
+   "sha": null,
+   "blocked_on": [
+    "B.010.ci-parallel-sharding"
+   ],
+   "park_reason": "BOSS 2026-09-06 03:1x wind-down: unassigned build with no executor; would never dispatch. Item file present and intact; resume by assigning an executor and setting status=queued."
+  },
+  {
+   "id": "B.010.ci-required-green-if-guard",
+   "status": "merged",
+   "executor": "EXEC-B",
+   "lane": "lane/010-ci-required-green-if-guard",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-ci-if-guard",
+   "proof_files": [
+    "../deploy/tests/test_ci_required_green.py",
+    "../deploy/tests/test_ci_required_gates.py"
+   ],
+   "artifact": "010.ci-required-green",
+   "gate": "FAIL",
+   "gate_sha": "5a9707547f85dc22976115a76ea71a4f13d9ea80",
+   "gated_at": "2026-09-06 04:40:10",
+   "branch": "lane/010-ci-required-green-if-guard",
+   "scope": [
+    "deploy/tests/**"
+   ],
+   "boss_note": "worktree was voicepod-codex-ci-required-green (a DIFFERENT lane, head 6a4a6e07); gate 04:13 measured that tree and passed 12 tests instead of this lane's 13. Gate result VOID, see CAPTAIN_VERDICTS 04:22 + 04:24 correction. deploy/** is on the DENY list, so this is a HAND-MERGE by design.",
+   "merged_sha": "f90559ad"
+  },
+  {
+   "id": "B.013.config-bundle-cycle-guard",
+   "status": "merged",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-013-cycleguard",
+   "branch": "lane/013-bundle-cycleguard",
+   "proof_files": [
+    "tests/test_config_bundles.py"
+   ],
+   "scope": [
+    "platform/core/config_bundles.py",
+    "platform/tests/**"
+   ],
+   "boss_note": "EXEC-E r2, MEASURED: S0 10 passed; break -> 1 failed with RecursionError at config_bundles.py:185 (the guard is load-bearing); restore green. Fix commit b5f96276, head a21425be. Fixes the FAILED 013.config-bundle (_seen is a depth accumulator, not a cycle guard).",
+   "gate": "PASS",
+   "gate_sha": "a21425be6a77a407862b985c99d98cb1b79f1f44",
+   "gated_at": "2026-09-06 04:32:12"
+  },
+  {
+   "id": "A.010.erasure-gap-historical-repair",
+   "status": "landed",
+   "assignee": "EXEC-G",
+   "branch": null,
+   "worktree": null,
+   "worktree_note": "DETACHED audit worktree at 6e868e24: git -C $TRUNK worktree add --detach $CN/voicepod-audit-erasuregap 6e868e24; then cd platform && uv sync --frozen. Never audit inside the builder's lane.",
+   "scope": [
+    "platform/**"
+   ],
+   "proof_files": [],
+   "boss_note": "Row merged (trunk 16416af5, lane 6e868e24, migration 247) with builder break-tests NOT RUN and Codex box-free. UNMEASURED audits do not satisfy Rule 3, so the row is stuck until executed. Trap: erasure register guard matches only columns literally named contact_id -> subject_contact_ids ARRAY columns survive erasure; a proof set excluding the array case cannot distinguish a working guard from an absent one.",
+   "note_boss": "stale stub (exec=-, lane=-). Artifact LANDED under Rule 3 on trunk (EXEC-F audit, 11 breaks executed). Closed 2026-09-06 20:1x on restart so the dispatcher stops counting it."
+  },
+  {
+   "id": "B.013.journey-exists-fail-open",
+   "status": "merged",
+   "assignee": "EXEC-E",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-013-failexists",
+   "branch": "lane/013-journey-exists",
+   "proof_files": [
+    "tests/test_config_bundles.py"
+   ],
+   "scope": [
+    "platform/core/config_bundles.py",
+    "platform/tests/**"
+   ],
+   "boss_note": "Closes the SECOND HIGH on 013.config-bundle (the first was the cycle guard, merged 9f258108). EXEC-E reproduced the fail-open first (journey_exists=None + phantom v9-nonexistent returned a clean DryRunResult), then REFUTED Codex's cause theory by measurement: no existence helper exists in platform/core, no in-tree caller passes journey_exists, _resolve is the only binding-resolution site. Fix refuses at point of need, not at construction. r2 MEASURED: 11 passed collected 11, break 1 failed.",
+   "gate": "PASS",
+   "gate_sha": "117042b6cfa0eef409612b4d1478f4947e3509fa",
+   "gated_at": "2026-09-06 05:15:39",
+   "merged_sha": "b007ed73"
+  },
+  {
+   "id": "B.017a.stack",
+   "status": "held",
+   "assignee": "EXEC-H",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "proof_files": [
+    "tests/test_rollout_inventory.py",
+    "tests/test_environment_registry.py",
+    "tests/test_recovery_contract.py",
+    "portal/src/routes/Help.test.tsx",
+    "portal/src/help/helpRegistry.test.ts",
+    "portal/src/routes/SettingsIA.test.tsx"
+   ],
+   "scope": [
+    "platform/**",
+    "portal/**",
+    "deploy/**",
+    "audit/**",
+    "plans/**"
+   ],
+   "boss_note": "SYNTHETIC STACK ITEM (BOSS 05:51). rollout-inventory r2 + settings-help-ia r3 + backfills are STACKED linearly on lane/017-rollout; a gate resolves HEAD from the worktree so they gate and merge as ONE unit. Gating by any single item id would measure only that item proof files on the combined tip - this item carries all three proof sets. EXEC-H judged backfills materially riskiest (new migration w/ 247 collision, two new tables, new admin route surface) but recommended gating as one because the risk concentrates at merge mechanics the gate re-verifies, and unpicking a shared linear history at this hour risks more than it insures. BOSS ACCEPTED. Migration stays 247 in-lane; BOSS assigns trunk-max+1 at merge. SCOPE CORRECTION (BOSS 05:59): my first declaration was platform/**+portal/** only. Measured 598031ce..06b8f77d: the lane also touches deploy/ (2: environment_registry.generated.json, environment_registry_policy.json), audit/ (21 logs+reports) and plans/ (2). The 05:56 gate run therefore reports scope FAIL on 25 files \u2014 that is MY declaration error, NOT a lane defect. deploy/** is on mergegate DENY (:53) so this merge is hand_merge=True by design. Fourth scope-too-narrow error tonight: diff the lane against its merge-base BEFORE declaring scope, never infer scope from the artifact's subject. BOSS 07:2x: GATED FAIL @ 06b8f77d and HELD as a unit. proofs 1 red (env registry, since fixed at 2f8ee875); Codex [high]+2[medium] all in platform/core/backfills.py; agy reject, 6 findings, converging on the same file. rollout-inventory and settings-help-ia are CLEAN and blocked only by stack position (settings r3 sits ABOVE the backfills commits). Backfills NOT fixed tonight by decision \u2014 the [high] is a callback-lifecycle design change, not a patch. Trunk ledger rows corrected 9690f7e1.",
+   "lane": "lane/017-rollout",
+   "gate": "FAIL",
+   "gate_sha": "06b8f77da02e61c4e19cc28f5bae5e65488a5139",
+   "gated_at": "2026-09-06 05:59:19"
+  },
+  {
+   "id": "B.011.fake-tuple-fix",
+   "kind": "build",
+   "artifact": "011.fake-tuple-fix",
+   "title": "build 011.fake-tuple-fix",
+   "executor": "EXEC-D",
+   "lane": "lane/011-fake-tuple-fix",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-011-fakefix",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "audit/**",
+    "plans/**"
+   ],
+   "proof_files": [
+    "tests/test_business_transition_contract.py",
+    "tests/test_approval_queue.py"
+   ],
+   "prompt_file": "B.011.fake-tuple-fix.md",
+   "status": "merged",
+   "dispatched_to": "",
+   "session": "",
+   "reported_at": "2026-09-06 07:55:08",
+   "report_sha": "0b1dda64",
+   "gate": "PASS",
+   "gate_sha": "0b1dda645ec906886dd2b54b6a6a83522053a4bd",
+   "gated_at": "2026-09-06 07:58:36",
+   "merged_sha": "c671f5ed"
+  },
+  {
+   "id": "B.010.gap-answer-auxiliary-retry-renumber",
+   "kind": "build",
+   "artifact": "010.gap-answer-auxiliary-retry",
+   "title": "rebase + renumber 247\u2192249 for 010.gap-answer-auxiliary-retry",
+   "executor": "EXEC-B",
+   "lane": "lane/010-gap-answer-auxiliary-retry",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-gap-answer-auxiliary-retry",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "audit/**",
+    "plans/**",
+    "TECHNICAL.md"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_settlement_disposition.py",
+    "tests/test_reply_path.py",
+    "tests/test_one_live_intent_per_message.py",
+    "tests/test_messaging_fencing.py",
+    "tests/test_gap_answer_stuck_path_money.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.010.gap-answer-auxiliary-retry-renumber.md",
+   "status": "dispatched",
+   "dispatched_to": "EXEC-B",
+   "session": "ses_f8d0831b1ffeiwstfvZfOIBSw9",
+   "note_boss": "BOSS assigned migration 249 at 0899f0c5 (trunk max 248). Re-verify max at merge; scope to be re-measured after rebase.",
+   "dispatched_at": "2026-09-06 20:18:37"
+  },
+  {
+   "id": "B.014a.artifact-custody-r3",
+   "kind": "build",
+   "artifact": "014a.artifact-custody",
+   "title": "014a: preview-bytes fix + re-report at head",
+   "executor": "EXEC-G",
+   "lane": "lane/014a-assets",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-014a",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**",
+    "agent/**",
+    "audit/**",
+    "plans/**",
+    "deploy/**",
+    "TECHNICAL.md"
+   ],
+   "proof_files": [
+    "tests/test_erasure_media.py",
+    "tests/test_permission_matrix.py",
+    "tests/test_media_workload_api.py",
+    "tests/test_docs_truth.py",
+    "tests/test_migration_runner.py",
+    "tests/test_erasure_dispositions.py",
+    "tests/test_environment_registry.py",
+    "tests/test_journey_source_manifests.py",
+    "tests/test_call_session_asset_source.py",
+    "tests/test_journey_effect_admission.py",
+    "tests/test_voice_stack.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.014a.artifact-custody-r3.md",
+   "status": "dispatched",
+   "dispatched_to": "EXEC-G",
+   "session": "ses_f8fb0be32ffezkK6OJwxWeeSh0",
+   "note_boss": "hand_merge expected (deploy/ denylist). Union proof set of both 014a items \u2014 one lane, one merge lands both.",
+   "dispatched_at": "2026-09-06 20:18:37"
+  },
+  {
+   "id": "B.010.gap-answer-portal-guard-r8",
+   "kind": "build",
+   "artifact": "010.gap-answer-portal-guard",
+   "title": "portal-guard: rebase + re-proof REWORK 5 at head (lane takeover from WORKER-1)",
+   "executor": "EXEC-D",
+   "lane": "lane/010-gap-answer-portal-guard",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-gap-answer-portal-guard",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**",
+    "audit/**",
+    "plans/**",
+    "TECHNICAL.md"
+   ],
+   "proof_files": [
+    "tests/test_gap_answer_idempotency.py",
+    "tests/test_knowledge_proposal_apply_pool_route.py",
+    "tests/test_learning_loop.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_tenant_graph_integrity.py",
+    "tests/test_gap_answer_settlement_disposition.py"
+   ],
+   "prompt_file": "B.010.gap-answer-portal-guard-r8.md",
+   "status": "dispatched",
+   "dispatched_to": "EXEC-D",
+   "session": "ses_f92c5cfedffeYU6iVctg0oiskT",
+   "note_boss": "proof_files to be re-measured from r7b's cmd: line by the executor and corrected by BOSS before gate; migration 249 free at trunk-max 248",
+   "dispatched_at": "2026-09-06 20:28:23"
+  },
+  {
+   "id": "B.017a.backfills-r2",
+   "kind": "build",
+   "artifact": "017a.backfills",
+   "title": "017a stack rework: 3 backfills.py findings + 1 red, rebase, provisional 249",
+   "executor": "EXEC-H",
+   "lane": "lane/017-rollout",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-lane-017",
+   "deps": [],
+   "scope": [
+    "platform/**",
+    "portal/**",
+    "deploy/**",
+    "audit/**",
+    "plans/**",
+    "TECHNICAL.md"
+   ],
+   "proof_files": [
+    "tests/test_backfills.py",
+    "tests/test_migration_runner.py",
+    "tests/test_docs_truth.py",
+    "tests/test_tenant_graph_integrity.py"
+   ],
+   "prompt_file": "B.017a.backfills-r2.md",
+   "status": "dispatched",
+   "dispatched_to": "EXEC-H",
+   "session": "ses_f8fb0bc85ffei7Ev4fSGf8JSeo",
+   "note_boss": "proof_files provisional \u2014 BOSS re-measures from the stack log cmd: line before gate. deploy/** in scope this morning (25 files) \u2192 hand_merge expected.",
+   "dispatched_at": "2026-09-06 20:30:41"
+  },
+  {
+   "id": "B.010.ci-undiagnosed-reds",
+   "kind": "build",
+   "artifact": "010.ci-required-green",
+   "title": "diagnose+fix portal npm-cache and deploy checksum reds from saved CI logs",
+   "executor": "EXEC-A2",
+   "lane": "lane/010-ci-required-green",
+   "worktree": "/Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-ci-required-green",
+   "deps": [],
+   "scope": [
+    ".github/**",
+    "deploy/**",
+    "portal/**",
+    "ci/**",
+    "scripts/**",
+    "agent/**",
+    "audit/**",
+    "plans/**"
+   ],
+   "proof_files": [],
+   "prompt_file": "B.010.ci-undiagnosed-reds.md",
+   "status": "dispatched",
+   "dispatched_to": "EXEC-A2",
+   "session": "ses_f8c2e96b6ffe0xCjNpLJiauFD4",
+   "note_boss": "box-free; proofs are deploy/tests + scripts/test_supply_chain + portal vitest/tsc (not platform/tests) \u2014 gate with --no-box and BOSS runs those by hand. hand_merge expected (.github/**, deploy/**).",
+   "dispatched_at": "2026-09-06 20:34:50"
+  }
+ ],
+ "updated": "2026-09-06 20:34:50"
+}

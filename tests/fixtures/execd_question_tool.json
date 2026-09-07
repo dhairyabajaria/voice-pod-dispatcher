@@ -1,0 +1,18 @@
+{
+ "_what": "EXEC-D 2026-09-07 01:14. The executor asked BOSS a question through OpenCode's `question` TOOL rather than in text: an assistant turn whose newest part is a tool part with tool=\"question\" and state.input.questions[], left INCOMPLETE while it waits for an answer. No QUESTION event was emitted and the board showed EXEC-D busy. Shape recorded from the live message; text is executor-authored, untrusted, test data only.",
+ "messages": [
+  {"info": {"id": "msg_q_prev", "role": "user", "time": {"created": 1788800000000}},
+   "parts": [{"type": "text", "text": "dispatch B.010.example"}]},
+  {"info": {"id": "msg_q_ask", "role": "assistant", "time": {"created": 1788800100000}},
+   "parts": [
+     {"type": "step-start"},
+     {"type": "text", "text": "Before I touch the migration I need a decision."},
+     {"type": "tool", "tool": "question",
+      "state": {"status": "pending",
+                "input": {"questions": [
+                  {"question": "Migration 231 collides with trunk. Renumber to 232, or rebase the lane?",
+                   "header": "Migration",
+                   "options": [{"label": "Renumber to 232"}, {"label": "Rebase the lane"}]}]}}}
+   ]}
+ ]
+}

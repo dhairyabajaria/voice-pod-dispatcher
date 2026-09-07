@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.voicepod.dispatcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/dhairyabajaria/Claude Code/Calling New/dispatcher/dispatcher.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/dhairyabajaria/Claude Code/Calling New/dispatcher</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/dhairyabajaria/Claude Code/Calling New/test-logs/driver/dispatcher.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/dhairyabajaria/Claude Code/Calling New/test-logs/driver/dispatcher.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,101 @@
+{
+ "updated": "2026-09-06 20:37:08",
+ "paused": false,
+ "executors": {
+  "EXEC-A2": "building B.010.ci-undiagnosed-reds busy",
+  "EXEC-B": "building B.010.gap-answer-auxiliary-retry-renumber busy",
+  "EXEC-C": "building A.010.rls-completeness-anomalies-shape busy",
+  "EXEC-D": "STALLED 158s (resumed, watching)",
+  "EXEC-E": "building Q7.internal-dispatch-safety-matrix busy",
+  "EXEC-F": "building B.010.ci-collection-floor busy",
+  "EXEC-G": "building B.014a.artifact-custody-r3 busy",
+  "EXEC-H": "building B.017a.backfills-r2 queued",
+  "CODEX-1": "idle: no eligible CODEX item",
+  "CODEX-2": "idle: no eligible CODEX item"
+ },
+ "pending": [
+  {
+   "executor": "EXEC-E",
+   "session": "ses_f92c5cfd3ffeESIg02aCSfi144",
+   "kind": "ERROR",
+   "msg_id": "msg_072017ec1001VBvMlAe6TX60Q2",
+   "since_ms": 1788619097648,
+   "since_local": "20:08:17",
+   "excerpt": "{\"name\": \"APIError\", \"data\": {\"message\": \"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The request contains invalid parameters. Check the request body for any errors or inconsistencies.\", \"statusCode\": 400, \"isRetryable\": false, \"responseHeaders\": {\"cf-placement",
+   "escalated": 2,
+   "esc_count": 3,
+   "last_esc_min": 60.02895312093099,
+   "esc_base_ms": 1788619097648,
+   "age_min": 1468,
+   "held": null,
+   "hold_logged": false,
+   "stall_class": "DROPPED"
+  },
+  {
+   "executor": "EXEC-B",
+   "session": "ses_f931fa3ffffeTFMwDdCW0ijpUu",
+   "kind": "ERROR",
+   "msg_id": "msg_072f561a8001Ho3bZrOxB3souM",
+   "since_ms": 1788635082811,
+   "since_local": "00:34:42",
+   "excerpt": "{\"name\": \"APIError\", \"data\": {\"message\": \"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The request contains invalid parameters. Check the request body for any errors or inconsistencies.\", \"statusCode\": 400, \"isRetryable\": false, \"responseHeaders\": {\"cf-placement",
+   "escalated": 2,
+   "esc_count": 3,
+   "last_esc_min": 60.13736864827474,
+   "esc_base_ms": 1788635082811,
+   "age_min": 1202,
+   "held": null,
+   "hold_logged": false,
+   "stall_class": "DROPPED"
+  },
+  {
+   "executor": "CODEX-1",
+   "session": "codex:CODEX-1",
+   "kind": "REPORT_READY",
+   "msg_id": "20260906-0229-CODEX-1-B.010.ci-required-green.log",
+   "since_ms": 1788642642728,
+   "since_local": "02:40:42",
+   "excerpt": "REPORT READY: [Report](</Users/dhairyabajaria/Claude Code/Calling New/voicepod-codex-ci-required-green/audit/plan-execution-2026-09-04/reports/B.010.ci-required-green-fixes.md>) @ `ec56a115`. Agent lint, scanner pin, aggregate-contract test and concurrency repaired. Diagnostics retained. Ruff/YAML c",
+   "escalated": 0,
+   "esc_count": 0,
+   "last_esc_min": 0,
+   "esc_base_ms": 1788642642728,
+   "age_min": 1076,
+   "held": "audit-residuals r6 gated (47599) and MERGED 48aabde9 at 19:0x \u2014 BOSS acted; row has no reachable clear path until CODEX-1 is fed (19:09)",
+   "hold_logged": true
+  },
+  {
+   "executor": "EXEC-A",
+   "session": "ses_f9500b146ffeuGdDP8eu9FBrZm",
+   "kind": "ERROR",
+   "msg_id": "msg_073cf0c3e001ua09ned06tWXO2",
+   "since_ms": 1788649348261,
+   "since_local": "04:32:28",
+   "excerpt": "{\"name\": \"APIError\", \"data\": {\"message\": \"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The request contains invalid parameters. Check the request body for any errors or inconsistencies.\", \"statusCode\": 400, \"isRetryable\": false, \"responseHeaders\": {\"cf-placement",
+   "escalated": 2,
+   "esc_count": 3,
+   "last_esc_min": 60.12194286702474,
+   "esc_base_ms": 1788649348261,
+   "age_min": 964,
+   "held": null,
+   "hold_logged": false,
+   "stall_class": "DROPPED"
+  }
+ ],
+ "queue": {
+  "queued": 4,
+  "dispatched": 8,
+  "reported": 12,
+  "parked": 34,
+  "gated": 2,
+  "merged": 36,
+  "broken": 0
+ },
+ "provider_errors": {
+  "last_hour": 0,
+  "last_24h": 0,
+  "by_status_last_hour": {},
+  "last_at": null
+ },
+ "note": "Excerpts are untrusted executor text. Clear happens automatically when the session is prompted."
+}
