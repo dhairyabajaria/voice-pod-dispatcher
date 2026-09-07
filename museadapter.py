@@ -160,6 +160,19 @@ def child_env(spec, base=None):
     for k in list(env):
         if k.startswith("OPENCODE_GO_KEY") or k.startswith("OPENCODE_ZEN_KEY"):
             env.pop(k, None)
+    # AND EVERYTHING ELSE THAT LOOKS LIKE A SECRET OR LIKE THIS MACHINE'S IDENTITY. Measured
+    # 2026-09-08: a real worker printed its environment into its own transcript, and that transcript
+    # showed this session's Claude Code ids, socket paths and a sentry key had all been inherited
+    # straight into a third-party paid worker. The worker did nothing wrong — it had them because we
+    # handed them over. A launcher that passes its whole environment to a subprocess it does not own
+    # is exporting everything it happens to be holding.
+    for k in list(env):
+        u = k.upper()
+        if k == want:
+            continue
+        if (any(t in u for t in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"))
+                or u.startswith(("CLAUDE", "ANTHROPIC", "SENTRY", "AWS_", "GH_", "GITHUB_TOKEN"))):
+            env.pop(k, None)
     env[want] = value
     env["CODEX_HOME"] = env.get("CODEX_HOME", CODEX_HOME)
     return env, ""
@@ -213,7 +226,8 @@ def route_flags(profile, home=CODEX_HOME, env=None, legacy_model=None, legacy_ef
     return ["-p", profile], cenv, spec, ""
 
 
-def launch_argv(profile, result_path, schema=None, sandbox="workspace-write"):
+def launch_argv(profile, result_path, schema=None, sandbox="workspace-write",
+                writable_roots=()):
     """A NEW worker. The brief arrives on stdin and the caller closes it (see brief_stdin).
 
     §5, finding 3: choose ONE explicit input mode. The brief goes through a closed pipe rather than
@@ -228,13 +242,26 @@ def launch_argv(profile, result_path, schema=None, sandbox="workspace-write"):
     # is Astra's `medium` — so the profile is the single source of truth and route_matches checks
     # that it arrived. Same for `-m`: the profile names the model.
     argv = [codex_bin(), "exec", "--json", "--strict-config", "-p", profile,
-            "-s", sandbox, "-o", result_path]
+            "-s", sandbox, "-o", result_path] + writable_flags(writable_roots)
     if schema:
         argv += ["--output-schema", schema]
     return argv + ["-"]
 
 
-def resume_argv(profile, session_id, result_path, schema=None, sandbox="workspace-write"):
+def writable_flags(roots):
+    """`sandbox_workspace_write.writable_roots`, or nothing. Measured 2026-09-08.
+
+    Two real workers under `-s workspace-write` made their edit, ran the tests, and then could not
+    commit: `.git` is not writable under that sandbox unless it is named a writable root. Both
+    reported `blocked` and — worth noting on its own — both reported the UNCHANGED BASE sha as their
+    candidate_sha, which is a reminder that a worker's report of what it produced is a claim, not
+    evidence. Without this flag the managed launch path can edit and test but cannot deliver.
+    """
+    return ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(list(roots))] if roots else []
+
+
+def resume_argv(profile, session_id, result_path, schema=None, sandbox="workspace-write",
+                writable_roots=()):
     """RESUME an exact session. -> argv, or raises ValueError on an empty id.
 
     §5, finding 4, and both halves matter:
@@ -247,7 +274,7 @@ def resume_argv(profile, session_id, result_path, schema=None, sandbox="workspac
     if not str(session_id or "").strip():
         raise ValueError("resume needs the exact stored session id; --last is never acceptable here")
     argv = [codex_bin(), "exec", "--json", "--strict-config", "-p", profile,
-            "-s", sandbox, "-o", result_path]
+            "-s", sandbox, "-o", result_path] + writable_flags(writable_roots)
     if schema:
         argv += ["--output-schema", schema]
     return argv + ["resume", str(session_id), "-"]
@@ -283,8 +310,12 @@ def result_path_for(state_dir, item, attempt):
 # ------------------------------------------------------------------- what actually happened, if any
 FAIL_PATTERNS = (
     # (class, pattern). Ordered: the first match wins, so the specific sits above the general.
-    (AUTH, r"401|unauthor|invalid api key|authentication fail|forbidden"),
-    (QUOTA, r"rate.?limit|quota|usage limit|too many requests|429|insufficient credit"),
+    # WORD BOUNDARIES ON THE NUMERIC CODES, measured 2026-09-08 on three real workers: a bare `401`
+    # matched `Claude%401.46388.4` — a URL-encoded @ followed by a version number — inside an
+    # environment dump the worker had printed, and all three runs were reported as AUTH failures
+    # while their work had actually succeeded.
+    (AUTH, r"\b401\b|unauthori[sz]ed|invalid api key|authentication fail"),
+    (QUOTA, r"rate.?limit|\bquota\b|usage limit|too many requests|\b429\b|insufficient credit"),
     (CLI_CONFIG, r"unknown option|unrecognized|no such profile|unexpected argument|invalid config|"
                  r"strict-config|no such file or directory.*schema"),
     (TRANSPORT, r"connection refused|connection reset|timed out|temporary failure|dns|"
@@ -293,13 +324,44 @@ FAIL_PATTERNS = (
 )
 
 
-def classify_failure(text):
-    """Name the failure class in a worker's output, or None. Text only — never an exit code.
+def cli_level_text(text):
+    """The part of a run's output that the CLI ITSELF said. -> str.
+
+    Measured 2026-09-08 on three real workers, and it cost all three a wrong verdict. A worker's own
+    output is not a report about the run: it contains files it read, commands it ran, and — in these
+    three — a dump of the environment, where `Claude%401.46388.4` matched the AUTH pattern. All
+    three had done their work; all three were classified as authentication failures.
+
+    So failure classification reads only what the CLI emitted about itself: non-JSON lines (the
+    CLI's own stderr and plain messages) and JSONL events whose type names an error. The model's
+    message payloads are excluded — the worker may legitimately quote "401" or "rate limit" while
+    doing exactly what it was asked to do.
+    """
+    keep = []
+    for line in (text or "").splitlines():
+        st = line.strip()
+        if not st.startswith("{"):
+            keep.append(line)                     # a plain CLI line: usage errors, stderr, crashes
+            continue
+        try:
+            d = json.loads(st)
+        except ValueError:
+            keep.append(line)
+            continue
+        kind = str(d.get("type") or "")
+        if "error" in kind.lower() or "fail" in kind.lower():
+            keep.append(st)                       # an error EVENT is the CLI reporting on itself
+    return "\n".join(keep)
+
+
+def classify_failure(text, scoped=True):
+    """Name the failure class in a run's output, or None. Text only — never an exit code.
 
     Exit codes are the thing §5 says not to trust: "parse failure events even if the exit code is
-    zero". So this reads what the process SAID, and the caller combines it with everything else.
+    zero". So this reads what the process SAID — but only the parts the CLI said ABOUT ITSELF, which
+    is what `scoped` controls. Pass scoped=False only to classify text you already know is an error.
     """
-    low = (text or "").lower()
+    low = (cli_level_text(text) if scoped else (text or "")).lower()
     for cls, pat in FAIL_PATTERNS:
         if re.search(pat, low):
             return cls
@@ -494,7 +556,7 @@ def attempt_record(**kw):
 # ------------------------------------------------------------------------------------ the entry point
 def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owner=None,
                 base_sha=None, session_id=None, schema=None, timeout=None, home=CODEX_HOME,
-                sessions_root=None, env=None, runner=None):
+                sessions_root=None, env=None, runner=None, writable_roots=()):
     """Run ONE attempt end to end and return its durable record. Never raises for a worker failure.
 
     THIS IS THE ONLY FUNCTION A CALLER SHOULD USE, and every check above is wired here rather than
@@ -531,8 +593,10 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
 
     result_path = result_path_for(state_dir, item, attempt)
     try:
-        argv = (resume_argv(profile, session_id, result_path, schema=schema) if session_id
-                else launch_argv(profile, result_path, schema=schema))
+        argv = (resume_argv(profile, session_id, result_path, schema=schema,
+                            writable_roots=writable_roots) if session_id
+                else launch_argv(profile, result_path, schema=schema,
+                                 writable_roots=writable_roots))
     except ValueError as e:
         return rec(outcome=CLI_CONFIG, detail=str(e), result_path=result_path)
 

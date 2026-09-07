@@ -350,6 +350,57 @@ o, d, fl = M.verify_finish(M.profile_spec("muse-go-1", home=HOME)[0], "HTTP 401 
                            VF, "C1", 1, sessions_root=SESS)
 ok(o == M.AUTH, "verify_finish reads failure text even with a complete result file on disk")
 
+# ================================================= what THREE REAL WORKERS taught, 2026-09-08
+# Each of these is pinned from a live run, because none of them was reachable from a fixture I
+# would have thought to write. A module proof cannot produce a worker that prints its own
+# environment, or a sandbox that refuses a commit.
+
+# 1. The verdict all three runs got wrong. `Claude%401.46388.4` is a URL-encoded @ and a version
+#    number, inside an environment dump the worker itself printed, and it matched the AUTH pattern.
+#    All three had done their work.
+REAL = ('{"type":"item.completed","payload":{"text":"BAGGAGE=sentry-release=Claude%401.46388.4,'
+        'CLAUDE_CODE_HOST_SESSION_ID=local_833b36ca"}}')
+ok(M.classify_failure(REAL) is None,
+   "MUST BITE: a worker printing Claude%401... in its own output is NOT an auth failure — the "
+   "three real runs of 2026-09-08 were all classified AUTH while their work had succeeded")
+ok(M.classify_failure('{"type":"item.completed","payload":{"text":"the docs mention rate limit"}}')
+   is None,
+   "a worker QUOTING a failure phrase is not a failure: message payloads are not the CLI reporting "
+   "on itself")
+ok(M.classify_failure("stream error: 401 Unauthorized") == M.AUTH,
+   "a real CLI-level auth line is still caught")
+ok(M.classify_failure('{"type":"error","payload":{"message":"429 too many requests"}}') == M.QUOTA,
+   "an error EVENT is classified — that IS the CLI reporting on itself")
+ok(M.classify_failure("HTTP 401 Unauthorized", scoped=False) == M.AUTH,
+   "scoped=False still classifies text a caller already knows is an error")
+
+# 2. The environment we hand a third-party paid worker. The same dump showed this machine's Claude
+#    Code ids, a sentry key and socket paths had been inherited straight into it.
+e, _why = M.child_env(s, base={"OPENCODE_GO_KEY_1": "v", "CLAUDE_CODE_HOST_SESSION_ID": "local_x",
+                               "SENTRY_DSN": "https://k@sentry", "GITHUB_TOKEN": "ghp_x",
+                               "AWS_SECRET_ACCESS_KEY": "z", "MY_API_KEY": "q",
+                               "PATH": "/usr/bin", "HOME": "/h"})
+ok(e and e["OPENCODE_GO_KEY_1"] == "v" and e["PATH"] == "/usr/bin" and e["HOME"] == "/h",
+   "the child keeps what it needs to run")
+ok(all(k not in e for k in ("CLAUDE_CODE_HOST_SESSION_ID", "SENTRY_DSN", "GITHUB_TOKEN",
+                            "AWS_SECRET_ACCESS_KEY", "MY_API_KEY")),
+   "MUST BITE: this machine's other secrets and its session identity do NOT travel into a "
+   "third-party worker. A launcher that passes its whole environment exports everything it holds")
+
+# 3. Two real workers edited, tested, and then could not commit: .git is not writable under
+#    -s workspace-write unless it is named a writable root. Both reported blocked — and both
+#    reported the UNCHANGED BASE sha as their candidate_sha.
+a2 = M.launch_argv("muse-go-1", "/r/x.json", writable_roots=["/w/.git"])
+ok("sandbox_workspace_write.writable_roots=[\"/w/.git\"]" in a2,
+   "MUST BITE: writable roots reach the argv — without them the managed path can edit and test but "
+   "cannot commit, which is what both real workers hit")
+ok(not any("writable_roots" in x for x in M.launch_argv("muse-go-1", "/r/x.json")),
+   "and nothing is granted when nothing is asked for")
+ok(any("writable_roots" in x for x in M.resume_argv("muse-go-1", SID, "/r/x.json",
+                                                    writable_roots=["/w/.git"])),
+   "a resumed session gets the same grant, or it cannot finish what it was resumed to finish")
+
+
 print(f"\n{P} passed, {len(F)} failed")
 for f in F:
     print("  FAILED:", f)

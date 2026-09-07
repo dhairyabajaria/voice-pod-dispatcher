@@ -2063,3 +2063,53 @@ false positive gets "fixed" by deleting the explanation.
   and its directory is not on sys.path. My wiring test passed throughout — it had put that directory
   on the path itself. A fixture that repairs the very condition it exists to observe. dispatcher.py
   now inserts its own directory, and the test asserts that line rather than supplying it.
+
+2026-09-08 05:0x  §6.2 round 1 — THREE REAL WORKERS, three defects a module proof could not reach
+  museadapter.py, tests/test_muse.py (104 checks). Suite ALL GREEN. Disposable repos only: no trunk,
+  no box, no platform code.
+
+  Ran muse-go-1, -2 and -3 concurrently, one bounded edit/test/report each. VERIFIED FROM THE
+  ROLLOUTS, not from exit statuses: three distinct session ids, three distinct providers
+  (muse-go-1/2/3), model muse-spark-1.3-contributor and effort xhigh on all three, three distinct
+  cwds. Isolation and per-slot routing hold on real runs.
+
+  THEN THREE DEFECTS, none of which any fixture I would have written could produce:
+
+  1. ALL THREE RUNS WERE CLASSIFIED AUTH WHILE THEIR WORK HAD SUCCEEDED. A worker printed its own
+     environment, which contained `Claude%401.46388.4` — a URL-encoded @ and a version number — and
+     the bare `401` pattern matched it. classify_failure now reads only CLI-LEVEL text (non-JSON
+     lines and error-typed events), never the model's message payloads, and the numeric codes carry
+     word boundaries. A worker may legitimately quote "401" or "rate limit" while doing exactly what
+     it was asked.
+
+  2. THE SAME DUMP SHOWED WHAT WE HAD HANDED IT: this session's Claude Code ids, socket paths and a
+     sentry key, inherited straight into a third-party paid worker. The worker did nothing wrong; it
+     had them because the launcher passed its whole environment. child_env now strips anything
+     matching KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL and the CLAUDE/ANTHROPIC/SENTRY/AWS_/GH_ prefixes,
+     keeping the selected credential and what the child needs to run.
+
+  3. TWO WORKERS EDITED, TESTED, AND COULD NOT COMMIT. `.git` is not writable under
+     -s workspace-write unless named a writable root, so the managed launch path could edit and test
+     but not deliver. launch_argv and resume_argv now take writable_roots. Worth recording on its
+     own: both blocked workers reported the UNCHANGED BASE sha as their candidate_sha — a worker's
+     report of what it produced is a claim, not evidence.
+
+  All three are pinned as tests from the real log, because none was reachable by imagination.
+
+2026-09-08 05:1x  §6.2 round 2 — the managed launch path PASSES end to end (WORKER-2)
+  PROOF_62.md. Six real workers total across both rounds, disposable repos only.
+
+  Two concurrent workers on accounts 1 and 2: both edited, tested, COMMITTED, and wrote schema-valid
+  results correlated to their own item and session. Reported shas are the repositories' actual HEADs
+  and they differ — neither touched the other's repo. 35s and 30s, concurrent. Routes read back from
+  the rollouts: muse-go-1 and muse-go-2, xhigh, distinct cwds.
+
+  Parked question: E2E-Q was briefed on a deliberately incomplete specification and did NOT guess —
+  outcome "question", candidate_sha "none", one question returned. The answer was delivered by
+  resuming THAT EXACT session id (argv confirmed live: parent options, then `resume <id>`, no
+  --last). The resumed run reported back the same session id, implemented the answer, tested both
+  branches and committed 6772f9a. It is the same session continuing, not a new one.
+
+  Not established, and recorded as such: three concurrent is a floor not a ceiling; trivial tasks in
+  tiny repos say nothing about the platform repo; 30-92s is no basis for a timeout; the 27x token
+  spread is still unexplained so no slot count follows.
