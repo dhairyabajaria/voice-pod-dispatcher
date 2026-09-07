@@ -2315,3 +2315,32 @@ false positive gets "fixed" by deleting the explanation.
   each of them. Deliberately NOT defaulted defensively in the product — making codex_spawn tolerate
   a half-built object would hide exactly the missing initialisation a test exists to find. The whole
   suite caught both; my own new file did not, because it had set the field itself.
+
+2026-09-08 07:0x  THE BOARD FROZE FOR NINETEEN HOURS — write it on the degraded path, and date it
+  dispatcher.py, dispatcherctl.sh, tests/test_serverdown.py (15), tests/test_ctlself.py (9).
+  Suite 65 files, ALL GREEN.
+
+  BOSS reported `dispatcherctl status` printing "CODEX-1 idle: no eligible CODEX item" over a Muse
+  worker that had been running 91 seconds, and read it as the control script guessing. It was worse
+  and simpler: pending.json was last written 2026-09-07 12:49:14 — NINETEEN HOURS — because the
+  opencode early return happens before write_pending(). Nothing was guessing. The file was old, and
+  nothing on the board said so. Fourteen EXEC rows of yesterday's state ("building ... busy") were
+  being read as current all night.
+
+  1. THE DEGRADED TICK NOW WRITES THE BOARD, with this tick's real CODEX rows, and REPLACES the
+     opencode rows with one that says they are UNMEASURED — the same shape as the PAUSED board. A
+     stale row is worse than a missing one, because a row is an assertion about an executor nobody
+     is reading.
+
+  2. `status` DATES THE BOARD IT PRINTS: "996 MIN OLD — every row below is a snapshot from then, not
+     now." The daemon fix stops this particular staleness; a board can still go stale for other
+     reasons (a dead daemon, a full disk), and the reader must say how old the thing it shows is.
+
+  Mutations 3 of 3 CAUGHT after one was re-run in a valid form (blanking the map rather than
+  breaking the call, which crashed instead of returning a verdict).
+
+  AND A CHECK OF MINE THAT COULD NOT DISTINGUISH ITS OWN CAUSE. The first staleness check accepted
+  `"ago" in output` — but the heartbeat line prints "ago" on every run, so it stayed GREEN with the
+  staleness warning mutated away. Caught by mutating the warning and watching the check not move.
+  Now it requires the marker on the board's own line, and the same mutation reddens two checks
+  instead of one. Testing the test is the only thing that found it.

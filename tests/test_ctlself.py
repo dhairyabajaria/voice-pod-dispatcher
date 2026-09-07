@@ -14,7 +14,7 @@ So the fix carries a seam: `selfpath` prints exactly the path `restart` would re
 checks run it the way BOSS ran it — by relative name, from an unrelated directory — and require the
 answer to be a real file. Stopping the daemon to test the rest is not something a test may do.
 """
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CTL = os.path.join(HERE, os.pardir, "dispatcherctl.sh")
@@ -60,6 +60,33 @@ ok("$0 restart --force" not in src,
 i_dry = src.index('"${2:-}" == "--dry-run"')
 ok(src.index('"$SELF" stop') > i_dry,
    "the dry-run branch still exits ahead of the re-invocation, so the guard's safe path stays safe")
+
+
+# --------------------------------------------- `status` must date the board it prints
+# 2026-09-08: pending.json was nineteen hours old and `status` printed every row as though it were
+# current — fourteen executor rows of yesterday, and CODEX-1 idle over a live worker. The daemon
+# side is fixed (it writes the board on the degraded path now), but a board can go stale for other
+# reasons — a dead daemon, a full disk — and the reader must say how old the thing it is showing is.
+import json as _json, subprocess as _sp, tempfile as _tf, time as _t, os as _os
+_st = _tf.mkdtemp(prefix="ctlstatus-")
+_json.dump({"updated": "2026-09-07 12:49:14", "pending": [],
+            "executors": {"CODEX-1": "idle: no eligible CODEX item"}},
+           open(_os.path.join(_st, "pending.json"), "w"))
+_os.utime(_os.path.join(_st, "pending.json"), (_t.time() - 19 * 3600, _t.time() - 19 * 3600))
+_r = _sp.run(["/bin/zsh", CTL, "status"], capture_output=True, text=True,
+             env=dict(_os.environ, STATE=_st, VOICEPOD_STATE=_st))
+_out = _r.stdout + _r.stderr
+# NOT `"ago" in _out`: the heartbeat line prints "ago" on every run, so that check passed with the
+# staleness warning mutated away — it could not distinguish its own cause. Caught by mutating the
+# warning and watching this check stay green.
+ok("MIN OLD" in _out and "pending for BOSS" in _out,
+   "MUST BITE: `status` dates the board it prints, on the board's OWN line. A nineteen-hour-old "
+   "snapshot rendered as the present is how fourteen fictional executor rows and an idle-over-live-"
+   "work line survived a whole night of people reading them")
+ok("snapshot from then, not now" in _out or "MIN OLD" in _out,
+   "and it says plainly that the rows are from then rather than now, not merely a number the reader "
+   "has to do arithmetic on")
+shutil.rmtree(_st, ignore_errors=True)
 
 print(f"\n{P} passed, {len(F)} failed")
 for x in F: print("  FAILED:", x)

@@ -2613,7 +2613,24 @@ class Dispatcher:
                 "effect": "opencode executors are NOT observed and NOT fed; CODEX slots continue",
                 "as_of": now_local()}
             # CODEX HAS NO DEPENDENCY ON THAT SERVER and must not be held by its health.
-            self.state["degraded"]["codex"] = self.codex_only_pass()
+            codex_status = self.codex_only_pass()
+            self.state["degraded"]["codex"] = codex_status
+            # AND THE BOARD MUST BE WRITTEN, or it freezes at its last value and renders as current.
+            # Measured 2026-09-08: pending.json was last written 2026-09-07 12:49:14 — nineteen
+            # hours — because this path returns before write_pending(). `dispatcherctl status` was
+            # therefore printing fourteen EXEC rows of yesterday's fiction ("building ... busy") and
+            # `CODEX-1 idle: no eligible CODEX item` over a Muse worker that had been running for 91
+            # seconds. Nothing was guessing: the file was simply old, and nothing said so.
+            #
+            # The opencode rows are replaced rather than left standing. A stale row is worse than a
+            # missing one — it is an assertion — and the honest rendering of a sensor that is not
+            # reading is a row that says so, the same shape as the PAUSED board above.
+            self.write_pending(dict(
+                codex_status,
+                **{"(not observed)": f"opencode server unreachable {int(down_for) // 60}m — "
+                                     f"executor state is NOT being read, nothing is auto-continued, "
+                                     f"and no escalation can fire. These rows are UNMEASURED, not "
+                                     f"idle. CODEX slots are unaffected and are shown above."}))
             self.write_heartbeat(f"opencode unreachable {int(down_for)}s — CODEX dispatch only")
             self.save_state()
             return

@@ -66,6 +66,8 @@ def daemon(queue_items, health_ok, spawned):
     dp.escalate = lambda *a: None
     dp.notify_owner = lambda *a, **k: None
     dp.save_state = lambda: saved.append(1)
+    dp.write_pending = lambda m: boards.append(m)
+    dp.provider_error_summary = lambda: {}
     dp.reload_cfg = lambda: None
     dp.poll_lockwatch = lambda: None
     dp.codex_spawn = lambda slot, item: (spawned.append((slot, item["id"])), True)[1]
@@ -76,7 +78,7 @@ ITEM = [{"id": "C1", "status": "queued", "executor": "CODEX", "worktree": os.pat
          "lane": "l", "title": "t"}]
 
 # ---------------------------------------------------------------- the server is down
-logs, events, saved, spawned = [], [], [], []
+logs, events, saved, spawned, boards = [], [], [], [], []
 DP, dp = daemon(ITEM, False, spawned)
 dp.server_down_since = time.time() - 3600
 dp.tick()
@@ -103,7 +105,7 @@ dp.state["server_down_emitted"] = True          # the SERVER_DOWN event will not
 # the old one, so the second tick's dispatch lands somewhere this check cannot see — and the check
 # then fails for a reason that has nothing to do with the daemon. Same shape as every other fixture
 # defect tonight: the instrument, not the product.
-for _lst in (logs, events, saved, spawned): _lst.clear()
+for _lst in (logs, events, saved, spawned, boards): _lst.clear()
 time.sleep(1.05)
 dp.tick()
 ok(not any(e[0] == "SERVER_DOWN" for e in events),
@@ -113,8 +115,28 @@ ok(dp.state.get("degraded", {}).get("for_s", 0) > first["for_s"],
    "Sixteen hours of outage were announced once, yesterday, and were silent afterwards")
 ok(spawned == [("CODEX-1", "C1")], "and codex keeps being dispatched on every degraded tick")
 
+# ------------------------------------------------ THE BOARD, which froze for nineteen hours
+# Measured 2026-09-08: pending.json was last written 2026-09-07 12:49:14 because this path returns
+# before write_pending(). `dispatcherctl status` printed fourteen EXEC rows of yesterday's state and
+# `CODEX-1 idle: no eligible CODEX item` over a Muse worker that had been running for 91 seconds.
+# Nothing was guessing — the file was old, and nothing said so. A stale row is worse than a missing
+# one, because a row is an assertion.
+ok(len(boards) == 1,
+   "MUST BITE: the degraded tick WRITES the board. Returning before write_pending() freezes it at "
+   "its last value, and a frozen board renders exactly like a live one")
+b = boards[0] if boards else {}
+ok(b.get("CODEX-1", "").startswith("dispatched")
+   or "REFUSED" in b.get("CODEX-1", "") or "idle" in b.get("CODEX-1", ""),
+   "the CODEX rows carry this tick's real status, not the last one before the outage")
+ok(any("UNMEASURED" in v and "NOT being read" in v for v in b.values()),
+   "MUST BITE: the opencode rows are REPLACED by a row saying they are unmeasured — a stale "
+   "executor row is an assertion about an executor nobody is reading")
+ok(not any(k.startswith("EXEC-") for k in b),
+   "and yesterday's EXEC rows do not stand alongside it")
+
+
 # ---------------------------------------------------------------- the server comes back
-logs, events, saved, spawned = [], [], [], []
+logs, events, saved, spawned, boards = [], [], [], [], []
 DP2, dp2 = daemon(ITEM, True, spawned)
 dp2.state["degraded"] = {"reason": "stale"}
 try:
@@ -126,7 +148,7 @@ ok("degraded" not in dp2.state,
    "reported, or the board learns to ignore it")
 
 # ---------------------------------------------------------- three states, not one string
-logs, events, saved, spawned = [], [], [], []
+logs, events, saved, spawned, boards = [], [], [], [], []
 DP3, dp3 = daemon(ITEM, False, spawned)
 dp3.server_down_since = time.time() - 3600
 dp3.codex_spawn = lambda slot, item: dp3.refuse_spawn(slot, "staggered: waiting 14s behind the last spawn")
@@ -136,7 +158,7 @@ ok("REFUSED C1" in st.get("CODEX-1", "") and "staggered" in st["CODEX-1"],
    "MUST BITE: a REFUSED spawn says so and gives the reason, where it used to render as 'idle: no "
    "eligible CODEX item' — the same string as an empty queue")
 
-logs, events, saved, spawned = [], [], [], []
+logs, events, saved, spawned, boards = [], [], [], [], []
 DP4, dp4 = daemon([], False, spawned)
 dp4.server_down_since = time.time() - 3600
 dp4.tick()
@@ -144,9 +166,9 @@ ok(dp4.state.get("degraded", {}).get("codex", {}).get("CODEX-1") == "idle: no CO
    "an EMPTY queue says empty, and says nothing about refusals")
 
 src = open(os.path.join(HERE, os.pardir, "dispatcher.py")).read()
-ok('self.state["degraded"]["codex"] = self.codex_only_pass()' in src
-   and src.index("codex_only_pass()") < src.index("self.save_state()\n            return"),
-   "the codex pass happens BEFORE the early return, not after it")
+ok(src.index("codex_only_pass()") < src.index("self.save_state()\n            return")
+   and src.index("self.write_pending(dict(") < src.index("self.save_state()\n            return"),
+   "the codex pass AND the board write both happen BEFORE the early return, not after it")
 
 print(f"\n{P} passed, {len(F)} failed")
 for x in F: print("  FAILED:", x)

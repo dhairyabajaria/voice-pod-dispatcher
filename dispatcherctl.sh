@@ -245,9 +245,18 @@ case "${1:-status}" in
     else echo "heartbeat: none yet"; fi
     if [ -f "$STATE/pending.json" ]; then
       /usr/bin/python3 - "$STATE/pending.json" <<'EOF'
-import json,sys
+import json,os,sys,time
 d=json.load(open(sys.argv[1])); p=d.get("pending",[])
-print(f"pending for BOSS: {len(p)}  (updated {d.get('updated')})")
+# THE AGE OF THIS FILE, LOUDLY. Every row below is a snapshot, and a snapshot with no timestamp
+# reads as the present. On 2026-09-08 this file was nineteen hours old — fourteen executor rows of
+# yesterday's state, and `CODEX-1 idle` over a worker that had been running for 91 seconds — and
+# nothing on the board said so. An old board is not a quiet board.
+age = int(time.time() - os.path.getmtime(sys.argv[1]))
+warn = ""
+if age > 120:
+    warn = (f"   !! {age // 60} MIN OLD — every row below is a snapshot from then, not now. "
+            f"The daemon has not written this board since.")
+print(f"pending for BOSS: {len(p)}  (updated {d.get('updated')}, {age}s ago){warn}")
 for e in p:
     print(f"  {e['executor']:7} {e['kind']:13} since {e['since_local']}  age {e.get('age_min','?'):>4} min  esc={e['escalated']}  {e['excerpt'][:90]}")
     if e.get("stale"): print(f"          !! {e['stale']}")
