@@ -2178,6 +2178,14 @@ class Dispatcher:
         return None
 
     # -- Codex executors (owner order 2026-09-05: Plan 010 residuals and other sensitive items go to Codex, gpt-6-astra medium)
+    def _queue_items(self):
+        """The queue's items, for counting how many conversations sit on each account. Best effort:
+        a load count that cannot be read is a worse-placed session, never a failed dispatch."""
+        try:
+            return json.load(open(os.path.join(STATE_DIR, "queue.json"))).get("items", [])
+        except Exception:  # noqa: BLE001
+            return []
+
     def codex_slots(self):
         return [f"CODEX-{i + 1}" for i in range(int(self.c("codex_slots", 0)))]
 
@@ -2251,7 +2259,14 @@ class Dispatcher:
         # profiles, steps over a held one, and falls back to zen only when every Go key is held.
         # `last` lives in self.state so the rotation survives a tick: kept in a local, it would
         # restart at the head every time and hand every dispatch to muse-go-1.
-        profile, pnote = museadapter.select_profile(slot, item, self.cfg, mstate)
+        profile, pnote = museadapter.select_profile(slot, item, self.cfg, mstate,
+                                                    items=self._queue_items())
+        if profile == museadapter.WAIT:
+            # NOT a failure and NOT a re-placement. This conversation is warm on a key that is
+            # behind a rolling wall, and its cached prefix is worth more than the wait. The item is
+            # left exactly as it was for a later tick.
+            self.log(f"{slot}: {item['id']} waits — {pnote}")
+            return False
         if profile is None:
             self.log(f"{slot}: no usable profile for {item['id']}: {pnote}")
             item["status"] = "broken"; item["error"] = f"no usable profile: {pnote}"[:200]
@@ -2296,7 +2311,15 @@ class Dispatcher:
             item["status"] = "broken"; item["error"] = f"codex spawn failed: {e}"
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"codex spawn failed: {e}")
             return False
-        mstate["last"] = profile      # so the next dispatch rotates onward rather than repeating
+        # AFFINITY IS WRITTEN ON THE ITEM, which is what makes it survive. Until now the chosen
+        # profile lived only in self.state["codex"][slot] — slot-keyed RUN state — so a resume or a
+        # re-spawn of the same item re-entered selection with nothing, was placed again, and landed
+        # somewhere else with its warm prefix discarded and re-sent at full price. The state map is
+        # only a load index; the item's own field is what select_profile reads.
+        if profile not in (museadapter.LEGACY,) and not item.get("profile"):
+            item["muse_profile"] = profile
+            mstate.setdefault("affinity", {})[item["id"]] = profile
+        mstate["last"] = profile      # tie-break only: placement is least-loaded, not a cursor
         mstate["last_spawn_at"] = time.time()   # the stagger clock starts when a spawn SUCCEEDS
         self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000),
                                      "profile_note": pnote,
@@ -2374,11 +2397,17 @@ class Dispatcher:
                     # "the code is broken".
                     kind = "REFUSED"
                 if failed in (museadapter.AUTH, museadapter.QUOTA) and run.get("profile"):
+                    # The SCOPE is parsed from the log itself, not from the summary line below it:
+                    # a rolling wall and a weekly wall call for opposite actions (wait vs move) and
+                    # only the provider's own words distinguish them.
+                    scope = museadapter.quota_scope(whole) if failed == museadapter.QUOTA else None
                     museadapter.mark_unhealthy(
                         self.state.setdefault("muse", {}), run["profile"], failed,
-                        minutes=int(self.c("quota_hold_minutes", 60)),
+                        minutes=int(self.c("quota_hold_minutes", 60)), scope=scope,
                         why=f"{run['item']} on {slot}, log {os.path.basename(run['log'])}")
-                    self.log(f"{slot}: holding {run['profile']} — {failed} reported by {run['item']}")
+                    self.log(f"{slot}: holding {run['profile']} — {failed}"
+                             + (f" ({scope} wall)" if scope else "")
+                             + f" reported by {run['item']}")
                 route_note = ""
                 if run.get("provider_intended"):
                     spec = {"profile": run.get("profile"), "model": run.get("model_intended"),

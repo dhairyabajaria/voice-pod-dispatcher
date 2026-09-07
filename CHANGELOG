@@ -2192,3 +2192,73 @@ false positive gets "fixed" by deleting the explanation.
   same second, so with staggering on they were deferred and passed for the wrong reason — proving
   the stagger rather than the route. Staggering is now off in the base config and exercised on its
   own.
+
+2026-09-08 06:1x  SESSION AFFINITY — place once, then leave it alone (WORKER-2)
+  museadapter.py, dispatcher.py, tests/test_muse.py (117), tests/test_codexroute.py (37),
+  MUSE_ADAPTER.md. Suite ALL GREEN.
+
+  BOSS withdrew the per-launch rotation an hour after asking for it, and he was right to: prompt
+  cache is per ACCOUNT and is 92% of everything Muse consumes (Go plan, 8,314,573,726 cache-read
+  against 4,988,483 output). Moving a live conversation to another key throws its prefix away and
+  re-sends it at full price, so distribution and cache pull in opposite directions.
+
+  His own check found the gap that made this urgent: select_profile's rule 1 honoured
+  item["profile"] and NOTHING EVER WROTE IT. The chosen profile lived only in
+  self.state["codex"][slot] — slot-keyed RUN state — so a resume or re-spawn of the same item
+  re-entered selection with nothing and was placed again somewhere else.
+
+  Now: a conversation's key is chosen once by LEAST-LOADED placement across the healthy Go profiles,
+  written onto the ITEM as muse_profile, and read back on every later dispatch. Least-loaded rather
+  than a cursor: it spreads by the thing that matters (warm conversations already on a key) and
+  self-corrects after a re-placement. Affinity follows the CONVERSATION, never CODEX-N — a
+  slot-keyed map moves warm sessions onto cold keys the moment slots are reassigned.
+
+  A warm conversation moves only when waiting cannot help: a ROLLING wall means WAIT (the window
+  refills; the cache outlives it), a WEEKLY wall or an AUTH hold means MOVE. An UNRECOGNISED wall
+  counts as rolling — guessing rolling idles a slot until someone looks, guessing weekly burns a
+  warm prefix on every wall we cannot parse, and the asymmetry is not close.
+
+  account_load() reports conversations per key, because ten sticky sessions over three accounts is
+  3-4 warm conversations per key and a weekly wall now takes 3-4 of them down together.
+
+  A MISSED MUTATION, and what it found. Ignoring the wall's scope in the REAP scored MISSED: every
+  check drove the SPAWN, and the scope is parsed in the reap — a guard on a path nothing in the
+  proof set entered, the same shape as the restart bug an hour earlier. Adding reap-level checks
+  then found a REAL DEFECT: `weekly limit reached` matched no QUOTA pattern at all, so a weekly
+  refusal was not classified as a refusal — no hold, no REFUSED row, and the next tick dispatched
+  straight back into the same wall. Fixed and pinned.
+
+  Mutations after that: 9 of 9 CAUGHT across both files (ignore affinity; move for a rolling wall;
+  wait for a weekly wall; default an unknown wall to weekly; place on the head instead of
+  least-loaded; stop writing affinity onto the item; treat WAIT as an ordinary selection; ignore the
+  scope in the reap; drop `limit reached`). One earlier attempt produced a NameError rather than a
+  verdict and was re-run as a valid mutation instead of being counted — a crash is neither a catch
+  nor a miss.
+
+
+2026-09-08 06:3x  Live HANDLES stripped from Muse workers — my defect, found in the list (WORKER-2)
+  museadapter.py, tests/test_muse.py (119). Suite ALL GREEN.
+
+  BOSS and ★ listed the running daemon's environment (names only) and found SSH_AUTH_SOCK alongside
+  all six OPENCODE keys. I checked my own stripping against it and it does NOT remove it:
+  SSH_AUTH_SOCK matches none of KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL and none of the prefixes. So
+  the Muse path was carrying the agent socket too, in code I had told BOSS was clean.
+
+  A handle is a different category from a secret. A secret is INFORMATION — holding it lets someone
+  act as us later. A handle is AUTHORITY — a live connection to something that acts on the owner's
+  behalf on request. A process holding SSH_AUTH_SOCK can ask the owner's running agent to SIGN: it
+  never sees the private key, it is not limited to reading, and the agent does not ask who is
+  calling. That is push access to everything the agent can authenticate.
+
+  HANDLES now strips SSH_AUTH_SOCK, SSH_AGENT_PID, GPG_AGENT_INFO, DBUS_SESSION_BUS_ADDRESS,
+  CLAUDE_CODE_MESSAGING_SOCKET, DOCKER_HOST and KUBECONFIG. 2 of 2 mutations CAUGHT.
+
+  THE LESSON IS BIGGER THAN THE LIST: a deny-list by pattern removes exactly what somebody thought
+  to name, and what nobody named is indistinguishable from what is not there. The list is now
+  enumerated and commented rather than inferred from word-shapes.
+
+  MUSE PATH ONLY. The LEGACY branch of route_flags still passes the unstripped environment to every
+  Astra spawn — the owner's decision, with both recommendations attached, and it is the same
+  two-line change pointing that branch at child_env. Stripping a socket from workers I introduced is
+  not a behaviour change to anything that was working; changing what the owner's reviewer slots
+  receive is.

@@ -44,12 +44,33 @@ five sessions on `muse-spark-1.3-contributor-free` via `muse-zen-1`, from a scra
 is not ours, between 02:24 and 02:33. Something else on this machine reaches for that profile.
 Passing the right flags is not evidence that they took.
 
-## Credentials
+## Credentials, and the difference between a secret and a handle
 
 Read by NAME, never by value. The adapter consults `bool(value)` and nothing else; no value is
 logged, compared, returned or stored in an attempt record. The child process gets exactly one
 account's variable, and every other account's credential is REMOVED from its environment even when
 this process inherited it.
+
+### Handles are not secrets, and a pattern list only removes what somebody named
+
+The child environment strips two different things for two different reasons.
+
+**Secrets** — anything matching KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL, or the CLAUDE/ANTHROPIC/
+SENTRY/AWS_/GH_ prefixes. These are *information*: holding one lets someone act as us later.
+
+**Handles** — `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`,
+`CLAUDE_CODE_MESSAGING_SOCKET`, `DOCKER_HOST`, `KUBECONFIG`. These are *authority*: a live connection
+to something that will act on the owner's behalf when asked.
+
+`SSH_AUTH_SOCK` is the one that makes the distinction matter. A process holding it can ask the
+owner's running agent to **sign**. It never sees the private key, it is not limited to reading, and
+the agent does not ask who is calling — that is push access to everything the agent can
+authenticate, for as long as the socket is reachable.
+
+**The name-matching missed it entirely**, because `SSH_AUTH_SOCK` contains none of those words, and
+this adapter was reported as clean while carrying it. That is the general lesson worth more than the
+list: a deny-list by pattern removes exactly what somebody thought to name, and the thing you did
+not think to name looks identical to the thing that is not there.
 
 ### Rotation warning — two spellings, one secret, one file
 
@@ -105,23 +126,60 @@ is the entirety of the three-key distribution.** No key logic belongs in the dis
 belongs in `roster.json`. The adapter still checks the selected key is present and non-empty before
 launch; it never handles the value.
 
-## Selecting a profile: pin, or rotate
+## Session affinity: place once, then leave it alone
+
+**Prompt cache is per account, and it is 92% of what Muse consumes** — measured on the Go plan,
+8,314,573,726 cache-read tokens against 4,988,483 output. Moving a live conversation to a different
+key throws that prefix away and re-sends it as fresh input at full price.
+
+So distribution and cache pull in opposite directions, and the resolution is: **spread NEW
+conversations widely, then never move them.**
+
+* A conversation's key is chosen once, on its first dispatch, by **least-loaded placement** across
+  the healthy Go profiles — the thing that matters is how many warm conversations a key already
+  carries, and least-loaded self-corrects after a re-placement where a rotating cursor would keep
+  feeding the busiest key.
+* The chosen profile is written **onto the item** (`muse_profile`). Every resume, retry and re-spawn
+  reads it and lands on the same key.
+* **Affinity follows the conversation, never the slot.** A mapping keyed on `CODEX-N` silently moves
+  a warm session onto a cold key the moment slots are reassigned.
+
+Per-launch rotation is the most expensive scheduling policy available and this file does not
+implement it.
+
+### When a warm conversation may be moved
+
+| the key is | action | why |
+|---|---|---|
+| behind a **rolling** wall | **WAIT** | the window refills on its own; the cache outlives it |
+| behind a **weekly** wall | **MOVE** | waiting a week costs more than a cold start |
+| **AUTH**-held | **MOVE** | waiting cannot help when a human has to act |
+
+**An unrecognised wall counts as rolling.** Guessing rolling when it was weekly idles a slot until
+someone looks; guessing weekly when it was rolling burns a warm prefix on every wall we cannot
+parse. The asymmetry is not close.
+
+## Selecting a profile: pin, or place
 
 `codex_routes` in `roster.json` says what a slot does, and the two options mean different things:
 
 | value | behaviour |
 |---|---|
 | a profile name (`muse-go-1`) | **pinned.** Always that key, unless it is held, in which case this dispatch is stepped over to a healthy one. |
-| `rotate` (or `muse` / `go` / `pool`) | **distributed.** Round-robin over the healthy Go profiles, advancing every dispatch. |
+| `rotate` (or `muse` / `go` / `pool`) | **placement.** A NEW conversation goes to the least-loaded healthy Go profile; an existing one keeps its own key. |
 | absent | the historic Astra route, unchanged. |
 
-**With every slot pinned to a name, no rotation happens and a third key is never selected.** That is
+**With every slot pinned to a name, no placement happens and a third key is never selected.** That is
 a legitimate configuration, but it is not the owner's "distribute across all three keys" — that
 needs `rotate`. An item's own `profile` field overrides both, and is honoured even for a held
 profile, because someone asked for that one specifically.
 
-`last` lives in the daemon's state, not in a local, so rotation advances across ticks rather than
-restarting at the head and handing every dispatch to `muse-go-1`.
+`last` survives in the daemon's state only as a tie-break between equally-loaded keys. Placement is
+by load, not by cursor.
+
+Ten sticky sessions over three accounts is **3-4 warm conversations per key**, which is good for
+cache and makes per-account quota the binding constraint — a weekly wall now takes 3-4 conversations
+down together, so `account_load()` reports the per-key count before that happens rather than after.
 
 ## Health: three failures, three different answers
 

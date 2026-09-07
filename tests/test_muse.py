@@ -378,6 +378,24 @@ e, _why = M.child_env(s, base={"OPENCODE_GO_KEY_1": "v", "CLAUDE_CODE_HOST_SESSI
                                "PATH": "/usr/bin", "HOME": "/h"})
 ok(e and e["OPENCODE_GO_KEY_1"] == "v" and e["PATH"] == "/usr/bin" and e["HOME"] == "/h",
    "the child keeps what it needs to run")
+
+# A HANDLE IS NOT A SECRET, and the pattern list did not cover it. BOSS and ★ listed the running
+# daemon's environment on 2026-09-08 and found SSH_AUTH_SOCK being handed to every worker. It grants
+# SIGNING — a worker can ask the owner's live agent to authenticate as them, without ever seeing a
+# private key — so it is authority, not information. My own name-matching missed it completely
+# (SSH_AUTH_SOCK contains none of KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL) and I had told BOSS this path
+# was clean. A pattern list removes only what somebody thought to name.
+_h, _why = M.child_env(s, base={"OPENCODE_GO_KEY_1": "v", "PATH": "/usr/bin",
+                                "SSH_AUTH_SOCK": "/tmp/agent.sock", "SSH_AGENT_PID": "123",
+                                "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc.sock",
+                                "KUBECONFIG": "/h/.kube/config", "DOCKER_HOST": "tcp://x"})
+ok(_h and all(k not in _h for k in ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "KUBECONFIG", "DOCKER_HOST",
+                                    "CLAUDE_CODE_MESSAGING_SOCKET")),
+   "MUST BITE: live HANDLES are stripped, not just secrets — a worker holding SSH_AUTH_SOCK can ask "
+   "the owner's agent to sign, which is push access rather than an exposed value")
+ok(_h.get("PATH") == "/usr/bin" and _h.get("OPENCODE_GO_KEY_1") == "v",
+   "and the child still gets what it needs to run")
+
 ok(all(k not in e for k in ("CLAUDE_CODE_HOST_SESSION_ID", "SENTRY_DSN", "GITHUB_TOKEN",
                             "AWS_SECRET_ACCESS_KEY", "MY_API_KEY")),
    "MUST BITE: this machine's other secrets and its session identity do NOT travel into a "
@@ -401,33 +419,59 @@ ok(any("writable_roots" in x for x in M.resume_argv("muse-go-1", SID, "/r/x.json
 # BOSS, 2026-09-08: preference_order and next_profile were called by nothing but their own tests, so
 # "distribute across all three keys, skip a key that has stopped working, fall back to zen when Go
 # stalls" was not implemented anywhere the daemon could reach. Landed-and-not-live, one layer down.
-st = {}
 CFG_ROTATE = {"codex_routes": {"CODEX-1": "rotate", "CODEX-2": "rotate"}}
-seen = []
-for _ in range(4):
-    _p, _n = M.select_profile("CODEX-1", cfg=CFG_ROTATE, state=st); st["last"] = _p; seen.append(_p)
-ok(seen == ["muse-go-1", "muse-go-2", "muse-go-3", "muse-go-1"],
-   "MUST BITE: a rotating slot uses ALL THREE keys and wraps — a static map never selects the third")
-ok(M.select_profile("CODEX-2", cfg={"codex_routes": {"CODEX-2": "muse-go-2"}},
-                    state=st)[0] == "muse-go-2",
-   "a slot pinned to a profile NAME still pins: rotation is asked for by token, not imposed")
-st2 = M.mark_unhealthy({}, "muse-go-1", M.AUTH, why="key refused")
-_p, _n = M.select_profile("CODEX-1", cfg={"codex_routes": {"CODEX-1": "muse-go-1"}}, state=st2)
-ok(_p != "muse-go-1" and "held" in _n and "stepped over" in _n,
-   "MUST BITE: a dead key is STEPPED OVER rather than taking its slot down, and the note says so")
-st3 = {}
-for g in M.GO_PROFILES: M.mark_unhealthy(st3, g, M.QUOTA, minutes=30, why="spent")
-_p, _n = M.select_profile("CODEX-1", cfg=CFG_ROTATE, state=st3)
-ok(_p in M.ZEN_PROFILES and "EVERY Go profile is held" in _n and "must not be offered as evidence" in _n,
-   "MUST BITE: zen is reached ONLY when every Go key is held, and the note refuses to let a zen "
-   "result stand in for a Go requirement")
-ok(M.select_profile("CODEX-1", cfg=dict(CFG_ROTATE, allow_zen=False), state=st3)[0] is None,
-   "with zen disabled, an exhausted pool yields NO profile rather than a silent legacy fallback")
-ok(M.select_profile("CODEX-9", cfg={}, state={})[0] == M.LEGACY,
+
+# PLACEMENT, NOT ROTATION. BOSS withdrew the per-launch rotation an hour after asking for it: prompt
+# cache is per ACCOUNT and is 92% of what Muse consumes (8.3B cache-read against 5M output on the Go
+# plan), so moving a live conversation re-sends its whole prefix at full price. New sessions spread;
+# existing ones stay put.
+st, its = {}, []
+for _i in range(6):
+    _it = {"id": f"I{_i}"}
+    _p, _n = M.select_profile("CODEX-1", _it, CFG_ROTATE, st, its)
+    _it["muse_profile"] = _p; its.append(_it)
+ok([i["muse_profile"] for i in its] == ["muse-go-1", "muse-go-2", "muse-go-3"] * 2,
+   "MUST BITE: NEW conversations are spread across all three keys by least-loaded placement")
+ok(M.account_load(st, its) == {"muse-go-1": 2, "muse-go-2": 2, "muse-go-3": 2},
+   "and the per-account load is even, which is what makes a weekly wall's blast radius visible")
+
+warm = its[0]
+ok(M.select_profile("CODEX-1", warm, CFG_ROTATE, st, its)[0] == "muse-go-1"
+   and "already warm" in M.select_profile("CODEX-1", warm, CFG_ROTATE, st, its)[1],
+   "MUST BITE: a conversation that already has a key KEEPS it — every resume, retry and re-spawn. "
+   "This is the whole point: a re-placed conversation throws away a prefix worth 92% of the spend")
+ok(M.select_profile("CODEX-2", warm, CFG_ROTATE, st, its)[0] == "muse-go-1",
+   "MUST BITE: affinity follows the CONVERSATION, not the slot — the same item on a different slot "
+   "still lands on its own warm key. A slot-keyed map moves warm sessions onto cold keys silently")
+
+st_roll = M.mark_unhealthy(dict(st), "muse-go-1", M.QUOTA, why="rate limit; resets in 42 min")
+_p, _n = M.select_profile("CODEX-1", warm, CFG_ROTATE, st_roll, its)
+ok(_p == M.WAIT and "rolling" in _n and "worth more than the wait" in _n,
+   "MUST BITE: a ROLLING wall makes a warm conversation WAIT for its own key, not move. The window "
+   "refills on its own and the cache outlives it")
+st_week = M.mark_unhealthy(dict(st), "muse-go-1", M.QUOTA, why="weekly limit reached for this key")
+_p, _n = M.select_profile("CODEX-1", warm, CFG_ROTATE, st_week, its)
+ok(_p != "muse-go-1" and _p != M.WAIT and "MOVED off" in _n and "warm prefix" in _n,
+   "MUST BITE: a WEEKLY wall re-places the conversation, and the note says the prefix is lost — "
+   "waiting a week for a key is worse than paying for a cold start")
+st_auth = M.mark_unhealthy(dict(st), "muse-go-1", M.AUTH, why="key refused")
+ok(M.select_profile("CODEX-1", warm, CFG_ROTATE, st_auth, its)[0] not in ("muse-go-1", M.WAIT),
+   "an AUTH hold also re-places: waiting cannot help when a human has to act")
+
+ok(M.quota_scope("weekly limit reached") == "weekly"
+   and M.quota_scope("resets in 42 min") == "rolling"
+   and M.quota_scope("some wall we have never seen") == "rolling",
+   "MUST BITE: an UNRECOGNISED wall defaults to rolling, so the conversation waits and keeps its "
+   "cache. Guessing rolling costs an idle slot; guessing weekly costs a warm prefix every time")
+ok(M.may_move({}, "muse-go-1") is False,
+   "a healthy profile is never a reason to move a conversation")
+
+ok(M.select_profile("CODEX-1", {"id": "X", "profile": "muse-go-2", "muse_profile": "muse-go-1"},
+                    CFG_ROTATE, st, its)[0] == "muse-go-2",
+   "an EXPLICIT item profile still beats affinity — a human naming a key means that key")
+ok(M.select_profile("CODEX-9", {"id": "X"}, {}, {}, [])[0] == M.LEGACY,
    "a slot with nothing muse-shaped configured still keeps the historic Astra route")
-ok(M.select_profile("CODEX-1", item={"profile": "muse-go-1"}, cfg=CFG_ROTATE, state=st2)[0] == "muse-go-1"
-   and "asked for it" in M.select_profile("CODEX-1", item={"profile": "muse-go-1"}, cfg=CFG_ROTATE, state=st2)[1],
-   "an item naming a HELD profile still gets it, and the note says the dispatch will try anyway")
+
 # health classes answer different questions
 h = M.mark_unhealthy({}, "muse-go-1", M.TRANSPORT, why="reset")
 ok(not M.unhealthy_now(h), "TRANSPORT is not held at all — that is the one worth retrying")

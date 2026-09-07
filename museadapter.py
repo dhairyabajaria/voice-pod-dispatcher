@@ -122,6 +122,20 @@ def next_profile(order, last=None):
 
 
 # --------------------------------------------------------------- credentials, in the child env only
+# A DIFFERENT CATEGORY FROM A SECRET, and the reason this list exists separately. Everything the
+# name-matching above removes is INFORMATION: knowing it lets someone impersonate us later. These
+# are HANDLES — a live connection to something that will act on the owner's behalf on request.
+#
+# SSH_AUTH_SOCK is the sharp one. A process holding it can ask the owner's running agent to SIGN. It
+# never sees the private key, it is not limited to reading, and the agent does not ask who is
+# calling: that is push access to everything the agent can authenticate, for as long as the socket
+# is reachable. Measured in the running daemon's environment by BOSS and ★ on 2026-09-08, and my own
+# stripping missed it — it matches none of KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL, so I told BOSS the
+# Muse path was clean when it was carrying the socket too. A pattern list only removes what somebody
+# thought to name.
+HANDLES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO", "DBUS_SESSION_BUS_ADDRESS",
+           "CLAUDE_CODE_MESSAGING_SOCKET", "DOCKER_HOST", "KUBECONFIG")
+
 KEY_ALIASES = {
     # Plan 003 §5, finding 1. The key file defines OPENCODE_GO_KEY1/2/3 and the profiles require
     # OPENCODE_GO_KEY_1/2/3 — one underscore apart, and no worker launches until something bridges
@@ -171,7 +185,8 @@ def child_env(spec, base=None):
         if k == want:
             continue
         if (any(t in u for t in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"))
-                or u.startswith(("CLAUDE", "ANTHROPIC", "SENTRY", "AWS_", "GH_", "GITHUB_TOKEN"))):
+                or u.startswith(("CLAUDE", "ANTHROPIC", "SENTRY", "AWS_", "GH_", "GITHUB_TOKEN"))
+                or u in HANDLES):
             env.pop(k, None)
     env[want] = value
     env["CODEX_HOME"] = env.get("CODEX_HOME", CODEX_HOME)
@@ -194,19 +209,98 @@ def child_env(spec, base=None):
 #   TRANSPORT                   -> not held at all. That is the one worth retrying.
 
 HOLD_FOREVER = 0            # held until a human clears it; a timestamp of 0 never expires
+WAIT = "WAIT"               # not a profile: this conversation should wait for its own key, not move
+
+# A quota wall has two shapes and they call for opposite actions. The rolling 5-hour window refills
+# on its own, so a warm conversation should WAIT for its own key. A weekly wall does not refill in
+# any useful time, so that conversation must be re-placed. Getting this backwards is expensive in
+# both directions: moving for a rolling wall throws away a prefix worth more than the wait, and
+# waiting for a weekly wall stalls a slot for days.
+WEEKLY_PATTERNS = r"weekly|per.?week|this week|7.?day|resets? (?:on|next) \w+day"
+ROLLING_PATTERNS = r"5.?h(?:our)?|rolling|resets? in \d+\s*(?:m|min|h|hour)"
+
+
+def quota_scope(text):
+    """'weekly' or 'rolling' for a quota refusal. Rolling is the DEFAULT and that is deliberate.
+
+    An unrecognised wall is treated as rolling, so the conversation waits and keeps its cache. The
+    cost of guessing rolling when it was weekly is a slot idle until someone looks; the cost of
+    guessing weekly when it was rolling is throwing away a warm prefix on every wall we cannot
+    parse. Prompt cache is 92% of what Muse consumes (measured on the Go plan: 8.3B cache-read
+    against 5M output), so the asymmetry is not close.
+    """
+    return "weekly" if re.search(WEEKLY_PATTERNS, (text or "").lower()) else "rolling"
 ROTATE_TOKENS = ("rotate", "muse", "muse-go", "go", "pool")   # a slot that distributes, not a pin
 LEGACY = "legacy-astra"     # the route the daemon has always taken: -m <model> plus a global effort
 
 
-def mark_unhealthy(state, profile, cls, now=None, minutes=60, why=""):
-    """Record that a profile is not usable, and for how long. Mutates and returns `state`."""
+def mark_unhealthy(state, profile, cls, now=None, minutes=60, why="", scope=None):
+    """Record that a profile is not usable, for how long, and whether a warm session may move."""
     now = time.time() if now is None else now
     if cls == TRANSPORT:
         return state                                  # retryable: nothing to hold
+    scope = scope or (quota_scope(why) if cls == QUOTA else None)
+    if cls == QUOTA and scope == "weekly":
+        minutes = max(minutes, 7 * 24 * 60)           # a weekly wall does not refill in an hour
     until = (now + minutes * 60) if cls == QUOTA else HOLD_FOREVER
-    state.setdefault("unhealthy", {})[profile] = {"class": cls, "until": until,
+    state.setdefault("unhealthy", {})[profile] = {"class": cls, "until": until, "scope": scope,
                                                   "since": now, "why": str(why)[:300]}
     return state
+
+
+def may_move(state, profile, now=None):
+    """May a warm conversation on `profile` be re-placed? -> bool.
+
+    Only when waiting cannot help: an AUTH hold (a human must act) or a WEEKLY quota wall. A rolling
+    quota refills on its own and the prefix is worth more than the wait.
+    """
+    h = (state or {}).get("unhealthy", {}).get(profile)
+    if not h:
+        return False
+    if h.get("class") == QUOTA:
+        return h.get("scope") == "weekly"
+    return True
+
+
+def account_load(state, items=()):
+    """How many conversations are placed on each Go profile. -> {profile: n}.
+
+    Instrumented because stickiness changes what a quota wall costs: ten sticky sessions over three
+    accounts is 3-4 warm conversations per key, so a weekly wall now takes 3-4 of them down together
+    rather than one. Counting is what makes that visible before it happens rather than after.
+    """
+    load = {p: 0 for p in GO_PROFILES}
+    seen = set()
+    for it in items or ():
+        p = (it or {}).get("muse_profile")
+        if p:
+            load[p] = load.get(p, 0) + 1
+            seen.add(str((it or {}).get("id")))
+    for iid, p in ((state or {}).get("affinity") or {}).items():
+        if str(iid) not in seen:
+            load[p] = load.get(p, 0) + 1
+    return load
+
+
+def place_new(state, held, items=()):
+    """Where a NEW conversation goes. -> profile or None. Least-loaded healthy Go key.
+
+    PLACEMENT, NOT ROTATION — BOSS, 2026-09-08, withdrawing the per-launch rotation he had asked for
+    an hour earlier. Prompt cache is per ACCOUNT, so moving a live conversation to another key throws
+    away its prefix and re-sends it at full price; distribution and cache pull in opposite
+    directions. The resolution is to spread NEW sessions widely and then leave them alone.
+
+    Least-loaded rather than round-robin: it spreads by the thing that actually matters (how many
+    warm conversations a key is already carrying) and it self-corrects after a re-placement, where a
+    rotating cursor would keep handing work to a key that is already the busiest.
+    """
+    pool = [p for p in GO_PROFILES if p not in held]
+    if not pool:
+        return None
+    load = account_load(state, items)
+    fewest = min(load.get(p, 0) for p in pool)
+    tied = [p for p in pool if load.get(p, 0) == fewest]
+    return next_profile(tied, (state or {}).get("last")) if len(tied) > 1 else tied[0]
 
 
 def unhealthy_now(state, now=None):
@@ -221,36 +315,47 @@ def unhealthy_now(state, now=None):
     return out
 
 
-def select_profile(slot, item=None, cfg=None, state=None, now=None):
-    """Which profile THIS dispatch should use. -> (profile, note); profile None means no usable one.
+def select_profile(slot, item=None, cfg=None, state=None, items=(), now=None):
+    """Which profile THIS dispatch should use. -> (profile, note).
 
-    Order, most specific first:
-      1. the item's own `profile` — an explicit instruction is never rotated away from, and it is
-         used even if that profile is held, because someone asked for that one specifically. The
-         note says so, and the launch then refuses on its own terms if the key really is gone.
-      2. NOTHING CONFIGURED -> LEGACY, immediately. An earlier cut of this function fell through to
-         rotation here, which would have put every unconfigured slot on Muse as a side effect of
-         wiring the policy — the exact silent re-route the default exists to avoid. The check for it
-         is why it was caught.
-      3. a rotation TOKEN (`codex_routes: {CODEX-1: rotate}`) -> round-robin over the healthy Go
-         profiles, starting after whichever was used last. `last` lives in the daemon's state so it
-         rotates ACROSS ticks; in a local it would restart at the head and hand everything to go-1.
-      4. a profile NAME -> pinned, unless that profile is held, in which case this dispatch is
-         stepped over to a healthy one rather than the slot going down with its key.
-      5. zen, only when EVERY Go profile is held. Permitted, not preferred, and the note says which
-         tier ran so a zen result cannot read as a Go result.
+    `profile` is a name, or LEGACY, or WAIT (this conversation should wait for its own key rather
+    than move), or None (nothing usable at all).
 
-    The note is returned as well as the choice because a substitution nobody can see is the failure
-    this layer exists to prevent.
+    THE ORDER, and every step is a decision about a warm prefix:
+      1. `item["profile"]` — an explicit human instruction. Honoured even if the profile is held,
+         because someone asked for that one specifically.
+      2. `item["muse_profile"]` — AFFINITY. Once a conversation has a key it keeps it, through every
+         resume, retry and re-spawn. Prompt cache is per ACCOUNT and is 92% of what Muse consumes
+         (8.3B cache-read against 5M output, Go plan), so moving a live conversation re-sends its
+         whole prefix at full price. When that key is held, the answer depends on WHY: a rolling
+         quota means WAIT (the cache outlives the wall), an AUTH hold or a WEEKLY wall means move.
+      3. nothing configured for the slot -> LEGACY, the historic Astra route, immediately.
+      4. a `rotate` token -> PLACEMENT of a new conversation on the least-loaded healthy key.
+      5. a profile NAME -> pinned, unless held, in which case this dispatch is stepped over.
+      6. zen, only when every Go profile is held.
+
+    Affinity is keyed on the CONVERSATION, never on `CODEX-N`: a slot-keyed mapping silently moves a
+    warm session onto a cold key the moment slots are reassigned, which is the same bug in a hat.
     """
     state = state if state is not None else {}
     cfg = cfg or {}
     held = unhealthy_now(state, now)
     if item and str(item.get("profile") or "").strip():
         p = item["profile"].strip()
-        return p, (f"item named {p}" + (f" — NOTE: it is currently held ({held[p]}), and this "
-                                        f"dispatch will try it anyway because the item asked for it"
-                                        if p in held else ""))
+        return p, (f"item explicitly names {p}"
+                   + (f" — NOTE: it is held ({held[p]}), and this dispatch will try it anyway "
+                      f"because the item asked for it" if p in held else ""))
+
+    stuck = str((item or {}).get("muse_profile") or "").strip()
+    if stuck:
+        if stuck not in held:
+            return stuck, f"affinity: this conversation is already warm on {stuck}"
+        if not may_move(state, stuck, now):
+            return WAIT, (f"affinity: {stuck} is held ({held[stuck]}) but the wall is a rolling one, "
+                          f"so this conversation WAITS for its own key rather than moving. Its "
+                          f"cached prefix is worth more than the wait")
+        # falls through to re-placement, and the note below will say it moved and why
+
     configured = str((cfg.get("codex_routes") or {}).get(slot) or "").strip()
     if not configured:
         return LEGACY, "nothing muse-shaped is configured for this slot"
@@ -259,13 +364,18 @@ def select_profile(slot, item=None, cfg=None, state=None, now=None):
     if not rotating and configured not in held:
         return configured, f"{slot} is configured for {configured}"
 
-    pool = [p for p in GO_PROFILES if p not in held]
-    if pool:
-        chosen = next_profile(pool, (state or {}).get("last"))
-        why = f"rotation across {len(pool)} healthy Go profile(s)"
-        if not rotating:
-            why = (f"{slot} is configured for {configured} but it is held ({held[configured]}), so "
-                   f"this dispatch is stepped over to {chosen} by {why}")
+    chosen = place_new(state, held, items)
+    if chosen:
+        load = account_load(state, items)
+        why = (f"placed on {chosen} ({load.get(chosen, 0)} conversation(s) already there; "
+               f"load {load})")
+        if stuck:
+            why = (f"MOVED off {stuck} — {held[stuck]} — and re-placed on {chosen}. The warm prefix "
+                   f"on {stuck} is lost, which is why only an AUTH hold or a WEEKLY wall may do "
+                   f"this. {why}")
+        elif not rotating:
+            why = (f"{slot} is configured for {configured} but it is held "
+                   f"({held[configured]}), so this dispatch is stepped over — {why}")
         return chosen, why
 
     zen = [p for p in ZEN_PROFILES if p not in held]
@@ -392,7 +502,13 @@ FAIL_PATTERNS = (
     # environment dump the worker had printed, and all three runs were reported as AUTH failures
     # while their work had actually succeeded.
     (AUTH, r"\b401\b|unauthori[sz]ed|invalid api key|authentication fail"),
-    (QUOTA, r"rate.?limit|\bquota\b|usage limit|too many requests|\b429\b|insufficient credit"),
+    # `limit reached` is here because a WEEKLY wall says exactly that and says nothing else: the
+    # first draft of these patterns matched "rate limit" and "quota" and missed "weekly limit
+    # reached" entirely, so a weekly refusal was not classified as a refusal at all — no hold, no
+    # REFUSED row, and the next tick dispatched straight back into the same wall. Found by a reap
+    # test, not by reading.
+    (QUOTA, r"rate.?limit|\bquota\b|usage limit|limit reached|weekly limit|"
+            r"too many requests|\b429\b|insufficient credit"),
     (CLI_CONFIG, r"unknown option|unrecognized|no such profile|unexpected argument|invalid config|"
                  r"strict-config|no such file or directory.*schema"),
     (TRANSPORT, r"connection refused|connection reset|timed out|temporary failure|dns|"

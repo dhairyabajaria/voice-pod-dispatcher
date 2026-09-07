@@ -47,7 +47,7 @@ M.CODEX_HOME = HOME          # route_flags' default home, so the daemon resolves
 WT = os.path.join(TMP, "wt"); os.makedirs(os.path.join(WT, "platform", ".venv", "bin"))
 LOGS = os.path.join(TMP, "logs"); os.makedirs(LOGS)
 ITEMS = os.path.join(TMP, "items"); os.makedirs(ITEMS)
-for _id in ("C1", "C2", "C3"):
+for _id in ("C1", "C2", "C3", "P0", "P1", "P2"):
     open(os.path.join(ITEMS, _id + ".md"), "w").write("the brief")
 
 
@@ -83,7 +83,7 @@ def daemon(cfg, env, spawned):
 # dispatches several times in the same second, and a stagger left on would defer them — every one of
 # those checks would then pass for the wrong reason, proving the stagger rather than the route.
 BASE_CFG = {"codex_bin": "/x/bin/codex", "codex_model": "gpt-6-astra", "codex_effort": "medium",
-            "codex_spawn_stagger_seconds": 0}
+            "codex_spawn_stagger_seconds": 0, "codex_slots": 1}
 
 def spawn(cfg_extra=None, item_extra=None, env=None):
     global logs, events
@@ -166,10 +166,10 @@ ok("read_result" not in src,
    "worker protocol changed first (§6.2). Claiming it here would be a guard that cannot fire")
 
 # ------------------------------------------------- the selection policy reaches the SPAWN PATH
-ok("museadapter.select_profile(" in src and 'mstate["last"] = profile' in src
-   and "museadapter.mark_unhealthy(" in src,
-   "MUST BITE: codex_spawn SELECTS (rotates, steps over a held key) rather than only routing, and "
-   "persists `last` in the daemon's state — kept in a local it would restart at the head each tick")
+ok("museadapter.select_profile(" in src and 'item["muse_profile"] = profile' in src
+   and "museadapter.mark_unhealthy(" in src and "museadapter.WAIT" in src,
+   "MUST BITE: codex_spawn SELECTS (places, keeps affinity, steps over a held key, waits behind a "
+   "rolling wall) rather than only routing, and writes the affinity onto the ITEM")
 
 for w in ("muse-go-1.config.toml", "muse-go-2.config.toml", "muse-go-3.config.toml"):
     open(os.path.join(HOME, w), "w").write(
@@ -178,24 +178,66 @@ for w in ("muse-go-1.config.toml", "muse-go-2.config.toml", "muse-go-3.config.to
         % (w[:9], w[:9], w[7]))
 ENV3 = {"PATH": "/usr/bin", "OPENCODE_GO_KEY_1": "k1", "OPENCODE_GO_KEY_2": "k2",
         "OPENCODE_GO_KEY_3": "k3"}
-picked, state = [], {}
-for _ in range(3):
+picked, state, seen_items = [], {}, []
+for _n in range(3):
     global logs, events
     logs, events = [], []
     cfg = dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"})
     spawned = {}
     DP, dp = daemon(cfg, ENV3, spawned)
-    dp.state["muse"] = state                      # the daemon's state, carried across ticks
+    dp.state["muse"] = state
+    dp._queue_items = lambda _s=seen_items: list(_s)      # the load index the daemon reads
+    it = {"id": f"P{_n}", "worktree": WT, "lane": "l", "title": "t"}
     real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
     try:
-        dp.codex_spawn("CODEX-1", {"id": "C1", "worktree": WT, "lane": "l", "title": "t"})
+        dp.codex_spawn("CODEX-1", it)
     finally:
         DP.os.environ.clear(); DP.os.environ.update(real)
     picked.append(spawned["cmd"][spawned["cmd"].index("-p") + 1])
+    seen_items.append(it)
     state = dp.state["muse"]
 ok(picked == ["muse-go-1", "muse-go-2", "muse-go-3"],
-   "MUST BITE: three consecutive dispatches through the REAL spawn path land on three different "
-   "keys — the owner's distribution instruction, on the path, not in a helper nobody calls")
+   "MUST BITE: three NEW conversations through the REAL spawn path are placed on three different "
+   "keys — the owner's distribution instruction, as placement rather than rotation")
+ok([i.get("muse_profile") for i in seen_items] == picked,
+   "MUST BITE: the chosen profile is written ONTO THE ITEM. Until now it lived only in slot-keyed "
+   "run state, so a resume re-entered selection with nothing and was placed again — discarding a "
+   "warm prefix worth 92% of the spend")
+ok(all(state["affinity"][i["id"]] == i["muse_profile"] for i in seen_items),
+   "and the daemon's load index agrees with the items")
+
+# the SAME conversation, dispatched again, must come back to its own key — even on another slot
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate", "CODEX-2": "rotate"}), ENV3, spawned)
+dp.state["muse"] = state
+dp._queue_items = lambda _s=seen_items: list(_s)
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    dp.codex_spawn("CODEX-2", dict(seen_items[0]))
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(spawned["cmd"][spawned["cmd"].index("-p") + 1] == seen_items[0]["muse_profile"],
+   "MUST BITE: a re-spawn of the same conversation ON A DIFFERENT SLOT still lands on its own warm "
+   "key — affinity follows the conversation, never CODEX-N")
+
+# a rolling wall: the item WAITS, untouched, rather than moving or breaking
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"}), ENV3, spawned)
+dp.state["muse"] = M.mark_unhealthy(dict(state), seen_items[0]["muse_profile"], M.QUOTA,
+                                    why="rate limit; resets in 30 min")
+dp._queue_items = lambda _s=seen_items: list(_s)
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    it0 = dict(seen_items[0])
+    rc = dp.codex_spawn("CODEX-1", it0)
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(rc is False and not spawned and it0.get("status") != "broken"
+   and any("waits" in str(x) for x in logs),
+   "MUST BITE: behind a ROLLING wall the conversation WAITS — nothing spawned, nothing broken, "
+   "nothing moved, and the log says why")
 
 logs, events = [], []
 spawned = {}
@@ -284,6 +326,50 @@ i_ref = src.index('kind = "REFUSED"')
 ok(src.index('pending[key] = {', i_ref) > i_ref,
    "and the REFUSED kind is set BEFORE the row is written, so the board sees it rather than the "
    "TURN_ENDED it would otherwise have been given")
+
+
+# ------------------------------------------------- THE REAP: a wall's SCOPE decides what happens next
+# A mutation that ignored the scope here scored MISSED: every check above drove the SPAWN, and the
+# scope is parsed in the REAP. The guard was on a path nothing in this file entered — the same shape
+# as the restart bug, found the same way.
+def reap(log_text, profile="muse-go-1"):
+    logs2, evs = [], []
+    DP2, dp2 = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"}), ENV3, {})
+    dp2.log = lambda *a, **k: logs2.append(a[0] if a else "")
+    dp2.emit = lambda *a: evs.append(a)
+    lg = os.path.join(LOGS, "reap.log"); open(lg, "w").write(log_text)
+    dp2.state["codex"] = {"CODEX-1": {"item": "C1", "pid": 999999, "log": lg,
+                                      "started_ms": int(time.time() * 1000), "profile": profile,
+                                      "model_intended": "muse-spark-1.3-contributor",
+                                      "provider_intended": profile, "effort_intended": "xhigh"}}
+    dp2.state["muse"] = {}
+    q = {"items": [{"id": "C1", "status": "dispatched", "dispatched_to": "CODEX-1"}]}
+    pend = {}
+    # codex_slots must be >= 1 or codex_tick iterates over NOTHING and every check below passes
+    # for the wrong reason — an empty loop is indistinguishable from a loop that did the work.
+    assert dp2.codex_slots(), "the reap harness must actually have a slot to reap"
+    dp2.codex_tick(q, pend, {}, 0, 0)
+    return dp2, pend, evs, logs2
+
+dp2, pend, evs, logs2 = reap("codex\nweekly limit reached for this key\n")
+h = dp2.state["muse"].get("unhealthy", {}).get("muse-go-1", {})
+ok(h.get("scope") == "weekly",
+   "MUST BITE: the reap parses the WALL'S SCOPE from the provider's own words — a weekly wall is "
+   "recorded as weekly, which is what later lets a warm conversation be re-placed")
+ok(h.get("until", 0) - h.get("since", 0) >= 6 * 24 * 3600,
+   "and a weekly hold lasts a week, not the rolling default's hour")
+ok(any(k[0] == "REFUSED" for k in evs),
+   "a refusal reaches the board as REFUSED rather than as a failure of the work")
+
+dp2, pend, evs, logs2 = reap("codex\nrate limit; resets in 42 min\n")
+h = dp2.state["muse"].get("unhealthy", {}).get("muse-go-1", {})
+ok(h.get("scope") == "rolling" and h.get("until", 0) - h.get("since", 0) < 6 * 24 * 3600,
+   "MUST BITE: a rolling wall is recorded as rolling and on a short clock — the conversation waits "
+   "for its own key instead of being moved off a cache worth 92% of the spend")
+
+dp2, pend, evs, logs2 = reap("codex\nREPORT READY: the work is done\n")
+ok(not dp2.state["muse"].get("unhealthy"),
+   "an ordinary finished run holds nothing: only a refusal takes a key out of service")
 
 
 print(f"\n{P} passed, {len(FAILED)} failed")
