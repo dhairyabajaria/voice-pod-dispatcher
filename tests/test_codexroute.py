@@ -47,7 +47,8 @@ M.CODEX_HOME = HOME          # route_flags' default home, so the daemon resolves
 WT = os.path.join(TMP, "wt"); os.makedirs(os.path.join(WT, "platform", ".venv", "bin"))
 LOGS = os.path.join(TMP, "logs"); os.makedirs(LOGS)
 ITEMS = os.path.join(TMP, "items"); os.makedirs(ITEMS)
-open(os.path.join(ITEMS, "C1.md"), "w").write("the brief")
+for _id in ("C1", "C2", "C3"):
+    open(os.path.join(ITEMS, _id + ".md"), "w").write("the brief")
 
 
 class FakeProc:
@@ -103,7 +104,7 @@ src = open(os.path.join(HERE, os.pardir, "dispatcher.py")).read()
 ok("sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))" in src,
    "MUST BITE: dispatcher.py puts its OWN directory on sys.path, so `import museadapter` survives "
    "being loaded by path — which is how all 62 test files load it")
-ok("import museadapter" in src and "museadapter.slot_route(" in src
+ok("import museadapter" in src and "museadapter.select_profile(" in src
    and "museadapter.route_flags(" in src and "museadapter.route_matches(" in src,
    "MUST BITE: dispatcher.py actually imports and calls museadapter — the check BOSS ran by hand "
    "(grep -c returned 0) is now a test that fails if the wiring is removed")
@@ -159,6 +160,67 @@ ok("read_result" not in src,
    "the daemon does NOT use the structured-result half: its workers report by writing REPORT READY "
    "in a log, not by writing a schema-shaped file, so correlating a terminal result needs the "
    "worker protocol changed first (§6.2). Claiming it here would be a guard that cannot fire")
+
+# ------------------------------------------------- the selection policy reaches the SPAWN PATH
+ok("museadapter.select_profile(" in src and 'mstate["last"] = profile' in src
+   and "museadapter.mark_unhealthy(" in src,
+   "MUST BITE: codex_spawn SELECTS (rotates, steps over a held key) rather than only routing, and "
+   "persists `last` in the daemon's state — kept in a local it would restart at the head each tick")
+
+for w in ("muse-go-1.config.toml", "muse-go-2.config.toml", "muse-go-3.config.toml"):
+    open(os.path.join(HOME, w), "w").write(
+        'model = "muse-spark-1.3-contributor"\nmodel_provider = "%s"\n'
+        'model_reasoning_effort = "xhigh"\n[model_providers.%s]\nenv_key = "OPENCODE_GO_KEY_%s"\n'
+        % (w[:9], w[:9], w[7]))
+ENV3 = {"PATH": "/usr/bin", "OPENCODE_GO_KEY_1": "k1", "OPENCODE_GO_KEY_2": "k2",
+        "OPENCODE_GO_KEY_3": "k3"}
+picked, state = [], {}
+for _ in range(3):
+    global logs, events
+    logs, events = [], []
+    cfg = dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"})
+    spawned = {}
+    DP, dp = daemon(cfg, ENV3, spawned)
+    dp.state["muse"] = state                      # the daemon's state, carried across ticks
+    real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+    try:
+        dp.codex_spawn("CODEX-1", {"id": "C1", "worktree": WT, "lane": "l", "title": "t"})
+    finally:
+        DP.os.environ.clear(); DP.os.environ.update(real)
+    picked.append(spawned["cmd"][spawned["cmd"].index("-p") + 1])
+    state = dp.state["muse"]
+ok(picked == ["muse-go-1", "muse-go-2", "muse-go-3"],
+   "MUST BITE: three consecutive dispatches through the REAL spawn path land on three different "
+   "keys — the owner's distribution instruction, on the path, not in a helper nobody calls")
+
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "muse-go-1"}), ENV3, spawned)
+dp.state["muse"] = M.mark_unhealthy({}, "muse-go-1", M.AUTH, why="refused earlier")
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    dp.codex_spawn("CODEX-1", {"id": "C2", "worktree": WT, "lane": "l", "title": "t"})
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+got = spawned["cmd"][spawned["cmd"].index("-p") + 1]
+ok(got != "muse-go-1" and any("stepped over" in str(x) for x in logs),
+   "MUST BITE: a held key is stepped over BY THE DAEMON and the substitution is logged — a slot "
+   "silently running on a key its config does not name is the failure this layer prevents")
+
+logs, events = [], []
+spawned = {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "muse-go-1"}), {"PATH": "/usr/bin"}, spawned)
+dp.state["muse"] = {}
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update({"PATH": "/usr/bin"})
+try:
+    it = {"id": "C3", "worktree": WT, "lane": "l", "title": "t"}
+    dp.codex_spawn("CODEX-1", it)
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(it["status"] == "broken" and "muse-go-1" in dp.state["muse"].get("unhealthy", {}),
+   "MUST BITE: a credential the launcher cannot find HOLDS the profile, so the next tick steps over "
+   "it instead of repeating the same refusal forever")
+
 
 print(f"\n{P} passed, {len(FAILED)} failed")
 for f in FAILED: print("  FAILED:", f)

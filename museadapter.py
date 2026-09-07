@@ -179,27 +179,104 @@ def child_env(spec, base=None):
 
 
 # ------------------------------------------------------------------------------ argv, launch/resume
-LEGACY = "legacy-astra"      # the route the daemon has always taken: -m <model> plus a global effort
+# ---------------------------------------------------------------- health, and the selection policy
+#
+# The owner's instruction has three parts and a static per-slot map implements none of them:
+# distribute across all three keys, SKIP a key that has stopped working, and fall back to zen when
+# Go stalls. A fixed map uses two keys, rotates nothing (muse-go-3 is never selected at all), and a
+# dead key takes its slot down with it rather than being stepped over.
+#
+# Health is held in the daemon's own state so it survives a tick, and the reasons are distinct
+# because they need different answers:
+#   AUTH / a missing credential -> held until a human fixes the key. Retrying cannot help and every
+#                                  retry is another refused call.
+#   QUOTA                       -> held until a CLOCK. It is not broken, it is spent.
+#   TRANSPORT                   -> not held at all. That is the one worth retrying.
+
+HOLD_FOREVER = 0            # held until a human clears it; a timestamp of 0 never expires
+ROTATE_TOKENS = ("rotate", "muse", "muse-go", "go", "pool")   # a slot that distributes, not a pin
+LEGACY = "legacy-astra"     # the route the daemon has always taken: -m <model> plus a global effort
 
 
-def slot_route(slot, item=None, cfg=None):
-    """Which profile a slot should run. -> profile name, or LEGACY for the historic Astra pair.
+def mark_unhealthy(state, profile, cls, now=None, minutes=60, why=""):
+    """Record that a profile is not usable, and for how long. Mutates and returns `state`."""
+    now = time.time() if now is None else now
+    if cls == TRANSPORT:
+        return state                                  # retryable: nothing to hold
+    until = (now + minutes * 60) if cls == QUOTA else HOLD_FOREVER
+    state.setdefault("unhealthy", {})[profile] = {"class": cls, "until": until,
+                                                  "since": now, "why": str(why)[:300]}
+    return state
 
-    Three sources, most specific first: the item's own `profile`, then a `codex_routes` map in
-    roster.json, then LEGACY.
 
-    THE DEFAULT IS DELIBERATELY THE OLD BEHAVIOUR. Every slot runs Astra today via `-m gpt-6-astra`
-    with no profile at all. Defaulting the slots to muse profiles here would re-route every existing
-    dispatch as a side effect of wiring, which is a change nobody asked for arriving inside a change
-    somebody did. Muse is opted INTO, per item or per slot, and the opt-in is one line of config.
+def unhealthy_now(state, now=None):
+    """The profiles that must be skipped right now, as {profile: reason}. Expired holds are gone."""
+    now = time.time() if now is None else now
+    out = {}
+    for prof, h in (state or {}).get("unhealthy", {}).items():
+        if h.get("until") == HOLD_FOREVER or now < h.get("until", 0):
+            when = ("until a human clears it" if h.get("until") == HOLD_FOREVER
+                    else f"for another {int((h['until'] - now) / 60) + 1} min")
+            out[prof] = f"{h.get('class')} {when}: {h.get('why') or 'no detail recorded'}"
+    return out
 
-    I do not write roster.json (it is not mine to edit), so `codex_routes` is read if someone adds it
-    and absent harmlessly if nobody has.
+
+def select_profile(slot, item=None, cfg=None, state=None, now=None):
+    """Which profile THIS dispatch should use. -> (profile, note); profile None means no usable one.
+
+    Order, most specific first:
+      1. the item's own `profile` — an explicit instruction is never rotated away from, and it is
+         used even if that profile is held, because someone asked for that one specifically. The
+         note says so, and the launch then refuses on its own terms if the key really is gone.
+      2. NOTHING CONFIGURED -> LEGACY, immediately. An earlier cut of this function fell through to
+         rotation here, which would have put every unconfigured slot on Muse as a side effect of
+         wiring the policy — the exact silent re-route the default exists to avoid. The check for it
+         is why it was caught.
+      3. a rotation TOKEN (`codex_routes: {CODEX-1: rotate}`) -> round-robin over the healthy Go
+         profiles, starting after whichever was used last. `last` lives in the daemon's state so it
+         rotates ACROSS ticks; in a local it would restart at the head and hand everything to go-1.
+      4. a profile NAME -> pinned, unless that profile is held, in which case this dispatch is
+         stepped over to a healthy one rather than the slot going down with its key.
+      5. zen, only when EVERY Go profile is held. Permitted, not preferred, and the note says which
+         tier ran so a zen result cannot read as a Go result.
+
+    The note is returned as well as the choice because a substitution nobody can see is the failure
+    this layer exists to prevent.
     """
+    state = state if state is not None else {}
+    cfg = cfg or {}
+    held = unhealthy_now(state, now)
     if item and str(item.get("profile") or "").strip():
-        return item["profile"].strip()
-    routes = (cfg or {}).get("codex_routes") or {}
-    return routes.get(slot) or LEGACY
+        p = item["profile"].strip()
+        return p, (f"item named {p}" + (f" — NOTE: it is currently held ({held[p]}), and this "
+                                        f"dispatch will try it anyway because the item asked for it"
+                                        if p in held else ""))
+    configured = str((cfg.get("codex_routes") or {}).get(slot) or "").strip()
+    if not configured:
+        return LEGACY, "nothing muse-shaped is configured for this slot"
+
+    rotating = configured.lower() in ROTATE_TOKENS
+    if not rotating and configured not in held:
+        return configured, f"{slot} is configured for {configured}"
+
+    pool = [p for p in GO_PROFILES if p not in held]
+    if pool:
+        chosen = next_profile(pool, (state or {}).get("last"))
+        why = f"rotation across {len(pool)} healthy Go profile(s)"
+        if not rotating:
+            why = (f"{slot} is configured for {configured} but it is held ({held[configured]}), so "
+                   f"this dispatch is stepped over to {chosen} by {why}")
+        return chosen, why
+
+    zen = [p for p in ZEN_PROFILES if p not in held]
+    if zen and cfg.get("allow_zen", True):
+        chosen = next_profile(zen, (state or {}).get("last"))
+        return chosen, ("EVERY Go profile is held (" + "; ".join(f"{k}: {v}" for k, v in held.items())
+                        + f") — falling back to the zen tier on {chosen}. A zen result must not be "
+                          f"offered as evidence for anything that named Go")
+    return None, ("every Go profile is held and " + ("zen is disabled by config" if zen else
+                  "no zen profile is available") + ": " +
+                  "; ".join(f"{k}: {v}" for k, v in held.items()))
 
 
 def route_flags(profile, home=CODEX_HOME, env=None, legacy_model=None, legacy_effort=None):

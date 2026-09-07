@@ -2113,3 +2113,45 @@ false positive gets "fixed" by deleting the explanation.
   Not established, and recorded as such: three concurrent is a floor not a ceiling; trivial tasks in
   tiny repos say nothing about the platform repo; 30-92s is no basis for a timeout; the 27x token
   spread is still unexplained so no slot count follows.
+
+2026-09-08 05:3x  SELECTION POLICY on the spawn path (WORKER-2, after BOSS's grep)
+  museadapter.py, dispatcher.py, tests/test_muse.py (113), tests/test_codexroute.py (21),
+  MUSE_ADAPTER.md. Suite ALL GREEN.
+
+  BOSS: preference_order and next_profile were called by nothing but their own tests, so the owner's
+  instruction — distribute across all three keys, skip a key that has stopped working, fall back to
+  zen when Go stalls — was not implemented anywhere the daemon could reach. Landed-and-not-live, one
+  layer inside the commit that fixed exactly that shape.
+
+  select_profile(slot, item, cfg, state) replaces slot_route, which is DELETED rather than kept: a
+  helper the daemon does not call is the thing being fixed, and two selectors invite the wrong one.
+  Order: an item's own profile (honoured even when held, because someone asked for that one) ->
+  nothing configured means LEGACY -> a `rotate` token means round-robin over the healthy Go profiles
+  -> a profile NAME pins, unless held, in which case the dispatch is stepped over -> zen only when
+  EVERY Go profile is held. Every branch returns a NOTE, and the daemon logs it whenever the choice
+  differs from the configured one: a slot silently running on a key its config does not name is the
+  failure this layer exists to prevent.
+
+  `last` is persisted in self.state["muse"], so rotation advances across ticks. In a local it would
+  restart at the head every time and hand every dispatch to muse-go-1 — proved by a mutation.
+
+  Health has three classes because they need three answers. AUTH and a missing credential are held
+  UNTIL A HUMAN clears them (retrying just refuses again); QUOTA is held until a CLOCK
+  (quota_hold_minutes, default 60 — the key is spent, not broken); TRANSPORT is not held at all,
+  being the one worth retrying. The spawn path holds a profile whose credential it cannot find; the
+  reap holds one whose log reports AUTH or QUOTA.
+
+  A DEFECT MY OWN CHECK CAUGHT MID-WRITE: the first cut fell through to rotation when nothing was
+  configured, which would have put every unconfigured slot on Muse as a side effect of wiring the
+  policy — the same silent re-route the default was chosen to avoid, reintroduced by the fix for
+  something else. The check that caught it existed only because I had written it for the earlier
+  wiring.
+
+  Mutations: 9 of 9 CAUGHT across both files, sources restored and md5-verified. Never rotate;
+  ignore held profiles; hold AUTH on a clock; hold TRANSPORT; reach zen before Go is exhausted;
+  rotate an unconfigured slot; stop persisting `last`; route without selecting; do not hold a
+  refused credential.
+
+  NOT LIVE YET, and it is a config line, not code: roster.json pins CODEX-1 to muse-go-1 and CODEX-2
+  to muse-go-2. Pinned slots do not rotate and muse-go-3 is never selected. Rotation needs
+  `codex_routes: {CODEX-1: rotate, CODEX-2: rotate}`. roster.json is not mine to edit.

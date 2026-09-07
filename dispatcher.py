@@ -2235,12 +2235,30 @@ class Dispatcher:
         # global `codex_effort` default is Astra's `medium` — passing it here would downgrade every
         # Muse worker with no error and a dispatch that looks correct. Nothing is re-routed by
         # default: with no `codex_routes` and no item `profile`, a slot keeps the historic Astra pair.
-        profile = museadapter.slot_route(slot, item, self.cfg)
+        # SELECTION, not just routing. A static per-slot map uses two keys, rotates none, and lets a
+        # dead key take its slot down with it. select_profile distributes across the healthy Go
+        # profiles, steps over a held one, and falls back to zen only when every Go key is held.
+        # `last` lives in self.state so the rotation survives a tick: kept in a local, it would
+        # restart at the head every time and hand every dispatch to muse-go-1.
+        mstate = self.state.setdefault("muse", {})
+        profile, pnote = museadapter.select_profile(slot, item, self.cfg, mstate)
+        if profile is None:
+            self.log(f"{slot}: no usable profile for {item['id']}: {pnote}")
+            item["status"] = "broken"; item["error"] = f"no usable profile: {pnote}"[:200]
+            self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"no usable profile: {pnote}")
+            return False
+        if profile != (self.cfg.get("codex_routes") or {}).get(slot):
+            # A substitution nobody can see is the failure this layer exists to prevent.
+            self.log(f"{slot}: profile {profile} — {pnote}")
         rflags, renv, rspec, rwhy = museadapter.route_flags(
             profile, env=dict(os.environ),
             legacy_model=self.c("codex_model", "gpt-6-astra"),
             legacy_effort=self.c("codex_effort", "medium"))
         if rflags is None:
+            # A credential this launcher cannot find is not a transient: hold the profile so the
+            # NEXT dispatch steps over it instead of repeating the same refusal on every tick.
+            if profile != museadapter.LEGACY:
+                museadapter.mark_unhealthy(mstate, profile, museadapter.AUTH, why=rwhy)
             # Refused BEFORE the paid work. A missing key or an unreadable profile discovered after
             # the worktree add and the uv sync costs both of them and shows DISPATCHED on the board.
             self.log(f"{slot}: route refused for {item['id']} ({profile}): {rwhy}")
@@ -2268,7 +2286,9 @@ class Dispatcher:
             item["status"] = "broken"; item["error"] = f"codex spawn failed: {e}"
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"codex spawn failed: {e}")
             return False
+        mstate["last"] = profile      # so the next dispatch rotates onward rather than repeating
         self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000),
+                                     "profile_note": pnote,
                                      "profile": rspec["profile"], "model_intended": rspec["model"],
                                      "provider_intended": rspec.get("provider"), "effort_intended": rspec.get("effort")}
         item.update({"status": "dispatched", "dispatched_to": slot, "session": f"codex:{proc.pid}", "dispatched_at": now_local()})
@@ -2330,6 +2350,16 @@ class Dispatcher:
                 # here is the difference between passing the right flags and knowing they took.
                 # UNMEASURED is not a pass and is not a failure either: it is reported and the run's
                 # own verdict stands, because a rollout we cannot read says nothing about the work.
+                # A key that refused or ran out is HELD here, where the evidence is, so the next
+                # dispatch steps over it. AUTH waits for a human, QUOTA waits for a clock, and
+                # TRANSPORT is not held at all — mark_unhealthy keeps that distinction.
+                failed = museadapter.classify_failure(whole)
+                if failed in (museadapter.AUTH, museadapter.QUOTA) and run.get("profile"):
+                    museadapter.mark_unhealthy(
+                        self.state.setdefault("muse", {}), run["profile"], failed,
+                        minutes=int(self.c("quota_hold_minutes", 60)),
+                        why=f"{run['item']} on {slot}, log {os.path.basename(run['log'])}")
+                    self.log(f"{slot}: holding {run['profile']} — {failed} reported by {run['item']}")
                 route_note = ""
                 if run.get("provider_intended"):
                     spec = {"profile": run.get("profile"), "model": run.get("model_intended"),

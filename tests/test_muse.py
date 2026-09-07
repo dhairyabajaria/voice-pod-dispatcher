@@ -314,14 +314,10 @@ ok('"--last"' not in src and "'--last'" not in src,
    "--last never appears as a string literal: it can only reach an argv as one, and it never does")
 
 # --------------------------------------------------------- the daemon's two routes, one builder
-ok(M.slot_route("CODEX-1") == M.LEGACY,
-   "MUST BITE: with nothing configured a slot keeps the OLD Astra route — wiring does not silently "
-   "re-route every existing dispatch")
-ok(M.slot_route("CODEX-1", cfg={"codex_routes": {"CODEX-1": "muse-go-1"}}) == "muse-go-1",
-   "a codex_routes entry selects a profile per slot")
-ok(M.slot_route("CODEX-1", item={"profile": "muse-go-2"},
-                cfg={"codex_routes": {"CODEX-1": "muse-go-1"}}) == "muse-go-2",
-   "an item's own profile beats the slot default")
+# slot_route was REMOVED, not kept alongside select_profile: a helper the daemon does not call is
+# the shape BOSS just caught one layer down, and keeping two selectors invites the wrong one.
+ok(not hasattr(M, "slot_route"),
+   "the superseded selector is gone rather than left as a second way to choose a profile")
 f, e, sp, why = M.route_flags(M.LEGACY, legacy_model="gpt-6-astra", legacy_effort="medium")
 ok(f == ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=medium"] and sp["tier"] == "legacy",
    "the legacy route keeps the historic pair exactly as it was")
@@ -399,6 +395,50 @@ ok(not any("writable_roots" in x for x in M.launch_argv("muse-go-1", "/r/x.json"
 ok(any("writable_roots" in x for x in M.resume_argv("muse-go-1", SID, "/r/x.json",
                                                     writable_roots=["/w/.git"])),
    "a resumed session gets the same grant, or it cannot finish what it was resumed to finish")
+
+
+# ========================================== the selection policy (the owner's actual instruction)
+# BOSS, 2026-09-08: preference_order and next_profile were called by nothing but their own tests, so
+# "distribute across all three keys, skip a key that has stopped working, fall back to zen when Go
+# stalls" was not implemented anywhere the daemon could reach. Landed-and-not-live, one layer down.
+st = {}
+CFG_ROTATE = {"codex_routes": {"CODEX-1": "rotate", "CODEX-2": "rotate"}}
+seen = []
+for _ in range(4):
+    _p, _n = M.select_profile("CODEX-1", cfg=CFG_ROTATE, state=st); st["last"] = _p; seen.append(_p)
+ok(seen == ["muse-go-1", "muse-go-2", "muse-go-3", "muse-go-1"],
+   "MUST BITE: a rotating slot uses ALL THREE keys and wraps — a static map never selects the third")
+ok(M.select_profile("CODEX-2", cfg={"codex_routes": {"CODEX-2": "muse-go-2"}},
+                    state=st)[0] == "muse-go-2",
+   "a slot pinned to a profile NAME still pins: rotation is asked for by token, not imposed")
+st2 = M.mark_unhealthy({}, "muse-go-1", M.AUTH, why="key refused")
+_p, _n = M.select_profile("CODEX-1", cfg={"codex_routes": {"CODEX-1": "muse-go-1"}}, state=st2)
+ok(_p != "muse-go-1" and "held" in _n and "stepped over" in _n,
+   "MUST BITE: a dead key is STEPPED OVER rather than taking its slot down, and the note says so")
+st3 = {}
+for g in M.GO_PROFILES: M.mark_unhealthy(st3, g, M.QUOTA, minutes=30, why="spent")
+_p, _n = M.select_profile("CODEX-1", cfg=CFG_ROTATE, state=st3)
+ok(_p in M.ZEN_PROFILES and "EVERY Go profile is held" in _n and "must not be offered as evidence" in _n,
+   "MUST BITE: zen is reached ONLY when every Go key is held, and the note refuses to let a zen "
+   "result stand in for a Go requirement")
+ok(M.select_profile("CODEX-1", cfg=dict(CFG_ROTATE, allow_zen=False), state=st3)[0] is None,
+   "with zen disabled, an exhausted pool yields NO profile rather than a silent legacy fallback")
+ok(M.select_profile("CODEX-9", cfg={}, state={})[0] == M.LEGACY,
+   "a slot with nothing muse-shaped configured still keeps the historic Astra route")
+ok(M.select_profile("CODEX-1", item={"profile": "muse-go-1"}, cfg=CFG_ROTATE, state=st2)[0] == "muse-go-1"
+   and "asked for it" in M.select_profile("CODEX-1", item={"profile": "muse-go-1"}, cfg=CFG_ROTATE, state=st2)[1],
+   "an item naming a HELD profile still gets it, and the note says the dispatch will try anyway")
+# health classes answer different questions
+h = M.mark_unhealthy({}, "muse-go-1", M.TRANSPORT, why="reset")
+ok(not M.unhealthy_now(h), "TRANSPORT is not held at all — that is the one worth retrying")
+h = M.mark_unhealthy({}, "muse-go-1", M.QUOTA, now=1000, minutes=30, why="spent")
+ok("muse-go-1" in M.unhealthy_now(h, now=1000) and not M.unhealthy_now(h, now=1000 + 31 * 60),
+   "MUST BITE: a QUOTA hold EXPIRES on a clock — it is spent, not broken")
+h = M.mark_unhealthy({}, "muse-go-1", M.AUTH, now=1000, why="refused")
+ok("muse-go-1" in M.unhealthy_now(h, now=1000 + 10 ** 7),
+   "an AUTH hold does NOT expire: retrying a refused key just refuses again")
+ok("until a human clears it" in M.unhealthy_now(h, now=1000)["muse-go-1"],
+   "and the reason says what would clear it")
 
 
 print(f"\n{P} passed, {len(F)} failed")

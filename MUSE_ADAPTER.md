@@ -105,6 +105,38 @@ is the entirety of the three-key distribution.** No key logic belongs in the dis
 belongs in `roster.json`. The adapter still checks the selected key is present and non-empty before
 launch; it never handles the value.
 
+## Selecting a profile: pin, or rotate
+
+`codex_routes` in `roster.json` says what a slot does, and the two options mean different things:
+
+| value | behaviour |
+|---|---|
+| a profile name (`muse-go-1`) | **pinned.** Always that key, unless it is held, in which case this dispatch is stepped over to a healthy one. |
+| `rotate` (or `muse` / `go` / `pool`) | **distributed.** Round-robin over the healthy Go profiles, advancing every dispatch. |
+| absent | the historic Astra route, unchanged. |
+
+**With every slot pinned to a name, no rotation happens and a third key is never selected.** That is
+a legitimate configuration, but it is not the owner's "distribute across all three keys" — that
+needs `rotate`. An item's own `profile` field overrides both, and is honoured even for a held
+profile, because someone asked for that one specifically.
+
+`last` lives in the daemon's state, not in a local, so rotation advances across ticks rather than
+restarting at the head and handing every dispatch to `muse-go-1`.
+
+## Health: three failures, three different answers
+
+A key that stops working is skipped and reported, never retried into the ground — and *how long* it
+is skipped depends on what went wrong:
+
+* **AUTH**, or a credential this launcher cannot find — held **until a human clears it**. Retrying
+  cannot help, and every retry is another refused call.
+* **QUOTA** — held **until a clock** (`quota_hold_minutes`, default 60). The key is not broken, it is
+  spent.
+* **TRANSPORT** — not held at all. That is the one failure worth retrying.
+
+Zen is reached only when **every** Go profile is held. The note on that dispatch says so, and says a
+zen result must not be offered as evidence for anything that named Go.
+
 ## Concurrency is a setting, and nobody can size it yet
 
 Six concurrent is a demonstrated floor, not a ceiling — nobody pushed past six, and a trivial prompt
