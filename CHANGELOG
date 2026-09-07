@@ -1930,3 +1930,86 @@ false positive gets "fixed" by deleting the explanation.
   Mutation-scored, restores verified: putting the counter back in front of the post CAUGHT.
   Verified: python3 tests/test_answer.py exit=0; zsh tests/run_all.sh exit=0, 64 files, 1145 PASS
   lines, 0 reds.
+
+2026-09-08 04:25  D — museadapter.py, the managed launch path for Codex CLI Muse workers (WORKER-2)
+  Plan 003 §5. NEW: museadapter.py (a68a1cb0), tests/test_muse.py (f96314a5, 77 checks),
+  MUSE_ADAPTER.md (48b63340); tests/run_all.sh wired (427a7a69). Suite 62 files, ALL GREEN.
+
+  run_attempt() is the only entry point and holds every guard, so no caller can forget one. The
+  chain, each link refused where nothing has been spent yet: the profile declares a route -> the
+  credential exists (checked BY NAME, never by value) -> the flags were accepted -> no failure
+  event in the output -> the intended route actually ran -> a terminal result correlated to item,
+  attempt and session on a path no earlier run could have written. Exit 0 is nowhere in that chain:
+  it is a statement about the process, not about the work, and the pilot's worker exited 0 having
+  done nothing.
+
+  Ten outcomes, each pointing a human somewhere different: OK BLOCKED AUTH QUOTA TRANSPORT
+  CLI_CONFIG CANCELLED INCOMPLETE ROUTE_MISMATCH NO_ATTEMPT. NO_ATTEMPT is deliberately not AUTH —
+  a credential that was never offered was never refused, and calling that an auth failure sends
+  somebody to inspect an account that is fine. Only TRANSPORT is retried; QUOTA waits for a clock
+  and AUTH waits for a human.
+
+  Routing: Go first, round-robin across all three keys so no one account discovers its limit alone;
+  zen permitted as a configured fallback (owner via BOSS 2026-09-08, withdrawing "never zen"). The
+  failure condition is "not the profile THIS attempt intended", which catches a Go attempt landing
+  on zen AND a zen attempt landing on Go. The route is read back from session_meta (provider) and
+  turn_context (model/effort), never from the worker's own report, because the pilot's worker
+  reported a model it was not running and because five zen sessions from a scratch workspace that
+  is not ours appeared on this machine on 2026-09-08. An unreadable route is UNMEASURED, and a
+  completed result on an unmeasured route returns INCOMPLETE: the work may be fine, but the claim
+  "this ran on <profile>" is the thing that cannot be made.
+
+  Credentials never leave the child environment: only bool(value) is ever consulted, every other
+  account's key is REMOVED from the child even when inherited, and the KEY1 -> KEY_1 spelling gap
+  is bridged there rather than by editing the shared key file. The alias map stays even though ★
+  has since fixed the file — a file that happens to be correct today is not a guard.
+
+  Mutation score, CALL SITES not helpers (standing rule 2026-09-07): 8 mutations, 8 CAUGHT, 0
+  MISSED; source restored and verified against its pre-image md5. Scored: dropping the credential
+  refusal, trusting the exit code, dropping the route refusal, dropping the result refusal, making
+  result paths reusable so a stale result satisfies a new run, resuming with --last, carrying every
+  account's credential into the child, and accepting an unverified route as OK.
+
+  Two defects found in my own code by running the set. (1) session_id_from_jsonl required an id of
+  >= 8 characters "because ids are UUIDs"; a short id then read as NO ID AT ALL and the attempt was
+  reported INCOMPLETE for the wrong reason — a length floor on a format that belongs to someone
+  else buys nothing and hides what it rejects. (2) Three of my checks were themselves broken: a
+  secret-leak check whose sentinel was the letter "v" (it matches ordinary prose), a path check
+  forbidding ".." inside an already-sanitised basename, and a source-order check that matched
+  run_attempt's docstring instead of its body.
+
+  NOT BUILT, named rather than left implicit: the pool that decides concurrency N and reports wait
+  reasons (run_attempt is per-attempt and holds no global state, so N concurrent workers already
+  work — nothing schedules them); and partial-edit preservation on a killed attempt, which needs
+  C's worktree convention first.
+
+2026-09-08 04:3x  D amendment — effort is part of the route (WORKER-2, after ★'s probe via BOSS)
+  museadapter.py 5b09d4de, tests/test_muse.py 6e647a22 (83 checks), MUSE_ADAPTER.md 4c9c00af.
+  Suite still ALL GREEN.
+
+  ★'s six-concurrent probe settled two things by reading rollouts rather than exit statuses:
+  --profile muse-go-N resolves to ~/.codex/muse-go-N.config.toml even though that name is in no
+  section of config.toml, and each profile's own model_reasoning_effort=xhigh reaches turn_context.
+
+  The trap that arrives WITH that fix rather than with the bug: the dispatcher's spawn argv passes a
+  global `-c model_reasoning_effort=<codex_effort>` defaulting to Astra's medium, so passing it
+  alongside --profile would downgrade every Muse worker from xhigh to medium with no error and a
+  correct-looking dispatch. launch_argv/resume_argv therefore pass NO effort flag and no -m — the
+  profile is the single source of truth — and route_matches now CHECKS the profile's effort arrived:
+  a differing effort is a refusal, an absent one is NOT FULLY MEASURED rather than a pass, and a
+  profile that declares no effort is not held to one. The verified-route note states in its own text
+  that turn_context records what the CLI SENT, not what the provider honoured.
+
+  Three more call-site mutations, all CAUGHT: adding the global effort flag to the argv, dropping the
+  effort half of the assertion, and treating a missing effort as verified. Running total 11/11, source
+  restored and md5-verified each time.
+
+  Also recorded in MUSE_ADAPTER.md, because it is a decision input and not a footnote: six identical
+  one-line prompts consumed 1,957 / 1,963 / 3,755 / 9,138 / 49,323 / 52,892 tokens — a 27x spread on
+  the same input, cause unexplained. Six concurrent is a demonstrated floor, not a ceiling. No slot
+  count can be justified from that, which is why no pool is built.
+
+  One chunk of D's credential work collapses: each profile carries its own model_provider AND env_key,
+  so one profile per slot IS the three-key distribution. No key logic in the dispatcher, no secret in
+  roster.json. The presence-and-non-empty check before launch stays; the alias map stays as a guard
+  against the file regressing, not because the file is wrong today.
