@@ -887,7 +887,9 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
     so a test cannot accidentally prove a path the product does not take.
     """
     sessions_root = sessions_root or SESSIONS_ROOT
-    runner = runner or subprocess_runner
+    # The worktree must be a subprocess input, not merely a label in its report.
+    # Existing injected runners retain the four-argument hermetic-test interface.
+    real_runner = runner is None
     rec = lambda **kw: attempt_record(item=item, attempt=attempt, owner=owner, worktree=worktree,
                                       base_sha=base_sha, profile=profile,
                                       started_at=started, ended_at=time.time(), **kw)
@@ -907,6 +909,10 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
         return rec(outcome=NO_ATTEMPT, detail=why)
 
     result_path = result_path_for(state_dir, item, attempt)
+    log_path = os.path.join(state_dir, os.path.basename(result_path) + ".events")
+    if real_runner:
+        from functools import partial
+        runner = partial(subprocess_runner, cwd=worktree, event_path=log_path)
     try:
         argv = (resume_argv(profile, session_id, result_path, schema=schema,
                             writable_roots=writable_roots) if session_id
@@ -924,7 +930,6 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
                    result_path=result_path)
 
     sid = session_id_from_jsonl(out) or session_id
-    log_path = os.path.join(state_dir, os.path.basename(result_path) + ".events")
     try:
         with open(log_path, "w") as fh:
             fh.write(out or "")
@@ -987,15 +992,59 @@ def verify_finish(spec, log_text, result_path, item, attempt, sessions_root=None
     return (OK if result.get("outcome") == "done" else BLOCKED), note, fields
 
 
-def subprocess_runner(argv, env, stdin_text, timeout):
-    """The real seam. Writes the brief down a pipe and CLOSES it (§5, finding 3)."""
+def subprocess_runner(argv, env, stdin_text, timeout, *, cwd=None, event_path=None):
+    """Run in the owned directory, persist live events, and stop only our process group.
+
+    A finite temporary stdin file gives the child EOF without putting the brief in
+    argv or blocking the parent on a full input pipe. Live logs survive a supervisor
+    crash; an absent terminal event remains incomplete, never a successful exit.
+    """
+    import selectors
+    import signal
     import subprocess
-    p = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True)
-    try:
-        out, err = p.communicate(input=stdin_text or "", timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        out, err = p.communicate()
-        raise TimeoutError(f"no result within {timeout}s; the worker (pid {p.pid}) was killed")
-    return p.returncode, out, err, p.pid
+    import tempfile
+    import contextlib
+    with tempfile.TemporaryFile() as prompt, contextlib.ExitStack() as stack:
+        prompt.write((stdin_text or "").encode()); prompt.seek(0)
+        # Refuse before launching if durable event storage is unavailable.
+        log = stack.enter_context(open(event_path, "ab", buffering=0)) if event_path else None
+        p = subprocess.Popen(argv, env=env, cwd=cwd, stdin=prompt,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             start_new_session=True)
+        chunks = {"out": [], "err": []}
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        cancelled = False
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(p.stdout, selectors.EVENT_READ, "out")
+                selector.register(p.stderr, selectors.EVENT_READ, "err")
+                while selector.get_map() or p.poll() is None:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        cancelled = True
+                        try: os.killpg(p.pid, signal.SIGTERM)
+                        except ProcessLookupError: pass
+                        try: p.wait(timeout=2)
+                        except subprocess.TimeoutExpired: pass
+                        # Descendants may still own pipes after the leader exits.
+                        try: os.killpg(p.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        deadline = None
+                    for key, _ in selector.select(timeout=0.1):
+                        data = os.read(key.fileobj.fileno(), 65536)
+                        if not data:
+                            selector.unregister(key.fileobj); key.fileobj.close()
+                            continue
+                        chunks[key.data].append(data)
+                        if log: log.write(data)
+            p.wait()
+        finally:
+            if log: log.close()
+            if p.poll() is None:
+                try: os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                p.wait()
+        out = b"".join(chunks["out"]).decode(errors="replace")
+        err = b"".join(chunks["err"]).decode(errors="replace")
+        if cancelled:
+            err += f"\nerror: cancelled after {timeout}s; owned process group stopped\n"
+        return p.returncode, out, err, p.pid
