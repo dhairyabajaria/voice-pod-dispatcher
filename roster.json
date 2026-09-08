@@ -29,6 +29,7 @@
  ],
  "codex_slots": 2,
  "codex_model": "gpt-6-astra",
+ "codex_routes": {"CODEX-1": "muse-go-1", "CODEX-2": "muse-go-2"},
  "codex_effort": "medium",
  "codex_max_minutes": 180,
  "codex_git_dir": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/.git",
