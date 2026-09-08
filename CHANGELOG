@@ -2389,3 +2389,55 @@ false positive gets "fixed" by deleting the explanation.
   calling it a result. The script now honours DISPATCHER_STATE, the test supplies its own board, and
   a CONTROL asserts a fresh board is NOT marked stale — without which the check would pass on a
   board of any age.
+
+2026-09-08 07:4x  A 401 INSIDE A FINDING TOOK muse-go-1 OUT OF SERVICE (WORKER-2)
+  museadapter.py, dispatcher.py, dispatcherctl.sh, tests/test_muse.py (126),
+  tests/test_serverdown.py (24). Suite ALL GREEN.
+
+  Found on the LIVE board, in my own code, against the first daemon-spawned Muse worker. The worker
+  was doing its job: reviewing a permissions surface, it wrote a finding containing "until
+  logout/401". classify_failure matched that 401, the run was recorded REFUSED instead of reported,
+  and muse-go-1 was held with until=0 — UNTIL A HUMAN CLEARS IT.
+
+  CAUSE, and it is the class again. cli_level_text scopes classification to the CLI's own words by
+  keeping non-JSON lines — which works only because a `--json` run puts the model's prose inside
+  JSONL payloads. THE DAEMON'S SPAWN PASSES NO `--json`. Its log is 100% prose, so the scoper "kept"
+  the entire 902,012-character transcript as CLI output: the same as no scoping at all. A guard that
+  cannot function on the path it is deployed to did not fall silent — it produced a confident wrong
+  verdict about a working account, and the verdict was durable by design.
+
+  FIX. cli_level_text now asks whether the log is structured at all. If it is not, only lines SHAPED
+  like a CLI error are considered (CLI_ERROR_LINE), which is a deliberately narrower net: a real
+  provider refusal still lands there because the CLI writes it to stderr and stderr is merged into
+  the log, while a worker quoting 401 or "rate limit" in its findings does not. Verified against the
+  real 902KB log: classifies as None, 0 of 902,012 chars kept.
+
+  THE ANCHORING IS DOUBLE and I got it wrong in a comment before measuring: the `^` in the pattern
+  AND `.match()` at the call site. Removing either ALONE changes nothing, so the honest mutation
+  removes both — and then two checks bite. I had written that the `^` was decoration; it is not.
+
+  A HOLD-CLEAR PATH, because there was none. `dispatcherctl.sh clear-hold <profile> [reason]` writes
+  a request; the daemon applies it on the next tick and emits HOLD_CLEARED. A request file rather
+  than an edit, for the same reason row clears use one: the daemon rewrites state.json every tick,
+  so hand-editing under a live daemon is a lost update waiting to happen. It runs on the DEGRADED
+  path too — that is exactly when a wrong hold is most likely to have been recorded. And the release
+  is an event, because a key silently returning to service is how nobody learns the hold was wrong.
+
+  Mutations 8 of 8 CAUGHT after two were re-run properly: one removed the `^` alone (a no-op, not a
+  miss), and one hit the FIRST of six identical `self._rm(path)` lines in the file rather than the
+  one under test. A mutation that lands somewhere else is not a result.
+
+  NOTE FOR WHOEVER READS THE BOARD: muse-go-1 is currently held by this false positive, in the LIVE
+  state.json. The classifier is fixed, but the recorded hold is durable and must be cleared —
+  `dispatcherctl.sh clear-hold muse-go-1` once this is committed and the daemon restarted.
+
+  Addendum: the reap fixtures used bare prose ("weekly limit reached") — a shape the CLI does not
+  produce — and passed only because the classifier was reading the worker's words too, which is the
+  bug. They are now CLI-shaped, and the control is the live case: a REPORT whose text quotes
+  "logout/401" and "rate limit" must hold nothing.
+
+  AN HONEST GAP, stated because it is the cost of this fix: NO REAL Muse quota refusal has ever been
+  observed in a daemon log, so the CLI_ERROR_LINE shapes are inferred rather than measured against
+  the thing they must catch. The failure mode has moved from "invent a refusal that did not happen"
+  to "possibly miss one that did" — the safer direction, and not free. The first real refusal we see
+  should be added to the pattern set verbatim.

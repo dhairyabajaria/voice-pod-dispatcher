@@ -217,6 +217,46 @@ ok(emitted["age_min"] >= 1000 and emitted["since_local"] == "12:24:11",
    "it — a rendered age must be computed at the moment of rendering")
 
 
+# ------------------------------------------- releasing a hold that should never have been recorded
+# A hold is durable BY DESIGN: an AUTH hold waits for a human, because retrying a refused key just
+# refuses again. That makes a WRONG hold durable too — and on 2026-09-08 one was, when a worker's
+# finding containing "until logout/401" was read as an authentication failure and muse-go-1 was taken
+# out of service. A REQUEST FILE rather than an edit, because the daemon rewrites state.json every
+# tick and a hand edit under a live daemon is a lost update waiting to happen.
+DP8, dp8 = daemon(ITEM, False, [])
+DP8.HOLDCLEAR_DIR = os.path.join(TMP, "holdclear"); os.makedirs(DP8.HOLDCLEAR_DIR, exist_ok=True)
+dp8.server_down_since = time.time() - 60
+dp8.state["muse"] = {"unhealthy": {"muse-go-1": {"class": "AUTH", "until": 0, "since": time.time(),
+                                                 "why": "a 401 inside a finding"}}}
+dp8._rm = lambda p: os.remove(p)
+dp8.write_pending = lambda m: None
+json.dump({"profile": "muse-go-1", "why": "the 401 was in the worker's own finding"},
+          open(os.path.join(DP8.HOLDCLEAR_DIR, "muse-go-1.json"), "w"))
+evs = []
+dp8.emit = lambda *a: evs.append(a)
+dp8.tick()
+ok("muse-go-1" not in dp8.state["muse"].get("unhealthy", {}),
+   "MUST BITE: a hold-clear request RELEASES the key — a wrong hold is as durable as a right one, "
+   "and there was no sanctioned way to undo it")
+ok(any(e[0] == "HOLD_CLEARED" for e in evs),
+   "MUST BITE: and the release is an EVENT. A key silently returning to service is how nobody ever "
+   "learns the hold was wrong")
+ok(not os.listdir(DP8.HOLDCLEAR_DIR), "the request is consumed, so it cannot re-apply every tick")
+
+DP9, dp9 = daemon(ITEM, False, [])
+DP9.HOLDCLEAR_DIR = os.path.join(TMP, "holdclear2"); os.makedirs(DP9.HOLDCLEAR_DIR, exist_ok=True)
+dp9.server_down_since = time.time() - 60
+dp9.state["muse"] = {}
+dp9._rm = lambda p: os.remove(p)
+dp9.write_pending = lambda m: None
+json.dump({"profile": "muse-go-2"}, open(os.path.join(DP9.HOLDCLEAR_DIR, "x.json"), "w"))
+lg = []
+dp9.log = lambda *a, **k: lg.append(a[0] if a else "")
+dp9.tick()
+ok(any("not held" in str(x) for x in lg),
+   "clearing a hold that does not exist says so rather than passing silently")
+
+
 # ---------------------------------------------------------------- the server comes back
 logs, events, saved, spawned, boards, notified, escalated = [], [], [], [], [], [], []
 DP2, dp2 = daemon(ITEM, True, spawned)

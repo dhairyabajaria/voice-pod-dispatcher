@@ -73,6 +73,7 @@ GATE_REQ_DIR = os.path.join(STATE_DIR, "gatereq")
 # daemon then skipped with "holds no dispatched, rework or reported item". The post and the un-park
 # have to be ONE operation or they drift, and only the daemon may write the queue row.
 ANSWER_REQ_DIR = os.path.join(STATE_DIR, "answerreq")
+HOLDCLEAR_DIR = os.path.join(STATE_DIR, "holdclear")
 # Queue feeding (owner order 2026-09-05): BOSS writes queue.json + items/<id>.md; the daemon hands the next
 # eligible item to an executor the moment it goes idle, so no executor waits on a round-trip for work.
 QUEUE = os.path.join(STATE_DIR, "queue.json")
@@ -292,6 +293,7 @@ class Dispatcher:
         os.makedirs(CLEAR_DIR, exist_ok=True)
         os.makedirs(GATE_REQ_DIR, exist_ok=True)
         os.makedirs(ANSWER_REQ_DIR, exist_ok=True)
+        os.makedirs(HOLDCLEAR_DIR, exist_ok=True)
         os.makedirs(ITEMS_DIR, exist_ok=True)
         os.makedirs(GATES_DIR, exist_ok=True)
         os.makedirs(CODEX_DIR, exist_ok=True)
@@ -2618,6 +2620,7 @@ class Dispatcher:
             # AGE AND ESCALATE ANYWAY. Neither needs the opencode server: escalate() appends to a
             # file. Skipping it here is why two REPORT_READY rows waited seventeen hours with nobody
             # told — the rows were already known, and answering them was never blocked on polling.
+            self.apply_hold_clears()
             self.age_and_escalate(self.state["pending"], degraded=True)
             # AND THE BOARD MUST BE WRITTEN, or it freezes at its last value and renders as current.
             # Measured 2026-09-08: pending.json was last written 2026-09-07 12:49:14 — 16.6
@@ -2648,6 +2651,7 @@ class Dispatcher:
         # sessions IN the roster, so a row for a retired/replaced session (EXEC-A, retired 04:36) is
         # unreachable by every clear path and escalates forever. Prune it here, where the roster is
         # known. codex:* keys are owned by codex_tick and are left alone.
+        self.apply_hold_clears()
         self.apply_clear_requests(pending)
         self.prune_offroster(pending)
         max_auto = int(self.c("max_auto_continue", 3))
@@ -2976,6 +2980,42 @@ class Dispatcher:
         if commits == 0:
             return "UNSEEN", "no trunk commit and no other executor answered since it landed — BOSS may be idle or inside a long turn"
         return "UNKNOWN", "could not read trunk history"
+
+    def apply_hold_clears(self):
+        """Apply `dispatcherctl.sh clear-hold <profile>` requests: return a held key to service.
+
+        A hold on an account is durable BY DESIGN — an AUTH hold waits for a human, because retrying
+        a refused key just refuses again. That makes a WRONG hold durable too, and on 2026-09-08 one
+        was: a worker doing its job wrote a finding containing "until logout/401", the failure
+        classifier matched that `401`, and muse-go-1 was taken out of service until a human cleared
+        it. The classifier is fixed; this is how the human clears it.
+
+        A REQUEST FILE rather than an edit, for the same reason the row clears use one: the daemon
+        rewrites state.json every tick, so hand-editing it under a live daemon is a lost update
+        waiting to happen. Going through here also makes the release an EVENT — a key silently
+        returning to service is how nobody would ever learn the hold had been wrong.
+        """
+        try:
+            reqs = sorted(f for f in os.listdir(HOLDCLEAR_DIR) if f.endswith(".json"))
+        except OSError:
+            return
+        for fn in reqs:
+            path = os.path.join(HOLDCLEAR_DIR, fn)
+            req = load_json(path, None)
+            self._rm(path)
+            if not isinstance(req, dict) or not req.get("profile"):
+                self.log(f"hold-clear request {fn} is malformed; ignored")
+                continue
+            prof = req["profile"]
+            held = (self.state.get("muse") or {}).get("unhealthy", {})
+            if prof not in held:
+                self.log(f"hold-clear {prof}: not held — nothing to clear")
+                continue
+            was = held.pop(prof)
+            self.emit("HOLD_CLEARED", "-", "-", "-", f"profile={prof}",
+                      f"was {was.get('class')} since {ms_local(int((was.get('since') or 0) * 1000))}"
+                      f" — {req.get('why') or 'no reason given'}")
+            self.log(f"hold-clear {prof}: released (was {was.get('class')})")
 
     def apply_clear_requests(self, pending):
         """Apply `dispatcherctl.sh clear` requests. Exactly one row each, or none.

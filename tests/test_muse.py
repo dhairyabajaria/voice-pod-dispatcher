@@ -220,12 +220,15 @@ open(rpth, "w").write(json.dumps(GOOD))
 ok(M.read_result(rpth, "C1", 1, SID)[0] == GOOD, "a correlated, schema-shaped result is accepted")
 
 # -------------------------------------------------------------------------- failure classification
+# The PATTERN TABLE, tested with scoped=False — these are bare phrases, not lines a CLI would emit
+# on their own, and scoping is a separate question with its own checks below. Testing the table
+# through the scoper would be testing two things and learning which failed from neither.
 for text, want in [("HTTP 401 Unauthorized", M.AUTH), ("rate limit exceeded", M.QUOTA),
                    ("429 Too Many Requests", M.QUOTA), ("connection refused", M.TRANSPORT),
                    ("unknown option '--nope'", M.CLI_CONFIG), ("stream cancelled", M.CANCELLED),
                    ("wrote the migration", None)]:
-    ok(M.classify_failure(text) == want, f"classify_failure({text!r}) -> {want}")
-ok(M.classify_failure("401 unauthorized: rate limit") == M.AUTH,
+    ok(M.classify_failure(text, scoped=False) == want, f"classify_failure({text!r}) -> {want}")
+ok(M.classify_failure("401 unauthorized: rate limit", scoped=False) == M.AUTH,
    "the specific class wins over the general when both words appear")
 ok(M.QUOTA not in M.RETRYABLE and M.AUTH not in M.RETRYABLE and M.TRANSPORT in M.RETRYABLE,
    "quota waits for a clock and auth needs a human; only transport is retried")
@@ -342,7 +345,8 @@ o, d, fl = M.verify_finish({"profile": M.LEGACY}, STARTED, VF, "C1", 1,
 ok(o == M.OK and fl["route_verified"] is None and "unverified" in d,
    "MUST BITE: the legacy route reports its route as UNVERIFIED, never as confirmed — there is no "
    "profile to read back, and an unchecked route must not render as a checked one")
-o, d, fl = M.verify_finish(M.profile_spec("muse-go-1", home=HOME)[0], "HTTP 401 Unauthorized",
+o, d, fl = M.verify_finish(M.profile_spec("muse-go-1", home=HOME)[0],
+                           "ERROR: HTTP 401 Unauthorized",   # a CLI-shaped line, as a real one is
                            VF, "C1", 1, sessions_root=SESS)
 ok(o == M.AUTH, "verify_finish reads failure text even with a complete result file on disk")
 
@@ -483,6 +487,43 @@ ok("muse-go-1" in M.unhealthy_now(h, now=1000 + 10 ** 7),
    "an AUTH hold does NOT expire: retrying a refused key just refuses again")
 ok("until a human clears it" in M.unhealthy_now(h, now=1000)["muse-go-1"],
    "and the reason says what would clear it")
+
+
+# ================================================ THE 401 IN A FINDING — a live worker, 2026-09-08
+# The daemon's spawn passes no `--json`, so its log is 100% prose and cli_level_text "kept" the
+# entire 902,012-character transcript as CLI output — the same as no scoping at all. A worker doing
+# its job wrote a finding containing "until logout/401"; the AUTH pattern matched that `401`; the run
+# was recorded REFUSED and muse-go-1 was held UNTIL A HUMAN CLEARS IT.
+#
+# A guard that cannot work on the path it is deployed to did not fall silent. It produced a confident
+# wrong verdict about a working account, and the verdict was durable by design.
+FINDING = ("codex\n"
+           "I reviewed the permissions surface. A downgraded admin keeps seeing write controls\n"
+           "until logout/401, and a 403 does not use the 401 handler. Direction: UI over-permit.\n"
+           "Also note the rate limit copy in the quota banner is stale.\n"
+           # mid-sentence error words: these match if the CLI-line pattern is not ANCHORED, which
+           # is the difference between reading a line the CLI wrote and reading a line about one
+           "The handler returns an error: 401 when the token expires, and we should\n"
+           "check whether the retry path can fail to renew it before the stream error surfaces.\n")
+ok(M.classify_failure(FINDING) is None,
+   "MUST BITE: a worker's own FINDING quoting 401, rate limit and quota is not a refusal. This "
+   "exact text held muse-go-1 out of service until a human cleared it")
+ok(M.cli_level_text(FINDING) == "",
+   "on an unstructured log NOTHING is treated as CLI output unless it is shaped like a CLI error — "
+   "with no structure there is no way to tell the CLI's words from the worker's")
+ok(all(not M.CLI_ERROR_LINE.match(l.strip()) for l in FINDING.splitlines()),
+   "MUST BITE: the CLI-error shape is ANCHORED at line start. Unanchored, a worker writing "
+   "\"returns an error: 401 when the token expires\" reads as the CLI reporting an auth failure — "
+   "the difference between a line the CLI wrote and a line ABOUT one")
+ok(M.classify_failure("some prose\nstream error: 429 Too Many Requests\nmore prose") == M.QUOTA,
+   "MUST BITE: a REAL provider refusal is still caught on that same unstructured path — the CLI "
+   "writes it to stderr, which is merged into the log")
+ok(M.classify_failure("ERROR: 401 Unauthorized") == M.AUTH,
+   "and a real CLI auth error is still caught")
+ok(M.classify_failure('{"type":"error","payload":{"message":"429 too many requests"}}') == M.QUOTA,
+   "CONTROL: the structured path is unchanged — an error EVENT still classifies")
+ok(M.classify_failure('{"type":"item.completed","payload":{"text":"until logout/401"}}') is None,
+   "CONTROL: and a payload quoting 401 still does not")
 
 
 print(f"\n{P} passed, {len(F)} failed")

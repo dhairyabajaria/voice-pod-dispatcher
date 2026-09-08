@@ -166,6 +166,28 @@ case "${1:-status}" in
       exit 1
     fi
     "$SELF" stop; sleep 1; "$SELF" start ;;
+  clear-hold)
+    # Return a held Muse account to service. The hold is durable by design (an AUTH hold waits for a
+    # human), so a WRONG hold is durable too — see the 401-in-a-finding case, 2026-09-08.
+    prof=${2:-}
+    if [[ -z $prof ]]; then
+      print -u2 "usage: $SELF clear-hold <profile> [reason]"
+      print -u2 "  currently held:"
+      /usr/bin/python3 -c "
+import json,sys
+try: d=json.load(open('$STATE/state.json'))
+except Exception: sys.exit(0)
+for k,v in (d.get('muse') or {}).get('unhealthy',{}).items():
+    print(f'    {k}  {v.get("class")}  {v.get("why","")[:80]}')" >&2
+      exit 2
+    fi
+    mkdir -p "$STATE/holdclear"
+    /usr/bin/python3 -c "
+import json,sys,time
+json.dump({'profile': sys.argv[1], 'why': sys.argv[2] if len(sys.argv)>2 else '', 'at': time.time()},
+          open(sys.argv[3], 'w'))" "$prof" "${3:-cleared by hand}" "$STATE/holdclear/$prof.json"
+    print "requested: release $prof — the daemon applies it on its next tick and emits HOLD_CLEARED."
+    print "  (a request file, not an edit: the daemon rewrites state.json every tick)" ;;
   selfpath)
     # Prints the path `restart` would re-invoke. Exists so the re-invocation can be PROVEN from a
     # different working directory without stopping the daemon to find out — the failure was that

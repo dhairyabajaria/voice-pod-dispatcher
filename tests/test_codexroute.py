@@ -356,7 +356,11 @@ def reap(log_text, profile="muse-go-1"):
     dp2.codex_tick(q, pend, {}, 0, 0)
     return dp2, pend, evs, logs2
 
-dp2, pend, evs, logs2 = reap("codex\nweekly limit reached for this key\n")
+# CLI-SHAPED lines, because that is what the classifier now requires on an unstructured log and it
+# is what a real refusal looks like: the CLI writes it to stderr and stderr is merged into this log.
+# The old fixtures used bare prose — a shape the CLI does not produce — and they passed only because
+# the classifier was reading the worker's own words too, which is the bug being fixed.
+dp2, pend, evs, logs2 = reap("codex\nworking on the sweep\nERROR: weekly limit reached for this key\n")
 h = dp2.state["muse"].get("unhealthy", {}).get("muse-go-1", {})
 ok(h.get("scope") == "weekly",
    "MUST BITE: the reap parses the WALL'S SCOPE from the provider's own words — a weekly wall is "
@@ -366,13 +370,16 @@ ok(h.get("until", 0) - h.get("since", 0) >= 6 * 24 * 3600,
 ok(any(k[0] == "REFUSED" for k in evs),
    "a refusal reaches the board as REFUSED rather than as a failure of the work")
 
-dp2, pend, evs, logs2 = reap("codex\nrate limit; resets in 42 min\n")
+dp2, pend, evs, logs2 = reap("codex\nworking\nstream error: rate limit; resets in 42 min\n")
 h = dp2.state["muse"].get("unhealthy", {}).get("muse-go-1", {})
 ok(h.get("scope") == "rolling" and h.get("until", 0) - h.get("since", 0) < 6 * 24 * 3600,
    "MUST BITE: a rolling wall is recorded as rolling and on a short clock — the conversation waits "
    "for its own key instead of being moved off a cache worth 92% of the spend")
 
-dp2, pend, evs, logs2 = reap("codex\nREPORT READY: the work is done\n")
+# AND THE CONTROL THAT MATTERS MOST: a worker whose REPORT quotes the very words the classifier
+# looks for. This is the live 2026-09-08 case that held muse-go-1 out of service.
+dp2, pend, evs, logs2 = reap("codex\nREPORT READY: the work is done. Note the admin keeps write\n"
+                             "controls until logout/401 and the rate limit copy is stale.\n")
 ok(not dp2.state["muse"].get("unhealthy"),
    "an ordinary finished run holds nothing: only a refusal takes a key out of service")
 

@@ -517,6 +517,19 @@ FAIL_PATTERNS = (
 )
 
 
+# The shapes the Codex CLI's own failures take on stdout/stderr. THE ANCHORING IS DOUBLE and both
+# halves are load-bearing: the `^` here, and `.match()` at the call site. Removing either alone
+# changes nothing — measured, after I wrote the opposite in this comment and had to correct it — so
+# a mutation must remove BOTH to score. What the anchoring enforces is the distinction between a
+# line the CLI WROTE and a line ABOUT one: unanchored, a worker writing "returns an error: 401 when
+# the token expires" reads as an authentication failure.
+CLI_ERROR_LINE = re.compile(
+    r"^(ERROR\b|error\b|error:|\[ERROR\]|stream error|stream disconnected|request failed|"
+    r"error sending request|failed to |unable to |thread .*failed|panicked at|"
+    r"unknown option|unexpected argument|usage:|no such |invalid |"
+    r"cancell?ed\b|interrupted\b|HTTP \d{3}\b|\d{3} (unauthorized|forbidden|too many))", re.I)
+
+
 def cli_level_text(text):
     """The part of a run's output that the CLI ITSELF said. -> str.
 
@@ -530,8 +543,26 @@ def cli_level_text(text):
     message payloads are excluded — the worker may legitimately quote "401" or "rate limit" while
     doing exactly what it was asked to do.
     """
+    # IS THIS LOG STRUCTURED AT ALL? The `--json` runs emit JSONL events and the model's prose lives
+    # inside payloads, so keeping the non-JSON lines keeps only the CLI's own words. The DAEMON's
+    # spawn passes no `--json`, so its log is 100% prose — and this function then "kept" the entire
+    # 902,012-character transcript as CLI output, which is the same as no scoping at all.
+    #
+    # Measured 2026-09-08, on a live worker doing its job: it wrote a finding about a UI permissions
+    # bug containing the words "until logout/401", the AUTH pattern matched that `401`, the run was
+    # recorded REFUSED, and muse-go-1 was held UNTIL A HUMAN CLEARS IT. A guard that cannot work on
+    # the path it is deployed to did not fall silent — it produced a confident wrong verdict about a
+    # working account.
+    lines = (text or "").splitlines()
+    structured = any(l.strip().startswith("{") and '"type"' in l for l in lines)
+    if not structured:
+        # NARROWER NET, DELIBERATELY. With no structure there is no way to tell the CLI's words from
+        # the worker's, so only lines shaped like a CLI error are considered. A genuine provider
+        # refusal still lands here — the CLI writes it to stderr, which is merged into this log —
+        # while a worker quoting "401" or "rate limit" in its own findings does not.
+        return "\n".join(l for l in lines if CLI_ERROR_LINE.match(l.strip()))
     keep = []
-    for line in (text or "").splitlines():
+    for line in lines:
         st = line.strip()
         if not st.startswith("{"):
             keep.append(line)                     # a plain CLI line: usage errors, stderr, crashes
