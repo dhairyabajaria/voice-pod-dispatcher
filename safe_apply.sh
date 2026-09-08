@@ -57,3 +57,8 @@ for m in mergegate gatereview2 citesweep; do
   f="$(dirname "$target")/$m.py"
   [[ -f $f ]] && print "  $m $(md5 -q "$f" | cut -c1-8)"
 done
+# EXIT 0 EXPLICITLY. Without this the script's status is the LAST `[[ -f ]]` test above, so applying
+# anything outside the dispatcher root — a file in tests/, where those three modules do not exist —
+# printed "applied ..." and then exited 1. A success reported as a failure is the same defect class
+# as a failure reported as a success, and it would eventually train someone to ignore the status.
+exit 0

@@ -300,6 +300,12 @@ for e in p:
     print(f"  {e['executor']:7} {e['kind']:13} since {e['since_local']}  age {e.get('age_min','?'):>4} min  esc={e['escalated']}  {e['excerpt'][:90]}")
     if e.get("stale"): print(f"          !! {e['stale']}")
 for k,v in d.get("executors",{}).items(): print(f"  {k:7} {v}")
+# THE SESSIONS BLOCK. Until 2026-09-08 an idle programme and a busy one rendered identically here:
+# every row above describes EXECUTORS, and the six hours lost on 2026-09-07/08 were Claude sessions
+# stopping with an empty queue, which no row on this board could show. An absent block says NOT
+# MEASURED rather than printing nothing, because nothing reads as calm.
+for line in (d.get("sessions") or ["sessions: NOT MEASURED — this board predates the census"]):
+    print("  " + line)
 EOF
     fi ;;
   clear)

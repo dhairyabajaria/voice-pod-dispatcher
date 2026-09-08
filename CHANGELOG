@@ -1,16 +1,43 @@
-2026-09-08 06:09  tests/test_clearhold.py 61ade578   [WORKER-2, own scope]
-  THE CLASS GUARD WAS DEFINED OVER ONE FILE INSTEAD OF OVER ITS POPULATION. Yesterday's embedded-
-  Python checker scanned dispatcherctl.sh alone — green for exactly one path. The day anyone adds a
-  `python3 -c "…"` to watch.sh, safe_apply.sh or run_all.sh, the defect the checker exists to catch
-  ships again against a fully green suite. Same shape as every discovery-by-literal-name finding in
-  this programme, committed inside the guard written to stop it.
-  It now enumerates every .sh in dispatcher/ and dispatcher/tests/ and reports per-file counts, so
-  an empty scan cannot pass as a clean one.
-  MEASURED, not argued: the exact defect class planted in safe_apply.sh — a script the old guard
-  never read — is CAUGHT by the widened guard and MISSED by the old one (simulated by restricting
-  the same scan to dispatcherctl.sh). safe_apply.sh restored to pre-image md5 e2c53d0d, suite green
-  after restore.
-  Population today is 2 of 2 in dispatcherctl.sh and 0 elsewhere, which is why this cost nothing now
-  and would have been worth nothing later.
-  PROOF: tests/test_clearhold.py 15 checks (was 14). Whole suite ALL GREEN.
+2026-09-08 12:24  museadapter.py 37886bdb   [OWNER'S OWN WORD, relayed verbatim by BOSS 2026-09-08]
+  THE LEGACY (ASTRA) BRANCH HANDED EVERY WORKER THE LAUNCHER'S WHOLE ENVIRONMENT. route_flags'
+  legacy branch returned `dict(env or os.environ)` while the Muse branch four lines below it was
+  carefully scrubbed — a guard that existed, was proved, and did not cover the path that was
+  leaking. SSH_AUTH_SOCK, all six provider keys and this session's CLAUDE_CODE_MESSAGING_* reached
+  every Astra worker. One strip now serves both routes: scrub_env(base, keep=None).
+  SCOPE, AS THE OWNER FENCED IT: the environment only. codex_model, codex_effort and codex_slots are
+  untouched, and roster.json was not opened.
+  ACCEPTANCE — THE INSTALLED THING, NOT THE DIFF. A child spawned with the computed environment
+  dumped its own names: 33 names, ZERO matching credentials or handles. CONTROL: the same regex
+  against this launcher's environment matches 30 names including SSH_AUTH_SOCK,
+  CLAUDE_CODE_MESSAGING_SOCKET/TOKEN and all six OPENCODE keys — so the zero is a measurement and
+  not a broken probe.
+  AND THE OTHER DIRECTION, which is the dangerous one: a REAL Astra worker spawned with the stripped
+  environment ran to completion. rc=0, 13s, model gpt-6-astra, effort medium, session
+  01a07fca-e423-78b3-b0ab-eb9b03e5dcda, replied OK. Astra authenticates from ~/.codex/auth.json — a
+  FILE, verified present first — so it needs no credential in the environment at all. A strip that
+  stops the worker starting would be worse than the leak.
+  PROOF: tests/test_legacyenv.py (18 checks, new, wired). EVERY check drives route_flags(M.LEGACY) —
+  the branch that was leaking; the Muse branch appears only as a control. Guard list taken FIRST and
+  it was EMPTY: no existing test asserted anything about the legacy branch's environment, so the
+  must-bite mutation is correctly aimed. Whole suite ALL GREEN.
+  Six mutations, 6/6 CAUGHT, all restored to pre-image md5: revert :404 to dict(env or os.environ)
+  (the must-bite) · stop stripping HANDLES · stop stripping CLAUDE*/SENTRY/GH_ · strip so
+  aggressively PATH and HOME go too · silently change the legacy DEFAULT effort · silently change
+  the legacy DEFAULT model.
+  TWO FOUND WHILE SCORING, both real:
+    * the scope fence was unguarded where it is weakest. Every check passed an explicit model and
+      effort, so the `or "gpt-6-astra"` / `or "medium"` fallbacks never ran and a default change
+      scored MISSED. A caller that passes nothing gets whatever the fallback says; now asserted.
+    * `keep` did not keep. The provider-key loop ran before the keep check, so
+      scrub_env(base, keep="OPENCODE_GO_KEY_2") removed the name it was told to keep. child_env
+      never noticed because it re-adds the key immediately after. A parameter named `keep` that does
+      not keep is a trap for the next reader. Fixed.
+  ONE MUTATION WAS INVALID AND IS RECORDED AS SUCH: dropping the OPENCODE prefix from the first loop
+  is byte-identical in behaviour, because the second loop's "KEY" substring catches every provider
+  key anyway. Measured both ways rather than inferred. The strip is defended in depth.
+  RESIDUAL, NOT IN SCOPE AND NOT CHANGED: the spawned child still carries
+  CODEX_COMPANION_SESSION_ID and CODEX_COMPANION_TRANSCRIPT_PATH. Neither is a credential and
+  neither is in HANDLES, but both are this session's handles by any ordinary reading. Named here so
+  it is a decision somebody makes rather than something nobody noticed.
+  dispatcher/ has no CI. This local green is the only evidence that will ever exist.
 

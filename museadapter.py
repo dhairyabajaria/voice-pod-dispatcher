@@ -169,28 +169,54 @@ def child_env(spec, base=None):
                       + (f" nor its unsuffixed spelling {alias}" if alias else "")
                       + " is set and non-empty in this environment. Nothing was launched, so nothing "
                         "was spent. (No value was read; only whether one exists.)")
+    env = scrub_env(base, keep=want)
+    env[want] = value
+    env["CODEX_HOME"] = env.get("CODEX_HOME", CODEX_HOME)
+    return env, ""
+
+
+def scrub_env(base, *, keep=None):
+    """Every credential and machine handle removed from a child's environment. -> dict.
+
+    ONE STRIP FOR BOTH ROUTES. Until the owner authorised this on 2026-09-08 the LEGACY branch of
+    `route_flags` returned `dict(env or os.environ)` — the launcher's WHOLE environment — so every
+    Astra worker received `SSH_AUTH_SOCK`, the six provider keys and this session's
+    `CLAUDE_CODE_MESSAGING_*`. The Muse branch was stripped and the legacy branch beside it was not,
+    which is the shape where a guard exists, is proved, and does not cover the path that matters.
+
+    Measured 2026-09-08: a real worker printed its environment into its own transcript, and that
+    transcript showed this session's Claude Code ids, socket paths and a sentry key inherited
+    straight into a third-party paid worker. The worker did nothing wrong — it had them because we
+    handed them over. A launcher that passes its whole environment to a subprocess it does not own
+    is exporting everything it happens to be holding.
+
+    `keep` is the ONE credential the caller is deliberately putting back (the selected account's
+    key). Legacy passes None: it authenticates from ~/.codex/auth.json, a file, so it needs no
+    credential in the environment at all — verified before this landed, because the dangerous
+    failure direction here is a strip so aggressive the worker cannot start.
+
+    No value is read, compared, logged or returned — only names are examined.
+    """
     env = dict(base)
-    # every credential this adapter knows about, dropped, then exactly one put back
+    # every credential this adapter knows about, dropped, then exactly one put back by the caller.
+    # `keep` is honoured HERE TOO. It did not used to be: the provider-key loop ran before the keep
+    # check, so `scrub_env(base, keep="OPENCODE_GO_KEY_2")` removed the very name it was asked to
+    # keep. child_env never noticed because it re-adds the selected key immediately afterwards — but
+    # a parameter named `keep` that does not keep is a trap laid for the next reader.
     for k in list(env):
+        if k == keep:
+            continue
         if k.startswith("OPENCODE_GO_KEY") or k.startswith("OPENCODE_ZEN_KEY"):
             env.pop(k, None)
-    # AND EVERYTHING ELSE THAT LOOKS LIKE A SECRET OR LIKE THIS MACHINE'S IDENTITY. Measured
-    # 2026-09-08: a real worker printed its environment into its own transcript, and that transcript
-    # showed this session's Claude Code ids, socket paths and a sentry key had all been inherited
-    # straight into a third-party paid worker. The worker did nothing wrong — it had them because we
-    # handed them over. A launcher that passes its whole environment to a subprocess it does not own
-    # is exporting everything it happens to be holding.
     for k in list(env):
         u = k.upper()
-        if k == want:
+        if keep is not None and k == keep:
             continue
         if (any(t in u for t in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"))
                 or u.startswith(("CLAUDE", "ANTHROPIC", "SENTRY", "AWS_", "GH_", "GITHUB_TOKEN"))
                 or u in HANDLES):
             env.pop(k, None)
-    env[want] = value
-    env["CODEX_HOME"] = env.get("CODEX_HOME", CODEX_HOME)
-    return env, ""
+    return env
 
 
 # ------------------------------------------------------------------------------ argv, launch/resume
@@ -401,7 +427,11 @@ def route_flags(profile, home=CODEX_HOME, env=None, legacy_model=None, legacy_ef
     if profile == LEGACY:
         return (["-m", legacy_model or "gpt-6-astra",
                  "-c", f"model_reasoning_effort={legacy_effort or 'medium'}"],
-                dict(env or os.environ),
+                # THE LEGACY BRANCH IS STRIPPED TOO (owner's word, 2026-09-08). It used to return
+                # dict(env or os.environ) — the launcher's entire environment — while the Muse
+                # branch four lines below was carefully scrubbed. Scope was the environment only:
+                # the model, the effort and the slot count above are deliberately untouched.
+                scrub_env(env or os.environ),
                 {"profile": LEGACY, "model": legacy_model or "gpt-6-astra", "provider": None,
                  "effort": legacy_effort or "medium", "env_key": None, "tier": "legacy"}, "")
     spec, why = profile_spec(profile, home=home)

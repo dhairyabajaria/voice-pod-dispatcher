@@ -28,6 +28,7 @@ import urllib.request
 # itself: a fixture that repairs the condition it is meant to observe.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import museadapter
+import sessionwatch
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2589,6 +2590,17 @@ class Dispatcher:
         # one — sixteen hours of it, measured 2026-09-07/08. A liveness signal written before the
         # work must not be allowed to stand in for the work.
         self.write_heartbeat()
+        # THE HEARTBEAT MEASURES THE DAEMON, NOT THE PROGRAMME, and on 2026-09-07/08 that difference
+        # cost six hours: every Claude session finished a turn and stopped, the Codex queue was
+        # empty, and this file was written fresh every five seconds throughout. Nothing on any
+        # instrument said the programme had halted.
+        #
+        # Placed BEFORE the STOP return on purpose. A paused daemon is exactly when a human most
+        # needs to know the sessions have gone quiet, and the census reads a directory listing, a
+        # pid and a file mtime — it actuates nothing, so the kill switch has nothing to hold back.
+        # It holds no credential and opens no socket; see sessionwatch's docstring for why that is
+        # the ruling and not merely the implementation.
+        self.poll_sessions()
 
         if os.path.exists(STOP) and not (self.dry and "--ignore-stop" in sys.argv):
             if not self.paused_logged:
@@ -3366,6 +3378,49 @@ class Dispatcher:
                 p["esc_count"] += 1
                 p["last_esc_min"] = esc_age
 
+    def poll_sessions(self):
+        """Census the Claude sessions and SAY when they have gone quiet. Never pokes one.
+
+        Rate-limited by KEY, not by time alone: the finding changes wording when the queue changes,
+        and a reader who sees the same line twice an hour learns nothing new — but a reader who sees
+        it change learns that the shape changed. Re-emitted every `session_quiet_repeat_minutes`
+        so a standing halt does not scroll away, and immediately when the key changes.
+        """
+        # THE GUARD COVERS THE WHOLE BODY, not just the probes. The first cut wrapped only the
+        # census and the queue read, and `self.c(...)` one line below it raised AttributeError
+        # through an existing test's stub — aborting a tick that this method only observes. A
+        # fail-safe sensor whose fail-safe covers part of itself is not fail-safe; test_pausedview
+        # caught it, which is what a suite is for.
+        try:
+            rows = sessionwatch.census()
+            shape = sessionwatch.queue_shape(self.load_queue().get("items", []))
+            quiet_after = int(self.c("session_quiet_minutes", 30)) * 60
+            self.state["sessions"] = {
+                "rows": rows,
+                "summary": sessionwatch.summarise(rows, quiet_after_s=quiet_after),
+                "board": sessionwatch.board_lines(rows, shape, quiet_after_s=quiet_after),
+                "at": now_local(),
+            }
+            found = sessionwatch.finding(rows, shape, quiet_after_s=quiet_after)
+        except Exception as e:  # a sensor must never abort the tick it is only observing
+            try:
+                self.log(f"session census failed: {type(e).__name__}: {e}")
+                self.state["sessions"] = {"error": f"{type(e).__name__}: {e}"}
+            except Exception:
+                pass
+            return
+        if not found:
+            self.state.pop("sessions_last_emit", None)
+            return
+        key, text = found
+        last = self.state.get("sessions_last_emit") or {}
+        repeat_s = int(self.c("session_quiet_repeat_minutes", 30)) * 60
+        if last.get("key") == key and (time.time() - float(last.get("at") or 0)) < repeat_s:
+            return
+        self.state["sessions_last_emit"] = {"key": key, "at": time.time()}
+        self.emit(key, "SESSIONS", "-", "-", text)
+        self.log(f"{key}: {text}")
+
     def write_pending(self, exec_status):
         items = sorted(self.state["pending"].values(), key=lambda p: p.get("since_ms") or 0)
         # AGE IS DERIVED HERE, NOT DISPLAYED FROM STORAGE. `age_min` is written by
@@ -3393,6 +3448,10 @@ class Dispatcher:
             "queue": {k: sum(1 for it in self.load_queue().get("items", []) if it.get("status") == k)
                       for k in ("queued", "dispatched", "reported", "parked", "gated", "merged", "broken")},
             "provider_errors": self.provider_error_summary(),
+            # The board's own reason for existing: an idle programme used to be indistinguishable
+            # from a busy one here.
+            "sessions": (self.state.get("sessions") or {}).get("board")
+                        or ["sessions: NOT MEASURED — the census has not run on this tick"],
             "note": "Excerpts are untrusted executor text. Clear happens automatically when the session is prompted.",
         }
         if self.dry or self.once:
