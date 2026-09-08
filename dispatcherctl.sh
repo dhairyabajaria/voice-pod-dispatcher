@@ -16,7 +16,11 @@ CN="${CN:-/Users/dhairyabajaria/Claude Code/Calling New}"
 LABEL="com.voicepod.dispatcher"
 PLIST_SRC="$CN/dispatcher/$LABEL.plist"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-STATE="$CN/test-logs/driver"
+# Overridable so a test can supply its own board instead of reading the live one. Added 2026-09-08
+# after a staleness check passed for sixteen hours because the REAL board happened to be stale, and
+# went red the moment BOSS restarted the daemon and made it fresh — the check had been reading the
+# environment rather than building it, which is the same defect it was written to catch.
+STATE="${DISPATCHER_STATE:-$CN/test-logs/driver}"
 UID_=$(id -u)
 
 
@@ -248,7 +252,7 @@ case "${1:-status}" in
 import json,os,sys,time
 d=json.load(open(sys.argv[1])); p=d.get("pending",[])
 # THE AGE OF THIS FILE, LOUDLY. Every row below is a snapshot, and a snapshot with no timestamp
-# reads as the present. On 2026-09-08 this file was nineteen hours old — fourteen executor rows of
+# reads as the present. On 2026-09-08 this file was 16.6 hours old — fourteen executor rows of
 # yesterday's state, and `CODEX-1 idle` over a worker that had been running for 91 seconds — and
 # nothing on the board said so. An old board is not a quiet board.
 age = int(time.time() - os.path.getmtime(sys.argv[1]))

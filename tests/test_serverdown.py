@@ -54,7 +54,7 @@ def daemon(queue_items, health_ok, spawned):
         return {}
     DP.http = http
     dp = DP.Dispatcher.__new__(DP.Dispatcher)
-    dp.dry = False; dp.observing = False; dp.observe_logged = False
+    dp.dry = False; dp.once = False; dp.observing = False; dp.observe_logged = False
     dp.cfg = {"codex_slots": 1, "codex_bin": "/x/codex", "codex_spawn_stagger_seconds": 0,
               "max_dispatch_per_tick": 2, "codex_model": "gpt-6-astra", "codex_effort": "medium"}
     dp.state = {"pending": {}, "parks": {}, "codex": {}, "server_down_emitted": False}
@@ -67,6 +67,12 @@ def daemon(queue_items, health_ok, spawned):
     dp.notify_owner = lambda *a, **k: None
     dp.save_state = lambda: saved.append(1)
     dp.write_pending = lambda m: boards.append(m)
+    dp.hold_reason = lambda who: None
+    dp.notify_owner = lambda *a, **k: notified.append(a)
+    dp.escalate = lambda text: escalated.append(text)
+    dp.undelivered_answer = lambda who: None
+    dp.boss_activity_since = lambda ms: ("NO_ACTIVITY", "BOSS has done nothing since")
+    dp.roster = {"EXEC-J": "ses_j"}
     dp.provider_error_summary = lambda: {}
     dp.reload_cfg = lambda: None
     dp.poll_lockwatch = lambda: None
@@ -78,7 +84,7 @@ ITEM = [{"id": "C1", "status": "queued", "executor": "CODEX", "worktree": os.pat
          "lane": "l", "title": "t"}]
 
 # ---------------------------------------------------------------- the server is down
-logs, events, saved, spawned, boards = [], [], [], [], []
+logs, events, saved, spawned, boards, notified, escalated = [], [], [], [], [], [], []
 DP, dp = daemon(ITEM, False, spawned)
 dp.server_down_since = time.time() - 3600
 dp.tick()
@@ -105,7 +111,7 @@ dp.state["server_down_emitted"] = True          # the SERVER_DOWN event will not
 # the old one, so the second tick's dispatch lands somewhere this check cannot see — and the check
 # then fails for a reason that has nothing to do with the daemon. Same shape as every other fixture
 # defect tonight: the instrument, not the product.
-for _lst in (logs, events, saved, spawned, boards): _lst.clear()
+for _lst in (logs, events, saved, spawned, boards, notified, escalated): _lst.clear()
 time.sleep(1.05)
 dp.tick()
 ok(not any(e[0] == "SERVER_DOWN" for e in events),
@@ -115,7 +121,7 @@ ok(dp.state.get("degraded", {}).get("for_s", 0) > first["for_s"],
    "Sixteen hours of outage were announced once, yesterday, and were silent afterwards")
 ok(spawned == [("CODEX-1", "C1")], "and codex keeps being dispatched on every degraded tick")
 
-# ------------------------------------------------ THE BOARD, which froze for nineteen hours
+# ------------------------------------------------ THE BOARD, which froze for 16.6 hours
 # Measured 2026-09-08: pending.json was last written 2026-09-07 12:49:14 because this path returns
 # before write_pending(). `dispatcherctl status` printed fourteen EXEC rows of yesterday's state and
 # `CODEX-1 idle: no eligible CODEX item` over a Muse worker that had been running for 91 seconds.
@@ -135,8 +141,84 @@ ok(not any(k.startswith("EXEC-") for k in b),
    "and yesterday's EXEC rows do not stand alongside it")
 
 
+# --------------------------------- THE AGE COLUMN, and the escalation behind the same early return
+# 2026-09-08. The board printed `EXEC-J REPORT_READY since 12:24:11 ... age 25 min` while the row was
+# 1025 minutes old. `age_min` is written by age_and_escalate(), which sits behind this early return,
+# so the number was frozen at 12:49 the previous day. The line contradicted ITSELF — `since 12:24`
+# and `age 25 min` cannot both be true — and that contradiction was the only honest thing on it.
+# Two real REPORT_READY rows waited seventeen hours behind that number, escalation included.
+OLD_MS = int((time.time() - 17 * 3600) * 1000)
+logs2, events2, saved2, spawned2, boards2, notified2, escalated2 = [], [], [], [], [], [], []
+DP5, dp5 = daemon(ITEM, False, spawned2)
+dp5.server_down_since = time.time() - 3600
+dp5.state["pending"] = {"ses_j": {"executor": "EXEC-J", "session": "ses_j", "kind": "REPORT_READY",
+                                  "msg_id": "m1", "since_ms": OLD_MS, "since_local": "12:24:11",
+                                  "excerpt": "", "escalated": 1, "esc_count": 1, "last_esc_min": 20,
+                                  "esc_base_ms": OLD_MS, "age_min": 25}}
+dp5.write_pending = lambda m: boards2.append(dict(m))
+dp5.notify_owner = lambda *a, **k: notified2.append(a)
+dp5.escalate = lambda text: escalated2.append(text)
+dp5.hold_reason = lambda who: None
+dp5.undelivered_answer = lambda who: None
+dp5.boss_activity_since = lambda ms: ("NO_ACTIVITY", "nothing since")
+dp5.roster = {"EXEC-J": "ses_j"}
+dp5.tick()
+row = dp5.state["pending"]["ses_j"]
+ok(row["age_min"] >= 1000,
+   "MUST BITE: a degraded tick AGES the pending rows. The displayed 25 minutes was a stored value "
+   "frozen when the sensor died, printed beside `since 12:24:11` on the same line")
+# One assertion, not an `or` of two: `A and B or C` binds as `(A and B) or C`, so a check written
+# that way can pass on a branch that proves nothing about the claim in its name.
+ok(len(escalated2) == 1 and "EXEC-J" in escalated2[0] and "REPORT_READY" in escalated2[0],
+   "MUST BITE: and it ESCALATES. escalate() only appends to a file — it never needed the opencode "
+   "server — so two reports waiting on BOSS sat seventeen hours with nobody told")
+
+# the roster is refreshed on the healthy path, so while degraded it may be empty
+logs2.clear(); escalated2.clear()
+DP6, dp6 = daemon(ITEM, False, [])
+dp6.server_down_since = time.time() - 3600
+dp6.cfg["executors"] = {"EXEC-J": "ses_j"}
+dp6.roster = {}
+dp6.state["pending"] = {"ses_j": dict(row, escalated=0, esc_count=0, last_esc_min=0,
+                                      stall_class=None)}
+dp6.write_pending = lambda m: None
+dp6.notify_owner = lambda *a, **k: None
+dp6.escalate = lambda text: escalated2.append(text)
+dp6.hold_reason = lambda who: None
+dp6.undelivered_answer = lambda who: None
+dp6.boss_activity_since = lambda ms: ("NO_ACTIVITY", "nothing since")
+dp6.tick()
+ok(dp6.state["pending"]["ses_j"].get("stall_class") != "OFF_ROSTER",
+   "MUST BITE: an EMPTY roster while degraded does not silently classify every row as OFF_ROSTER. "
+   "The roster is refreshed on the healthy path, so an empty one here means UNKNOWN, not absent — "
+   "and a silent no-op is the failure this whole area keeps producing")
+ok(bool(escalated2), "and the row still escalates rather than being skipped")
+
+
+# THE REAL write_pending, not the stub. Every check above replaces it, so its body was never
+# executed and a mutation that removed the render-time aging scored MISSED — a guard on a path the
+# proof set does not enter, which is the same defect being fixed one layer down.
+DP7, dp7 = daemon(ITEM, False, [])
+DP7.PENDING = os.path.join(TMP, "pending_real.json")
+DP7.HOLD_DIR = os.path.join(TMP, "holds"); os.makedirs(DP7.HOLD_DIR, exist_ok=True)
+dp7.state["pending"] = {"ses_j": {"executor": "EXEC-J", "session": "ses_j", "kind": "REPORT_READY",
+                                  "msg_id": "m1", "since_ms": OLD_MS, "since_local": "12:24:11",
+                                  "excerpt": "", "escalated": 1, "esc_count": 1,
+                                  "esc_base_ms": OLD_MS,
+                                  "age_min": 25}}          # the frozen value the board printed
+dp7.provider_error_summary = lambda: {}
+dp7.load_queue = lambda: {"items": []}
+del dp7.write_pending                                       # use the real one
+dp7.write_pending({"CODEX-1": "building X busy"})
+emitted = json.load(open(DP7.PENDING))["pending"][0]
+ok(emitted["age_min"] >= 1000 and emitted["since_local"] == "12:24:11",
+   "MUST BITE: the board EMITS a derived age, not the stored one. `since 12:24:11` beside "
+   "`age 25 min` was a line contradicting itself, and the contradiction was the only true thing on "
+   "it — a rendered age must be computed at the moment of rendering")
+
+
 # ---------------------------------------------------------------- the server comes back
-logs, events, saved, spawned, boards = [], [], [], [], []
+logs, events, saved, spawned, boards, notified, escalated = [], [], [], [], [], [], []
 DP2, dp2 = daemon(ITEM, True, spawned)
 dp2.state["degraded"] = {"reason": "stale"}
 try:
@@ -148,7 +230,7 @@ ok("degraded" not in dp2.state,
    "reported, or the board learns to ignore it")
 
 # ---------------------------------------------------------- three states, not one string
-logs, events, saved, spawned, boards = [], [], [], [], []
+logs, events, saved, spawned, boards, notified, escalated = [], [], [], [], [], [], []
 DP3, dp3 = daemon(ITEM, False, spawned)
 dp3.server_down_since = time.time() - 3600
 dp3.codex_spawn = lambda slot, item: dp3.refuse_spawn(slot, "staggered: waiting 14s behind the last spawn")
@@ -158,7 +240,7 @@ ok("REFUSED C1" in st.get("CODEX-1", "") and "staggered" in st["CODEX-1"],
    "MUST BITE: a REFUSED spawn says so and gives the reason, where it used to render as 'idle: no "
    "eligible CODEX item' — the same string as an empty queue")
 
-logs, events, saved, spawned, boards = [], [], [], [], []
+logs, events, saved, spawned, boards, notified, escalated = [], [], [], [], [], [], []
 DP4, dp4 = daemon([], False, spawned)
 dp4.server_down_since = time.time() - 3600
 dp4.tick()

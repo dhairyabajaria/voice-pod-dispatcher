@@ -63,7 +63,7 @@ ok(src.index('"$SELF" stop') > i_dry,
 
 
 # --------------------------------------------- `status` must date the board it prints
-# 2026-09-08: pending.json was nineteen hours old and `status` printed every row as though it were
+# 2026-09-08: pending.json was 16.6 hours old and `status` printed every row as though it were
 # current — fourteen executor rows of yesterday, and CODEX-1 idle over a live worker. The daemon
 # side is fixed (it writes the board on the degraded path now), but a board can go stale for other
 # reasons — a dead daemon, a full disk — and the reader must say how old the thing it is showing is.
@@ -73,19 +73,33 @@ _json.dump({"updated": "2026-09-07 12:49:14", "pending": [],
             "executors": {"CODEX-1": "idle: no eligible CODEX item"}},
            open(_os.path.join(_st, "pending.json"), "w"))
 _os.utime(_os.path.join(_st, "pending.json"), (_t.time() - 19 * 3600, _t.time() - 19 * 3600))
+# DISPATCHER_STATE, not STATE: the script sets STATE itself, so the old override did nothing and
+# this check was reading the LIVE board. It passed for 16.6 hours because that board happened to be
+# stale, and failed the moment the daemon was restarted and wrote a fresh one — a check that was
+# measuring somebody else's state and calling it a result.
 _r = _sp.run(["/bin/zsh", CTL, "status"], capture_output=True, text=True,
-             env=dict(_os.environ, STATE=_st, VOICEPOD_STATE=_st))
+             env=dict(_os.environ, DISPATCHER_STATE=_st))
 _out = _r.stdout + _r.stderr
 # NOT `"ago" in _out`: the heartbeat line prints "ago" on every run, so that check passed with the
 # staleness warning mutated away — it could not distinguish its own cause. Caught by mutating the
 # warning and watching this check stay green.
 ok("MIN OLD" in _out and "pending for BOSS" in _out,
-   "MUST BITE: `status` dates the board it prints, on the board's OWN line. A nineteen-hour-old "
+   "MUST BITE: `status` dates the board it prints, on the board's OWN line. A 16.6-hour-old "
    "snapshot rendered as the present is how fourteen fictional executor rows and an idle-over-live-"
    "work line survived a whole night of people reading them")
 ok("snapshot from then, not now" in _out or "MIN OLD" in _out,
    "and it says plainly that the rows are from then rather than now, not merely a number the reader "
    "has to do arithmetic on")
+
+# THE CONTROL: a FRESH board must NOT be marked stale, or the check above passes on any board at all.
+_st2 = _tf.mkdtemp(prefix="ctlfresh-")
+_json.dump({"updated": "now", "pending": [], "executors": {}}, open(_os.path.join(_st2, "pending.json"), "w"))
+_r2 = _sp.run(["/bin/zsh", CTL, "status"], capture_output=True, text=True,
+              env=dict(_os.environ, DISPATCHER_STATE=_st2))
+ok("MIN OLD" not in (_r2.stdout + _r2.stderr),
+   "CONTROL: a board written seconds ago is NOT marked stale — without this, the staleness check "
+   "would pass on a board of any age and prove nothing about the warning")
+shutil.rmtree(_st2, ignore_errors=True)
 shutil.rmtree(_st, ignore_errors=True)
 
 print(f"\n{P} passed, {len(F)} failed")

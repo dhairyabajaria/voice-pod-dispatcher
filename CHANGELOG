@@ -2316,13 +2316,13 @@ false positive gets "fixed" by deleting the explanation.
   a half-built object would hide exactly the missing initialisation a test exists to find. The whole
   suite caught both; my own new file did not, because it had set the field itself.
 
-2026-09-08 07:0x  THE BOARD FROZE FOR NINETEEN HOURS — write it on the degraded path, and date it
+2026-09-08 07:0x  THE BOARD FROZE FOR 16.6 HOURS — write it on the degraded path, and date it
   dispatcher.py, dispatcherctl.sh, tests/test_serverdown.py (15), tests/test_ctlself.py (9).
   Suite 65 files, ALL GREEN.
 
   BOSS reported `dispatcherctl status` printing "CODEX-1 idle: no eligible CODEX item" over a Muse
   worker that had been running 91 seconds, and read it as the control script guessing. It was worse
-  and simpler: pending.json was last written 2026-09-07 12:49:14 — NINETEEN HOURS — because the
+  and simpler: pending.json was last written 2026-09-07 12:49:14 — 16.6 HOURS — because the
   opencode early return happens before write_pending(). Nothing was guessing. The file was old, and
   nothing on the board said so. Fourteen EXEC rows of yesterday's state ("building ... busy") were
   being read as current all night.
@@ -2344,3 +2344,48 @@ false positive gets "fixed" by deleting the explanation.
   staleness warning mutated away. Caught by mutating the warning and watching the check not move.
   Now it requires the marker on the board's own line, and the same mutation reddens two checks
   instead of one. Testing the test is the only thing that found it.
+
+2026-09-08 07:2x  THE AGE COLUMN WAS A STORED SNAPSHOT — and escalation sat behind the same return
+  dispatcher.py, tests/test_serverdown.py (20). Suite ALL GREEN.
+
+  BOSS: the board printed `EXEC-J REPORT_READY since 12:24:11 ... age 25 min` against a row that was
+  1025 minutes old, and `EXEC-G ... age 16 min` against 1016. The line CONTRADICTED ITSELF — `since
+  12:24` and `age 25 min` cannot both be true — and that contradiction was the only thing on the
+  board telling the truth.
+
+  Cause: `age_min` is written by age_and_escalate(), which sits behind the opencode early return, so
+  the number froze at 12:49 the previous day along with everything else. Not a stopped clock: a
+  stored value from a pass that had not run, displayed as current. Same class as the board freeze,
+  one field deeper.
+
+  1. THE AGE IS NOW DERIVED AT RENDER TIME in write_pending, from since_ms, for every row it emits.
+     Correct no matter which path wrote the board or how long ago the aging pass last ran.
+
+  2. AGING AND ESCALATION RUN ON THE DEGRADED PATH. Neither needs the opencode server — escalate()
+     appends a line to a file. TWO REAL REPORT_READY ROWS WAITED SEVENTEEN HOURS with esc=2 and
+     esc=1 and nobody told, because a pass that answers BOSS was blocked behind a sensor it does not
+     use. That is the same defect as codex dispatch, in the reporting direction.
+
+  3. AN EMPTY ROSTER WHILE DEGRADED IS UNKNOWN, NOT ABSENT. The roster refreshes on the healthy
+     path, so after a restart with the server down it can be empty — and the OFF_ROSTER branch would
+     then silently classify every row as being pruned and escalate none of them. `degraded` is
+     passed rather than inferred precisely because that one branch has to change.
+
+  Mutations 5 of 5 CAUGHT. One scored MISSED first: removing the render-time aging, because every
+  check stubbed write_pending and its body never ran — a guard on a path the proof set does not
+  enter, which is the defect being fixed one layer down, found in the tests for it. A check that
+  drives the REAL write_pending now covers it.
+
+  CORRECTION TO MY OWN WRITE-UPS, made everywhere it appeared (5 files): I wrote "nineteen hours"
+  for the board freeze. My own figure — 59,814 s — and BOSS's 998 minutes both say 16.6. The number
+  was wrong in the CHANGELOG, in two source comments and in two test docstrings; the conclusions do
+  not change. `AGENT_SOCKET_EVIDENCE.md`'s "zero fetch occurrences" was corrected earlier to name
+  `mergegate.py:1186`, a local worktree-path fetch that needs no agent.
+
+  Addendum: my staleness check was itself reading the environment instead of building it. It passed
+  an `env STATE=` that the script ignores (dispatcherctl sets STATE itself), so it was testing the
+  LIVE board — green for 16.6 hours only because that board happened to be stale, and RED the moment
+  BOSS restarted the daemon and wrote a fresh one. A check measuring somebody else's state and
+  calling it a result. The script now honours DISPATCHER_STATE, the test supplies its own board, and
+  a CONTROL asserts a fresh board is NOT marked stale — without which the check would pass on a
+  board of any age.

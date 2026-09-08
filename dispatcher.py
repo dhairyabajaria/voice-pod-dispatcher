@@ -2615,8 +2615,12 @@ class Dispatcher:
             # CODEX HAS NO DEPENDENCY ON THAT SERVER and must not be held by its health.
             codex_status = self.codex_only_pass()
             self.state["degraded"]["codex"] = codex_status
+            # AGE AND ESCALATE ANYWAY. Neither needs the opencode server: escalate() appends to a
+            # file. Skipping it here is why two REPORT_READY rows waited seventeen hours with nobody
+            # told — the rows were already known, and answering them was never blocked on polling.
+            self.age_and_escalate(self.state["pending"], degraded=True)
             # AND THE BOARD MUST BE WRITTEN, or it freezes at its last value and renders as current.
-            # Measured 2026-09-08: pending.json was last written 2026-09-07 12:49:14 — nineteen
+            # Measured 2026-09-08: pending.json was last written 2026-09-07 12:49:14 — 16.6
             # hours — because this path returns before write_pending(). `dispatcherctl status` was
             # therefore printing fourteen EXEC rows of yesterday's fiction ("building ... busy") and
             # `CODEX-1 idle: no eligible CODEX item` over a Muse worker that had been running for 91
@@ -2886,7 +2890,7 @@ class Dispatcher:
         if json.dumps(q, sort_keys=True) != q_before:
             self.save_queue(q)
         qlock.close()  # releases the flock
-        self.age_and_escalate(pending)
+        self.age_and_escalate(pending, degraded=False)
         self.write_pending(exec_status)
         self.save_state()
 
@@ -3204,18 +3208,32 @@ class Dispatcher:
                           f"kind={p.get('kind')} age_min={p.get('age_min')}",
                           why + " — NOT pruned: it may still carry a question, BOSS clears it")
 
-    def age_and_escalate(self, pending):
+    def age_and_escalate(self, pending, degraded=False):
+        """Age every pending row and escalate the ones that have waited too long.
+
+        `degraded` means the opencode sensor is down. It is passed rather than inferred because the
+        one branch that must change is the OFF_ROSTER skip: the roster is refreshed on the healthy
+        path, so while degraded it may be empty or stale, and an empty roster would silently classify
+        every row as OFF_ROSTER and escalate none of them. A silent no-op is exactly the failure this
+        whole area keeps producing.
+
+        Escalation itself needs no server — escalate() appends a line to a file — so a row waiting on
+        BOSS must keep escalating whether or not the executors can be polled. Two REPORT_READY rows
+        sat for seventeen hours with esc=2 and esc=1 because this pass never ran.
+        """
         levels = self.c("escalate_after_minutes", [10, 20])
         repeat = self.c("escalation_repeat_minutes", 20)
         now_ms = time.time() * 1000
         live = set(self.roster.values())
+        roster_unknown = degraded and not live
         for sid, p in pending.items():
             p["age_min"] = int((now_ms - (p.get("since_ms") or now_ms)) / 60000)
             # A row for a session the roster no longer carries is on its way out (prune_offroster
             # removes it once the grace window closes). Escalating it in the meantime would ask BOSS
             # to rule on an executor that no longer exists — measured on the first staged dry-run,
             # which fired three DEAD escalations for exactly those rows.
-            if self.c("executors", {}) and not str(sid).startswith("codex:") and sid not in live:
+            if (self.c("executors", {}) and not str(sid).startswith("codex:") and sid not in live
+                    and not roster_unknown):
                 p["stall_class"] = "OFF_ROSTER"
                 p["held"] = "session is not in the roster — row is being pruned, no escalation"
                 continue
@@ -3268,6 +3286,19 @@ class Dispatcher:
 
     def write_pending(self, exec_status):
         items = sorted(self.state["pending"].values(), key=lambda p: p.get("since_ms") or 0)
+        # AGE IS DERIVED HERE, NOT DISPLAYED FROM STORAGE. `age_min` is written by
+        # age_and_escalate(), which sits behind the opencode early return, so on 2026-09-08 the board
+        # printed `EXEC-J REPORT_READY since 12:24:11 ... age 25 min` — a stored value frozen at
+        # 12:49 the previous day — while the row was actually 1025 minutes old. The line contradicted
+        # ITSELF: `since 12:24` and `age 25 min` cannot both be true, and that contradiction was the
+        # only thing on the board telling the truth.
+        #
+        # Two real REPORT_READY rows waited seventeen hours behind that number. Recomputing at the
+        # moment of rendering makes the displayed age correct no matter which path wrote the board or
+        # how long ago the aging pass last ran.
+        now_ms = time.time() * 1000
+        for _p in items:
+            _p["age_min"] = int((now_ms - (_p.get("since_ms") or now_ms)) / 60000)
         doc = {
             "updated": now_local(),
             "paused": os.path.exists(STOP),
