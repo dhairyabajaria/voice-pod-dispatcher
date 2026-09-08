@@ -50,6 +50,9 @@ class Runner(unittest.TestCase):
             profile.write_text('model="muse-spark-1.3-contributor"\nmodel_provider="muse-go-1"\n'
                                'model_reasoning_effort="xhigh"\n[model_providers.muse-go-1]\n'
                                'env_key="OPENCODE_GO_KEY_1"\n')
+            isolated = Path(root) / "muse-homes" / "muse-go-1"
+            isolated.mkdir(parents=True)
+            (isolated / "config.toml").write_text(profile.read_text())
             with patch.object(m, "subprocess_runner", return_value=(1, "", "error: 429 Too Many Requests", 123)) as run:
                 m.run_attempt("test", "1", "brief", root, "muse-go-1", worktree=root,
                               home=root, env={"OPENCODE_GO_KEY_1": "test-key"})

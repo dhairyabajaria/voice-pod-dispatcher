@@ -44,6 +44,10 @@ open(os.path.join(HOME, "muse-go-1.config.toml"), "w").write(GO1)
 open(os.path.join(HOME, "muse-go-2.config.toml"), "w").write(GO1.replace("go-1", "go-2").replace("KEY_1", "KEY_2"))
 open(os.path.join(HOME, "muse-zen-1.config.toml"), "w").write(ZEN1)
 open(os.path.join(HOME, "muse-broken.config.toml"), "w").write('model = "x"\n')
+for profile, text in (("muse-go-1", GO1), ("muse-go-2", GO1.replace("go-1", "go-2").replace("KEY_1", "KEY_2")),
+                      ("muse-zen-1", ZEN1)):
+    d = os.path.join(HOME, "muse-homes", profile); os.makedirs(d)
+    open(os.path.join(d, "config.toml"), "w").write(text)
 
 def rollout(sid, model="muse-spark-1.3-contributor", provider="muse-go-1", effort="xhigh",
             meta=True, turn=True):
@@ -112,6 +116,8 @@ ok(M.next_profile([], "x") is None, "an exhausted order yields no profile, not a
 # --------------------------------------------------------------------- credentials: names, not values
 e, why = M.child_env(s, base={"OPENCODE_GO_KEY_1": "v", "OPENCODE_GO_KEY_2": "other"})
 ok(e and e.get("OPENCODE_GO_KEY_1") == "v", "the selected account's credential is carried")
+ok(e and e.get("CODEX_HOME") == os.path.join(HOME, "muse-homes", "muse-go-1"),
+   "the selected route uses its isolated Codex home, never the shared default home")
 ok(e and "OPENCODE_GO_KEY_2" not in e,
    "another account's credential is REMOVED from the child even when inherited")
 e2, why2 = M.child_env(s, base={"OPENCODE_GO_KEY1": "unsuffixed-only"})

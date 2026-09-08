@@ -89,13 +89,19 @@ def profile_spec(profile, home=CODEX_HOME):
     m = re.search(r'env_key\s*=\s*"([A-Z0-9_]+)"', text)
     if m:
         env_key = m.group(1)
+    profile_home = os.path.join(home, "muse-homes", profile)
+    profile_config = os.path.join(profile_home, "config.toml")
     spec = {"profile": profile, "model": one("model"), "provider": one("model_provider"),
             "effort": one("model_reasoning_effort"), "env_key": env_key,
+            "codex_home": profile_home,
             "tier": "go" if profile in GO_PROFILES else "zen" if profile in ZEN_PROFILES else "other"}
     missing = [k for k in ("model", "provider", "env_key") if not spec[k]]
     if missing:
         return None, (f"{path} declares no {', '.join(missing)} — this adapter will not guess a "
                       f"route, because a guessed route is the silent substitution Plan 003 forbids")
+    if not os.path.isfile(profile_config):
+        return None, (f"{profile} has no isolated Codex home at {profile_config} — refusing the "
+                      "shared home because it can silently select its default provider instead")
     return spec, ""
 
 
@@ -175,7 +181,11 @@ def child_env(spec, base=None):
                         "was spent. (No value was read; only whether one exists.)")
     env = scrub_env(base, keep=want)
     env[want] = value
-    env["CODEX_HOME"] = env.get("CODEX_HOME", CODEX_HOME)
+    # Codex v0.153 layers a profile on top of the shared home, but the shared
+    # home can still select its default OpenAI model. Each Muse route therefore
+    # owns a complete isolated home whose config.toml is the route we validated
+    # above. A successful process on the shared home is not a Muse success.
+    env["CODEX_HOME"] = spec["codex_home"]
     return env, ""
 
 

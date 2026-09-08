@@ -42,6 +42,10 @@ HOME = os.path.join(TMP, "codex"); os.makedirs(HOME)
 open(os.path.join(HOME, "muse-go-1.config.toml"), "w").write(
     'model = "muse-spark-1.3-contributor"\nmodel_provider = "muse-go-1"\n'
     'model_reasoning_effort = "xhigh"\n[model_providers.muse-go-1]\nenv_key = "OPENCODE_GO_KEY_1"\n')
+os.makedirs(os.path.join(HOME, "muse-homes", "muse-go-1"))
+open(os.path.join(HOME, "muse-homes", "muse-go-1", "config.toml"), "w").write(
+    'model = "muse-spark-1.3-contributor"\nmodel_provider = "muse-go-1"\n'
+    'model_reasoning_effort = "xhigh"\n[model_providers.muse-go-1]\nenv_key = "OPENCODE_GO_KEY_1"\n')
 M.CODEX_HOME = HOME          # route_flags' default home, so the daemon resolves our fixture profiles
 
 WT = os.path.join(TMP, "wt"); os.makedirs(os.path.join(WT, "platform", ".venv", "bin"))

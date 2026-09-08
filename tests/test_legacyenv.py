@@ -113,6 +113,9 @@ HOME_ = tempfile.mkdtemp(prefix="legacyenv-home-")
 open(os.path.join(HOME_, "muse-go-1.config.toml"), "w").write(
     'model = "muse-spark-1.3-contributor"\nmodel_provider = "muse-go-1"\n'
     'model_reasoning_effort = "xhigh"\n[model_providers.muse-go-1]\nenv_key = "OPENCODE_GO_KEY_1"\n')
+os.makedirs(os.path.join(HOME_, "muse-homes", "muse-go-1"))
+open(os.path.join(HOME_, "muse-homes", "muse-go-1", "config.toml"), "w").write(
+    open(os.path.join(HOME_, "muse-go-1.config.toml")).read())
 mf, menv, mspec, mwhy = M.route_flags("muse-go-1", env=DIRTY, home=HOME_)
 ok(mf == ["-p", "muse-go-1"] and menv.get("OPENCODE_GO_KEY_1") == "irrelevant",
    "CONTROL: the Muse branch still carries EXACTLY ONE key — its own — so the shared strip did not "

@@ -72,6 +72,9 @@ class Conversation(unittest.TestCase):
                    'env_key="OPENCODE_GO_KEY_1"\n[model_providers.muse-go-1.http_headers]\n'
                    'x-opencode-session="old-static"\nx-custom="keep-me"\n')
         profile.write_text(content)
+        isolated = Path(self.root) / "muse-homes" / "muse-go-1"
+        isolated.mkdir(parents=True)
+        (isolated / "config.toml").write_text(content)
         seen = []
         def runner(argv, env, brief, timeout):
             override = next(x for x in argv if x.startswith("model_providers."))
