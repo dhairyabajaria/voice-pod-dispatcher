@@ -149,6 +149,10 @@ run = dp.state["codex"]["CODEX-1"]
 ok(run["profile"] == "muse-go-1" and run["provider_intended"] == "muse-go-1"
    and run["effort_intended"] == "xhigh",
    "the run record carries what this dispatch INTENDED, so the reap can check what actually ran")
+ok(run.get("cwd") == sp["kw"].get("cwd") and run.get("cwd"),
+   "MUST BITE: and it carries the cwd the process was actually launched in. When the CLI prints no "
+   "session id the cwd is the ONLY thing that identifies the rollout, and a run record without it "
+   "sends the fallback to a resolver that must refuse — see tests/test_routewindow.py")
 
 rc, sp, item, dp, lg, ev = spawn(item_extra={"profile": "muse-go-1"},
                                  env={"PATH": "/usr/bin", "OPENCODE_GO_KEY_1": "sk-x"})

@@ -2337,7 +2337,7 @@ class Dispatcher:
         mstate["last"] = profile      # tie-break only: placement is least-loaded, not a cursor
         mstate["last_spawn_at"] = time.time()   # the stagger clock starts when a spawn SUCCEEDS
         self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000),
-                                     "profile_note": pnote,
+                                     "profile_note": pnote, "cwd": wt,   # the fallback route resolver's only discriminator
                                      "profile": rspec["profile"], "model_intended": rspec["model"],
                                      "provider_intended": rspec.get("provider"), "effort_intended": rspec.get("effort")}
         item.update({"status": "dispatched", "dispatched_to": slot, "session": f"codex:{proc.pid}", "dispatched_at": now_local()})
@@ -2423,19 +2423,46 @@ class Dispatcher:
                     self.log(f"{slot}: holding {run['profile']} — {failed}"
                              + (f" ({scope} wall)" if scope else "")
                              + f" reported by {run['item']}")
-                route_note = ""
+                # REFUSED AND NOT MEASURED ARE DIFFERENT FACTS ABOUT DIFFERENT SUBJECTS. REFUSED is
+                # the provider declining to run. NOT MEASURED is US failing to observe — a statement
+                # about our instrument, not about the work. BOSS, 2026-09-08: the first real Muse
+                # sweep succeeded (26 KB report, two commits, positive control 5/5, 40 candidate
+                # rows, a REJECTED section, and it refuted his seed) and was recorded broken because
+                # the CLI printed no session id. Conflating the two discards exactly the output we
+                # most want to keep. So: an unresolvable route blocks a MERGE — that ruling stands,
+                # and it is written onto the item where the gate reads it — but it never sets `kind`
+                # and never marks finished work broken.
+                route_note, route_state, route_detail = "", None, ""
                 if run.get("provider_intended"):
                     spec = {"profile": run.get("profile"), "model": run.get("model_intended"),
                             "provider": run.get("provider_intended"), "effort": run.get("effort_intended")}
                     sid = museadapter.session_id_from_jsonl(whole)
                     roll, rwhy = museadapter.rollout_for_session(sid)
+                    how = ""
+                    if not roll:
+                        # The id is the CHEAP route to the rollout, not the only one. When the CLI
+                        # does not print one, exactly one session written in this run's window with
+                        # this run's cwd identifies it — which is how BOSS resolved it by hand.
+                        roll, how = museadapter.rollout_by_window(
+                            run.get("cwd"), run.get("started_ms"), int(time.time() * 1000))
+                        if not roll:
+                            rwhy = f"{rwhy}; and the time-and-cwd fallback found nothing: {how}"
+                            how = ""
                     verdict, note = museadapter.route_matches(
                         spec, museadapter.resolved_route(roll) if roll else {})
+                    route_state = verdict
                     if verdict is False:
                         kind = "ROUTE_MISMATCH"
                         route_note = note
                     elif verdict is None:
-                        route_note = f"route unverified: {note or rwhy}"
+                        route_note = ("route NOT MEASURED — WE could not observe what ran. This says "
+                                      "nothing about the work and does not mark it broken; it does "
+                                      "block a merge, because an attempt whose route is unknown "
+                                      "cannot be cited as evidence for the route it intended. "
+                                      + (note or rwhy))
+                    elif how:
+                        route_note = f"route VERIFIED, resolved without a session id: {how}"
+                    route_detail = route_note
                     if route_note:
                         self.log(f"{slot}: {route_note}")
                 exc = clean_excerpt(((route_note + "\n\n") if route_note else "") + text[-1500:])
@@ -2460,6 +2487,21 @@ class Dispatcher:
                             it.update({"status": "reported" if kind == "REPORT_READY" else ("parked" if kind == "QUESTION" else "broken"),
                                        "reported_at": now_local(),
                                        **({"parked_from": it.get("status")} if kind == "QUESTION" else {})})
+                        if run.get("provider_intended"):
+                            # The gate cannot re-derive this: the rollout window has passed and the
+                            # run state is gone. Written on the ITEM because that is what survives.
+                            # THREE STATES, THREE FIELDS. A MISMATCH IS MEASURED — it is a failure
+                            # of the candidate and reads as one. UNMEASURED is a failure of the
+                            # instrument and reads as "no result", which blocks a merge without
+                            # calling the work bad. Collapsing them into one boolean is the same
+                            # mistake one level up.
+                            it["route_verified"] = route_state is True
+                            it.pop("route_unverified", None)
+                            it.pop("route_mismatch", None)
+                            if route_state is False:
+                                it["route_mismatch"] = route_detail[:400]
+                            elif route_state is None:
+                                it["route_unverified"] = (route_detail or "route not established")[:400]
                 del self.state["codex"][slot]
                 run = None
             if not run and fed_this_tick < max_feed and self.c("feed_queue", True) and not os.path.exists(QUEUE_HOLD) \

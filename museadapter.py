@@ -619,9 +619,15 @@ def session_id_from_jsonl(text):
     return None
 
 
-def rollout_for_session(session_id, root=SESSIONS_ROOT):
-    """The rollout file for THIS session id. -> (path, "") or (None, why). Refuses on 0 and on >1."""
+def rollout_for_session(session_id, root=None):
+    """The rollout file for THIS session id. -> (path, "") or (None, why). Refuses on 0 and on >1.
+
+    `root=None` means SESSIONS_ROOT read AT CALL TIME. It was a default argument, which binds at
+    import: setting the module global afterwards was accepted and silently ignored, so an override
+    that looked applied never was.
+    """
     import glob
+    root = root or SESSIONS_ROOT
     if not session_id:
         return None, ("the CLI reported NO SESSION ID on stdout — looked for a JSONL line carrying "
                       "`thread_id`, `session_id` or `conversation_id`, of which cli 0.153.2 prints "
@@ -635,6 +641,61 @@ def rollout_for_session(session_id, root=SESSIONS_ROOT):
         return None, (f"{len(hits)} rollouts carry session id {session_id}; refusing to choose "
                       f"between them")
     return hits[0], ""
+
+
+def rollout_by_window(cwd, started_ms, ended_ms, root=None, slack_ms=120000):
+    """The rollout for a run whose CLI printed NO session id, matched by TIME AND CWD.
+
+    -> (path, why_it_matched) or (None, why_not). Refuses on 0 and on >1, like rollout_for_session:
+    a window that admits two sessions has not identified one, and the second-best match is not a
+    match. NOTE the return shape: unlike rollout_for_session the note is non-empty on success too,
+    because a route resolved this way must carry HOW it was resolved wherever it is cited. Callers
+    test the path, never the note.
+
+    BOSS, 2026-09-08: the first real Muse sweep succeeded — 26 KB report, two commits, positive
+    control 5/5, 40 candidate rows, a REJECTED section, and it refuted his seed — and the reap
+    recorded it as broken because the CLI printed no session id. He resolved the route by hand at
+    05:20:33 straight from this directory: exactly one session in the window, cwd matching the
+    worktree the daemon created. That is available to us and was sufficient for him, so it is the
+    fallback here BEFORE we declare NOT MEASURED.
+
+    The cwd is the discriminator and it is REQUIRED. A window on its own matches every session that
+    happened to run at the same moment — including the zen sessions from a scratch workspace that
+    are not ours (route_matches' docstring) — so with no cwd this refuses rather than guessing.
+    """
+    import glob
+    root = root or SESSIONS_ROOT      # read at CALL time; a default argument binds at import
+    if not cwd:
+        return None, ("the run recorded no cwd, and a time window with no directory matches any "
+                      "session that happened to run alongside ours — refusing to guess")
+    if not started_ms or not ended_ms or ended_ms < started_ms:
+        return None, (f"the run recorded no usable window (started_ms={started_ms!r}, "
+                      f"ended_ms={ended_ms!r}), so there is nothing to match against")
+    want = os.path.realpath(cwd)
+    lo = (started_ms - slack_ms) / 1000.0
+    hi = (ended_ms + slack_ms) / 1000.0
+    hits, in_window = [], 0
+    for path in sorted(glob.glob(os.path.join(root, "*", "*", "*", "*.jsonl"))):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:      # a rollout rotated away between the glob and the stat
+            continue
+        if not (lo <= mtime <= hi):
+            continue
+        in_window += 1
+        meta = resolved_route(path)
+        seen = meta.get("cwd")
+        if seen and os.path.realpath(seen) == want:
+            hits.append(path)
+    if not hits:
+        return None, (f"no rollout under {root} was written in the window AND records cwd {want} "
+                      f"— {in_window} rollout(s) fell in the window at all")
+    if len(hits) > 1:
+        return None, (f"{len(hits)} rollouts match cwd {want} inside the window; refusing to choose "
+                      f"between them: {[os.path.basename(h) for h in hits]}")
+    return hits[0], (f"the CLI printed no session id, so the rollout was matched by time and cwd: "
+                     f"exactly one session under {root} was written between {started_ms} and "
+                     f"{ended_ms} (+/-{slack_ms}ms) with cwd {want}")
 
 
 def resolved_route(rollout_path):

@@ -432,6 +432,40 @@ def provenance_from_rollout(path):
     return out
 
 
+def run_route_provenance_row(it, rec, warn):
+    """The route the reap read back, carried onto the gate. Records at most one row.
+
+    The gate CANNOT re-derive this: by the time it runs the daemon's run state is gone and the
+    rollout window has passed, so provenance is whatever the reap wrote on the item.
+
+    BOSS, 2026-09-08: REFUSED (the provider declined) and NOT MEASURED (we failed to observe) are
+    facts about different subjects, and conflating them cost the first real Muse result — a sweep
+    that succeeded outright was recorded broken because the CLI printed no session id. The same
+    split applies here, one level up:
+
+        FAIL      the session records a route nobody asked for   -> the candidate is wrong
+        NOT RUN   we could not establish what ran                -> our instrument, not the work
+        PASS      the session's own metadata matches the intent
+
+    NOT RUN blocks the merge exactly as any unrun check does — an attempt whose route is unknown
+    cannot be cited as evidence for the route it intended — while never calling the work bad.
+    """
+    if it.get("route_mismatch"):
+        rec("route verified", False, str(it["route_mismatch"]))
+    elif it.get("route_unverified"):
+        rec("route verified", None, "the daemon could not establish what actually ran, so there is "
+                                    "no provenance to gate on: " + str(it["route_unverified"]))
+    elif it.get("route_verified"):
+        rec("route verified", True, "the reap read the route back from the session's own metadata")
+    elif str(it.get("dispatched_to", "")).startswith("CODEX") or it.get("executor") == "CODEX":
+        # Deliberately advisory and NOT gating: rows dispatched before the reap recorded provenance
+        # carry no field at all, and turning every one of them INCOMPLETE would change the verdict
+        # of work that predates the check. Visible and named, rather than silent.
+        warn("route verified: NO ROW — this item carries none of route_verified/route_unverified/"
+             "route_mismatch, so it was dispatched before the reap recorded route provenance. "
+             "Advisory only; re-dispatch under the current daemon to gate on it.")
+
+
 def route_row(prov, why="", model=ASTRA_MODEL, effort=ASTRA_EFFORT):
     """Is this review's identity what we pinned? -> (True | False | None, text).
 
@@ -1933,6 +1967,7 @@ def _main(ctx):
         rec("scope", UNDECLARED, UNDECL_FIX.format(what="scope") + f" ({len(files)} files changed)")
     else:
         rec("scope", not outside, f"{len(files)} files; scope={scope}; OUTSIDE={outside}")
+    run_route_provenance_row(it, rec, warn)
     hand_merge = bool(denied)
     checks.append(("hand-merge required", "YES" if hand_merge else "no",
                    f"foundation/denylisted files touched: {denied} — BOSS merges by hand" if hand_merge else "none"))
