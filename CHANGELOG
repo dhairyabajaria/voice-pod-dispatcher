@@ -1,36 +1,28 @@
-2026-09-08 05:57  museadapter.py 8b3653a3, dispatcher.py 8f68875c, mergegate.py 69472b51   [BOSS 2026-09-08]
-  REFUSED IS NOT NOT-MEASURED. REFUSED is the provider declining to run. NOT MEASURED is US failing
-  to observe — a statement about our instrument, not about the work. The first real Muse sweep
-  SUCCEEDED (26 KB report, two commits, positive control 5/5, 40 candidate rows, a REJECTED section,
-  and it refuted BOSS's own seed) and the reap recorded the item `broken`, because the CLI printed
-  no session id on stdout and route_matches therefore returned NOT MEASURED. Conflating the two
-  discards exactly the output we most want to keep.
-  FALLBACK: museadapter.rollout_by_window(cwd, started_ms, ended_ms) identifies a session with no
-  id by TIME AND CWD — how BOSS resolved this one by hand at 05:20:33. Refuses on 0 and on >1: the
-  second-best match is not a match. The cwd is REQUIRED and is the discriminator; a bare window
-  matches every session that ran alongside ours, including the zen sessions from a scratch workspace
-  that are not ours. The reap reaches it only when the cheap id path finds nothing.
-  THREE STATES, THREE FIELDS on the item, because the gate cannot re-derive any of this once the run
-  state is gone and the window has passed: route_mismatch (measured, wrong -> FAIL), route_unverified
-  (unobservable -> NOT RUN, blocks the merge without calling the work bad), route_verified (PASS).
-  NOT MEASURED no longer sets `kind` and no longer marks finished work broken. mergegate's new
-  run_route_provenance_row records the row; a codex item with no field at all is WARNED, not failed,
-  so work that predates the check does not have its verdict changed underneath it.
-  ALSO FIXED, found by the first red rather than by reading: rollout_for_session and
-  rollout_by_window took root=SESSIONS_ROOT as a DEFAULT ARGUMENT, which binds at import. Setting
-  the module global afterwards was accepted and silently ignored — an override that looked applied
-  and never was. Both now read it at call time.
-  ALSO: codex_spawn records the run's cwd. Without it the fallback has no discriminator and must
-  refuse; the mutation that removes it scored MISSED until tests/test_codexroute.py asserted it.
-  PROOF: tests/test_routewindow.py (28 checks, new, wired into run_all.sh), tests/test_codexroute.py
-  (38, +1). Whole suite ALL GREEN. Seven call-site mutations scored, 7/7 CAUGHT, no crashes, every
-  file restored to its pre-image md5: delete the fallback call site; let NOT MEASURED condemn again;
-  stop writing route_unverified; stop recording the run cwd; delete the gate's call to the row; take
-  the newest of two matches instead of refusing; drop the cwd requirement.
-  NOTE ON PROCESS, unprompted: I first edited mergegate.py IN PLACE, bypassing safe_apply.sh, which
-  is the gate-stamped path. No gate was running (checked), and load-time module hashing makes the
-  race harmless, but the check was skipped. I reconstructed the pre-image, restored it, and
-  re-applied through safe_apply.sh.
-  Takes effect on the NEXT daemon restart — running gates and the live daemon still execute the old
-  image.
+2026-09-08 06:01  dispatcherctl.sh be449518   [BOSS 2026-09-08, found by running it]
+  `clear-hold` WITH NO ARGUMENT DIED: `SyntaxError: f-string: invalid syntax -> (v.get(class))`.
+  The listing block sits inside a double-quoted `python3 -c "…"`, where an inner " is not a quote to
+  the shell — it CLOSES the argument — so `v.get("class")` reached Python as `v.get(class)`, a
+  keyword. The RELEASE branch one line below was already argv-driven and worked; BOSS proved it
+  live. The listing branch is reached only with no argument and the suite never exercised it. Third
+  unexercised branch of a guard to ship broken in one night (the others: `restart`'s self-call
+  behind --dry-run, the render-time aging behind a stubbed write_pending).
+  Both the path and the strings now come in through argv, so no shell quoting reaches Python.
+  ALSO, unprompted and found while exercising the branch: an UNREADABLE state file printed an empty
+  list under `currently held:`, identical to nothing being held — a reader would have concluded the
+  account was in service. It now says CANNOT SAY and names the file and the error. And an empty hold
+  map says so in words instead of printing a heading with nothing under it.
+  PROOF: tests/test_clearhold.py (14 checks, new, wired into run_all.sh) drives the REAL script in a
+  subprocess through every clear-hold branch — held, empty, unreadable, and the release request —
+  because the defect lived in shell quoting and only the shell reproduces it. Whole suite ALL GREEN.
+  Four mutations scored, 4/4 CAUGHT, no crashes, restored to pre-image md5: restore BOSS's exact
+  broken f-string; let an unreadable file render as empty; drop the 'nothing is held' line; write
+  state.json instead of the request file.
+  AND THE CLASS, which is the part that matters: the test compiles EVERY embedded `python3 -c "…"`
+  body in the script after applying the shell's own quote-stripping, and refuses any body containing
+  a bare ". That catches this defect without anyone running the branch, and catches the next one in
+  a branch nobody has run either. Its own control asserts the scan reaches every embedded Python
+  present (2 of 2), because a checker that silently skips a form is the shape it exists to catch.
+  DELIBERATELY NOT DONE: running every ctl verb to see which crash — `restart`, `pause` and `stop`
+  act on the live daemon. The class check is static for that reason and is weaker for it: it catches
+  a body that cannot parse, not one that parses and does the wrong thing.
 

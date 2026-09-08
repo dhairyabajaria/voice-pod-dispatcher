@@ -173,12 +173,25 @@ case "${1:-status}" in
     if [[ -z $prof ]]; then
       print -u2 "usage: $SELF clear-hold <profile> [reason]"
       print -u2 "  currently held:"
+      # THE PATH AND THE QUOTES BOTH COME IN THROUGH ARGV. This block is inside a double-quoted
+      # shell string, so an inner " is not a quote to the shell at all: it CLOSES the string, and
+      # `v.get("class")` reached Python as `v.get(class)` — a keyword — dying with a SyntaxError
+      # that named an f-string. BOSS found it by RUNNING it, 2026-09-08. The release branch below
+      # was already argv-driven and worked; this branch is reached only with no argument and the
+      # suite never exercised it. Third unexercised branch of a guard to ship broken in one night.
       /usr/bin/python3 -c "
 import json,sys
-try: d=json.load(open('$STATE/state.json'))
-except Exception: sys.exit(0)
-for k,v in (d.get('muse') or {}).get('unhealthy',{}).items():
-    print(f'    {k}  {v.get("class")}  {v.get("why","")[:80]}')" >&2
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception as e:
+    # An unreadable state file printed an EMPTY LIST, which reads exactly like 'nothing is held' —
+    # and the reader would conclude the account is in service. Say which one it is.
+    print('    (CANNOT SAY — %s is unreadable: %s. This is not the same as nothing being held.)'
+          % (sys.argv[1], e)); sys.exit(0)
+held=(d.get('muse') or {}).get('unhealthy',{})
+if not held: print('    (none — nothing is held)')
+for k,v in held.items():
+    print('    %s  %s  %s' % (k, v.get('class'), (v.get('why') or '')[:80]))" "$STATE/state.json" >&2
       exit 2
     fi
     mkdir -p "$STATE/holdclear"
