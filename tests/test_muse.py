@@ -279,6 +279,7 @@ ok(r["outcome"] == M.INCOMPLETE and r["route_verified"] is None and "NOT MEASURE
 
 zrol = rollout("0199a1b2-zenr-un00-0003-000000000003", model="muse-spark-1.3-contributor-free", provider="muse-zen-1")
 r = M.run_attempt("C1", 1, "b", STATE, "muse-zen-1", home=HOME, sessions_root=SESS,
+                  conversation_id="independent-zen-conversation",
                   env={"OPENCODE_ZEN_KEY_1": "k"},
                   runner=fake_runner(0, json.dumps({"type": "thread.started", "thread_id": "0199a1b2-zenr-un00-0003-000000000003"}),
                                      write=dict(GOOD, session_id="0199a1b2-zenr-un00-0003-000000000003")))

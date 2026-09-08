@@ -29,6 +29,10 @@ import os
 import re
 import time
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import musesession
+
 D = os.path.dirname(os.path.abspath(__file__))
 CODEX_HOME = os.path.expanduser("~/.codex")
 SESSIONS_ROOT = os.path.join(CODEX_HOME, "sessions")
@@ -444,7 +448,7 @@ def route_flags(profile, home=CODEX_HOME, env=None, legacy_model=None, legacy_ef
 
 
 def launch_argv(profile, result_path, schema=None, sandbox="workspace-write",
-                writable_roots=()):
+                writable_roots=(), provider_flags=()):
     """A NEW worker. The brief arrives on stdin and the caller closes it (see brief_stdin).
 
     §5, finding 3: choose ONE explicit input mode. The brief goes through a closed pipe rather than
@@ -459,7 +463,7 @@ def launch_argv(profile, result_path, schema=None, sandbox="workspace-write",
     # is Astra's `medium` — so the profile is the single source of truth and route_matches checks
     # that it arrived. Same for `-m`: the profile names the model.
     argv = [codex_bin(), "exec", "--json", "--strict-config", "-p", profile,
-            "-s", sandbox, "-o", result_path] + writable_flags(writable_roots)
+            "-s", sandbox, "-o", result_path] + writable_flags(writable_roots) + list(provider_flags)
     if schema:
         argv += ["--output-schema", schema]
     return argv + ["-"]
@@ -478,7 +482,7 @@ def writable_flags(roots):
 
 
 def resume_argv(profile, session_id, result_path, schema=None, sandbox="workspace-write",
-                writable_roots=()):
+                writable_roots=(), provider_flags=()):
     """RESUME an exact session. -> argv, or raises ValueError on an empty id.
 
     §5, finding 4, and both halves matter:
@@ -491,7 +495,7 @@ def resume_argv(profile, session_id, result_path, schema=None, sandbox="workspac
     if not str(session_id or "").strip():
         raise ValueError("resume needs the exact stored session id; --last is never acceptable here")
     argv = [codex_bin(), "exec", "--json", "--strict-config", "-p", profile,
-            "-s", sandbox, "-o", result_path] + writable_flags(writable_roots)
+            "-s", sandbox, "-o", result_path] + writable_flags(writable_roots) + list(provider_flags)
     if schema:
         argv += ["--output-schema", schema]
     return argv + ["resume", str(session_id), "-"]
@@ -871,7 +875,7 @@ def attempt_record(**kw):
 # ------------------------------------------------------------------------------------ the entry point
 def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owner=None,
                 base_sha=None, session_id=None, schema=None, timeout=None, home=CODEX_HOME,
-                sessions_root=None, env=None, runner=None, writable_roots=()):
+                sessions_root=None, env=None, runner=None, writable_roots=(), conversation_id=None):
     """Run ONE attempt end to end and return its durable record. Never raises for a worker failure.
 
     THIS IS THE ONLY FUNCTION A CALLER SHOULD USE, and every check above is wired here rather than
@@ -908,6 +912,14 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
         # an account that is probably fine.
         return rec(outcome=NO_ATTEMPT, detail=why)
 
+    try:
+        conversation = musesession.prepare(state_dir, str(conversation_id or item),
+                                           spec, session_id=session_id, owner=item,
+                                           worktree=worktree or os.getcwd())
+        provider_flags = musesession.flags(conversation)
+    except (ValueError, OSError) as e:
+        return rec(outcome=CLI_CONFIG, detail=str(e))
+    rec = lambda _rec=rec, **kw: _rec(provider_conversation=conversation["header"], **kw)
     result_path = result_path_for(state_dir, item, attempt)
     log_path = os.path.join(state_dir, os.path.basename(result_path) + ".events")
     if real_runner:
@@ -915,9 +927,9 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
         runner = partial(subprocess_runner, cwd=worktree, event_path=log_path)
     try:
         argv = (resume_argv(profile, session_id, result_path, schema=schema,
-                            writable_roots=writable_roots) if session_id
+                            writable_roots=writable_roots, provider_flags=provider_flags) if session_id
                 else launch_argv(profile, result_path, schema=schema,
-                                 writable_roots=writable_roots))
+                                 writable_roots=writable_roots, provider_flags=provider_flags))
     except ValueError as e:
         return rec(outcome=CLI_CONFIG, detail=str(e), result_path=result_path)
 
@@ -930,6 +942,12 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
                    result_path=result_path)
 
     sid = session_id_from_jsonl(out) or session_id
+    binding_error = None
+    if sid:
+        try:
+            musesession.bind(state_dir, sid, conversation)
+        except (ValueError, OSError) as e:
+            binding_error = str(e)
     try:
         with open(log_path, "w") as fh:
             fh.write(out or "")
@@ -937,6 +955,10 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
                 fh.write("\n----- stderr -----\n" + err)
     except OSError:
         log_path = None
+
+    if binding_error:
+        return rec(outcome=CLI_CONFIG, detail=binding_error, pid=pid, session_id=sid,
+                   result_path=result_path, event_log=log_path)
 
     # ONE completion path, shared with the daemon. codex_spawn cannot call run_attempt (it launches
     # and reaps a tick later, where this blocks), so the checks live in verify_finish and BOTH

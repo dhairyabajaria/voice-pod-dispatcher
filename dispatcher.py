@@ -2275,6 +2275,13 @@ class Dispatcher:
         # profiles, steps over a held one, and falls back to zen only when every Go key is held.
         # `last` lives in self.state so the rotation survives a tick: kept in a local, it would
         # restart at the head every time and hand every dispatch to muse-go-1.
+        if not self.dry:
+            try:
+                persisted = museadapter.musesession.existing(CODEX_DIR, item["id"])
+                if persisted and not item.get("profile"):
+                    item["muse_profile"] = persisted["route"]["profile"]
+            except (ValueError, OSError) as e:
+                return self.refuse_spawn(slot, f"Muse conversation identity refused: {e}")
         profile, pnote = museadapter.select_profile(slot, item, self.cfg, mstate,
                                                     items=self._queue_items())
         if profile == museadapter.WAIT:
@@ -2306,6 +2313,15 @@ class Dispatcher:
             item["status"] = "broken"; item["error"] = f"route {profile}: {rwhy}"[:200]
             self.emit("ERROR", slot, "-", "-", f"item={item['id']}", f"route {profile} refused: {rwhy}")
             return self.refuse_spawn(slot, f"route {profile} refused: {rwhy}")
+        conversation = None
+        if profile != museadapter.LEGACY and not self.dry:
+            try:
+                # Durable before Popen, including retries after a failed spawn/restart.
+                conversation = museadapter.musesession.prepare(
+                    CODEX_DIR, item["id"], rspec, worktree=wt, replace_profile=True)
+                rflags += museadapter.musesession.flags(conversation)
+            except (ValueError, OSError) as e:
+                return self.refuse_spawn(slot, f"Muse conversation identity refused: {e}")
         cmd = [self.c("codex_bin", "codex"), "exec", "-s", "workspace-write", "-c", f"sandbox_workspace_write.writable_roots={roots}",
                *rflags, "--skip-git-repo-check", prompt]
         if self.dry:
@@ -2338,6 +2354,8 @@ class Dispatcher:
         mstate["last"] = profile      # tie-break only: placement is least-loaded, not a cursor
         mstate["last_spawn_at"] = time.time()   # the stagger clock starts when a spawn SUCCEEDS
         self.state["codex"][slot] = {"item": item["id"], "pid": proc.pid, "log": log, "started_ms": int(time.time() * 1000),
+                                     "provider_conversation": conversation["header"] if conversation else None,
+                                     "provider_conversation_record": conversation,
                                      "profile_note": pnote, "cwd": wt,   # the fallback route resolver's only discriminator
                                      "profile": rspec["profile"], "model_intended": rspec["model"],
                                      "provider_intended": rspec.get("provider"), "effort_intended": rspec.get("effort")}
@@ -2463,6 +2481,12 @@ class Dispatcher:
                                       + (note or rwhy))
                     elif how:
                         route_note = f"route VERIFIED, resolved without a session id: {how}"
+                    if sid and run.get("provider_conversation_record"):
+                        try:
+                            museadapter.musesession.bind(CODEX_DIR, sid, run["provider_conversation_record"])
+                        except (ValueError, OSError) as e:
+                            route_state = None
+                            route_note = f"Muse exact-session identity binding refused: {e}"
                     route_detail = route_note
                     if route_note:
                         self.log(f"{slot}: {route_note}")

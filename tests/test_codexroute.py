@@ -59,7 +59,8 @@ def daemon(cfg, env, spawned):
     spec = importlib.util.spec_from_file_location(
         "dsp" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     DP = importlib.util.module_from_spec(spec); spec.loader.exec_module(DP)
-    DP.CODEX_DIR = LOGS
+    # Each independent daemon fixture owns separate persistent conversation state.
+    DP.CODEX_DIR = tempfile.mkdtemp(prefix="daemon-", dir=LOGS)
     DP.ITEMS_DIR = ITEMS
     DP.museadapter.CODEX_HOME = HOME
     # every expensive real thing, stubbed: the venv probe passes, uv and git never run, Popen records
@@ -67,7 +68,18 @@ def daemon(cfg, env, spawned):
     class R:  # a subprocess result that always succeeds
         returncode = 0; stdout = ""; stderr = ""
     DP.subprocess.run = lambda *a, **k: R()
-    DP.subprocess.Popen = lambda cmd, **k: (spawned.update(cmd=cmd, kw=k), FakeProc())[1]
+    def fake_spawn(cmd, **kw):
+        headers = [x for x in cmd if x.startswith("model_providers.")]
+        persisted = []
+        identity_dir = os.path.join(DP.CODEX_DIR, "muse-conversations")
+        if os.path.isdir(identity_dir):
+            for filename in os.listdir(identity_dir):
+                if filename.startswith("conversation-") and filename.endswith(".json"):
+                    with open(os.path.join(identity_dir, filename)) as stream:
+                        persisted.append(json.load(stream)["header"])
+        spawned.update(cmd=cmd, kw=kw, persisted_headers=persisted, header_flags=headers)
+        return FakeProc()
+    DP.subprocess.Popen = fake_spawn
     dp = DP.Dispatcher.__new__(DP.Dispatcher)
     dp.dry = False; dp.observing = False
     dp.cfg = cfg
@@ -146,6 +158,9 @@ ok("profile=muse-go-1" in hdr and "muse-spark-1.3-contributor" in hdr and "gpt-6
    "MUST BITE: the header carries the RESOLVED pair. A global header logs a Muse run as Astra and "
    "every attribution taken from it afterwards is wrong")
 run = dp.state["codex"]["CODEX-1"]
+ok(run["provider_conversation"] in sp["persisted_headers"]
+   and any(run["provider_conversation"] in flag for flag in sp["header_flags"]),
+   "Muse conversation identity is persisted before Popen and the exact header reaches the CLI")
 ok(run["profile"] == "muse-go-1" and run["provider_intended"] == "muse-go-1"
    and run["effort_intended"] == "xhigh",
    "the run record carries what this dispatch INTENDED, so the reap can check what actually ran")
@@ -187,7 +202,7 @@ for w in ("muse-go-1.config.toml", "muse-go-2.config.toml", "muse-go-3.config.to
         % (w[:9], w[:9], w[7]))
 ENV3 = {"PATH": "/usr/bin", "OPENCODE_GO_KEY_1": "k1", "OPENCODE_GO_KEY_2": "k2",
         "OPENCODE_GO_KEY_3": "k3"}
-picked, state, seen_items = [], {}, []
+picked, state, seen_items, identity_roots, conversation_headers = [], {}, [], [], []
 for _n in range(3):
     global logs, events
     logs, events = [], []
@@ -202,6 +217,8 @@ for _n in range(3):
         dp.codex_spawn("CODEX-1", it)
     finally:
         DP.os.environ.clear(); DP.os.environ.update(real)
+    identity_roots.append(DP.CODEX_DIR)
+    conversation_headers.append(dp.state["codex"]["CODEX-1"]["provider_conversation"])
     picked.append(spawned["cmd"][spawned["cmd"].index("-p") + 1])
     seen_items.append(it)
     state = dp.state["muse"]
@@ -223,7 +240,11 @@ dp.state["muse"] = state
 dp._queue_items = lambda _s=seen_items: list(_s)
 real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
 try:
+    DP.CODEX_DIR = identity_roots[0]  # persistent identity survives a new daemon object
+    original_header = conversation_headers[0]
     dp.codex_spawn("CODEX-2", dict(seen_items[0]))
+    ok(dp.state["codex"]["CODEX-2"]["provider_conversation"] == original_header,
+       "daemon retry on another slot retains the persisted provider conversation header")
 finally:
     DP.os.environ.clear(); DP.os.environ.update(real)
 ok(spawned["cmd"][spawned["cmd"].index("-p") + 1] == seen_items[0]["muse_profile"],
@@ -325,6 +346,21 @@ try:
 finally:
     DP.os.environ.clear(); DP.os.environ.update(real)
 ok(bool(spawned), "a stagger of 0 disables it rather than blocking every spawn forever")
+
+# A persisted identity must not disable deliberate exhausted-account re-placement.
+logs, events, spawned = [], [], {}
+DP, dp = daemon(dict(BASE_CFG, codex_routes={"CODEX-1": "rotate"}), ENV3, spawned)
+DP.CODEX_DIR = identity_roots[0]
+dp.state["muse"] = M.mark_unhealthy({}, "muse-go-1", M.QUOTA, scope="weekly", why="weekly exhausted")
+real = dict(DP.os.environ); DP.os.environ.clear(); DP.os.environ.update(ENV3)
+try:
+    moved = dict(seen_items[0])
+    rc = dp.codex_spawn("CODEX-1", moved)
+finally:
+    DP.os.environ.clear(); DP.os.environ.update(real)
+ok(rc is True and moved["muse_profile"] != "muse-go-1"
+   and dp.state["codex"]["CODEX-1"]["provider_conversation"] != conversation_headers[0],
+   "a weekly exhausted account is re-placed with a NEW persisted conversation identity")
 
 # ------------------------------------------------------------- REFUSED is not FAILED, on the board
 ok('kind = "REFUSED"' in src,
