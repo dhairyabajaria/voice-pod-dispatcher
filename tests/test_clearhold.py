@@ -98,35 +98,51 @@ ok(json.load(open(os.path.join(ST, "state.json"))) == HELD,
 # Every embedded Python body in the script, put through the shell's own quote-stripping and then
 # compiled. This is the check that would have caught the defect above without anyone running the
 # branch — and it catches the next one in a branch nobody has run either.
-src = open(CTL).read()
-bodies, bad_quote = [], []
-for m in re.finditer(r'python3 -c "', src):
-    start = m.end()
-    end = src.index('"', start)
-    body = src[start:end]
-    after = src[end + 1:end + 2]
-    line = src[:start].count("\n") + 1
-    # If the character after the closing quote is not whitespace or a redirect, the shell did NOT
-    # end the argument there — the quote was one somebody meant as Python, and everything after it
-    # reaches Python unquoted. That is precisely `v.get("class")` -> `v.get(class)`.
-    if after not in (" ", "\t", "\n", ">", ""):
-        bad_quote.append((line, body[-60:] + '"' + src[end + 1:end + 20]))
-    bodies.append((line, body))
-ok(bodies, "  CONTROL: the scan actually found embedded Python — an empty scan passes vacuously")
-ok(len(bodies) == src.count("python3 -c"),
-   f"MUST BITE: the scan reaches EVERY embedded Python in the script, not just the double-quoted "
-   f"ones it knows how to parse — {len(bodies)} scanned of {src.count('python3 -c')} present. If "
+# THE GUARD IS DEFINED OVER THE POPULATION, NOT OVER THE FILE THAT HAPPENED TO HAVE THE BUG.
+# The first cut of this scanned dispatcherctl.sh alone. That is green for exactly one path: the day
+# someone adds a `python3 -c "…"` to watch.sh or safe_apply.sh, the defect this file exists to catch
+# ships again with a fully green suite. Today dispatcherctl.sh is the only script carrying embedded
+# Python (2 of 2) — which is why the widening costs nothing now and is worth exactly nothing later
+# if it is not done now.
+D = os.path.join(HERE, os.pardir)
+SHELLS = sorted(
+    [os.path.join(D, f) for f in os.listdir(D) if f.endswith(".sh")]
+    + [os.path.join(HERE, f) for f in os.listdir(HERE) if f.endswith(".sh")])
+bodies, bad_quote, per_file = [], [], {}
+for path in SHELLS:
+    src = open(path).read()
+    rel = os.path.relpath(path, D)
+    per_file[rel] = src.count("python3 -c")
+    for m in re.finditer(r'python3 -c "', src):
+        start = m.end()
+        end = src.index('"', start)
+        body = src[start:end]
+        after = src[end + 1:end + 2]
+        line = src[:start].count("\n") + 1
+        # If the character after the closing quote is not whitespace or a redirect, the shell did
+        # NOT end the argument there — the quote was one somebody meant as Python, and everything
+        # after it reaches Python unquoted. That is precisely `v.get("class")` -> `v.get(class)`.
+        if after not in (" ", "\t", "\n", ">", ""):
+            bad_quote.append((rel, line, body[-60:] + '"' + src[end + 1:end + 20]))
+        bodies.append((rel, line, body))
+ok(len(SHELLS) >= 4 and any(f.endswith("dispatcherctl.sh") for f in SHELLS),
+   f"  CONTROL: the scan enumerates every shell script in dispatcher/ and tests/, not one file — "
+   f"{len(SHELLS)} found: {[os.path.basename(f) for f in SHELLS]}")
+ok(bodies, "  CONTROL: it actually found embedded Python — an empty scan passes vacuously")
+ok(len(bodies) == sum(per_file.values()),
+   f"MUST BITE: the scan reaches EVERY embedded Python present, not just the double-quoted ones it "
+   f"knows how to parse — {len(bodies)} scanned of {sum(per_file.values())} present {per_file}. If "
    f"this fails because someone wrote `python3 -c '…'` or a heredoc, extend the scan: a checker "
    f"that silently skips a form is the same absence-reads-as-a-pass shape it exists to catch")
 ok(not bad_quote,
    "MUST BITE: no embedded Python body contains a bare \" — inside a double-quoted shell string "
    f"that closes the argument and the rest reaches Python unquoted: {bad_quote}")
 uncompilable = []
-for line, body in bodies:
+for rel, line, body in bodies:
     try:
-        compile(body, f"{os.path.basename(CTL)}:{line}", "exec")
+        compile(body, f"{rel}:{line}", "exec")
     except SyntaxError as e:
-        uncompilable.append((line, str(e)))
+        uncompilable.append((rel, line, str(e)))
 ok(not uncompilable,
    f"MUST BITE: every embedded Python body compiles, so a branch nobody has run cannot ship a "
    f"SyntaxError: {uncompilable}")

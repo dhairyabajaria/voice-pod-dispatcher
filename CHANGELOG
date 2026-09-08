@@ -1,28 +1,16 @@
-2026-09-08 06:01  dispatcherctl.sh be449518   [BOSS 2026-09-08, found by running it]
-  `clear-hold` WITH NO ARGUMENT DIED: `SyntaxError: f-string: invalid syntax -> (v.get(class))`.
-  The listing block sits inside a double-quoted `python3 -c "…"`, where an inner " is not a quote to
-  the shell — it CLOSES the argument — so `v.get("class")` reached Python as `v.get(class)`, a
-  keyword. The RELEASE branch one line below was already argv-driven and worked; BOSS proved it
-  live. The listing branch is reached only with no argument and the suite never exercised it. Third
-  unexercised branch of a guard to ship broken in one night (the others: `restart`'s self-call
-  behind --dry-run, the render-time aging behind a stubbed write_pending).
-  Both the path and the strings now come in through argv, so no shell quoting reaches Python.
-  ALSO, unprompted and found while exercising the branch: an UNREADABLE state file printed an empty
-  list under `currently held:`, identical to nothing being held — a reader would have concluded the
-  account was in service. It now says CANNOT SAY and names the file and the error. And an empty hold
-  map says so in words instead of printing a heading with nothing under it.
-  PROOF: tests/test_clearhold.py (14 checks, new, wired into run_all.sh) drives the REAL script in a
-  subprocess through every clear-hold branch — held, empty, unreadable, and the release request —
-  because the defect lived in shell quoting and only the shell reproduces it. Whole suite ALL GREEN.
-  Four mutations scored, 4/4 CAUGHT, no crashes, restored to pre-image md5: restore BOSS's exact
-  broken f-string; let an unreadable file render as empty; drop the 'nothing is held' line; write
-  state.json instead of the request file.
-  AND THE CLASS, which is the part that matters: the test compiles EVERY embedded `python3 -c "…"`
-  body in the script after applying the shell's own quote-stripping, and refuses any body containing
-  a bare ". That catches this defect without anyone running the branch, and catches the next one in
-  a branch nobody has run either. Its own control asserts the scan reaches every embedded Python
-  present (2 of 2), because a checker that silently skips a form is the shape it exists to catch.
-  DELIBERATELY NOT DONE: running every ctl verb to see which crash — `restart`, `pause` and `stop`
-  act on the live daemon. The class check is static for that reason and is weaker for it: it catches
-  a body that cannot parse, not one that parses and does the wrong thing.
+2026-09-08 06:09  tests/test_clearhold.py 61ade578   [WORKER-2, own scope]
+  THE CLASS GUARD WAS DEFINED OVER ONE FILE INSTEAD OF OVER ITS POPULATION. Yesterday's embedded-
+  Python checker scanned dispatcherctl.sh alone — green for exactly one path. The day anyone adds a
+  `python3 -c "…"` to watch.sh, safe_apply.sh or run_all.sh, the defect the checker exists to catch
+  ships again against a fully green suite. Same shape as every discovery-by-literal-name finding in
+  this programme, committed inside the guard written to stop it.
+  It now enumerates every .sh in dispatcher/ and dispatcher/tests/ and reports per-file counts, so
+  an empty scan cannot pass as a clean one.
+  MEASURED, not argued: the exact defect class planted in safe_apply.sh — a script the old guard
+  never read — is CAUGHT by the widened guard and MISSED by the old one (simulated by restricting
+  the same scan to dispatcherctl.sh). safe_apply.sh restored to pre-image md5 e2c53d0d, suite green
+  after restore.
+  Population today is 2 of 2 in dispatcherctl.sh and 0 elsewhere, which is why this cost nothing now
+  and would have been worth nothing later.
+  PROOF: tests/test_clearhold.py 15 checks (was 14). Whole suite ALL GREEN.
 
