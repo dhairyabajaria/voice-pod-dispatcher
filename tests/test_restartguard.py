@@ -47,12 +47,21 @@ case "$*" in
   *"-o args="*) echo "  (args)" ;;
 esac
 """
+# A FIXED daemon start time, so staleness is decided by the FIXTURE and never by how long the real
+# daemon on this machine happens to have been up. Before this, `report_staleness` read the live
+# process table through a bare `ps` that bypassed the stub, and the CONTROL check ("an up-to-date
+# daemon is NOT called stale") went red on 2026-09-10 simply because the running daemon was a day
+# older than `now - 86400`. The test was reporting the machine's uptime as a code defect.
+T0 = 1788000000                      # a fixed instant; both mtimes below are set relative to IT
+T0_LSTART = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(T0))
+
 IDLE = """#!/bin/sh
 case "$*" in
   *"-eo pid=,args="*) echo "  99999 /bin/zsh -c echo dispatcher/mergegate.py in a prompt" ;;
   *"-p 99999 -o comm="*) echo "/bin/zsh" ;;
+  *"-o lstart="*) echo "%s" ;;
 esac
-"""
+""" % T0_LSTART
 
 def fake_ps(body, name="ps_fake"):
     p = os.path.join(ROOT, name)
@@ -128,12 +137,12 @@ check("  and daemon_pid confirms the pid's own comm, so an argv match alone cann
 
 # staleness: a daemon started BEFORE its source was modified must be called stale, and one started
 # after must not — the second is what stops the warning from being wallpaper.
-os.utime(os.path.join(ROOT, "dispatcher", "dispatcher.py"), (time.time() + 3600,) * 2)
+os.utime(os.path.join(ROOT, "dispatcher", "dispatcher.py"), (T0 + 3600,) * 2)
 rc, out = ctl("status", ps=fake_ps(IDLE, "ps_idle2"))
 check("MUST-BITE  status says STALE when dispatcher.py is newer than the running daemon — the only "
       "symptom otherwise is something quietly not happening",
       "STALE" in out, FL.flat(out)[:200])
-os.utime(os.path.join(ROOT, "dispatcher", "dispatcher.py"), (time.time() - 86400,) * 2)
+os.utime(os.path.join(ROOT, "dispatcher", "dispatcher.py"), (T0 - 3600,) * 2)
 rc, out = ctl("status", ps=fake_ps(IDLE, "ps_idle3"))
 check("MUST-BITE  CONTROL: an up-to-date daemon is NOT called stale — a warning on every status is "
       "a warning on none",

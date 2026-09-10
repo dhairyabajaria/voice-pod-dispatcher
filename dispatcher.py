@@ -3419,13 +3419,25 @@ class Dispatcher:
             rows = sessionwatch.census()
             shape = sessionwatch.queue_shape(self.load_queue().get("items", []))
             quiet_after = int(self.c("session_quiet_minutes", 30)) * 60
+            # THE ROUTE SET IS THE ONE THIS DAEMON WOULD ACTUALLY DISPATCH TO, taken from the
+            # roster's own `codex_routes` plus any affinity a conversation already holds — not a
+            # constant, and not every profile the adapter can name. If the roster configures
+            # nothing, the daemon is on the legacy pair and this census has nothing to say, so it
+            # reports NOT MEASURED rather than inventing a set it can then declare all-held.
+            mstate = self.state.setdefault("muse", {})
+            configured = sorted({p for p in (self.cfg.get("codex_routes") or {}).values() if p}
+                                | {p for p in (mstate.get("affinity") or {}).values() if p})
+            routes = (sessionwatch.route_health(mstate, profiles=configured)
+                      if configured else None)
             self.state["sessions"] = {
                 "rows": rows,
                 "summary": sessionwatch.summarise(rows, quiet_after_s=quiet_after),
-                "board": sessionwatch.board_lines(rows, shape, quiet_after_s=quiet_after),
+                "routes": routes,
+                "board": sessionwatch.board_lines(rows, shape, quiet_after_s=quiet_after,
+                                                  routes=routes),
                 "at": now_local(),
             }
-            found = sessionwatch.finding(rows, shape, quiet_after_s=quiet_after)
+            found = sessionwatch.finding(rows, shape, quiet_after_s=quiet_after, routes=routes)
         except Exception as e:  # a sensor must never abort the tick it is only observing
             try:
                 self.log(f"session census failed: {type(e).__name__}: {e}")

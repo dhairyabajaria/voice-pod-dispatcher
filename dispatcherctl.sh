@@ -10,6 +10,13 @@ set -u
 # and the ACTION never was: a proof set that exercises only the safe path is the same shape as a
 # fixture that builds the condition it should observe.
 SELF=${0:A}
+# ONE `ps` SEAM FOR THE WHOLE FILE. It used to be `local PSCMD` inside live_children only, so four
+# other call sites read the REAL process table however a test tried to stub them — including
+# report_staleness, whose staleness verdict therefore depended on when the LIVE daemon happened to
+# start. On 2026-09-10 that turned a control check red because the running daemon was a day old: a
+# test reporting the machine's uptime as a code defect. A seam that does not cover its own subject
+# is the same shape as a guard excluded from its own proof set.
+PSCMD=${DISPATCHERCTL_PS:-ps}
 # CN is overridable so this script can be exercised against a temp tree by the tests. Nothing else
 # about its behaviour changes; the default is the real checkout.
 CN="${CN:-/Users/dhairyabajaria/Claude Code/Calling New}"
@@ -39,7 +46,7 @@ daemon_pid() {
   # path, and our own prompts and reports do (BOSS, 2026-09-07: the same shape of grep counted 6
   # pytests when 1 was running, because the handoff text quotes the command).
   for p in ${(f)"$(ps -eo pid=,args= | grep 'dispatcher/dispatcher\.py' | grep -v grep | awk '{print $1}')"}; do
-    local c=$(ps -p $p -o comm= 2>/dev/null)
+    local c=$($PSCMD -p $p -o comm= 2>/dev/null)
     case "${c:t}" in python*) print -- "$p"; return 0 ;; esac
   done
   return 1
@@ -62,7 +69,6 @@ live_children() {
   # all. The old test passed because its fake ps answered `/usr/bin/python3`, lowercase — a fixture
   # using a name the real system does not produce.
   local pid c base
-  local PSCMD=${DISPATCHERCTL_PS:-ps}
   local listing
   if ! listing=$($PSCMD -eo pid=,args= 2>/dev/null); then
     print -- "UNKNOWN  --  ps itself failed; this check cannot establish that there are no children"
@@ -96,7 +102,7 @@ report_staleness() {
   local pid=$1 src="$CN/dispatcher/dispatcher.py"
   [[ -z $pid ]] && return 0
   local started mtime
-  started=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 0
+  started=$($PSCMD -p "$pid" -o lstart= 2>/dev/null) || return 0
   started=$(date -j -f "%a %b %d %T %Y" "$started" +%s 2>/dev/null) || return 0
   mtime=$(stat -f %m "$src")
   if (( mtime > started )); then
@@ -225,7 +231,7 @@ json.dump({'profile': sys.argv[1], 'why': sys.argv[2] if len(sys.argv)>2 else ''
     # imply it worked.
     obs_pid=$(daemon_pid)
     if [[ -n $obs_pid ]]; then
-      obs_started=$(ps -p "$obs_pid" -o lstart= 2>/dev/null)
+      obs_started=$($PSCMD -p "$obs_pid" -o lstart= 2>/dev/null)
       obs_started=$(date -j -f "%a %b %d %T %Y" "$obs_started" +%s 2>/dev/null || echo 0)
       obs_mtime=$(stat -f %m "$CN/dispatcher/dispatcher.py")
       if (( obs_started > 0 && obs_mtime > obs_started )); then
@@ -270,7 +276,7 @@ json.dump({'profile': sys.argv[1], 'why': sys.argv[2] if len(sys.argv)>2 else ''
     # Report it from the pidfile so `status` cannot imply lock monitoring that is not there.
     if [ -f "$STATE/lockwatch.pid" ]; then
       lwp=$(cat "$STATE/lockwatch.pid")
-      if ps -p "$lwp" -o args= 2>/dev/null | grep -q "lockwatch.py"; then
+      if $PSCMD -p "$lwp" -o args= 2>/dev/null | grep -q "lockwatch.py"; then
         echo "lockwatch: standalone ALIVE, pid=$lwp"
       else
         echo "lockwatch: pidfile says $lwp but NO such lockwatch process — box lock is UNWATCHED"

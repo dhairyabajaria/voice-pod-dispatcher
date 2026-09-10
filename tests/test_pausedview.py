@@ -31,6 +31,12 @@ DSP = importlib.util.module_from_spec(spec); sys.modules["dspp"] = DSP; spec.loa
 
 ROOT = tempfile.mkdtemp(prefix="pausedview-")
 DSP.STOP = os.path.join(ROOT, "STOP")
+# OBSERVE IS REDIRECTED TOO, and it was not. `write_pending` appends an OBSERVE-ONLY suffix when the
+# LIVE test-logs/driver/OBSERVE exists, so this file's control check went red on 2026-09-10 the
+# moment somebody put the daemon into observe-only mode — a test reporting the machine's operating
+# mode as a code defect. Same class as the STOP near-miss, seen from the reading side: a test must
+# not depend on a live control file any more than it may write one.
+DSP.OBSERVE = os.path.join(ROOT, "OBSERVE")
 DSP.PENDING = os.path.join(ROOT, "pending.json")
 DSP.HEARTBEAT = os.path.join(ROOT, "heartbeat")
 DSP.HOLD_DIR = ROOT

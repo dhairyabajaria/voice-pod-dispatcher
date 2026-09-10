@@ -130,10 +130,11 @@ ok(SW.transcript_mtime(1, uuid_of=lambda p: None, projects_root=PROJ) is None,
 ITEMS = [{"status": "queued"}, {"status": "queued"}, {"status": "dispatched"},
          {"status": "reported"}, {"status": "merged"}, {"status": "broken"}]
 shape = SW.queue_shape(ITEMS)
-ok(shape["dispatchable"] == 2 and shape["in_flight"] == 1 and shape["awaiting_boss"] == 2
-   and shape["outstanding"] == 5,
-   f"  the queue shape separates 'a worker could take this now' from 'this is waiting on BOSS' "
-   f"and excludes terminal rows from outstanding: {shape}")
+ok(shape["dispatchable"] == 2 and shape["in_flight"] == 1 and shape["awaiting_boss"] == 1
+   and shape["refused"] == 1 and shape["outstanding"] == 5,
+   f"  the queue shape separates FOUR things: a worker could take this now / it is in flight / a "
+   f"person must act / it was dispatched and REFUSED. `refused` used to be folded into "
+   f"awaiting_boss, which hid three failed audits behind rows genuinely waiting on BOSS: {shape}")
 ok(SW.queue_shape([])["outstanding"] == 0 and SW.queue_shape(None)["total"] == 0,
    "  an empty or absent queue does not raise")
 
@@ -224,6 +225,94 @@ ok(len(d._evs) == n + 1 and d._evs[-1][0] == "SESSIONS_QUIET_WORK_WAITING",
    "MUST BITE: but a CHANGE of finding emits immediately — the rate limit is on the key, not on the "
    "clock, so 'nothing to do' becoming 'not picking it up' is never held back")
 
+# --- EXECUTORS_UNAVAILABLE: the third fault ------------------------------------------------------
+# BOSS, 2026-09-08/10: three audits dispatched at 11:59 were ALL refused on QUOTA within two
+# minutes. He told ★ and the owner they were running and did not learn otherwise for nineteen
+# minutes. Neither existing finding would have caught it: "nothing dispatchable" was technically
+# true and completely false (the queue was not empty — three items had been dispatched and failed),
+# and nobody was failing to pick work up. The executors could not work at all.
+NOW2 = 2_000_000.0
+def mstate(**profs):
+    return {"unhealthy": {p: dict(v) for p, v in profs.items()}}
+
+ALL_HELD = mstate(
+    **{"muse-go-1": {"class": "QUOTA", "scope": "rolling", "until": NOW2 + 3600, "why": "wall"},
+       "muse-go-2": {"class": "QUOTA", "scope": "weekly", "until": NOW2 + 7 * 86400, "why": "wall"},
+       "muse-go-3": {"class": "AUTH", "until": 0, "why": "401"}})
+THREE = ("muse-go-1", "muse-go-2", "muse-go-3")
+
+rh = SW.route_health(ALL_HELD, profiles=THREE, now=NOW2)
+ok(rh["all_held"] and not rh["available"] and len(rh["held"]) == 3,
+   "MUST BITE: every route held reads as all_held with nothing available")
+byp = {h["profile"]: h for h in rh["held"]}
+ok(byp["muse-go-1"]["cls"] == "QUOTA" and byp["muse-go-1"]["expires_in_s"] == 3600
+   and byp["muse-go-3"]["cls"] == "AUTH",
+   "MUST BITE: each held route carries its REASON and its EXPIRY — QUOTA waits for a clock and AUTH "
+   "waits for a human, and those need different actions")
+ok(byp["muse-go-3"]["expires_in_s"] is None,
+   "MUST BITE: a hold with no expiry is None, NOT 0. `0 min left` reads as 'about to clear' when it "
+   "means 'until a human clears it' — the opposite")
+
+# THE EXPIRED-HOLD CASE, which is the live state on this machine right now.
+EXPIRED = mstate(**{p: {"class": "QUOTA", "until": NOW2 - 3600, "why": "lapsed"} for p in THREE})
+rh_exp = SW.route_health(EXPIRED, profiles=THREE, now=NOW2)
+ok(not rh_exp["all_held"] and len(rh_exp["available"]) == 3,
+   "MUST BITE: EXPIRED holds are not holds. The live state carries three QUOTA records that lapsed "
+   "54 hours ago, and a census reading the raw map would report a dead programme")
+ok(SW.route_health({}, profiles=THREE, now=NOW2)["all_held"] is False
+   and SW.route_health(ALL_HELD, profiles=(), now=NOW2)["all_held"] is False,
+   "  an empty health map is not all-held, and neither is an EMPTY route set — `all([])` is True "
+   "and would have declared a daemon with no routes configured to be fully blocked")
+
+# the held-ness rule is the DAEMON'S, not a second copy
+called = {"n": 0}
+def _spy(state, now):
+    called["n"] += 1
+    return {}
+SW.route_health(ALL_HELD, profiles=THREE, now=NOW2, held_now=_spy)
+ok(called["n"] == 1,
+   "  held-ness comes from an injectable rule, and the default is museadapter.unhealthy_now — the "
+   "same one select_profile dispatches on. A board that computes its own answer eventually "
+   "disagrees with the daemon, and the disagreement is invisible")
+
+# --- the finding, and its RANK -------------------------------------------------------------------
+QUIET_EMPTY = SW.queue_shape([{"status": "reported"}, {"status": "broken"}, {"status": "broken"}])
+key, text = SW.finding(rows, QUIET_EMPTY, quiet_after_s=1800, routes=rh)
+ok(key == "EXECUTORS_UNAVAILABLE",
+   "MUST BITE: all-routes-held OUTRANKS every quiet finding, because it EXPLAINS them. Reporting "
+   "'nothing dispatchable' here would be true about the wrong subject, and a finding that is true "
+   "about the wrong subject gets acted on")
+ok("QUOTA" in text and "AUTH" in text and "until a human clears it" in text,
+   f"  and it carries every reason and expiry into the one line: {text}")
+ok("2 REFUSED" in text,
+   f"MUST BITE: the REFUSED count travels with it. Three dispatched-and-refused items must not read "
+   f"as a healthy empty queue: {text}")
+ok("muse-go-1, muse-go-2, muse-go-3" in text,
+   "MUST BITE: the log NAMES the route set it considered, so 'every route' cannot be read as a "
+   "wider or narrower claim than the one measured")
+ok(SW.finding(rows, QUIET_EMPTY, quiet_after_s=1800, routes=rh_exp)[0]
+   != "EXECUTORS_UNAVAILABLE",
+   "  CONTROL: with the same sessions and queue but routes AVAILABLE, this finding does not fire")
+ok(SW.finding(rows, QUIET_EMPTY, quiet_after_s=1800, routes=None)[0] != "EXECUTORS_UNAVAILABLE",
+   "  CONTROL: no route census at all is NOT all-held — absence must not manufacture the finding")
+
+# --- REFUSED is its own column -------------------------------------------------------------------
+sh2 = SW.queue_shape([{"status": "broken"}, {"status": "reported"}, {"status": "parked"}])
+ok(sh2["refused"] == 1 and sh2["awaiting_boss"] == 2,
+   f"MUST BITE: `broken` is counted separately and is NO LONGER folded into awaiting_boss — an item "
+   f"dispatched and refused is neither waiting for a worker nor waiting for a person: {sh2}")
+
+# --- the board says which, and says NOT MEASURED when it does not know ---------------------------
+bl = SW.board_lines(rows, QUIET_EMPTY, routes=rh)
+ok(any("ALL HELD" in l for l in bl) and any("AUTH" in l for l in bl),
+   f"MUST BITE: the board shows the routes and marks all-held loudly: {[l for l in bl if 'routes' in l]}")
+ok(any("refused" in l for l in bl), "  and the queue half of the board shows the refused count")
+ok(any("routes: NOT MEASURED" in l for l in SW.board_lines(rows, QUIET_EMPTY, routes=None)),
+   "MUST BITE: with no route census the board says NOT MEASURED rather than printing nothing — "
+   "nothing reads as calm")
+ok(any("all 3 available" in l for l in SW.board_lines(rows, QUIET_EMPTY, routes=rh_exp)),
+   "  CONTROL: healthy routes render as available rather than being omitted")
+
 # --- THE TICK MUST ACTUALLY CALL IT --------------------------------------------------------------
 # Removing `self.poll_sessions()` from tick() scored MISSED against every check above: they all
 # drive poll_sessions directly, which proves the method and never the path to it. So this drives the
@@ -258,6 +347,39 @@ ok(called["n"] == 1,
 ok(d.state.get("sessions", {}).get("summary", {}).get("live") == 3,
    "  and the census it ran is the one that lands in state")
 
+# --- THE ROUTE CENSUS CALL SITE, driven through poll_sessions ------------------------------------
+# Deleting the route census from the daemon, and inventing a route set when none is configured, BOTH
+# scored MISSED against every check above: they all drive route_health and finding directly, which
+# proves the functions and never the path to them. This drives the daemon.
+mod, d = daemon()
+mod.sessionwatch.census = lambda **k: rows
+d.cfg = dict(d.cfg, codex_routes={"CODEX-1": "muse-go-1", "CODEX-2": "muse-go-2"})
+d.state["muse"] = {"unhealthy": {
+    "muse-go-1": {"class": "QUOTA", "scope": "rolling", "until": time.time() + 3600, "why": "wall"},
+    "muse-go-2": {"class": "AUTH", "until": 0, "why": "401"}}}
+d.load_queue = lambda: {"items": [{"status": "broken"}, {"status": "broken"}]}
+d.poll_sessions()
+ok(d.state["sessions"].get("routes") is not None
+   and d.state["sessions"]["routes"]["all_held"] is True,
+   "MUST BITE: the daemon actually CENSUSES the routes and lands the result in state — with both "
+   "configured routes held, all_held is true")
+ok(d._evs and d._evs[-1][0] == "EXECUTORS_UNAVAILABLE",
+   f"MUST BITE: and it emits the third finding rather than a quiet one: {d._evs[-1][0] if d._evs else None}")
+ok("muse-go-1, muse-go-2" in d._evs[-1][-1],
+   "  naming the route set it considered, taken from the roster's own codex_routes")
+
+# CONTROL: a daemon with NO routes configured must report NOT MEASURED, never all-held.
+mod, d = daemon()
+mod.sessionwatch.census = lambda **k: rows
+d.cfg = dict(d.cfg, codex_routes={})
+d.state["muse"] = {}
+d.poll_sessions()
+ok(d.state["sessions"].get("routes") is None,
+   "MUST BITE: with nothing configured the route census is NOT MEASURED — inventing an empty set "
+   "would let the daemon declare itself fully blocked on the strength of having no routes at all")
+ok(not any(e[0] == "EXECUTORS_UNAVAILABLE" for e in d._evs),
+   "  and it emits no all-held finding from that absence")
+
 # --- LIVE SMOKE: the DEFAULT probes, against this machine ----------------------------------------
 # EVERY CHECK ABOVE INJECTS ITS PROBES, AND THAT IS EXACTLY HOW THE FIRST VERSION SHIPPED INERT.
 # This one runs the real `ps` and the real projects directory. It is environment-dependent by
@@ -273,6 +395,26 @@ ok(measured,
    f"all six real sessions. Got {len(measured)} measured of {len(live)} socket(s)")
 ok(all(isinstance(r["quiet_s"], int) and r["quiet_s"] >= 0 for r in measured),
    "  and the measured values are real non-negative seconds, not a sentinel")
+
+# The ROUTE census on its DEFAULT held-ness rule — no injected `held_now`, so this exercises the
+# real museadapter.unhealthy_now against this machine's real state file. The rest of the route
+# checks inject that rule, which is how a detector ships inert: the injected path works and the
+# default one is never run.
+_live_state = os.path.expanduser("~/Claude Code/Calling New/test-logs/driver/state.json")
+if os.path.isfile(_live_state):
+    _mst = (json.load(open(_live_state)) or {}).get("muse", {})
+    _profs = sorted({p for p in (_mst.get("affinity") or {}).values() if p}) or ["muse-go-1"]
+    _rh = SW.route_health(_mst, profiles=_profs)
+    ok(set(_rh["considered"]) == set(_profs)
+       and len(_rh["held"]) + len(_rh["available"]) == len(_profs),
+       f"LIVE SMOKE — MUST BITE: route_health runs on its DEFAULT rule against the real state file "
+       f"and accounts for every route exactly once: {len(_rh['held'])} held, "
+       f"{len(_rh['available'])} available of {len(_profs)}")
+    ok(all(h["expires_in_s"] is None or h["expires_in_s"] >= 0 for h in _rh["held"]),
+       "  and every real hold's expiry is a non-negative duration or an explicit None — the live "
+       "state carries QUOTA records that lapsed 54 hours ago, and those must read as AVAILABLE")
+else:
+    ok(False, "LIVE SMOKE: the live state file was not found — this check measured nothing")
 
 print(f"\n{P} passed, {len(FAILED)} failed")
 for f in FAILED: print("  FAILED:", f)

@@ -181,6 +181,57 @@ def summarise(rows, *, quiet_after_s=1800):
     }
 
 
+def route_health(mstate, *, profiles=(), now=None, held_now=None):
+    """Which worker routes can run RIGHT NOW, and for the ones that cannot, why and until when.
+
+    -> {"held": [{profile, cls, scope, until, expires_in_s, why}], "available": [...],
+        "all_held": bool, "considered": [...]}
+
+    BOSS, 2026-09-08/10: three audits were dispatched at 11:59 and were all REFUSED on QUOTA within
+    two minutes. He told ★ and the owner they were running, and did not learn otherwise for nineteen
+    minutes. **`board-reports-what-it-sent`, committed in the hour we spent designing against it.**
+
+    "Nobody has work", "somebody is not picking it up" and **"nobody can work"** are three different
+    faults needing three different actions. The first two were already split; this is the third.
+
+    HELD-NESS IS NOT REDEFINED HERE. It comes from `museadapter.unhealthy_now`, the same rule
+    `select_profile` dispatches on, because a board that computes its own answer will eventually
+    disagree with the daemon and the disagreement is invisible. **Expired holds are not holds**: the
+    live state right now carries three QUOTA records that lapsed 54 hours ago, and a census that
+    read the raw map would report a dead programme.
+
+    `profiles` is the set to consider, passed in by the caller rather than assumed, and it is named
+    in the finding so nobody has to guess what "every route" meant. LEGACY is deliberately NOT in
+    it by default: it is a different account, this mechanism never holds it, and including it would
+    make the finding unable to fire.
+    """
+    now = time.time() if now is None else now
+    if held_now is None:
+        from museadapter import unhealthy_now as held_now_fn
+    else:
+        held_now_fn = held_now
+    reasons = held_now_fn(mstate or {}, now)
+    raw = (mstate or {}).get("unhealthy", {})
+    held, available = [], []
+    for prof in profiles:
+        if prof in reasons:
+            h = raw.get(prof, {})
+            until = h.get("until", 0)
+            held.append({
+                "profile": prof,
+                "cls": h.get("class") or "UNKNOWN",
+                "scope": h.get("scope"),
+                "until": until,
+                # HOLD_FOREVER (0) is "until a human clears it", which is not a duration. None, not 0.
+                "expires_in_s": None if not until else max(0, int(until - now)),
+                "why": reasons[prof],
+            })
+        else:
+            available.append(prof)
+    return {"held": held, "available": available, "considered": list(profiles),
+            "all_held": bool(profiles) and not available}
+
+
 def queue_shape(items):
     """What the queue has for anyone to do. -> dict.
 
@@ -199,13 +250,18 @@ def queue_shape(items):
         "total": len(items or []),
         "dispatchable": by.get("queued", 0),
         "in_flight": by.get("dispatched", 0),
-        "awaiting_boss": by.get("reported", 0) + by.get("parked", 0) + by.get("broken", 0),
+        # BROKEN IS ITS OWN COLUMN. An item dispatched and then refused is neither waiting for a
+        # worker nor done, and a census that counts only `queued` reports a healthy empty queue over
+        # three failures — which is exactly what happened on 2026-09-08. Folding it into
+        # `awaiting_boss` hid it behind rows that are genuinely waiting for a person.
+        "refused": by.get("broken", 0),
+        "awaiting_boss": by.get("reported", 0) + by.get("parked", 0),
         "outstanding": sum(n for s, n in by.items() if s not in terminal),
         "by_status": by,
     }
 
 
-def finding(rows, shape, *, quiet_after_s=1800):
+def finding(rows, shape, *, quiet_after_s=1800, routes=None):
     """The one sentence worth emitting, or None when there is nothing to say. -> (key, text) | None
 
     Deliberately reports the SHAPE and never a remedy: this module does not know whether the answer
@@ -213,6 +269,25 @@ def finding(rows, shape, *, quiet_after_s=1800):
     step from taking it.
     """
     s = summarise(rows, quiet_after_s=quiet_after_s)
+    # EVERY ROUTE HELD OUTRANKS EVERY QUIET FINDING, because it EXPLAINS them. On 2026-09-08 the
+    # quiet reading would have been "nothing dispatchable" — technically true and completely false:
+    # the queue was not empty, three items had been dispatched and refused. A finding that is true
+    # about the wrong subject is worse than no finding, because it gets acted on.
+    if routes and routes.get("all_held"):
+        held = routes["held"]
+        def _when(h):
+            if h["expires_in_s"] is None:
+                return "until a human clears it"
+            return f"{h['expires_in_s'] // 60} min"
+        detail = "; ".join(f"{h['profile']} {h['cls']}"
+                           + (f"/{h['scope']}" if h.get("scope") else "")
+                           + f" {_when(h)}" for h in held)
+        return ("EXECUTORS_UNAVAILABLE",
+                f"ALL {len(routes['considered'])} worker route(s) held — nobody can work, which is "
+                f"not the same as nobody having work. {detail}. Queue: "
+                f"{shape['dispatchable']} dispatchable, {shape['refused']} REFUSED, "
+                f"{shape['outstanding']} outstanding. Routes considered: "
+                f"{', '.join(routes['considered'])}.")
     if not s["live"]:
         return None
     mins = quiet_after_s // 60
@@ -233,7 +308,7 @@ def finding(rows, shape, *, quiet_after_s=1800):
     return None
 
 
-def board_lines(rows, shape, *, quiet_after_s=1800):
+def board_lines(rows, shape, *, quiet_after_s=1800, routes=None):
     """What the board prints. Every state is named; nothing absent is rendered as a number."""
     s = summarise(rows, quiet_after_s=quiet_after_s)
     if not rows:
@@ -243,7 +318,19 @@ def board_lines(rows, shape, *, quiet_after_s=1800):
            + (f", {s['unknown']} UNKNOWN" if s["unknown"] else "")
            + (f", {s['unmeasured']} live but NOT MEASURED" if s["unmeasured"] else "")
            + f"  |  queue: {shape['dispatchable']} dispatchable, "
-             f"{shape['outstanding']} outstanding"]
+             f"{shape['outstanding']} outstanding, {shape['refused']} refused"]
+    if routes is None:
+        out.append("  routes: NOT MEASURED — this board was written without a route census")
+    elif routes["held"]:
+        out.append(f"  routes: {len(routes['available'])} of {len(routes['considered'])} available"
+                   + ("  ** ALL HELD **" if routes["all_held"] else "")
+                   + "  held: " + "; ".join(
+                       f"{h['profile']} {h['cls']}"
+                       + (f" {h['expires_in_s'] // 60}m left" if h["expires_in_s"] is not None
+                          else " until a human clears it")
+                       for h in routes["held"]))
+    else:
+        out.append(f"  routes: all {len(routes['considered'])} available")
     for r in rows:
         if r["state"] != LIVE:
             continue
