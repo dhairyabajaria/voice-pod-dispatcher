@@ -46,6 +46,24 @@ def daemon(queue_items, health_ok, spawned):
     DP.QUEUE_HOLD = os.path.join(TMP, "HOLD")
     DP.EVENTS = os.path.join(TMP, "events.log")
     DP.CODEX_DIR = TMP; DP.ITEMS_DIR = os.path.join(TMP, "items")
+    # REDIRECT EVERY REMAINING LIVE PATH, BY POPULATION AND NOT ONE AT A TIME.
+    # 2026-09-10 21:58: five checks in this file went red for a reason that had nothing to do with
+    # the daemon — BOSS created the real `hold/CODEX-1.feed` at 21:52 while working around item 6,
+    # and `codex_tick` reads `HOLD_DIR` to decide whether a slot is parked. HOLD_DIR was never
+    # redirected here, so this test was reading a LIVE CONTROL FILE and its verdict depended on
+    # what the operator happened to be doing. Nine of twenty-three module paths were unredirected;
+    # naming them one by one is how the tenth gets missed, so this rebases the whole set. Item 6
+    # made it urgent: with the answer consumer now on the degraded path, an unredirected
+    # ANSWER_REQ_DIR would have let this test READ AND DELETE real answer requests.
+    for _n in dir(DP):
+        if not _n.isupper():
+            continue
+        _v = getattr(DP, _n)
+        if isinstance(_v, str) and _v.startswith(str(os.path.expanduser("~"))) and TMP not in _v:
+            setattr(DP, _n, os.path.join(TMP, "live", _n.lower()))
+    for _n in ("ANSWER_REQ_DIR", "HOLD_DIR", "HOLDCLEAR_DIR", "CLEAR_DIR", "GATE_REQ_DIR",
+               "GATES_DIR"):
+        os.makedirs(getattr(DP, _n), exist_ok=True)
     json.dump({"items": queue_items}, open(DP.QUEUE, "w"))
 
     def http(method, path, **kw):
@@ -291,6 +309,24 @@ src = open(os.path.join(HERE, os.pardir, "dispatcher.py")).read()
 ok(src.index("codex_only_pass()") < src.index("self.save_state()\n            return")
    and src.index("self.write_pending(dict(") < src.index("self.save_state()\n            return"),
    "the codex pass AND the board write both happen BEFORE the early return, not after it")
+
+# ---------------------------------------------------- ITEM 6: WHAT THIS FILE'S GREEN DID NOT COVER
+# BOSS closed item 3 at 19:59 on the strength of everything above — codex dispatch, aging,
+# escalation, the board, the heartbeat — and REOPENED it at 21:48 having measured the thing this
+# file never touched. `apply_answer_requests(q)` had exactly ONE caller, on the healthy path, AFTER
+# the early return: with opencode unreachable the daemon never read `answerreq/` at all. He filed a
+# valid answer for a parked CODEX row at 21:46 and three ticks passed with the file untouched and no
+# ANSWERED or ANSWER_REFUSED event.
+#
+# A GREEN LICENSES ONLY THE PATHS IT WALKS. Nothing above was wrong; the conclusion drawn from it
+# was wider than the checks. This assertion lives HERE, in the file whose green was over-read, so
+# the next reader of "the early return drops nothing" meets the correction in the same place as the
+# claim. The behavioural proof is tests/test_degradedanswer.py.
+ok("self.apply_answer_requests(q)" in src[src.index("def codex_only_pass"):
+                                          src.index("    # -- one tick")],
+   "MUST BITE (item 6): the ANSWER CONSUMER runs inside codex_only_pass, on the degraded path, "
+   "BEFORE this early return — a CODEX question is answered by BOSS, not by the opencode server, "
+   "and holding it behind that server's health is the same mistake as holding codex dispatch")
 
 print(f"\n{P} passed, {len(F)} failed")
 for x in F: print("  FAILED:", x)

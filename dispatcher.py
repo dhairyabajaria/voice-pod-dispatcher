@@ -2642,6 +2642,30 @@ class Dispatcher:
             q = self.load_queue()
             before = json.dumps(q, sort_keys=True)
             status = {}
+            # ITEM 6 (BOSS, 2026-09-10 21:48, reopening item 3). `apply_answer_requests` has exactly
+            # ONE caller on the healthy path, and it sits AFTER the degraded early return — so with
+            # opencode unreachable the daemon never reads `answerreq/` at all. BOSS filed a valid
+            # answer for a parked CODEX row at 21:46 and three ticks passed with the file untouched
+            # and no ANSWERED or ANSWER_REFUSED event. A CODEX question is answered by BOSS, not by
+            # the opencode server, so holding it behind that server's health is the same mistake as
+            # holding codex dispatch behind it — the one this whole degraded path exists to undo.
+            #
+            # HIS CORRECTION OF HIS OWN CLOSURE IS THE LESSON: test_serverdown.py proved the codex
+            # pass, the aging, the escalation, the board and the heartbeat. It never proved answers.
+            # A green licenses only the paths it walks, and item 3 was closed on a proof set read
+            # wider than it was.
+            #
+            # HERE, not before the return, because this is where the queue lock and the queue are
+            # already held — the healthy path applies answers under the same lock, and taking a
+            # second one would be a deadlock rather than a guard. BEFORE codex_tick, so a row this
+            # un-parks is dispatchable in the SAME tick, which is the healthy path's order too.
+            try:
+                self.apply_answer_requests(q)
+            except Exception as e:  # noqa: BLE001
+                # ISOLATED FROM THE CODEX PASS. Sharing the outer try would let one malformed
+                # request file cancel codex dispatch for every tick it survived — restoring the
+                # sixteen-hour outage through a different door.
+                self.log(f"answer requests failed on the degraded pass: {type(e).__name__}: {e}")
             self.codex_tick(q, self.state["pending"], status, 0,
                             int(self.c("max_dispatch_per_tick", 2)))
             if json.dumps(q, sort_keys=True) != before:

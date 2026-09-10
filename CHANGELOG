@@ -1,55 +1,49 @@
-2026-09-10 21:55  museadapter.py e8f4e9b8, dispatcher.py 814d62a3, tests/test_profileroot.py (new)   [BOSS item 5, 2026-09-10 21:46]
-  THE ROUTE DETECTOR ENUMERATED THE DIRECTORY THE SPAWNS STOPPED WRITING TO. `3b38f14` gave each Muse
-  profile an isolated CODEX_HOME (museadapter.py:96, applied to the spawn at :188), so a spawn writes
-  its rollout under ~/.codex/muse-homes/<profile>/sessions. Both resolvers still defaulted to the
-  module constant SESSIONS_ROOT = ~/.codex/sessions (:37-38, :674, :711), and the reap called BOTH
-  with no root at all (dispatcher.py:2490, :2497). Three CODEX-1 runs were reported "route NOT
-  MEASURED — WE could not observe what ran" and one PARKED A QUESTION, while their rollouts sat on
-  disk, unambiguous, one directory away. A false negative that blocks merges.
-  MEASURED 2026-09-10 21:50 on the live run, same cwd, same window, same rule, changing only the root:
-    LEGACY  ~/.codex/sessions                       -> None
-    PROFILE ~/.codex/muse-homes/muse-go-1/sessions  -> rollout-...T21-40-05-...jsonl
-                                                       muse-go-1 / muse-spark-1.3-contributor / xhigh
-  The RULE was never wrong. Its POPULATION was — discovery by literal path, one layer above where the
-  same shape was found in the pgserver census an hour earlier the same evening.
-  FIX: `sessions_root_for(profile, home=None)` derives the root from the profile that ran. Wired at
-  both reap call sites and inside verify_finish, which had the same defect via `spec`.
-  GUARDS:
-    G1 LEGACY keeps the shared root, named explicitly — it is the one route with no isolated home.
-    G2 NEVER A UNION. Searching both roots would let a legacy rollout satisfy an isolated-home spawn,
-       and with a file in each, "refuse on >1" would turn a correct resolution into a refusal.
-    G3 THE REFUSAL NAMES THE DIRECTORY IT SEARCHED. The note was built as `note or rwhy`, and the
-       matcher's note is always non-empty, so the resolver's reason — the only half that carries the
-       PATH — was thrown away every time. That is why this survived three runs: the line named the
-       failure and never named the place. Now both are carried.
-    G4 A profile with no sessions directory is UNMEASURED, never a silent fall back to the legacy
-       root; a fallback would restore this exact defect and answer confidently from a directory the
-       profile never wrote to.
-    G5 The 0-and->1 refusal is untouched.
-    G7 The resolver reads only sessions/**/*.jsonl under the profile home; the auth material beside
-       it is never opened, and no credential name or value reaches the item, the events or the log.
-  `home=None` READ AT CALL TIME, not a default argument. This module already carries that scar at
-  rollout_for_session, where an override that looked applied was silently ignored.
-  PROOF: tests/test_profileroot.py (13 checks, new, wired), every check through codex_tick.
-  IT EXISTS SEPARATELY FROM test_routewindow.py BECAUSE THAT FILE CANNOT DISCRIMINATE: its one seam
-  points at whatever root the product reads, so it passes on both sides of this fix. The
-  discriminator is a DECOY — a rollout under the legacy root with the same cwd and window, which must
-  not be claimed. MUTATION MEASURED: reverting `root=sroot` at both call sites -> 9 passed, 4 failed.
-  A SHIELDED NEGATIVE CONTROL, CAUGHT BY THAT MUTATION. The first cut removed the profile directory
-  entirely for the decoy case; a missing directory makes G4 skip the fallback, so the negative control
-  PASSED against the reverted code and proved nothing about the guard in its name (12 passed, 1
-  failed, and the 1 was the positive control). It now empties the directory and keeps it.
-  ALSO REPAIRED: tests/test_routewindow.py rooted its fixture at TMP/sessions; after this change the
-  product no longer reads there, so it would have gone on passing while proving an adjacent path. Its
-  root is now the profile's own sessions dir and CODEX_HOME is a named second seam.
-  LIVE RE-RESOLUTION, 2026-09-10 21:52, read-only: 44738 -> rollout T21-21-30, muse-go-1 /
-  muse-spark-1.3-contributor / xhigh, cwd matches; 63949 -> rollout T21-40-05, same route, cwd
-  matches. Both were NOT MEASURED before. 58305 does NOT resolve, and correctly so — see below.
-  A SECOND FINDING, NOT FIXED HERE AND NOT ITEM 5. B.B2.renumber-015a-scheduler-252 declares worktree
-  voicepod-lane-015a-renumber-252, WHICH DOES NOT EXIST ON DISK, and its 21:33 rollout records cwd
-  voicepod-lane-015a-journey-sole-scheduler — another item's worktree. So that run executed somewhere
-  other than the directory its item names. The cwd discriminator refuses it, which is the correct
-  behaviour: claiming it would verify a route against another lane's directory. Reported to BOSS.
-  Full suite green: 127/18/41/28/13/10/15/68/20/21/24, rc=0.
-  NOT IN EFFECT UNTIL A RESTART. Not restarted — CODEX-1 pid 63949 is live and BOSS holds the word.
+2026-09-10 22:01  dispatcher.py fc4f3571, tests/test_degradedanswer.py (new)   [BOSS item 6, 2026-09-10 21:48 — reopening item 3]
+  BOSS'S ANSWERS TO CODEX QUESTIONS WERE STRANDED BEHIND THE OPENCODE HEALTH CHECK.
+  `apply_answer_requests(q)` had exactly ONE caller, dispatcher.py:2801, AFTER the degraded early
+  return. With opencode unreachable (30+ h) the daemon never read `answerreq/` at all: BOSS filed a
+  valid answer for the parked B.B2.renumber-015a-scheduler-252 at 21:46 and three ticks passed with
+  the file untouched and no ANSWERED or ANSWER_REFUSED event. A CODEX question is answered by BOSS,
+  not by the opencode server — holding it behind that server's health is the identical mistake as
+  holding codex dispatch behind it, arriving a second time through a different door.
+  THE REOPENING IS THE FINDING. BOSS closed item 3 at 19:59 on the strength of test_serverdown.py,
+  which proves the codex pass, the aging, the escalation, the board and the heartbeat. It never
+  proved answers. Nothing in that file was wrong; the conclusion drawn from it was wider than its
+  checks. A GREEN LICENSES ONLY THE PATHS IT WALKS — negative-control-scope-lesson, applied to a
+  whole proof set rather than to one assertion.
+  FIX: `self.apply_answer_requests(q)` inside `codex_only_pass`, where the queue lock and the queue
+  are ALREADY HELD (a second lock would be a deadlock, not a guard) and BEFORE `codex_tick`, which
+  is the healthy path's order too. ISOLATED in its own try/except: sharing the outer one would let a
+  single malformed request file cancel codex dispatch on every tick it survived, re-creating the
+  sixteen-hour outage from the inside.
+  PROOF: tests/test_degradedanswer.py (17 checks, new, wired). PC a degraded tick consumes an answer
+  for a parked CODEX row, emits ANSWERED and moves the row; NC the same file against a non-parked row
+  is ANSWER_REFUSED with the row unchanged and the status named; the double-booking guard still holds
+  on the degraded path (queued AND PINNED, not restored to dispatched); a malformed request does not
+  cancel codex dispatch; a RAISING consumer does not either, and is logged; no request means no
+  noise. MUTATION MEASURED: removing the call -> 4 passed, 13 failed, zero tracebacks.
+  A CHECK OF MINE THAT ASSERTED A DEFECT, AND THE PRODUCT WAS RIGHT. The first version claimed an
+  un-parked row is DISPATCHED in the same tick. It is not, deliberately: an answered row returns to
+  `dispatched` because the executor already holds it, and re-spawning would run the same
+  item twice. Asserting the convenient thing would have pinned a defect (tests-can-pin-defects); the
+  ordering claim belongs on the SOURCE, where it now is.
+  SOURCE-ORDER ASSERTION ADDED TO test_serverdown.py, as BOSS asked and in the file whose green was
+  over-read, so the next reader meets the correction beside the claim.
+  CRASH IS NEITHER CATCH NOR MISS. The source-order checks used `str.index`, which RAISES when the
+  term is deleted — the first mutation run ended in `ValueError: substring not found` after 11 clean
+  reds. Replaced with a helper where a missing term is a clean False.
+  ---- AND A LIVE-STATE DEFECT IN test_serverdown.py, FOUND BY THIS WORK AND NOT CAUSED BY IT ----
+  Five checks in that file went red at 21:58 for a reason that had nothing to do with the daemon:
+  `codex_tick` reads `HOLD_DIR/<slot>.feed`, HOLD_DIR was never redirected in that fixture, and BOSS
+  created the real `hold/CODEX-1.feed` at 21:52 while working around item 6. The test was reading a
+  LIVE CONTROL FILE and its verdict depended on what the operator was doing. Proven pre-existing by
+  running it against HEAD's dispatcher.py (same five reds without item 6).
+  NINE of twenty-three module paths were unredirected there. Naming them one at a time is how the
+  tenth gets missed, so the fixture now rebases THE WHOLE SET into its temp dir. Item 6 made it
+  urgent rather than merely wrong: with the answer consumer on the degraded path, an unredirected
+  ANSWER_REQ_DIR would have let that test READ AND DELETE real answer requests. It did not — the live
+  directory was already empty (BOSS removed his file at 21:47) and no ANSWER_* event was emitted —
+  but that was luck, not a guard. THIRD instance of "a test never touches a live control file".
+  Full suite green: 127/18/41/28/13/10/15/68/20/21/25/17, rc=0.
+  NOT IN EFFECT UNTIL A RESTART. Not restarted; asked BOSS once for both this and item 5.
 
