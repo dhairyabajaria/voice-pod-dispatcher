@@ -1,42 +1,41 @@
-2026-09-10 19:34  sessionwatch.py 5dc1f2c6, dispatcher.py ea433a5b, dispatcherctl.sh 95ebf7c2   [BOSS 2026-09-10, resumed after the stop]
-  EXECUTORS_UNAVAILABLE — THE THIRD FAULT. "Nobody has work", "somebody is not picking it up" and
-  "NOBODY CAN WORK" need three different actions. BOSS dispatched three audits at 11:59 on
-  2026-09-08; all three were REFUSED on QUOTA within two minutes; he told the owner they were
-  running and did not learn otherwise for nineteen minutes. Neither existing finding would have
-  caught it — "nothing dispatchable" was technically true and completely false, because the queue
-  was not empty: three items had been dispatched and had failed.
-  It outranks both quiet findings because it EXPLAINS them, and it carries each held route's CLASS
-  and EXPIRY (QUOTA waits for a clock, AUTH waits for a human) plus the refused count and the names
-  of the routes considered.
-  HELD-NESS IS NOT REDEFINED: route_health delegates to museadapter.unhealthy_now, the rule
-  select_profile already dispatches on. A board that computes its own answer eventually disagrees
-  with the daemon and the disagreement is invisible. It matters today: the live state carries three
-  QUOTA holds that LAPSED 54 hours ago, and a census reading the raw map would report a dead
-  programme.
-  `broken` is now its own queue column instead of being folded into awaiting_boss, where three
-  failed audits sat behind rows genuinely waiting on a person.
-  The route set is taken from the roster's own codex_routes plus existing affinity — not a constant.
-  With nothing configured the census reports NOT MEASURED rather than inventing a set it can then
-  declare all-held; `all([])` is True and would have called an unconfigured daemon fully blocked.
-  PROOF: tests/test_sessionwatch.py 64 checks (was 40). Guard list taken FIRST: test_sessionwatch.py
-  is the only guard for route_health/all_held/EXECUTORS_UNAVAILABLE, and the two other files
-  matching "refused" are unrelated (a mark_unhealthy `why=` and a docstring). Eight mutations,
-  8/8 CAUGHT, every file restored to pre-image md5. BOTH CALL-SITE MUTATIONS SCORED MISSED FIRST —
-  deleting the daemon's route census, and inventing a set when none is configured — because every
-  check drove route_health directly. Fixed by driving poll_sessions.
-  LIVE SMOKE on the DEFAULT rule (no injected held_now) against the real state file, because the
-  rest of the route checks inject it and that is exactly how the detector shipped inert last time.
-
-  ALSO, FOUND ON RESUMING: TWO TESTS WERE READING LIVE CONTROL STATE and were red on arrival.
-  test_pausedview redirected STOP but not OBSERVE, so it went red the moment somebody put the daemon
-  into observe-only mode — a test reporting the machine's operating MODE as a code defect.
-  test_restartguard compared against the LIVE daemon's start time, so its "an up-to-date daemon is
-  not stale" control failed simply because the running daemon was a day old.
-  ROOT CAUSE, and it is a class: `dispatcherctl.sh` had a $PSCMD seam used in ONE function while
-  FOUR other call sites read the real process table through a bare `ps` — including
-  report_staleness. A seam that does not cover its own subject is a guard excluded from its own
-  proof set. PSCMD is now file-scope and all four sites go through it; the staleness fixture pins a
-  fixed daemon start time so the verdict comes from the fixture, not the machine's uptime.
-  The live OBSERVE file was NOT touched — it is the owner's operating mode, not test scaffolding.
+2026-09-10 19:51  pglock.py e8521241 (new), dispatcher.py 4f6e6f1e   [BOSS item 2, 2026-09-10]
+  THE THIRD LOCK, MADE VISIBLE. pgserver serialises EVERY postgres start and stop on this machine
+  through one lockfile — a CLASS attribute at a fixed per-user path, shared across worktrees,
+  checkouts, xdist workers and unrelated projects, with the pgdata path never entering the lock
+  identity and no timeout on the wait (★, docs/ops/2026-09-09/PGSERVER-GLOBAL-LOCK.md). It cost one
+  run 102 minutes of invisible waiting. box.lock.d and portal.lock.d do not know it exists, so the
+  board can show a run "holding the box" that is stalled behind a process holding no project lock at
+  all — board-reports-what-it-sent, third lock edition.
+  READ-ONLY BY CONSTRUCTION, AND THE CONSTRAINT CHOSE THE MECHANISM.
+    * lsof was the obvious probe and IT DOES NOT WORK HERE. Measured against a process genuinely
+      holding the lock: lsof's lock field reports `l ` (no lock) for BOTH flock and POSIX lockf on
+      this macOS. It lists who has the file OPEN, conflating the holder with everyone queued behind
+      it — the one distinction that matters, reported backwards.
+    * A non-blocking flock/lockf attempt ACQUIRES the lock when it is free. Forbidden: this daemon
+      must never become the thing that serialises a test run.
+    * fcntl(F_GETLK) TESTS for a conflicting lock, never takes one, and returns the holder's pid.
+      Verified both ways — HELD by the exact pid while a real holder ran, FREE the moment it exited,
+      and an INDEPENDENT process still could not take the lock after our probes.
+  THREE STATES: LIVE / STALLED / UNMEASURED. STALLED needs BOTH halves — the global lock held by a
+  process that is not this run, AND effectively no CPU burned between two consecutive samples. One
+  sample is never a stall. The run that HOLDS the lock is never STALLED: it is what everyone else is
+  waiting for, a different row and a different action. And the wording says STALLED is a
+  CORRELATION, not proof — a run idle for its own reasons looks the same.
+  UNMEASURED IS NEVER RENDERED AS FREE. A missing lockfile, an unreadable one or a refused query all
+  report UNMEASURED and say so on the board. platformdirs is NOT importable by /usr/bin/python3 — the
+  daemon's interpreter — so the path is written out rather than derived, and a path that ever goes
+  stale reports "no lockfile, NOT the same as a free lock" instead of a silent FREE.
+  A dead pid's CPU is None, never 0.0: 0.0 is exactly the stall signature and would report every
+  finished run as stalled forever.
+  PROOF: tests/test_pglock.py (20 checks, new, wired) — the holder cases take a REAL POSIX lock in a
+  REAL subprocess against a temp file, because a stubbed lock proves the parser and not the probe,
+  which is the trap this detector already fell into once. Plus 4 call-site checks in
+  test_sessionwatch.py (68 checks, was 64). Whole suite ALL GREEN.
+  Seven mutations, 7/7 CAUGHT, every file restored to pre-image md5 — including the forbidden
+  implementation (acquire instead of test), a missing lockfile reading as FREE, calling the holder
+  stalled, dropping the CPU half, accepting one sample, a dead pid reading 0.0, and DELETING THE
+  DAEMON'S PROBE, which scored MISSED until a check drove poll_sessions.
+  NOT TOUCHED, and deliberately: the lock itself, pgserver, and platform/testsupport/. That is
+  WORKER-1's lane.
   dispatcher/ has no CI. This local green is the only evidence that will ever exist.
 

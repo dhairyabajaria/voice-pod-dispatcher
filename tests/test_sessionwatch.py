@@ -380,6 +380,32 @@ ok(d.state["sessions"].get("routes") is None,
 ok(not any(e[0] == "EXECUTORS_UNAVAILABLE" for e in d._evs),
    "  and it emits no all-held finding from that absence")
 
+# --- THE PGSERVER LOCK CALL SITE, driven through poll_sessions -----------------------------------
+# Deleting the daemon's lock probe scored MISSED against every check in test_pglock.py: they all
+# drive pglock directly. Same lesson as the route census one screen up — the function was never the
+# thing at risk.
+mod, d = daemon()
+mod.sessionwatch.census = lambda **k: rows
+probed = {"n": 0}
+_realprobe = mod.pglock.probe
+def _counting_probe(*a, **k):
+    probed["n"] += 1
+    return _realprobe(*a, **k)
+mod.pglock.probe = _counting_probe
+d.state["codex"] = {"CODEX-1": {"pid": os.getpid(), "item": "A.x"}}
+d.poll_sessions()
+ok(probed["n"] == 1 and d.state["sessions"].get("pgserver_lock") is not None,
+   "MUST BITE: the daemon PROBES the pgserver lock every tick and lands the result in state — "
+   "box.lock.d and portal.lock.d do not know this lock exists")
+ok(d.state["sessions"].get("runs") and d.state["sessions"]["runs"][0]["pid"] == os.getpid(),
+   "  and it gives every tracked run a verdict against that lock")
+ok(any("pgserver lock" in l for l in d.state["sessions"]["board"]),
+   f"MUST BITE: and the board carries a pgserver row: "
+   f"{[l for l in d.state['sessions']['board'] if 'pgserver' in l]}")
+ok(d.state.get("pgserver_cpu"),
+   "  the CPU sample is stored for the next tick — a stall needs two, and one tick cannot tell "
+   "working from waiting")
+
 # --- LIVE SMOKE: the DEFAULT probes, against this machine ----------------------------------------
 # EVERY CHECK ABOVE INJECTS ITS PROBES, AND THAT IS EXACTLY HOW THE FIRST VERSION SHIPPED INERT.
 # This one runs the real `ps` and the real projects directory. It is environment-dependent by

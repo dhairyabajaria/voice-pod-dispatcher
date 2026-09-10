@@ -29,6 +29,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import museadapter
 import sessionwatch
+import pglock
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -285,6 +286,21 @@ def clean_excerpt(text, n=300):
 
 
 # ----------------------------------------------------------------------------- daemon
+def pglock_board_lines(lock, runs):
+    """The pgserver lock row. An UNMEASURED probe says so; it never renders as free."""
+    if lock.get("state") == pglock.UNMEASURED:
+        out = [f"  pgserver lock: NOT MEASURED — {lock.get('why', '')[:90]}"]
+    elif lock.get("state") == pglock.HELD:
+        out = [f"  pgserver lock: HELD by pid {lock.get('pid')} — every postgres start/stop on this "
+               f"machine queues behind it, no timeout"]
+    else:
+        out = ["  pgserver lock: free"]
+    for r in runs:
+        if r["state"] != pglock.LIVE:
+            out.append(f"    {r['slot']} pid {r['pid']} {r['state']}: {r['why'][:110]}")
+    return out
+
+
 class Dispatcher:
     def __init__(self, once=False, dry=False):
         self.once = once
@@ -3437,7 +3453,35 @@ class Dispatcher:
                                                   routes=routes),
                 "at": now_local(),
             }
+            # THE THIRD LOCK. `box.lock.d` and `portal.lock.d` do not know pgserver's global
+            # postgres mutex exists, so a run can hold the box and be stalled behind a process
+            # holding no project lock at all — board-reports-what-it-sent, third lock edition
+            # (★, docs/ops/2026-09-09/PGSERVER-GLOBAL-LOCK.md: one run waited 102 minutes).
+            # READ-ONLY: F_GETLK tests for the lock and never takes it. Never acquire here — this
+            # daemon must not become the thing that serialises a test run.
+            lock = pglock.probe()
+            prev_cpu = self.state.get("pgserver_cpu") or {}
+            cpu_now, runs = {}, []
+            for slot, run in (self.state.get("codex") or {}).items():
+                pid = run.get("pid")
+                if not pid:
+                    continue
+                c = pglock.cpu_seconds(pid)
+                cpu_now[str(pid)] = c
+                state_, why_ = pglock.verdict(pid, lock, c, prev_cpu.get(str(pid)))
+                runs.append({"slot": slot, "pid": pid, "item": run.get("item"),
+                             "state": state_, "why": why_, "cpu_s": c})
+            self.state["pgserver_cpu"] = cpu_now
+            self.state["sessions"]["pgserver_lock"] = lock
+            self.state["sessions"]["runs"] = runs
+            self.state["sessions"]["board"] = (
+                self.state["sessions"]["board"] + pglock_board_lines(lock, runs))
             found = sessionwatch.finding(rows, shape, quiet_after_s=quiet_after, routes=routes)
+            if not found:
+                stalled = [r for r in runs if r["state"] == pglock.STALLED]
+                if stalled:
+                    found = ("RUN_STALLED",
+                             "; ".join(f"{r['slot']} ({r['item']}) {r['why']}" for r in stalled))
         except Exception as e:  # a sensor must never abort the tick it is only observing
             try:
                 self.log(f"session census failed: {type(e).__name__}: {e}")
