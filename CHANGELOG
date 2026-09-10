@@ -1,3 +1,62 @@
+2026-09-10 20:14  pglock.py 8480bc7f, dispatcher.py 42eed0c8, tests/test_pgpopulation.py (new)   [BOSS item 4, 2026-09-10 20:07]
+  THE VERDICT WAS RIGHT AND IT SCORED THE WRONG SET. The tick's pgserver loop ran over
+  `state["codex"]` — THIS DAEMON'S OWN SPAWNS — so a box run nobody here started could never be
+  STALLED. The 102-minute wait the whole probe was built for was WORKER-1's run. The instrument
+  could not see its own founding incident, and an empty `runs` list rendered as silence. A guard
+  defined over one file instead of over its population, one layer up from where that was last found.
+  THE SUBJECT IS THE WAITER, NOT THE POSTMASTER. Measured 2026-09-10 20:01: every live postmaster on
+  this box has PPID 1 — reparented to launchd — so they lead nowhere upward, and a live postmaster
+  proves the start ALREADY SUCCEEDED. The process that queues on the global mutex is the python
+  inside PostgresServer.__enter__/.cleanup(). Postmasters corroborate by pgdata; they never
+  contribute a row. (This corrected the sketch the population was first designed against.)
+  THE POPULATION COMES FROM THE BOX. Primary: the per-run markers
+  $TMPDIR/voicepod-test-pg-session-*/.voicepod-test-postgres-owner.json, which name owner_pid,
+  owner_started_at, pgdata and suite_root. Secondary, for ATTRIBUTION only: test-logs/box.lock.d/owner
+  (`owner=`, `pid=`, `what=`). READ-ONLY for both — the daemon never writes a marker, never writes or
+  releases the box lock, and never removes the stale markers it skips. They are not ours to clean up.
+  GUARDS, each with a check that bites:
+    G1 A STALE MARKER IS NOT A RUN. A marker whose owner_pid is dead is debris and gets NO ROW — not
+       LIVE, not STALLED, not an UNMEASURED row. There was a real one on the box while this was
+       written (owner_pid 41101, another session's abandoned wt-premerge run). Without G1 the first
+       thing this change does is invent a permanently stalled run out of a leftover file.
+    G2 PID REUSE. (pid, start_time) identifies the process. owner_started_at IS the owner's creation
+       time — verified to the second against `ps -o lstart=` — so a recycled pid does not inherit a
+       dead run's row.
+    G4 ABSENCE HAS TWO DIFFERENT SENTENCES. An unreadable marker root is UNMEASURED ("we could not
+       look"). A readable root with no live runs is NO_RUNS ("we looked, there is nothing"), rendered
+       as its own line. DELIBERATE DEPARTURE from the approved design, which said absence renders
+       UNMEASURED: calling an idle box UNMEASURED on every quiet tick would teach the reader to skip
+       the row, which is this detector's own failure arriving from the other side. Both are stated,
+       neither is silence.
+    G5 A postmaster being up is not evidence of working; corroboration only.
+    G6 The CPU baseline keys on (pid, start_time), never on pid alone, so a recycled pid cannot come
+       out LIVE on a delta spanning two different processes.
+    G8 EVERY ROW NAMES WHOSE RUN IT IS — box owner name plus suite_root — and RUN_STALLED carries the
+       owner AND the pid. A verdict addressed to nobody is a verdict without an owner.
+  PROOF: tests/test_pgpopulation.py (21 checks, new, wired). EVERY CHECK DRIVES tick(), not
+  pglock.verdict(): the defect IS the call site, and asserting on verdict() would prove the function
+  that was never at risk. The daemon is driven with a STOP file inside the test's own temp dir — a
+  test never touches a live control file. PC1 a foreign idle run under a foreign held lock scores
+  STALLED; PC2 the holder is LIVE, never STALLED; PC3 a foreign run burning CPU is LIVE; PC4 dead
+  owner_pid, no row; PC5 pid reuse, no row; PC6 unreadable root is UNMEASURED; PC7 another session's
+  abandoned marker by shape. NEGATIVE CONTROL: the identical tick with the OLD population produces no
+  row at all, so PC1 is a statement about the population and not about verdict().
+  TWO REDS ON THE WAY, both the instrument rather than the product. (1) Patching DP.pglock.population
+  rebinds the SHARED module, so each case captured the previous case's lambda as "real" and recursed;
+  every check after PC1 died and the negative control PASSED VACUOUSLY inside the wreck. Captured the
+  originals once, before any patch. (2) A marker_root stub that SWALLOWED its argument made PC6 read a
+  directory that does exist, turning UNMEASURED into NO_RUNS — the stub had quietly changed the
+  subject under test.
+  ALSO: tests/test_sessionwatch.py's lock call-site check asserted runs[0], which after this change is
+  whoever the BOX is running, and it read the real markers — a test depending on live state it does not
+  own. Now stubs the population and asserts by MEMBERSHIP.
+  LIVE SMOKE 2026-09-10 20:12, read-only, temp state dir: four real runs of lane-004-pgserver-lock
+  (pids 99359-99362, postmasters 99529/99549/99605/99571) all LIVE under a FREE lock, each row named
+  by owner and suite_root; the 41101 stale marker produced NO ROW and was reported as a counted note.
+  Full suite green: 127/18/41/28/10/15/68/20/21/24, rc=0.
+  NOT IN EFFECT UNTIL A RESTART. Not restarted — asked BOSS first, because WORKER-1's suite is live on
+  the box and he wants the new census to see it while it is running.
+
 2026-09-10 19:51  pglock.py e8521241 (new), dispatcher.py 4f6e6f1e   [BOSS item 2, 2026-09-10]
   THE THIRD LOCK, MADE VISIBLE. pgserver serialises EVERY postgres start and stop on this machine
   through one lockfile — a CLASS attribute at a fixed per-user path, shared across worktrees,

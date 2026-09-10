@@ -286,8 +286,14 @@ def clean_excerpt(text, n=300):
 
 
 # ----------------------------------------------------------------------------- daemon
-def pglock_board_lines(lock, runs):
-    """The pgserver lock row. An UNMEASURED probe says so; it never renders as free."""
+def pglock_board_lines(lock, runs, pop_state=None, notes=None):
+    """The pgserver lock row. An UNMEASURED probe says so; it never renders as free.
+
+    The RUN rows below it are the ITEM 4 change. They used to come from `state["codex"]` — this
+    daemon's own spawns — so a box run nobody here started could not appear at all, and an empty
+    list rendered as silence. Now the population comes from the box, and its ABSENCE has two
+    different sentences: NOT MEASURED (we could not look) and none observed (we looked).
+    """
     if lock.get("state") == pglock.UNMEASURED:
         out = [f"  pgserver lock: NOT MEASURED — {lock.get('why', '')[:90]}"]
     elif lock.get("state") == pglock.HELD:
@@ -295,9 +301,19 @@ def pglock_board_lines(lock, runs):
                f"machine queues behind it, no timeout"]
     else:
         out = ["  pgserver lock: free"]
+    if pop_state == pglock.UNMEASURED:
+        out.append("    runs: NOT MEASURED — the marker root could not be read, so this says "
+                   "nothing about what is running")
+    elif pop_state == pglock.NO_RUNS:
+        out.append("    runs: none observed on the box")
     for r in runs:
+        who = r.get("slot") or "?"
         if r["state"] != pglock.LIVE:
-            out.append(f"    {r['slot']} pid {r['pid']} {r['state']}: {r['why'][:110]}")
+            out.append(f"    {who} pid {r['pid']} {r['state']}: {r['why'][:110]}")
+        else:
+            out.append(f"    {who} pid {r['pid']} LIVE — {r.get('item', '')[-58:]}")
+    for n in (notes or []):
+        out.append(f"    note: {n[:120]}")
     return out
 
 
@@ -3462,26 +3478,57 @@ class Dispatcher:
             lock = pglock.probe()
             prev_cpu = self.state.get("pgserver_cpu") or {}
             cpu_now, runs = {}, []
+            # ITEM 4. THE POPULATION COMES FROM THE BOX, NOT FROM THIS DAEMON'S OWN SPAWNS. The
+            # loop below used to run over `state["codex"]`, which meant a run this daemon did not
+            # start could never be STALLED — and the 102-minute wait this whole probe was built for
+            # was WORKER-1's run, not ours. The instrument could not see its own founding incident.
+            box_runs, pop_notes, pop_state = pglock.population()
+            # G6: the CPU baseline is keyed on (pid, start_time), never on pid alone. A pid that is
+            # recycled between two ticks would otherwise inherit the dead run's CPU reading and
+            # come out LIVE on a delta that spans two different processes.
+            def _key(pid, started):
+                return f"{int(pid)}:{int(started)}" if started else f"{int(pid)}:?"
+            seen = set()
+            for r in box_runs:
+                pid = r["pid"]
+                k = _key(pid, r.get("started_at"))
+                c = pglock.cpu_seconds(pid)
+                cpu_now[k] = c
+                state_, why_ = pglock.verdict(pid, lock, c, prev_cpu.get(k))
+                runs.append({"slot": r.get("owner") or r.get("session"), "pid": pid,
+                             "item": r.get("suite_root"), "state": state_, "why": why_,
+                             "cpu_s": c, "source": "box", "session": r.get("session"),
+                             "postmaster": r.get("postmaster")})
+                seen.add(pid)
+            # The daemon's own codex runs stay in the set — they are box runs too, they just do not
+            # write pgserver markers. Deduped by pid so a codex run that DOES appear as a marker is
+            # one row, not two.
             for slot, run in (self.state.get("codex") or {}).items():
                 pid = run.get("pid")
-                if not pid:
+                if not pid or pid in seen:
                     continue
+                k = _key(pid, pglock.start_time(pid))
                 c = pglock.cpu_seconds(pid)
-                cpu_now[str(pid)] = c
-                state_, why_ = pglock.verdict(pid, lock, c, prev_cpu.get(str(pid)))
+                cpu_now[k] = c
+                state_, why_ = pglock.verdict(pid, lock, c, prev_cpu.get(k))
                 runs.append({"slot": slot, "pid": pid, "item": run.get("item"),
-                             "state": state_, "why": why_, "cpu_s": c})
+                             "state": state_, "why": why_, "cpu_s": c, "source": "codex"})
             self.state["pgserver_cpu"] = cpu_now
             self.state["sessions"]["pgserver_lock"] = lock
             self.state["sessions"]["runs"] = runs
+            self.state["sessions"]["pgserver_population"] = {
+                "state": pop_state, "notes": pop_notes, "root": pglock.marker_root(),
+                "box_owner": pglock.box_owner()}
             self.state["sessions"]["board"] = (
-                self.state["sessions"]["board"] + pglock_board_lines(lock, runs))
+                self.state["sessions"]["board"]
+                + pglock_board_lines(lock, runs, pop_state, pop_notes))
             found = sessionwatch.finding(rows, shape, quiet_after_s=quiet_after, routes=routes)
             if not found:
                 stalled = [r for r in runs if r["state"] == pglock.STALLED]
                 if stalled:
                     found = ("RUN_STALLED",
-                             "; ".join(f"{r['slot']} ({r['item']}) {r['why']}" for r in stalled))
+                             "; ".join(f"{r['slot']} pid {r['pid']} ({r['item']}) {r['why']}"
+                                       for r in stalled))
         except Exception as e:  # a sensor must never abort the tick it is only observing
             try:
                 self.log(f"session census failed: {type(e).__name__}: {e}")

@@ -392,13 +392,21 @@ def _counting_probe(*a, **k):
     probed["n"] += 1
     return _realprobe(*a, **k)
 mod.pglock.probe = _counting_probe
+# THE BOX POPULATION IS STUBBED OUT HERE, and that is the point of this comment rather than a
+# convenience. After item 4 the run set comes from the box's own markers, so leaving it live would
+# make this check read the REAL markers under $TMPDIR — it would pass or fail depending on whether
+# somebody else's suite happened to be running, and its first row would be their run, not ours.
+# A test never depends on live state it does not own. The subject here is narrower and unchanged:
+# the daemon's own tracked codex run still gets a verdict against the lock.
+mod.pglock.population = lambda: ([], [], mod.pglock.NO_RUNS)
 d.state["codex"] = {"CODEX-1": {"pid": os.getpid(), "item": "A.x"}}
 d.poll_sessions()
 ok(probed["n"] == 1 and d.state["sessions"].get("pgserver_lock") is not None,
    "MUST BITE: the daemon PROBES the pgserver lock every tick and lands the result in state — "
    "box.lock.d and portal.lock.d do not know this lock exists")
-ok(d.state["sessions"].get("runs") and d.state["sessions"]["runs"][0]["pid"] == os.getpid(),
-   "  and it gives every tracked run a verdict against that lock")
+ok(any(r["pid"] == os.getpid() for r in (d.state["sessions"].get("runs") or [])),
+   "  and it gives every tracked run a verdict against that lock — asserted by MEMBERSHIP, not by "
+   "position: the box population is prepended now, so runs[0] is whoever the box is running")
 ok(any("pgserver lock" in l for l in d.state["sessions"]["board"]),
    f"MUST BITE: and the board carries a pgserver row: "
    f"{[l for l in d.state['sessions']['board'] if 'pgserver' in l]}")
