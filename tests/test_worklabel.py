@@ -24,6 +24,7 @@ import importlib.util, os, sys, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 import fixturelog as FL
 
 fails = []
@@ -33,6 +34,7 @@ def check(name, cond, detail=""):
 
 spec = importlib.util.spec_from_file_location("dsp", os.path.join(HERE, os.pardir, "dispatcher.py"))
 DSP = importlib.util.module_from_spec(spec); sys.modules["dsp"] = DSP; spec.loader.exec_module(DSP)
+fixtures.redirect_state(DSP)   # item 9: never the LIVE state dir
 
 IDS = ["B.014a.artifact-custody", "B.014a.artifact-custody-r3",
        "B.010.portal-platform-contention-mutex", "B.012.trigger-builder",

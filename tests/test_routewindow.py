@@ -27,10 +27,12 @@ import importlib, importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 # NOT the dispatcher directory: dispatcher.py must put its own directory on sys.path.
 _spec = importlib.util.spec_from_file_location(
     "museadapter_rw", os.path.join(HERE, os.pardir, "museadapter.py"))
 M = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(M)
+fixtures.redirect_state(M)   # item 9: never the LIVE state dir
 
 P, FAILED = 0, []
 def ok(cond, what):
@@ -139,6 +141,7 @@ def daemon():
     spec = importlib.util.spec_from_file_location(
         "dsprw" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    fixtures.redirect_state(mod)   # item 9: never the LIVE state dir
     # TWO seams now, and both are named. CODEX_HOME is the one the reap actually uses (it derives
     # the profile's own sessions dir from it); SESSIONS_ROOT still covers the LEGACY profile, which
     # has no isolated home. Neither may ever be the real ~/.codex.

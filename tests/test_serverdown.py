@@ -23,6 +23,7 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 P, F = 0, []
 def ok(c, w):
     global P
@@ -38,6 +39,7 @@ def daemon(queue_items, health_ok, spawned):
     spec = importlib.util.spec_from_file_location(
         "dsp" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     DP = importlib.util.module_from_spec(spec); spec.loader.exec_module(DP)
+    fixtures.redirect_state(DP)   # item 9: never the LIVE state dir
     DP.STATE_DIR = TMP
     DP.HEARTBEAT = os.path.join(TMP, "heartbeat")
     DP.QUEUE = os.path.join(TMP, "queue.json")
@@ -46,24 +48,9 @@ def daemon(queue_items, health_ok, spawned):
     DP.QUEUE_HOLD = os.path.join(TMP, "HOLD")
     DP.EVENTS = os.path.join(TMP, "events.log")
     DP.CODEX_DIR = TMP; DP.ITEMS_DIR = os.path.join(TMP, "items")
-    # REDIRECT EVERY REMAINING LIVE PATH, BY POPULATION AND NOT ONE AT A TIME.
-    # 2026-09-10 21:58: five checks in this file went red for a reason that had nothing to do with
-    # the daemon — BOSS created the real `hold/CODEX-1.feed` at 21:52 while working around item 6,
-    # and `codex_tick` reads `HOLD_DIR` to decide whether a slot is parked. HOLD_DIR was never
-    # redirected here, so this test was reading a LIVE CONTROL FILE and its verdict depended on
-    # what the operator happened to be doing. Nine of twenty-three module paths were unredirected;
-    # naming them one by one is how the tenth gets missed, so this rebases the whole set. Item 6
-    # made it urgent: with the answer consumer now on the degraded path, an unredirected
-    # ANSWER_REQ_DIR would have let this test READ AND DELETE real answer requests.
-    for _n in dir(DP):
-        if not _n.isupper():
-            continue
-        _v = getattr(DP, _n)
-        if isinstance(_v, str) and _v.startswith(str(os.path.expanduser("~"))) and TMP not in _v:
-            setattr(DP, _n, os.path.join(TMP, "live", _n.lower()))
-    for _n in ("ANSWER_REQ_DIR", "HOLD_DIR", "HOLDCLEAR_DIR", "CLEAR_DIR", "GATE_REQ_DIR",
-               "GATES_DIR"):
-        os.makedirs(getattr(DP, _n), exist_ok=True)
+    # The blanket rebase that used to live here inline is now `fixtures.redirect_state`, called
+    # above and shared by all 34 files that load the daemon (item 9). Keeping a second copy here
+    # would mean two definitions of "every live path", which is how the two drift apart.
     json.dump({"items": queue_items}, open(DP.QUEUE, "w"))
 
     def http(method, path, **kw):

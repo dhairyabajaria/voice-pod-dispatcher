@@ -16,6 +16,7 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE); import fixturelog as FL
+import fixtures                      # item 9: the shared state redirect
 
 fails = []
 def check(name, cond, detail=""):
@@ -25,7 +26,15 @@ def check(name, cond, detail=""):
 def load(mod, fname):
     spec = importlib.util.spec_from_file_location(
         mod + str(time.time_ns()), os.path.join(HERE, os.pardir, fname))
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    if 'dispatcher.py' in fname:
+        # ROSTER_PATH is KEPT deliberately: the check at the bottom of this file asserts that
+        # with no override the daemon reads the REAL roster.json, so redirecting it would delete
+        # the check's own subject. roster.json is READ by the daemon and never written by it, and
+        # this session never writes it either. Every deliberate live read in the suite is findable
+        # with `grep -rn "keep=" tests/`.
+        fixtures.redirect_state(m, keep=("ROSTER_PATH",))   # item 9
+    return m
 
 AG = load("agr", "autogate.py")
 

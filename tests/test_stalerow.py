@@ -7,8 +7,10 @@ import importlib.util, json, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import sys as _s; _s.path.insert(0, HERE); import fixturelog as FL
+import fixtures                      # item 9: the shared state redirect
 spec = importlib.util.spec_from_file_location("dstale", os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); sys.modules["dstale"] = D; spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 FX = os.path.join(HERE, "fixtures")
 Q = json.load(open(os.path.join(FX, "queue.json")))
 PEND = json.load(open(os.path.join(FX, "pending.json")))["pending"]

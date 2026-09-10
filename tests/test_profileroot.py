@@ -30,6 +30,7 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, os.pardir))
+import fixtures                      # item 9: the shared state redirect
 import museadapter as M                                        # noqa: E402
 
 P, F = 0, []
@@ -66,6 +67,7 @@ def reap(log_text, *, cwd=WT, profile=PROFILE):
     spec = importlib.util.spec_from_file_location(
         "dspr" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    fixtures.redirect_state(mod)   # item 9: never the LIVE state dir
     mod.museadapter.CODEX_HOME = HOME              # the profile home the reap must derive from
     mod.museadapter.SESSIONS_ROOT = LEGACY_ROOT    # the legacy root it must NOT read for a profile
     d = mod.Dispatcher.__new__(mod.Dispatcher)

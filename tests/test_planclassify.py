@@ -19,6 +19,7 @@ import importlib.util, os, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE); import fixturelog as FL
+import fixtures                      # item 9: the shared state redirect
 
 fails = []
 def check(name, cond, detail=""):
@@ -28,6 +29,7 @@ def check(name, cond, detail=""):
 spec = importlib.util.spec_from_file_location(
     "dpl" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 
 def kind(text, after_compaction=False):
     m = {"info": {"id": "m", "role": "assistant", "time": {"created": 1, "completed": 1}},

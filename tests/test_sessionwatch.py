@@ -26,6 +26,7 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 _spec = importlib.util.spec_from_file_location(
     "sessionwatch_t", os.path.join(HERE, os.pardir, "sessionwatch.py"))
 SW = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(SW)
@@ -179,6 +180,7 @@ def daemon():
     spec = importlib.util.spec_from_file_location(
         "dspsw" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    fixtures.redirect_state(mod)   # item 9: never the LIVE state dir
     d = mod.Dispatcher.__new__(mod.Dispatcher)
     d.state = {}
     d.cfg = {"session_quiet_minutes": 30, "session_quiet_repeat_minutes": 30}

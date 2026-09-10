@@ -21,6 +21,7 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 P, F = 0, []
 def ok(c, w):
     global P
@@ -34,6 +35,7 @@ def daemon(items, *, reqs=(), spawned=None):
     spec = importlib.util.spec_from_file_location(
         "dspa" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     DP = importlib.util.module_from_spec(spec); spec.loader.exec_module(DP)
+    fixtures.redirect_state(DP)   # item 9: never the LIVE state dir
     st = os.path.join(TMP, "s" + str(time.time_ns())); os.makedirs(st)
     DP.STATE_DIR = st
     DP.HEARTBEAT = os.path.join(st, "heartbeat")

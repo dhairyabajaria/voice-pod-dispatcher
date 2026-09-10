@@ -25,9 +25,11 @@ import importlib.util, os, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 import fixturelog as FL
 spec = importlib.util.spec_from_file_location("dnt", os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); sys.modules["dnt"] = D; spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 
 fails = []
 def check(name, cond, detail=""):

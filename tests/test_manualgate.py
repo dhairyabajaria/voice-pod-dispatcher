@@ -18,6 +18,7 @@ import importlib.util, json, os, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE); import fixturelog as FL
+import fixtures                      # item 9: the shared state redirect
 CTL = os.path.join(HERE, os.pardir, "dispatcherctl.sh")
 
 fails = []
@@ -28,7 +29,10 @@ def check(name, cond, detail=""):
 def load(mod, fname):
     spec = importlib.util.spec_from_file_location(
         mod + str(time.time_ns()), os.path.join(HERE, os.pardir, fname))
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    if 'dispatcher.py' in fname:
+        fixtures.redirect_state(m)   # item 9: never the LIVE state dir
+    return m
 
 AG = load("ag", "autogate.py")
 

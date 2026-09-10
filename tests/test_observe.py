@@ -24,6 +24,7 @@ import importlib.util, json, os, shutil, sys, tempfile, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 import fixturelog as FL
 
 fails = []
@@ -33,6 +34,7 @@ def check(name, cond, detail=""):
 
 spec = importlib.util.spec_from_file_location("dspo", os.path.join(HERE, os.pardir, "dispatcher.py"))
 DSP = importlib.util.module_from_spec(spec); sys.modules["dspo"] = DSP; spec.loader.exec_module(DSP)
+fixtures.redirect_state(DSP)   # item 9: never the LIVE state dir
 
 ROOT = tempfile.mkdtemp(prefix="observe-")
 DSP.STOP = os.path.join(ROOT, "STOP"); DSP.OBSERVE = os.path.join(ROOT, "OBSERVE")

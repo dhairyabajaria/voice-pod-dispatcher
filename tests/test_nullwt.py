@@ -21,9 +21,11 @@ import importlib.util, os, shutil, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 import fixturelog as FL
 spec = importlib.util.spec_from_file_location("dnw", os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); sys.modules["dnw"] = D; spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 
 fails = []
 def check(name, cond, detail=""):
@@ -105,6 +107,7 @@ def fed(text, worktree):
     sp = importlib.util.spec_from_file_location(
         "dnwf" + str(_t.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     M = importlib.util.module_from_spec(sp); sp.loader.exec_module(M)
+    fixtures.redirect_state(M)   # item 9: never the LIVE state dir
     x = M.Dispatcher.__new__(M.Dispatcher)
     x.state = {"handled": {}, "autogate": {}, "parks": {}, "auto": {}, "pending": {},
                "gate_skipped": {}, "stale_seen": {}}

@@ -17,6 +17,7 @@ import importlib.util, json, os, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 import fixturelog as FL
 
 CTL = os.path.join(HERE, os.pardir, "dispatcherctl.sh")
@@ -79,6 +80,7 @@ def daemon(root, d, roster=None, post=None):
     spec = importlib.util.spec_from_file_location(
         "dsp" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     DP = importlib.util.module_from_spec(spec); spec.loader.exec_module(DP)
+    fixtures.redirect_state(DP)   # item 9: never the LIVE state dir
     DP.STATE_DIR = d
     DP.ANSWER_REQ_DIR = os.path.join(d, "answerreq")
     DP.EVENTS = os.path.join(d, "events.log")

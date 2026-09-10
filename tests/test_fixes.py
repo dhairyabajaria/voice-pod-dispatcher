@@ -4,11 +4,13 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import sys as _s; _s.path.insert(0, HERE); import fixturelog as FL
+import fixtures                      # item 9: the shared state redirect
 FX = os.path.join(HERE, "fixtures")
 TMP = tempfile.mkdtemp(prefix="dispfix-")
 
 spec = importlib.util.spec_from_file_location("dstaged", os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); sys.modules["dstaged"] = D; spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 D.HOLD_DIR = os.path.join(TMP, "hold"); os.makedirs(D.HOLD_DIR, exist_ok=True)
 
 Q = json.load(open(os.path.join(FX, "queue.json")))

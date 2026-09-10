@@ -20,6 +20,7 @@ import importlib.util, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 # NOTE what is deliberately NOT here: the dispatcher directory. dispatcher.py must put its own
 # directory on sys.path, because every test loads it by path and nothing else will. The first cut of
 # this file added that path itself and passed while eleven other test files died on
@@ -63,6 +64,7 @@ def daemon(cfg, env, spawned):
     spec = importlib.util.spec_from_file_location(
         "dsp" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     DP = importlib.util.module_from_spec(spec); spec.loader.exec_module(DP)
+    fixtures.redirect_state(DP)   # item 9: never the LIVE state dir
     # Each independent daemon fixture owns separate persistent conversation state.
     DP.CODEX_DIR = tempfile.mkdtemp(prefix="daemon-", dir=LOGS)
     DP.ITEMS_DIR = ITEMS

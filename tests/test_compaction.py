@@ -8,8 +8,10 @@ import importlib.util, json, os, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import sys as _s; _s.path.insert(0, HERE); import fixturelog as FL
+import fixtures                      # item 9: the shared state redirect
 spec = importlib.util.spec_from_file_location("dcomp", os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); sys.modules["dcomp"] = D; spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 FX = json.load(open(os.path.join(HERE, "fixtures", "execd_compaction.json")))["messages"]
 SID = "ses_f92c5cfedffeYU6iVctg0oiskT"
 INERT = FX[-1]                      # the post-compaction turn, as the daemon saw it

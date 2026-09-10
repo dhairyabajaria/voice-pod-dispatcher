@@ -1,33 +1,42 @@
-2026-09-10 22:09  dispatcher.py 04061983, tests/test_degradedanswer.py   [BOSS item 7, 2026-09-10 22:12]
-  THE SHAPE, NOT THE INSTANCE. The degraded early return is DEFINED by what it protects (opencode)
-  and SCOPED by position (everything after it). Those are not the same set, and the difference is
-  where things get dropped in silence — item 6 was one instance of it, found by BOSS the hard way.
-  MOVED into the degraded pass, own try/except EACH (three functions behind one guard is one
-  function's worth of protection), under the queue lock already held, in the healthy path's order:
-    * apply_gate_requests — BOSS's hand-named gates. No `http(`, no roster, no session id: a merge
-      gate is a subprocess. `dispatcherctl.sh gate` has been silently doing nothing for 30 h.
-    * collect_gates — launching a gate nobody collects is worse than not launching it; the findings
-      never reach anyone. Guarded by the same auto_gate/manual_gates_live condition as the healthy
-      path, not a looser one.
-  STILL STRANDED, AND CORRECTLY — stated rather than left as the residue of what nobody moved:
-  check_dead, check_stall, check_session_idle, feed, feed_when_idle, post_prompt, roster_refresh,
-  recover_missed_reports, prune_offroster, apply_clear_requests. Every one reads the roster, a
-  session or the server, so a degraded tick genuinely cannot do them.
-  THE THIRD FUNCTION BOSS NAMED IS **NOT** MOVED, AND THE REFUSAL IS THE POINT.
-  `clear_feed_holds_for_answered` REMOVES `hold/<EXEC>.feed`. At 22:12 the same message ordered both
-  slot holds KEPT after the restart — the owner has stopped all Codex/Muse work and
-  `hold/CODEX-1.feed` (21:52:58) is what enforces it. Moving that function would build an AUTOMATIC
-  path to deleting the hold the owner's stop depends on: the moment any queued row carries
-  `answered_at` with `executor=CODEX-1` — exactly the workflow BOSS is using to answer parked rows —
-  the next degraded tick would clear it. Measured: no queued row carries `answered_at` right now, so
-  it would not have fired today; the hazard is latent, not theoretical, and the healthy path (which
-  has the same behaviour) has not run for 30 h. HELD PENDING HIS RULING. A test asserts its ABSENCE
-  so this cannot be re-added silently.
-  PROOF: tests/test_degradedanswer.py 17 -> 26 checks. PC a hand-named gate LAUNCHES on a degraded
-  tick and its request file is consumed; NC a request for a non-gateable row is refused there exactly
-  as on the healthy path; PC a finished gate is COLLECTED; a RAISING gate consumer cancels neither
-  the answer consumer, nor collection, nor codex dispatch; source order on the same `_before` helper
-  (a missing term is a clean False, never a ValueError).
-  MUTATION MEASURED: removing both item-7 calls -> 18 passed, 8 failed, zero tracebacks.
-  NOT IN EFFECT UNTIL A RESTART. Not restarted; BOSS holds the word and a codex run is still live.
+2026-09-10 22:21  tests/fixtures.py (new), tests/test_fixtureguard.py (new), 34 test files   [BOSS item 9, 2026-09-10 22:32]
+  A TEST NEVER TOUCHES A LIVE CONTROL FILE — MADE A FLOOR INSTEAD OF A CONVENTION.
+  Item 8's sweep: 12 of 35 files left at least one DELETABLE live path unredirected while driving
+  the daemon. The daemon removes files under ANSWER_REQ_DIR, CLEAR_DIR, GATE_REQ_DIR, HOLDCLEAR_DIR
+  and HOLD_DIR, so those tests could destroy operator state. The trigger was concrete: BOSS created
+  the real hold/CODEX-1.feed at 21:52:58 and five checks in test_serverdown.py went red, because
+  codex_tick reads HOLD_DIR and that fixture never redirected it — A TEST'S VERDICT DEPENDED ON WHAT
+  THE OPERATOR WAS DOING, and a different operator action would have had the suite DELETE his file
+  rather than merely read it. Items 6 and 7 sharpened it: apply_answer_requests and
+  apply_gate_requests now run on the DEGRADED path, which is the path those tests take.
+  NOT TWELVE PATCHES. Twelve patches is how the thirteenth gets missed — the same "one file instead
+  of its population" shape as the pgserver census (item 4) and the route resolver (item 5), all three
+  found the same evening. `fixtures.redirect_state(mod)` rebases EVERY constant that points under
+  $HOME into a private temp root, creating the directories (a listdir of a missing dir is an OSError
+  that several call sites swallow, and a swallowed error looks exactly like an empty directory).
+  IT TAKES ONLY THE MODULE, and that is what made the change mechanical: an earlier design took the
+  caller's TMP too, which would have meant discovering thirty-five different temp-variable names and
+  thirty-five hand-placed calls. Taking none, it mints its own root, so the insertion point is
+  identical in every file — immediately after exec_module — and each test's own later assignments
+  still win, which makes the helper a FLOOR, not a ceiling.
+  34 files call it; 20 took a one-line insertion, 10 needed an import anchor, 4 share a generic
+  `load(mod, fname)` helper where the call is guarded on `'dispatcher.py' in fname`.
+  ONE DELIBERATE OPT-OUT, AND IT IS GREPPABLE. test_restartdrop.py keeps ROSTER_PATH live, because
+  its check's SUBJECT is that the daemon reads the REAL roster.json with no override — redirecting it
+  would delete the check's own subject. Expressed as `keep=("ROSTER_PATH",)` rather than by poking
+  the module afterwards, so `grep -rn "keep=" tests/` enumerates every deliberate live read in the
+  suite and anything absent from that list is an accident. roster.json is READ by the daemon and
+  never written by it.
+  THE 36th FILE CANNOT SKIP IT: tests/test_fixtureguard.py (8 checks, new, wired) walks
+  tests/test_*.py and fails any module that loads dispatcher.py without the helper. The criterion is
+  LOADS THE MODULE (spec_from_file_location AND the literal dispatcher.py), not MENTIONS THE FILE:
+  test_restartguard.py drives dispatcherctl.sh as a subprocess and holds no module object, and a
+  guard with an exception list is one edit away from having two. It carries its own controls — that
+  35 files were found (an empty population is not a clean one) and that a freshly loaded dispatcher.py
+  really does point at 26 live paths.
+  MUTATIONS MEASURED, both clean, no tracebacks:
+    * a file forgets the call -> 7 passed, 1 failed, naming the file.
+    * the helper stops redirecting HOLD_DIR — the 21:52 incident exactly -> 5 passed, 3 failed.
+  Full suite green: 127/18/41/28/13/10/15/68/20/21/25/8/26, rc=0. Live state verified untouched
+  after every run: all four hold files present, all four request directories empty.
+  NO RESTART NEEDED — tests only; the daemon is unchanged.
 

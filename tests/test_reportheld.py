@@ -21,9 +21,11 @@ import importlib.util, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import fixtures                      # item 9: the shared state redirect
 import fixturelog as FL
 spec = importlib.util.spec_from_file_location("drh", os.path.join(HERE, os.pardir, "dispatcher.py"))
 D = importlib.util.module_from_spec(spec); sys.modules["drh"] = D; spec.loader.exec_module(D)
+fixtures.redirect_state(D)   # item 9: never the LIVE state dir
 
 fails = []
 def check(name, cond, detail=""):
@@ -144,6 +146,7 @@ def fed(status, dispatched_to="EXEC-F"):
     sp = importlib.util.spec_from_file_location(
         "dfed" + str(_time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     M = importlib.util.module_from_spec(sp); sp.loader.exec_module(M)
+    fixtures.redirect_state(M)   # item 9: never the LIVE state dir
     d = M.Dispatcher.__new__(M.Dispatcher)
     d.state = {"handled": {}, "autogate": {}, "parks": {}, "auto": {}, "pending": {},
                "gate_skipped": {}, "stale_seen": {}}
