@@ -91,6 +91,7 @@ run "test_sessionstatus.py (exact turn evidence)" $PY "$HERE/test_sessionstatus.
 run "test_legacyenv.py (legacy strip)"    $PY "$HERE/test_legacyenv.py"
 run "test_codexroute.py (spawn wiring)"   $PY "$HERE/test_codexroute.py"
 run "test_routewindow.py (route by window)" $PY "$HERE/test_routewindow.py"
+run "test_profileroot.py (profile root)"   $PY "$HERE/test_profileroot.py"
 run "test_ctlself.py (ctl restart)"       $PY "$HERE/test_ctlself.py"
 run "test_clearhold.py (ctl clear-hold)"  $PY "$HERE/test_clearhold.py"
 run "test_sessionwatch.py (sessions)"     $PY "$HERE/test_sessionwatch.py"

@@ -39,7 +39,13 @@ def ok(cond, what):
     else: FAILED.append(what); print(f"FAIL {what}")
 
 TMP = tempfile.mkdtemp(prefix="routewindow-")
-ROOT = os.path.join(TMP, "sessions")
+# ITEM 5: the reap now resolves rollouts under the PROFILE'S OWN home, because `3b38f14` gave each
+# Muse profile an isolated CODEX_HOME and the spawn writes its rollout there — while the resolvers
+# were still reading the shared `~/.codex/sessions`, which is how three real runs with rollouts on
+# disk were reported "route NOT MEASURED". So the fixture root IS the profile's sessions directory,
+# and the seam below is CODEX_HOME. Left at TMP/sessions this file would have gone on passing while
+# reading a directory the product no longer looks in — a proof set proving an adjacent path.
+ROOT = os.path.join(TMP, "muse-homes", "muse-go-1", "sessions")
 WT = os.path.join(TMP, "wt"); os.makedirs(WT)
 OTHER = os.path.join(TMP, "other-wt"); os.makedirs(OTHER)
 MODEL, PROV, EFFORT = "muse-spark-1.3-contributor", "muse-go-1", "xhigh"
@@ -133,7 +139,11 @@ def daemon():
     spec = importlib.util.spec_from_file_location(
         "dsprw" + str(time.time_ns()), os.path.join(HERE, os.pardir, "dispatcher.py"))
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-    mod.museadapter.SESSIONS_ROOT = ROOT      # the ONE seam: never read the real ~/.codex/sessions
+    # TWO seams now, and both are named. CODEX_HOME is the one the reap actually uses (it derives
+    # the profile's own sessions dir from it); SESSIONS_ROOT still covers the LEGACY profile, which
+    # has no isolated home. Neither may ever be the real ~/.codex.
+    mod.museadapter.CODEX_HOME = TMP
+    mod.museadapter.SESSIONS_ROOT = ROOT
     d = mod.Dispatcher.__new__(mod.Dispatcher)
     d.state = {"codex": {}, "muse": {}}
     d.cfg = {"codex_slots": ["CODEX-1"], "quota_hold_minutes": 60, "max_auto_continue": 3,

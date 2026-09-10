@@ -1,100 +1,55 @@
-2026-09-10 20:14  pglock.py 8480bc7f, dispatcher.py 42eed0c8, tests/test_pgpopulation.py (new)   [BOSS item 4, 2026-09-10 20:07]
-  THE VERDICT WAS RIGHT AND IT SCORED THE WRONG SET. The tick's pgserver loop ran over
-  `state["codex"]` — THIS DAEMON'S OWN SPAWNS — so a box run nobody here started could never be
-  STALLED. The 102-minute wait the whole probe was built for was WORKER-1's run. The instrument
-  could not see its own founding incident, and an empty `runs` list rendered as silence. A guard
-  defined over one file instead of over its population, one layer up from where that was last found.
-  THE SUBJECT IS THE WAITER, NOT THE POSTMASTER. Measured 2026-09-10 20:01: every live postmaster on
-  this box has PPID 1 — reparented to launchd — so they lead nowhere upward, and a live postmaster
-  proves the start ALREADY SUCCEEDED. The process that queues on the global mutex is the python
-  inside PostgresServer.__enter__/.cleanup(). Postmasters corroborate by pgdata; they never
-  contribute a row. (This corrected the sketch the population was first designed against.)
-  THE POPULATION COMES FROM THE BOX. Primary: the per-run markers
-  $TMPDIR/voicepod-test-pg-session-*/.voicepod-test-postgres-owner.json, which name owner_pid,
-  owner_started_at, pgdata and suite_root. Secondary, for ATTRIBUTION only: test-logs/box.lock.d/owner
-  (`owner=`, `pid=`, `what=`). READ-ONLY for both — the daemon never writes a marker, never writes or
-  releases the box lock, and never removes the stale markers it skips. They are not ours to clean up.
-  GUARDS, each with a check that bites:
-    G1 A STALE MARKER IS NOT A RUN. A marker whose owner_pid is dead is debris and gets NO ROW — not
-       LIVE, not STALLED, not an UNMEASURED row. There was a real one on the box while this was
-       written (owner_pid 41101, another session's abandoned wt-premerge run). Without G1 the first
-       thing this change does is invent a permanently stalled run out of a leftover file.
-    G2 PID REUSE. (pid, start_time) identifies the process. owner_started_at IS the owner's creation
-       time — verified to the second against `ps -o lstart=` — so a recycled pid does not inherit a
-       dead run's row.
-    G4 ABSENCE HAS TWO DIFFERENT SENTENCES. An unreadable marker root is UNMEASURED ("we could not
-       look"). A readable root with no live runs is NO_RUNS ("we looked, there is nothing"), rendered
-       as its own line. DELIBERATE DEPARTURE from the approved design, which said absence renders
-       UNMEASURED: calling an idle box UNMEASURED on every quiet tick would teach the reader to skip
-       the row, which is this detector's own failure arriving from the other side. Both are stated,
-       neither is silence.
-    G5 A postmaster being up is not evidence of working; corroboration only.
-    G6 The CPU baseline keys on (pid, start_time), never on pid alone, so a recycled pid cannot come
-       out LIVE on a delta spanning two different processes.
-    G8 EVERY ROW NAMES WHOSE RUN IT IS — box owner name plus suite_root — and RUN_STALLED carries the
-       owner AND the pid. A verdict addressed to nobody is a verdict without an owner.
-  PROOF: tests/test_pgpopulation.py (21 checks, new, wired). EVERY CHECK DRIVES tick(), not
-  pglock.verdict(): the defect IS the call site, and asserting on verdict() would prove the function
-  that was never at risk. The daemon is driven with a STOP file inside the test's own temp dir — a
-  test never touches a live control file. PC1 a foreign idle run under a foreign held lock scores
-  STALLED; PC2 the holder is LIVE, never STALLED; PC3 a foreign run burning CPU is LIVE; PC4 dead
-  owner_pid, no row; PC5 pid reuse, no row; PC6 unreadable root is UNMEASURED; PC7 another session's
-  abandoned marker by shape. NEGATIVE CONTROL: the identical tick with the OLD population produces no
-  row at all, so PC1 is a statement about the population and not about verdict().
-  TWO REDS ON THE WAY, both the instrument rather than the product. (1) Patching DP.pglock.population
-  rebinds the SHARED module, so each case captured the previous case's lambda as "real" and recursed;
-  every check after PC1 died and the negative control PASSED VACUOUSLY inside the wreck. Captured the
-  originals once, before any patch. (2) A marker_root stub that SWALLOWED its argument made PC6 read a
-  directory that does exist, turning UNMEASURED into NO_RUNS — the stub had quietly changed the
-  subject under test.
-  ALSO: tests/test_sessionwatch.py's lock call-site check asserted runs[0], which after this change is
-  whoever the BOX is running, and it read the real markers — a test depending on live state it does not
-  own. Now stubs the population and asserts by MEMBERSHIP.
-  LIVE SMOKE 2026-09-10 20:12, read-only, temp state dir: four real runs of lane-004-pgserver-lock
-  (pids 99359-99362, postmasters 99529/99549/99605/99571) all LIVE under a FREE lock, each row named
-  by owner and suite_root; the 41101 stale marker produced NO ROW and was reported as a counted note.
-  Full suite green: 127/18/41/28/10/15/68/20/21/24, rc=0.
-  NOT IN EFFECT UNTIL A RESTART. Not restarted — asked BOSS first, because WORKER-1's suite is live on
-  the box and he wants the new census to see it while it is running.
-
-2026-09-10 19:51  pglock.py e8521241 (new), dispatcher.py 4f6e6f1e   [BOSS item 2, 2026-09-10]
-  THE THIRD LOCK, MADE VISIBLE. pgserver serialises EVERY postgres start and stop on this machine
-  through one lockfile — a CLASS attribute at a fixed per-user path, shared across worktrees,
-  checkouts, xdist workers and unrelated projects, with the pgdata path never entering the lock
-  identity and no timeout on the wait (★, docs/ops/2026-09-09/PGSERVER-GLOBAL-LOCK.md). It cost one
-  run 102 minutes of invisible waiting. box.lock.d and portal.lock.d do not know it exists, so the
-  board can show a run "holding the box" that is stalled behind a process holding no project lock at
-  all — board-reports-what-it-sent, third lock edition.
-  READ-ONLY BY CONSTRUCTION, AND THE CONSTRAINT CHOSE THE MECHANISM.
-    * lsof was the obvious probe and IT DOES NOT WORK HERE. Measured against a process genuinely
-      holding the lock: lsof's lock field reports `l ` (no lock) for BOTH flock and POSIX lockf on
-      this macOS. It lists who has the file OPEN, conflating the holder with everyone queued behind
-      it — the one distinction that matters, reported backwards.
-    * A non-blocking flock/lockf attempt ACQUIRES the lock when it is free. Forbidden: this daemon
-      must never become the thing that serialises a test run.
-    * fcntl(F_GETLK) TESTS for a conflicting lock, never takes one, and returns the holder's pid.
-      Verified both ways — HELD by the exact pid while a real holder ran, FREE the moment it exited,
-      and an INDEPENDENT process still could not take the lock after our probes.
-  THREE STATES: LIVE / STALLED / UNMEASURED. STALLED needs BOTH halves — the global lock held by a
-  process that is not this run, AND effectively no CPU burned between two consecutive samples. One
-  sample is never a stall. The run that HOLDS the lock is never STALLED: it is what everyone else is
-  waiting for, a different row and a different action. And the wording says STALLED is a
-  CORRELATION, not proof — a run idle for its own reasons looks the same.
-  UNMEASURED IS NEVER RENDERED AS FREE. A missing lockfile, an unreadable one or a refused query all
-  report UNMEASURED and say so on the board. platformdirs is NOT importable by /usr/bin/python3 — the
-  daemon's interpreter — so the path is written out rather than derived, and a path that ever goes
-  stale reports "no lockfile, NOT the same as a free lock" instead of a silent FREE.
-  A dead pid's CPU is None, never 0.0: 0.0 is exactly the stall signature and would report every
-  finished run as stalled forever.
-  PROOF: tests/test_pglock.py (20 checks, new, wired) — the holder cases take a REAL POSIX lock in a
-  REAL subprocess against a temp file, because a stubbed lock proves the parser and not the probe,
-  which is the trap this detector already fell into once. Plus 4 call-site checks in
-  test_sessionwatch.py (68 checks, was 64). Whole suite ALL GREEN.
-  Seven mutations, 7/7 CAUGHT, every file restored to pre-image md5 — including the forbidden
-  implementation (acquire instead of test), a missing lockfile reading as FREE, calling the holder
-  stalled, dropping the CPU half, accepting one sample, a dead pid reading 0.0, and DELETING THE
-  DAEMON'S PROBE, which scored MISSED until a check drove poll_sessions.
-  NOT TOUCHED, and deliberately: the lock itself, pgserver, and platform/testsupport/. That is
-  WORKER-1's lane.
-  dispatcher/ has no CI. This local green is the only evidence that will ever exist.
+2026-09-10 21:55  museadapter.py e8f4e9b8, dispatcher.py 814d62a3, tests/test_profileroot.py (new)   [BOSS item 5, 2026-09-10 21:46]
+  THE ROUTE DETECTOR ENUMERATED THE DIRECTORY THE SPAWNS STOPPED WRITING TO. `3b38f14` gave each Muse
+  profile an isolated CODEX_HOME (museadapter.py:96, applied to the spawn at :188), so a spawn writes
+  its rollout under ~/.codex/muse-homes/<profile>/sessions. Both resolvers still defaulted to the
+  module constant SESSIONS_ROOT = ~/.codex/sessions (:37-38, :674, :711), and the reap called BOTH
+  with no root at all (dispatcher.py:2490, :2497). Three CODEX-1 runs were reported "route NOT
+  MEASURED — WE could not observe what ran" and one PARKED A QUESTION, while their rollouts sat on
+  disk, unambiguous, one directory away. A false negative that blocks merges.
+  MEASURED 2026-09-10 21:50 on the live run, same cwd, same window, same rule, changing only the root:
+    LEGACY  ~/.codex/sessions                       -> None
+    PROFILE ~/.codex/muse-homes/muse-go-1/sessions  -> rollout-...T21-40-05-...jsonl
+                                                       muse-go-1 / muse-spark-1.3-contributor / xhigh
+  The RULE was never wrong. Its POPULATION was — discovery by literal path, one layer above where the
+  same shape was found in the pgserver census an hour earlier the same evening.
+  FIX: `sessions_root_for(profile, home=None)` derives the root from the profile that ran. Wired at
+  both reap call sites and inside verify_finish, which had the same defect via `spec`.
+  GUARDS:
+    G1 LEGACY keeps the shared root, named explicitly — it is the one route with no isolated home.
+    G2 NEVER A UNION. Searching both roots would let a legacy rollout satisfy an isolated-home spawn,
+       and with a file in each, "refuse on >1" would turn a correct resolution into a refusal.
+    G3 THE REFUSAL NAMES THE DIRECTORY IT SEARCHED. The note was built as `note or rwhy`, and the
+       matcher's note is always non-empty, so the resolver's reason — the only half that carries the
+       PATH — was thrown away every time. That is why this survived three runs: the line named the
+       failure and never named the place. Now both are carried.
+    G4 A profile with no sessions directory is UNMEASURED, never a silent fall back to the legacy
+       root; a fallback would restore this exact defect and answer confidently from a directory the
+       profile never wrote to.
+    G5 The 0-and->1 refusal is untouched.
+    G7 The resolver reads only sessions/**/*.jsonl under the profile home; the auth material beside
+       it is never opened, and no credential name or value reaches the item, the events or the log.
+  `home=None` READ AT CALL TIME, not a default argument. This module already carries that scar at
+  rollout_for_session, where an override that looked applied was silently ignored.
+  PROOF: tests/test_profileroot.py (13 checks, new, wired), every check through codex_tick.
+  IT EXISTS SEPARATELY FROM test_routewindow.py BECAUSE THAT FILE CANNOT DISCRIMINATE: its one seam
+  points at whatever root the product reads, so it passes on both sides of this fix. The
+  discriminator is a DECOY — a rollout under the legacy root with the same cwd and window, which must
+  not be claimed. MUTATION MEASURED: reverting `root=sroot` at both call sites -> 9 passed, 4 failed.
+  A SHIELDED NEGATIVE CONTROL, CAUGHT BY THAT MUTATION. The first cut removed the profile directory
+  entirely for the decoy case; a missing directory makes G4 skip the fallback, so the negative control
+  PASSED against the reverted code and proved nothing about the guard in its name (12 passed, 1
+  failed, and the 1 was the positive control). It now empties the directory and keeps it.
+  ALSO REPAIRED: tests/test_routewindow.py rooted its fixture at TMP/sessions; after this change the
+  product no longer reads there, so it would have gone on passing while proving an adjacent path. Its
+  root is now the profile's own sessions dir and CODEX_HOME is a named second seam.
+  LIVE RE-RESOLUTION, 2026-09-10 21:52, read-only: 44738 -> rollout T21-21-30, muse-go-1 /
+  muse-spark-1.3-contributor / xhigh, cwd matches; 63949 -> rollout T21-40-05, same route, cwd
+  matches. Both were NOT MEASURED before. 58305 does NOT resolve, and correctly so — see below.
+  A SECOND FINDING, NOT FIXED HERE AND NOT ITEM 5. B.B2.renumber-015a-scheduler-252 declares worktree
+  voicepod-lane-015a-renumber-252, WHICH DOES NOT EXIST ON DISK, and its 21:33 rollout records cwd
+  voicepod-lane-015a-journey-sole-scheduler — another item's worktree. So that run executed somewhere
+  other than the directory its item names. The cwd discriminator refuses it, which is the correct
+  behaviour: claiming it would verify a route against another lane's directory. Reported to BOSS.
+  Full suite green: 127/18/41/28/13/10/15/68/20/21/24, rc=0.
+  NOT IN EFFECT UNTIL A RESTART. Not restarted — CODEX-1 pid 63949 is live and BOSS holds the word.
 

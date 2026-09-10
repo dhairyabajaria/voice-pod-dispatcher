@@ -2488,14 +2488,27 @@ class Dispatcher:
                     spec = {"profile": run.get("profile"), "model": run.get("model_intended"),
                             "provider": run.get("provider_intended"), "effort": run.get("effort_intended")}
                     sid = museadapter.session_id_from_jsonl(whole)
-                    roll, rwhy = museadapter.rollout_for_session(sid)
-                    how = ""
-                    if not roll:
+                    # ITEM 5. THE ROOT COMES FROM THE PROFILE THAT RAN. Both resolvers below used to
+                    # be called with no root, so they fell back to the module constant
+                    # `SESSIONS_ROOT` (~/.codex/sessions) — while `3b38f14` gives each profile an
+                    # isolated CODEX_HOME and the spawn writes its rollout under THAT. The detector
+                    # was enumerating a directory the spawns no longer write to, and three runs whose
+                    # rollouts were sitting on disk were reported "route NOT MEASURED — WE could not
+                    # observe what ran", blocking their merges. A false negative from a literal path.
+                    sroot, srwhy = museadapter.sessions_root_for(run.get("profile"))
+                    roll, rwhy, how = None, srwhy, ""
+                    if sroot:
+                        roll, rwhy = museadapter.rollout_for_session(sid, root=sroot)
+                    if not roll and sroot:
                         # The id is the CHEAP route to the rollout, not the only one. When the CLI
                         # does not print one, exactly one session written in this run's window with
                         # this run's cwd identifies it — which is how BOSS resolved it by hand.
+                        # SAME ROOT as above, never a union: searching both would let a rollout from
+                        # the shared legacy root satisfy a spawn that ran with an isolated home,
+                        # which is precisely the claim this must never make.
                         roll, how = museadapter.rollout_by_window(
-                            run.get("cwd"), run.get("started_ms"), int(time.time() * 1000))
+                            run.get("cwd"), run.get("started_ms"), int(time.time() * 1000),
+                            root=sroot)
                         if not roll:
                             rwhy = f"{rwhy}; and the time-and-cwd fallback found nothing: {how}"
                             how = ""
@@ -2506,11 +2519,17 @@ class Dispatcher:
                         kind = "ROUTE_MISMATCH"
                         route_note = note
                     elif verdict is None:
+                        # BOTH reasons, never `note or rwhy`. The matcher's note says "there was
+                        # no observed route to compare"; the RESOLVER'S why says WHICH DIRECTORY
+                        # came up empty — and `or` threw the second one away, because the matcher
+                        # always has something to say. That is how item 5 stayed invisible across
+                        # three runs: the line named the failure and never named the place, so
+                        # nobody could see it was looking in the wrong directory.
                         route_note = ("route NOT MEASURED — WE could not observe what ran. This says "
                                       "nothing about the work and does not mark it broken; it does "
                                       "block a merge, because an attempt whose route is unknown "
                                       "cannot be cited as evidence for the route it intended. "
-                                      + (note or rwhy))
+                                      + " ".join(x for x in (note, rwhy) if x))
                     elif how:
                         route_note = f"route VERIFIED, resolved without a session id: {how}"
                     if sid and run.get("provider_conversation_record"):

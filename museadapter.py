@@ -663,6 +663,39 @@ def session_id_from_jsonl(text):
     return None
 
 
+def sessions_root_for(profile, home=None):
+    """Where THIS profile's rollouts are written. -> (root, "") or (None, why).
+
+    ITEM 5 (BOSS, 2026-09-10 21:46). `3b38f14` gave each Muse profile an isolated CODEX_HOME
+    (`:96`, applied to the spawn at `:188`), so a spawn writes its rollout under
+    `~/.codex/muse-homes/<profile>/sessions`. The resolvers kept reading the module constant
+    `SESSIONS_ROOT` — `~/.codex/sessions` — which the spawns no longer write to. The daemon then
+    reported "route NOT MEASURED — WE could not observe what ran" for three runs whose rollouts were
+    sitting on disk, unambiguous, one directory away, and PARKED a QUESTION on the strength of it.
+    Measured 2026-09-10 21:50 on the live run: same cwd, same window, same rule, LEGACY root -> None,
+    profile root -> the rollout, muse-go-1 / muse-spark-1.3-contributor / xhigh. The RULE was never
+    wrong; its POPULATION was. Discovery by literal path, one layer above where the same shape was
+    found in the pgserver census an hour earlier.
+
+    G4: A MISSING PROFILE HOME IS "WE CANNOT LOOK", NOT A REASON TO READ THE LEGACY ROOT. Falling
+    back would restore the exact defect being fixed here, and it would do it silently — the caller
+    would get a confident NOT MEASURED, or worse a match, from a directory this profile never wrote
+    to. LEGACY is the one route with no isolated home, and it is named rather than inferred.
+    """
+    # `home=None` means CODEX_HOME READ AT CALL TIME. A default argument binds at import, so an
+    # override of the module global is accepted and silently ignored — the exact trap this module
+    # already carries a scar from at `rollout_for_session`. Written this way from the start here.
+    home = home or CODEX_HOME
+    if not profile or profile == LEGACY:
+        return SESSIONS_ROOT, ""
+    root = os.path.join(home, "muse-homes", profile, "sessions")
+    if not os.path.isdir(root):
+        return None, (f"no sessions directory for profile {profile} at {root} — this profile has an "
+                      f"isolated CODEX_HOME and has never written a rollout there. NOT the same as "
+                      f"a run we could not find, and NOT a reason to read the shared legacy root")
+    return root, ""
+
+
 def rollout_for_session(session_id, root=None):
     """The rollout file for THIS session id. -> (path, "") or (None, why). Refuses on 0 and on >1.
 
@@ -900,7 +933,10 @@ def run_attempt(item, attempt, brief, state_dir, profile, *, worktree=None, owne
     pass a fake; production passes `subprocess_runner`. Nothing else in this function is mockable,
     so a test cannot accidentally prove a path the product does not take.
     """
-    sessions_root = sessions_root or SESSIONS_ROOT
+    # ITEM 5: NOT defaulted to SESSIONS_ROOT here. Left as None so `verify_finish` derives it from
+    # the SPEC of the profile that actually ran — the legacy constant points at a directory an
+    # isolated-home profile never writes to, and defaulting it here would decide the question
+    # before the profile is even read. An explicit argument from a caller still wins.
     # The worktree must be a subprocess input, not merely a label in its report.
     # Existing injected runners retain the four-argument hermetic-test interface.
     real_runner = runner is None
@@ -992,7 +1028,14 @@ def verify_finish(spec, log_text, result_path, item, attempt, sessions_root=None
     call run_attempt, which blocks until the worker exits. Left unsplit, the daemon would have grown
     a second, weaker copy of these checks, and a guard that is not on the path is not a guard.
     """
-    sessions_root = sessions_root or SESSIONS_ROOT
+    # ITEM 5: the root comes from the profile in the SPEC, not from the module constant. This is
+    # the same defect the daemon's reap had at dispatcher.py:2490/2497 — one directory apart from
+    # the rollouts it was looking for. An explicit `sessions_root` from a caller still wins, and a
+    # profile with no sessions directory yields None, which is reported rather than papered over
+    # with the legacy root.
+    root_why = ""
+    if not sessions_root:
+        sessions_root, root_why = sessions_root_for(spec.get("profile"))
     fields = {}
     cls = classify_failure(log_text or "")
     sid = session_id_from_jsonl(log_text or "")
@@ -1008,6 +1051,10 @@ def verify_finish(spec, log_text, result_path, item, attempt, sessions_root=None
             return INCOMPLETE, f"{why} (legacy route: no profile to verify against)", fields
         fields["candidate_sha"] = result.get("candidate_sha")
         return (OK if result.get("outcome") == "done" else BLOCKED), "legacy route, unverified", fields
+    if not sessions_root:
+        # G4: "we could not look" — never the legacy root as a consolation prize.
+        fields["route_verified"] = None
+        return INCOMPLETE, root_why, fields
     rollout, why = rollout_for_session(sid, root=sessions_root)
     actual = resolved_route(rollout) if rollout else {}
     ok_, note = route_matches(spec, actual)
