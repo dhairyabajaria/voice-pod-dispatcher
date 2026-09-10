@@ -1,49 +1,33 @@
-2026-09-10 22:01  dispatcher.py fc4f3571, tests/test_degradedanswer.py (new)   [BOSS item 6, 2026-09-10 21:48 — reopening item 3]
-  BOSS'S ANSWERS TO CODEX QUESTIONS WERE STRANDED BEHIND THE OPENCODE HEALTH CHECK.
-  `apply_answer_requests(q)` had exactly ONE caller, dispatcher.py:2801, AFTER the degraded early
-  return. With opencode unreachable (30+ h) the daemon never read `answerreq/` at all: BOSS filed a
-  valid answer for the parked B.B2.renumber-015a-scheduler-252 at 21:46 and three ticks passed with
-  the file untouched and no ANSWERED or ANSWER_REFUSED event. A CODEX question is answered by BOSS,
-  not by the opencode server — holding it behind that server's health is the identical mistake as
-  holding codex dispatch behind it, arriving a second time through a different door.
-  THE REOPENING IS THE FINDING. BOSS closed item 3 at 19:59 on the strength of test_serverdown.py,
-  which proves the codex pass, the aging, the escalation, the board and the heartbeat. It never
-  proved answers. Nothing in that file was wrong; the conclusion drawn from it was wider than its
-  checks. A GREEN LICENSES ONLY THE PATHS IT WALKS — negative-control-scope-lesson, applied to a
-  whole proof set rather than to one assertion.
-  FIX: `self.apply_answer_requests(q)` inside `codex_only_pass`, where the queue lock and the queue
-  are ALREADY HELD (a second lock would be a deadlock, not a guard) and BEFORE `codex_tick`, which
-  is the healthy path's order too. ISOLATED in its own try/except: sharing the outer one would let a
-  single malformed request file cancel codex dispatch on every tick it survived, re-creating the
-  sixteen-hour outage from the inside.
-  PROOF: tests/test_degradedanswer.py (17 checks, new, wired). PC a degraded tick consumes an answer
-  for a parked CODEX row, emits ANSWERED and moves the row; NC the same file against a non-parked row
-  is ANSWER_REFUSED with the row unchanged and the status named; the double-booking guard still holds
-  on the degraded path (queued AND PINNED, not restored to dispatched); a malformed request does not
-  cancel codex dispatch; a RAISING consumer does not either, and is logged; no request means no
-  noise. MUTATION MEASURED: removing the call -> 4 passed, 13 failed, zero tracebacks.
-  A CHECK OF MINE THAT ASSERTED A DEFECT, AND THE PRODUCT WAS RIGHT. The first version claimed an
-  un-parked row is DISPATCHED in the same tick. It is not, deliberately: an answered row returns to
-  `dispatched` because the executor already holds it, and re-spawning would run the same
-  item twice. Asserting the convenient thing would have pinned a defect (tests-can-pin-defects); the
-  ordering claim belongs on the SOURCE, where it now is.
-  SOURCE-ORDER ASSERTION ADDED TO test_serverdown.py, as BOSS asked and in the file whose green was
-  over-read, so the next reader meets the correction beside the claim.
-  CRASH IS NEITHER CATCH NOR MISS. The source-order checks used `str.index`, which RAISES when the
-  term is deleted — the first mutation run ended in `ValueError: substring not found` after 11 clean
-  reds. Replaced with a helper where a missing term is a clean False.
-  ---- AND A LIVE-STATE DEFECT IN test_serverdown.py, FOUND BY THIS WORK AND NOT CAUSED BY IT ----
-  Five checks in that file went red at 21:58 for a reason that had nothing to do with the daemon:
-  `codex_tick` reads `HOLD_DIR/<slot>.feed`, HOLD_DIR was never redirected in that fixture, and BOSS
-  created the real `hold/CODEX-1.feed` at 21:52 while working around item 6. The test was reading a
-  LIVE CONTROL FILE and its verdict depended on what the operator was doing. Proven pre-existing by
-  running it against HEAD's dispatcher.py (same five reds without item 6).
-  NINE of twenty-three module paths were unredirected there. Naming them one at a time is how the
-  tenth gets missed, so the fixture now rebases THE WHOLE SET into its temp dir. Item 6 made it
-  urgent rather than merely wrong: with the answer consumer on the degraded path, an unredirected
-  ANSWER_REQ_DIR would have let that test READ AND DELETE real answer requests. It did not — the live
-  directory was already empty (BOSS removed his file at 21:47) and no ANSWER_* event was emitted —
-  but that was luck, not a guard. THIRD instance of "a test never touches a live control file".
-  Full suite green: 127/18/41/28/13/10/15/68/20/21/25/17, rc=0.
-  NOT IN EFFECT UNTIL A RESTART. Not restarted; asked BOSS once for both this and item 5.
+2026-09-10 22:09  dispatcher.py 04061983, tests/test_degradedanswer.py   [BOSS item 7, 2026-09-10 22:12]
+  THE SHAPE, NOT THE INSTANCE. The degraded early return is DEFINED by what it protects (opencode)
+  and SCOPED by position (everything after it). Those are not the same set, and the difference is
+  where things get dropped in silence — item 6 was one instance of it, found by BOSS the hard way.
+  MOVED into the degraded pass, own try/except EACH (three functions behind one guard is one
+  function's worth of protection), under the queue lock already held, in the healthy path's order:
+    * apply_gate_requests — BOSS's hand-named gates. No `http(`, no roster, no session id: a merge
+      gate is a subprocess. `dispatcherctl.sh gate` has been silently doing nothing for 30 h.
+    * collect_gates — launching a gate nobody collects is worse than not launching it; the findings
+      never reach anyone. Guarded by the same auto_gate/manual_gates_live condition as the healthy
+      path, not a looser one.
+  STILL STRANDED, AND CORRECTLY — stated rather than left as the residue of what nobody moved:
+  check_dead, check_stall, check_session_idle, feed, feed_when_idle, post_prompt, roster_refresh,
+  recover_missed_reports, prune_offroster, apply_clear_requests. Every one reads the roster, a
+  session or the server, so a degraded tick genuinely cannot do them.
+  THE THIRD FUNCTION BOSS NAMED IS **NOT** MOVED, AND THE REFUSAL IS THE POINT.
+  `clear_feed_holds_for_answered` REMOVES `hold/<EXEC>.feed`. At 22:12 the same message ordered both
+  slot holds KEPT after the restart — the owner has stopped all Codex/Muse work and
+  `hold/CODEX-1.feed` (21:52:58) is what enforces it. Moving that function would build an AUTOMATIC
+  path to deleting the hold the owner's stop depends on: the moment any queued row carries
+  `answered_at` with `executor=CODEX-1` — exactly the workflow BOSS is using to answer parked rows —
+  the next degraded tick would clear it. Measured: no queued row carries `answered_at` right now, so
+  it would not have fired today; the hazard is latent, not theoretical, and the healthy path (which
+  has the same behaviour) has not run for 30 h. HELD PENDING HIS RULING. A test asserts its ABSENCE
+  so this cannot be re-added silently.
+  PROOF: tests/test_degradedanswer.py 17 -> 26 checks. PC a hand-named gate LAUNCHES on a degraded
+  tick and its request file is consumed; NC a request for a non-gateable row is refused there exactly
+  as on the healthy path; PC a finished gate is COLLECTED; a RAISING gate consumer cancels neither
+  the answer consumer, nor collection, nor codex dispatch; source order on the same `_before` helper
+  (a missing term is a clean False, never a ValueError).
+  MUTATION MEASURED: removing both item-7 calls -> 18 passed, 8 failed, zero tracebacks.
+  NOT IN EFFECT UNTIL A RESTART. Not restarted; BOSS holds the word and a codex run is still live.
 

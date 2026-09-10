@@ -44,6 +44,8 @@ def daemon(items, *, reqs=(), spawned=None):
     DP.ITEMS_DIR = os.path.join(st, "items"); os.makedirs(DP.ITEMS_DIR)
     open(os.path.join(DP.ITEMS_DIR, "C1.md"), "w").write("brief")
     DP.ANSWER_REQ_DIR = os.path.join(st, "answerreq"); os.makedirs(DP.ANSWER_REQ_DIR)
+    DP.GATE_REQ_DIR = os.path.join(st, "gatereq"); os.makedirs(DP.GATE_REQ_DIR)
+    DP.GATES_DIR = os.path.join(st, "gates"); os.makedirs(DP.GATES_DIR)
     DP.HOLD_DIR = os.path.join(st, "holds"); os.makedirs(DP.HOLD_DIR)
     DP.HOLDCLEAR_DIR = os.path.join(st, "holdclear"); os.makedirs(DP.HOLDCLEAR_DIR)
     DP.PENDING = os.path.join(st, "pending.json")
@@ -201,6 +203,85 @@ ok(_before(body, "self.apply_answer_requests(q)", "self.codex_tick("),
 ok(_before(body, "self.queue_lock()", "self.apply_answer_requests(q)"),
    "  and it runs under the queue lock this pass already holds — a second lock would be a deadlock, "
    "not a guard")
+
+
+# ============================== ITEM 7: the other two things stranded by position ==================
+# BOSS, 2026-09-10 22:12, on the shape rather than the instance. The early return is DEFINED by what
+# it protects (opencode) and SCOPED by position (everything after it). `apply_gate_requests` and
+# `collect_gates` touch no `http(`, no roster and no session — a merge gate is a subprocess — so they
+# were held back by nothing but where they sat in the function.
+
+# ---------------------------------------------------- PC: a hand-named gate LAUNCHES on a degraded tick
+logs, events, escalated = [], [], []
+DP, dp = daemon([{"id": "G1", "status": "reported", "executor": "CODEX",
+                  "dispatched_to": "CODEX-1", "worktree": os.path.join(TMP, "wt"),
+                  "lane": "l", "title": "t"}])
+json.dump({"item": "G1"}, open(os.path.join(DP.GATE_REQ_DIR, "g.json"), "w"))
+launched = []
+dp.launch_gate = lambda it, no_box=False, source="": (launched.append((it["id"], source)), "head")[1:]
+dp.state["autogate"] = {}
+dp.tick()
+ok(launched and launched[0][0] == "G1",
+   "PC MUST BITE (item 7): a hand-named gate request LAUNCHES on a degraded tick. A merge gate is a "
+   "subprocess and needs nothing from the opencode server — it was stranded by position alone, and "
+   "BOSS's `dispatcherctl.sh gate` has been silently doing nothing for 30 hours of outage")
+ok(not os.listdir(DP.GATE_REQ_DIR),
+   "  and the request file is consumed, so it cannot re-launch on every tick")
+
+# NC: a request for an item in no state to be gated is REFUSED on the degraded tick, as on the healthy one
+logs, events, escalated = [], [], []
+DP, dp = daemon([{"id": "G2", "status": "queued", "executor": "CODEX",
+                  "worktree": os.path.join(TMP, "wt"), "lane": "l", "title": "t"}])
+json.dump({"item": "G2"}, open(os.path.join(DP.GATE_REQ_DIR, "g.json"), "w"))
+launched = []
+dp.launch_gate = lambda it, no_box=False, source="": (launched.append(it["id"]), "head")[1:]
+dp.state["autogate"] = {}
+dp.tick()
+ok(not launched and any(e[0] == "MANUAL_GATE_REFUSED" for e in events),
+   "NC MUST BITE: a gate request for a row that is not gateable is REFUSED on the degraded tick "
+   "exactly as on the healthy one. Reaching the consumer is not permission to relax it")
+
+# ---------------------------------------------------- PC: a FINISHED gate is COLLECTED on a degraded tick
+logs, events, escalated = [], [], []
+DP, dp = daemon([{"id": "G3", "status": "reported", "executor": "CODEX",
+                  "dispatched_to": "CODEX-1", "worktree": os.path.join(TMP, "wt"),
+                  "lane": "l", "title": "t"}])
+collected = []
+dp.collect_gates = lambda q: collected.append(len(q["items"]))
+dp.tick()
+ok(collected == [1],
+   "PC MUST BITE (item 7): finished gates are COLLECTED on a degraded tick. Launching a gate nobody "
+   "collects is worse than not launching it — the findings never reach anyone, which is the "
+   "'message and state are one action' failure with a subprocess in the middle")
+
+# --------------------------------- each of the three has its OWN guard: one raising must not stop the others
+logs, events, escalated, spawned = [], [], [], []
+DP, dp = daemon([{"id": "C7", "status": "queued", "executor": "CODEX",
+                  "worktree": os.path.join(TMP, "wt"), "lane": "l", "title": "t"}], spawned=spawned)
+def bang(*a, **k):
+    raise RuntimeError("gate requests exploded")
+dp.apply_gate_requests = bang
+collected = []
+dp.collect_gates = lambda q: collected.append(1)
+dp.tick()
+ok(spawned == ["C7"] and collected == [1] and any("gate requests failed" in l for l in logs),
+   "MUST BITE: one try/except PER FUNCTION. A raising gate consumer must not cancel the answer "
+   "consumer, the gate collection or codex dispatch — three functions behind one guard is one "
+   "function's worth of protection")
+
+# ---------------------------------------------------------------- source order, on the same helper
+ok(_before(body, "self.apply_gate_requests(q)", "self.apply_answer_requests(q)"),
+   "item 7 source order: gate requests precede answer requests, as on the healthy path")
+ok(_before(body, "self.apply_answer_requests(q)", "self.collect_gates(q)"),
+   "  and collection comes after both, so a gate launched by this tick is collected by a later one "
+   "rather than half-collected by this one")
+ok(_before(body, "self.queue_lock()", "self.apply_gate_requests(q)"),
+   "  and all of it runs under the queue lock this pass already holds")
+ok("self.clear_feed_holds_for_answered" not in body,
+   "MUST BITE: clear_feed_holds_for_answered is NOT here, and its absence is deliberate — it "
+   "REMOVES hold/<EXEC>.feed, and the owner's stop currently depends on hold/CODEX-1.feed staying. "
+   "Moving it would have built an automatic path to deleting the hold BOSS ordered kept. Held "
+   "pending his ruling; see the CHANGELOG")
 
 print(f"\n{P} passed, {len(F)} failed")
 for x in F: print("  FAILED:", x)

@@ -2659,13 +2659,36 @@ class Dispatcher:
             # already held — the healthy path applies answers under the same lock, and taking a
             # second one would be a deadlock rather than a guard. BEFORE codex_tick, so a row this
             # un-parks is dispatchable in the SAME tick, which is the healthy path's order too.
+            # ITEM 7 (BOSS, 2026-09-10 22:12). Same shape as item 6, and the shape is the finding:
+            # THE EARLY RETURN IS DEFINED BY WHAT IT PROTECTS (opencode) AND SCOPED BY POSITION
+            # (everything after it). Those are not the same set, and the difference is where things
+            # get dropped in silence. Enumerating tick() either side of the return and checking each
+            # method for `http(`, the roster or a session id: `apply_gate_requests` and
+            # `collect_gates` touch NONE of the three — a merge gate is a subprocess — so they were
+            # stranded by position alone. The order below is the healthy path's order, deliberately.
+            #
+            # STILL STRANDED, AND CORRECTLY: check_dead, check_stall, check_session_idle, feed,
+            # feed_when_idle, post_prompt, roster_refresh, recover_missed_reports, prune_offroster,
+            # apply_clear_requests — every one reads the roster, a session or the server itself, so
+            # a degraded tick genuinely cannot do them. That list is stated rather than left as the
+            # residue of what nobody moved.
+            try:
+                self.apply_gate_requests(q)     # BOSS's hand-named gates: a subprocess, not a post
+            except Exception as e:  # noqa: BLE001
+                self.log(f"gate requests failed on the degraded pass: {type(e).__name__}: {e}")
             try:
                 self.apply_answer_requests(q)
             except Exception as e:  # noqa: BLE001
                 # ISOLATED FROM THE CODEX PASS. Sharing the outer try would let one malformed
                 # request file cancel codex dispatch for every tick it survived — restoring the
-                # sixteen-hour outage through a different door.
+                # sixteen-hour outage through a different door. One try PER FUNCTION for the same
+                # reason: three functions behind one guard is one function's worth of protection.
                 self.log(f"answer requests failed on the degraded pass: {type(e).__name__}: {e}")
+            if self.c("auto_gate", True) or self.manual_gates_live():
+                try:
+                    self.collect_gates(q)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"collect_gates failed on the degraded pass: {type(e).__name__}: {e}")
             self.codex_tick(q, self.state["pending"], status, 0,
                             int(self.c("max_dispatch_per_tick", 2)))
             if json.dumps(q, sort_keys=True) != before:
