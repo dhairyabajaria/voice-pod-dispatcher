@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git status:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git merge-base:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git blame:*)",
+      "Bash(grep -rn:*)",
+      "Bash(wc -l:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Edit(///Users/dhairyabajaria/Claude Code/Calling New/vp-worktrees/union-*/**)",
+      "Bash(git merge:*)",
+      "Bash(git commit:*)",
+      "Bash(git add:*)",
+      "Bash(git mv:*)"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(//Users/dhairyabajaria/.codex/auth.json)",
+      "Read(//Users/dhairyabajaria/.local/share/**/auth.json)",
+      "Read(//Users/dhairyabajaria/.config/voicepod/opencode-go-keys.env)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)",
+      "Bash(git checkout:*)",
+      "Bash(git clean:*)",
+      "Bash(git stash:*)",
+      "Bash(git update-ref:*)",
+      "Bash(git worktree:*)",
+      "Bash(rm:*)",
+      "Bash(sudo:*)",
+      "Bash(launchctl:*)",
+      "Bash(pkill:*)",
+      "Bash(kill:*)",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "Task",
+      "Bash(git -C:*)"
+    ]
+  }
+}

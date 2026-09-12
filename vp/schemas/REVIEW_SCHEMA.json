@@ -1,0 +1,133 @@
+{
+  "$comment": "Voice Pod v12 review record (senior per item, final per union). Validated by vpschema.validate_review. verdict=APPROVE requires >=1 evidence line naming file:line AND every benchmark id in verdicts[]; a [medium]+ finding with a reproduce command blocks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "item",
+    "subject",
+    "base",
+    "candidate",
+    "reviewer",
+    "verdict",
+    "verdicts",
+    "findings",
+    "evidence",
+    "summary"
+  ],
+  "properties": {
+    "item": {
+      "type": "string"
+    },
+    "subject": {
+      "enum": [
+        "item",
+        "union"
+      ]
+    },
+    "base": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "candidate": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "reviewer": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "APPROVE",
+        "FINDINGS",
+        "BLOCKED"
+      ]
+    },
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "verdict",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "UNKNOWN"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "title",
+          "file",
+          "line",
+          "detail",
+          "reproduce",
+          "benchmark_line"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "reproduce": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "benchmark_line": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "summary": {
+      "type": "string"
+    }
+  }
+}

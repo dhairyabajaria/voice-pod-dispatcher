@@ -1,0 +1,16 @@
+{
+  "$comment": "Voice Pod v9 Builder result. All keys required. Validated by vpschema.validate_result.",
+  "type": "object",
+  "required": ["item", "attempt", "commit", "base", "diff_stat", "checks", "disputes", "blocked", "notes"],
+  "properties": {
+    "item": {"type": "string"},
+    "attempt": {"type": "integer"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+    "base": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+    "diff_stat": {"type": "object", "required": ["files", "insertions", "deletions"]},
+    "checks": {"type": "array", "items": {"type": "object", "required": ["name", "command", "exit", "log"]}},
+    "disputes": {"type": "array", "items": {"type": "object", "required": ["line", "reason"]}},
+    "blocked": {"type": ["null", "string"]},
+    "notes": {"type": "string"}
+  }
+}
