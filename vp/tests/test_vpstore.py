@@ -617,6 +617,40 @@ def test_vpctl_exit_codes_and_json():
 
 
 @test
+def test_packet_submit_reads_critical_from_front_matter():
+    """SAFE-07b: PACKET.md said critical: true, nobody passed --critical, the
+    review ran on the ordinary model."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = new_root(tmp, "crit")
+        env = dict(os.environ, VP_RUN_ROOT=root,
+                   VP_STOP_FILE=os.path.join(root, "STOP"))
+
+        def run(*a):
+            return subprocess.run([sys.executable, os.path.join(VP, "vpctl.py"), *a],
+                                  capture_output=True, text=True, env=env, cwd=VP)
+
+        def packet(name, critical_line):
+            p = os.path.join(tmp, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("---\nitem: X\n%s\n---\n## Goal\nx\n" % critical_line)
+            return p
+
+        def submitted(item, pkt, *extra):
+            r = run("packet", "submit", item, "--benchmark", "B.md", "--packet", pkt,
+                    "--base", "base000", *extra)
+            assert r.returncode == 0, r.stderr
+            assert run("packet", "ready", r.stdout.strip()).returncode == 0
+            return json.loads(run("packet", "show", item, "--json").stdout)["critical"]
+
+        assert run("run", "init", "run-crit").returncode == 0
+        assert submitted("I-1", packet("P1.md", "critical: true")) is True
+        assert submitted("I-2", packet("P2.md", "critical: false")) is False
+        assert submitted("I-3", packet("P3.md", "critical: false"), "--critical") is True
+        # the packet path is recorded, never required to exist at submit
+        assert submitted("I-4", os.path.join(tmp, "missing.md")) is False
+
+
+@test
 def test_event_file_failure_rolls_back_the_db_row():
     """The jsonl mirror is inside the transaction boundary: if the file write
     fails the DB row must not survive."""

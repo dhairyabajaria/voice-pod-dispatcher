@@ -11,8 +11,21 @@ import argparse
 import json
 import sys
 
+import vplint
 import vpstore
 from vpstore import Conflict, Refused, Store, Usage
+
+
+def packet_says_critical(path):
+    """`critical: true` in the PACKET.md front-matter routes the item to
+    model_critical without the submitter remembering --critical."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    hdr, _ = vplint.parse_front_matter(text)
+    return bool(hdr) and hdr.get("critical") is True
 
 
 # --------------------------------------------------------------------------
@@ -349,8 +362,9 @@ def dispatch(args, st: Store):
 
     if c == "packet":
         if s == "submit":
+            critical = args.critical or packet_says_critical(args.packet)
             pid = st.packet_submit(args.item, args.benchmark, args.packet, args.base,
-                                   args.submitted_by, args.critical,
+                                   args.submitted_by, critical,
                                    csv(args.allowed_files) if args.allowed_files else None)
             return out(args, {"packet_id": pid}, pid)
         if s == "ready":
