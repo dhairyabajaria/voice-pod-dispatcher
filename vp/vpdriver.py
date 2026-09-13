@@ -104,7 +104,10 @@ RESUME_PROMPT = "continue"
 UNION_ALWAYS_PATHS = ("platform/tests/test_environment_registry.py",
                       "deploy/tests/test_worker_packaging.py",
                       # corpus meta-test over agent/*.py: any agent change can red it
-                      "agent/tests/test_log_privacy.py")
+                      "agent/tests/test_log_privacy.py",
+                      # TECHNICAL.md route/migration facts vs the live app: any new
+                      # route or migration reds it on the merged tree
+                      "platform/tests/test_docs_truth.py")
 
 
 def _kind_of_always_path(p):
