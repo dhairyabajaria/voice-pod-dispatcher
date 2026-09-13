@@ -899,6 +899,13 @@ class Driver(object):
                     continue
                 if rec.get("open_proof") and self._proof_thread_live(rec.get("candidate_sha")):
                     continue
+            if role == "final" and rec.get("union_id"):
+                # one final review per union: skip if a sibling item is already live
+                sibs = [r["item"] for r in items
+                        if r.get("union_id") == rec.get("union_id") and r["item"] != item]
+                with self._lock:
+                    if any(x in self._live_items for x in sibs):
+                        continue
             if self._spawn_role(rec, role):
                 spawned += 1
         if may_start and not self._stopping:
@@ -960,7 +967,28 @@ class Driver(object):
 
     # -- one turn ----------------------------------------------------------------
 
+    def _reload_roster_if_changed(self):
+        """Hot-reload roles/budget/concurrency/proof from the roster file (mtime)."""
+        try:
+            m = self.roster_path.stat().st_mtime
+        except OSError:
+            return
+        if m == getattr(self, "_roster_mtime", None):
+            return
+        try:
+            data = json.loads(self.roster_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return
+        self._roster_mtime = m
+        self.roster = data
+        self.roles = data.get("roles", {})
+        self.budget = data.get("budget", {})
+        self.conc = data.get("concurrency", {})
+        self.proof_cfg = data.get("proof", {})
+        self.log("roster reloaded (mtime changed)")
+
     def _spec_for(self, rec, role, server, runner, wt, prompt, session_id, tag, n):
+        self._reload_roster_if_changed()
         rcfg = self.roles.get(role) or {}
         out_path = wt / ".vp" / OUTPUT_OF_ROLE[role]
         mm = self.conc.get("max_minutes_per_turn", {})
