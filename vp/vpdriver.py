@@ -1056,6 +1056,14 @@ class Driver(object):
         rcfg = self.roles.get(role) or {}
         kind = KIND_OF_ROLE[role]
         model = rcfg.get("model")
+        # the tick's item snapshot can be stale by a transition (a senior's
+        # review+findings moved SEC-01d1 GRADING->BUILDING 36 ms before a
+        # grader spawned on the GRADING snapshot); re-read before spending a turn
+        if role in ROLE_FOR_STATUS.values():
+            fresh = next((r for r in self.store.report_items() if r["item"] == item), None)
+            if fresh and ROLE_FOR_STATUS.get(fresh.get("status")) != role:
+                self.log("SKIP %s %s: status is %s now" % (item, role, fresh.get("status")))
+                return
         attempt_id = self.store.turn_start(item, kind, rec.get("session_id"), server,
                                            rcfg.get("agent"), model, rcfg.get("variant"),
                                            runner, os.getpid())
