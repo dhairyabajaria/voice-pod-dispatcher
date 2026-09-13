@@ -308,8 +308,9 @@ class Store(object):
             args += ["--item", item]
         try:
             self.call(args)
+            return True
         except StoreError:
-            pass
+            return False
 
     def reconcile(self, live_pids):
         _rc, data = self.call(["run", "reconcile", "--live-pids",
@@ -430,6 +431,23 @@ class Driver(object):
         self._alerted.add(key)
         self.store.alert(kind, text, item)
         self.log("ALERT %s %s" % (kind, text))
+
+    def alert_store_down(self, key, text):
+        """The store itself is refusing; store.alert would be swallowed, so the
+        owner line is appended directly when the store cannot take it."""
+        if key in self._alerted:
+            return
+        self._alerted.add(key)
+        self.log("ALERT STORE_UNAVAILABLE %s" % text)
+        if self.store.alert("STORE_UNAVAILABLE", text):
+            return
+        line = "- %s **STORE_UNAVAILABLE** — %s (line written by the driver; the store " \
+               "could not record it)\n" % (utc_ms(), text[:500])
+        try:
+            with open(self.run_root / "OWNER-ALERTS.md", "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
 
     # -- clock / windows ----------------------------------------------------
 
@@ -848,15 +866,20 @@ class Driver(object):
             self._stop_started = time.monotonic()
             self.log("STOP file seen; grace %ds" % self.stop_grace_s)
         if not self._reconciled:
-            self._reconciled = True
             try:
                 res = self.store.reconcile([os.getpid()])
+            except StoreError as exc:
+                self.log("reconcile failed: %s" % exc)
+                self.alert_once("reconcile", "RECONCILE_FAILED",
+                                "reconcile of RUNNING attempts failed (%s); attempts left by "
+                                "a dead driver stay RUNNING; retrying every tick"
+                                % str(exc)[:200])
+            else:
+                self._reconciled = True
                 if res.get("orphaned"):
                     self.log("RECONCILE orphaned %s" % json.dumps(res["orphaned"])[:400])
                     self.store.alert("ORPHANED", "%d RUNNING attempts from a dead driver "
                                      "marked ORPHANED" % len(res["orphaned"]))
-            except StoreError as exc:
-                self.log("reconcile failed: %s" % exc)
         self.write_heartbeat()
         if self._stopping:
             self._stop_step()
@@ -874,12 +897,20 @@ class Driver(object):
             items = self.store.report_items()
         except StoreError as exc:
             self.log("report items failed: %s" % exc)
+            self.alert_store_down("store:report_items",
+                                  "report items failed (%s); the driver idles every tick "
+                                  "until the store answers again" % str(exc)[:200])
             return 0
+        self._alerted.discard("store:report_items")
         if may_start:
             self.auto_assign_tick(items)
             try:
                 items = self.store.report_items()
-            except StoreError:
+            except StoreError as exc:
+                self.log("report items failed: %s" % exc)
+                self.alert_store_down("store:report_items",
+                                      "report items failed (%s); the driver idles every "
+                                      "tick until the store answers again" % str(exc)[:200])
                 return 0
         spawned = 0
         for rec in self._fair_order(items):
@@ -1391,6 +1422,11 @@ class Driver(object):
                 self.log("FINAL %s %s -> %s" % (it, rid, verdict))
             except StoreError as exc:
                 self.log("final review record refused for %s: %s" % (it, exc))
+                self.store.alert("FINAL_RECORD_REFUSED",
+                                 "%s: final verdict %s for %s could not be recorded (%s); "
+                                 "the item has no final review row even if the union is "
+                                 "marked %s" % (it, verdict, uid, str(exc)[:200], verdict),
+                                 it)
         self.store.union_status(uid, verdict, doc.get("summary", "")[:200])
         if verdict == "APPROVED":
             self.store.alert("UNION_APPROVED", "%s (%s) approved by final review; promotion "
@@ -1516,6 +1552,10 @@ class Driver(object):
                                      timeout_s=120)
         if rc != 0:
             self.log("UNION union-%d registry --write rc=%s: %s" % (no, rc, (err or out)[:200]))
+            self.store.alert("UNION_REGISTRY_STALE",
+                             "union-%d: environment registry --write failed rc=%s; the union "
+                             "proof runs on whatever registry the merge left: %s"
+                             % (no, rc, (err or out)[:200]))
             return "registry --write failed rc=%s" % rc
         rc, out, _ = self.git(["-C", str(wt), "status", "--porcelain", "--",
                                "deploy/environment_registry.generated.json", "DEPLOYMENT.md"])
@@ -1527,6 +1567,10 @@ class Driver(object):
                                  "union-%d: regenerate environment registry (integrator)" % no])
         if rc != 0:
             self.log("UNION union-%d registry commit failed: %s" % (no, (err or out)[:200]))
+            self.store.alert("UNION_REGISTRY_STALE",
+                             "union-%d: regenerated registry (%s) could not be committed; "
+                             "the union sha does not carry it: %s"
+                             % (no, ",".join(changed), (err or out)[:200]))
             return "registry commit failed"
         self.log("UNION union-%d integrator regenerated %s" % (no, ",".join(changed)))
         return "integrator regenerated %s" % ",".join(changed)
@@ -1651,6 +1695,10 @@ class Driver(object):
                 self.store.proof_record(pid, status, cpath)
             except StoreError as exc:
                 self.log("proof record refused for %s: %s" % (pid, exc))
+                self.store.alert("PROOF_RECORD_REFUSED",
+                                 "%s: proof %s came out %s but the store refused the record "
+                                 "(%s); item state and the proof table now disagree"
+                                 % (item, pid, status, str(exc)[:200]), item)
         self.log("PROOF %s %s -> %s" % (item, pid, status))
         if status == "FAIL_PRODUCT":
             self._proof_findings(union, rec, failed, pid, self._proof_errors(logs, failed))
@@ -1751,6 +1799,10 @@ class Driver(object):
                 self.store.findings(it, fpath)
             except StoreError as exc:
                 self.log("proof findings refused for %s: %s" % (it, exc))
+                self.store.alert("FINDINGS_REFUSED",
+                                 "%s: proof %s FAIL findings are on disk at %s but the store "
+                                 "refused them (%s); the item was not sent back to building"
+                                 % (it, pid, fpath, str(exc)[:200]), it)
 
     # -- STOP (K-18) --------------------------------------------------------------
 

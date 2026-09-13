@@ -557,6 +557,56 @@ def test_fence_extraction():
     assert vprunners.extract_json_fence('{"c": 3}') == {"c": 3}
 
 
+def test_final_record_refused_reaches_owner_alerts():
+    """SAFE-03p, run-v12-20260913: the item was PAUSED when its final verdict
+    arrived; the union alerted UNION_APPROVED while the item's own record was
+    refused with only a driver.log line to show for it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-11")
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [final_approve])
+        orig = drv._deliver_final
+
+        def paused_then_deliver(rec, wt, record, attempt_id):
+            drv.store.item_pause(rec["item"])
+            return orig(rec, wt, record, attempt_id)
+        drv._deliver_final = paused_then_deliver
+        pump(drv)
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert alerts.count("UNION_APPROVED") == 1, alerts
+        assert "FINAL_RECORD_REFUSED" in alerts and "`M-11`" in alerts, alerts
+        assert env.item("M-11")["status"] == "PAUSED"
+
+
+def test_store_down_alerts_owner_once_without_the_store():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-12")
+        drv = make_driver(env, [], [], [], [], auto=False)
+        real_items, real_alert = drv.store.report_items, drv.store.alert
+
+        def broken(*_a, **_k):
+            raise vpdriver.StoreError("vpctl report items exited 1: database is locked")
+        drv.store.report_items = broken
+        drv.store.alert = lambda *_a, **_k: False
+        for _ in range(3):
+            drv.tick()
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert alerts.count("STORE_UNAVAILABLE") == 1, alerts
+        assert "written by the driver" in alerts
+        # recovery clears the latch; a second outage is a second line
+        drv.store.report_items, drv.store.alert = real_items, real_alert
+        drv.tick()
+        drv.store.report_items = broken
+        drv.tick()
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert alerts.count("STORE_UNAVAILABLE") == 2, alerts
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
