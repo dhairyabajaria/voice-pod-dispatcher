@@ -607,6 +607,39 @@ def test_store_down_alerts_owner_once_without_the_store():
         assert alerts.count("STORE_UNAVAILABLE") == 2, alerts
 
 
+def test_claude_spec_schema_follows_role():
+    """A claude-run junior must be asked for a FINDINGS record, not a REVIEW one
+    (the roster may route junior/senior/final all to claude)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        drv = make_driver(env, [], [], [], [], auto=False)
+        (env.run_root / "claude-settings").mkdir(exist_ok=True)
+        (env.run_root / "claude-settings" / "junior.json").write_text(
+            json.dumps({"permissions": {"allow": ["Read", "Grep"], "deny": []}}))
+        # the driver hot-reloads roles from the roster file, so change it there
+        rp = env.run_root / "roster.json"
+        roster = json.loads(rp.read_text())
+        roster["roles"]["junior"] = {"runner": "claude", "model": "sonnet", "effort": "low",
+                                     "max_turns": 40}
+        roster["roles"]["senior"] = {"runner": "claude", "model": "opus", "effort": "low",
+                                     "model_critical": "claude-fable-5-1"}
+        rp.write_text(json.dumps(roster, indent=2))
+        wt = Path(tmp) / "wt"
+        rec = {"item": "M-1", "round": 0}
+        js = drv._spec_for(rec, "junior", None, "claude", wt, "p", None, "t", 1)
+        ss = drv._spec_for(rec, "senior", None, "claude", wt, "p", None, "t", 1)
+        assert json.loads(js.schema_text) == vpschema.FINDINGS_SCHEMA_DOC
+        assert json.loads(ss.schema_text) == vpschema.REVIEW_SCHEMA_DOC
+        assert js.model == "sonnet" and js.effort == "low" and js.max_turns == 40
+        assert ss.model == "opus" and ss.effort == "low"
+        crit = drv._spec_for(dict(rec, critical=True), "senior", None, "claude", wt, "p", None, "t", 1)
+        assert crit.model == "claude-fable-5-1" and crit.effort == "low"
+        assert js.settings_path.endswith("junior.json") and js.allowed_tools == ["Read", "Grep"]
+        assert js.out_path.endswith("FINDINGS.json") and ss.out_path.endswith("REVIEW.json")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

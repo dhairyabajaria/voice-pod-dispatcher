@@ -142,6 +142,12 @@ VALIDATOR_OF_ROLE = {"builder": vpschema.validate_result,
                      "junior": vpschema.validate_findings,
                      "senior": vpschema.validate_review,
                      "final": vpschema.validate_review}
+# claude --json-schema must match the record the role's validator expects
+SCHEMA_DOC_OF_ROLE = {"builder": vpschema.RESULT_SCHEMA_DOC,
+                      "infra": vpschema.RESULT_SCHEMA_DOC,
+                      "junior": vpschema.FINDINGS_SCHEMA_DOC,
+                      "senior": vpschema.REVIEW_SCHEMA_DOC,
+                      "final": vpschema.REVIEW_SCHEMA_DOC}
 
 
 def utc_ms():
@@ -1072,8 +1078,12 @@ class Driver(object):
                     "permissions", {}).get("allow", [])
             except ValueError:
                 allowed = []
-        return TurnSpec(role, rec["item"], wt, prompt, rcfg.get("model", "opus"),
-                        effort=effort, schema_text=json.dumps(vpschema.REVIEW_SCHEMA_DOC),
+        schema_doc = SCHEMA_DOC_OF_ROLE.get(role, vpschema.REVIEW_SCHEMA_DOC)
+        model = rcfg.get("model", "opus")
+        if rec.get("critical") and rcfg.get("model_critical"):
+            model = rcfg["model_critical"]
+        return TurnSpec(role, rec["item"], wt, prompt, model,
+                        effort=effort, schema_text=json.dumps(schema_doc),
                         settings_path=str(settings) if settings.exists() else None,
                         allowed_tools=allowed, max_turns=rcfg.get("max_turns", 30),
                         max_budget_usd=self.budget.get("claude_max_budget_usd_per_call", 3),
