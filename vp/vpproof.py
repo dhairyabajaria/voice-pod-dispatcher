@@ -179,6 +179,41 @@ def lock_status(cn):
 # the proof
 # --------------------------------------------------------------------------
 
+_VITEST_FILES_RE = re.compile(r"Test Files\s+(.*)\n")
+_VITEST_TESTS_RE = re.compile(r"\bTests\s+(.*)\n")
+_VITEST_FAIL_RE = re.compile(r"^\s*(?:FAIL|\u00d7|\u2716)\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s*>\s*(.+?))?\s*$", re.M)
+
+
+def _classify_vitest(rc, log_text, timed_out):
+    """vitest run: 'Test Files  N passed (N)' / 'Tests  N passed (N)' summary lines;
+    a failing file prints ' FAIL  path > name' lines. rc 1 with
+    'No test files found' is infra, not product."""
+    files = _VITEST_FILES_RE.search(log_text)
+    tests = _VITEST_TESTS_RE.search(log_text)
+    def _node(m):
+        f = m.group(1)
+        f = f if f.startswith("portal/") else "portal/" + f   # cwd is portal/
+        return ("%s::%s" % (f, m.group(2))) if m.group(2) else f
+    failed = sorted(set(_node(m) for m in _VITEST_FAIL_RE.finditer(log_text)))
+    marker = bool(files and tests)
+    counts = {"rc": rc, "failed_nodes": failed, "marker": marker,
+              "collected": None, "summary": (tests.group(1).strip() if tests else None),
+              "timed_out": timed_out, "runner": "vitest"}
+    if timed_out:
+        return "FAIL_INFRA", counts
+    if "No test files found" in log_text:
+        return "FAIL_INFRA", dict(counts, reason="vitest: no test files matched")
+    if "FAIL_INFRA: node is not v22" in log_text:
+        return "FAIL_INFRA", dict(counts, reason="node is not v22")
+    if rc == 0 and marker and "failed" not in (files.group(1) + tests.group(1)):
+        return "PASS", counts
+    if rc != 0 and marker and ("failed" in (files.group(1) + tests.group(1)) or failed):
+        return "FAIL_PRODUCT", counts
+    if rc != 0 and not marker:
+        return "FAIL_INFRA", dict(counts, reason="vitest exited %s without a summary" % rc)
+    return "UNKNOWN", counts
+
+
 def _classify(rc, log_text, timed_out):
     failed = [m.group(2) for m in _FAILED_RE.finditer(log_text)]
     marker = bool(_MARKER_RE.search(log_text))
@@ -203,6 +238,12 @@ def _classify(rc, log_text, timed_out):
     if rc == 0 and not marker:
         return "FAIL_INFRA", dict(counts, reason="rc 0 without [100%] marker")
     return "UNKNOWN", counts
+
+
+def _rec(args, st, *a, **k):
+    if getattr(args, 'no_record', False):
+        return None
+    return st.proof_record(*a, **k)
 
 
 def run_proof(args):
@@ -231,7 +272,7 @@ def run_proof(args):
     ok, why = locks.acquire(wait_max * 60)
     if not ok:
         counts = {"reason": "box busy: %s" % why, "waited_min": wait_max}
-        st.proof_record(args.proof_id, "FAIL_INFRA", counts=counts,
+        _rec(args, st, args.proof_id, "FAIL_INFRA", counts=counts,
                         artifacts=str(meta_path))
         meta_path.write_text(json.dumps({"ts": utc_ms(), "status": "FAIL_INFRA",
                                          "counts": counts, "notes": notes}, indent=2),
@@ -239,16 +280,27 @@ def run_proof(args):
         print(json.dumps({"status": "FAIL_INFRA", "counts": counts}))
         return 0
     try:
-        st.proof_record(args.proof_id, "RUNNING")
+        _rec(args, st, args.proof_id, "RUNNING")
         paths = [p for p in (args.paths or "").split(",") if p.strip()]
         wt = Path(args.worktree)
         env = dict(os.environ)
         env["PATH"] = NODE22_BIN + os.pathsep + env.get("PATH", "")
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         if args.proof_kind == "portal":
-            argv = ["npx", "vitest", "run"] + paths
+            # vitest runs from portal/; packet paths are repo-relative
+            rel = [p[len("portal/"):] if p.startswith("portal/") else p for p in paths]
+            argv = ["npx", "vitest", "run"] + rel
             cwd = str(wt / "portal")
             pre = ["node", "--version"]
+        elif args.proof_kind == "agent":
+            # agent suite: its own venv (symlinked from trunk), serial, from agent/
+            py = str(wt / "agent" / ".venv" / "bin" / "python")
+            if not Path(py).exists():
+                py = str(Path(trunk) / "agent" / ".venv" / "bin" / "python")
+            rel = [p[len("agent/"):] if p.startswith("agent/") else p for p in paths]
+            argv = [py, "-m", "pytest", "-q", "-p", "no:cacheprovider"] + (rel or ["tests"])
+            cwd = str(wt / "agent")
+            pre = None
         elif args.proof_kind == "deploy":
             py = str(Path(trunk) / "platform" / ".venv" / "bin" / "python")
             argv = [py, "-m", "pytest", "-q", "-p", "no:cacheprovider"] + \
@@ -285,7 +337,7 @@ def run_proof(args):
                     fh.write("# FAIL_INFRA: node is not v22\n")
                     fh.flush()
                     counts = {"reason": "node %s is not v22" % v}
-                    st.proof_record(args.proof_id, "FAIL_INFRA", counts=counts,
+                    _rec(args, st, args.proof_id, "FAIL_INFRA", counts=counts,
                                     artifacts=str(log_path))
                     print(json.dumps({"status": "FAIL_INFRA", "counts": counts}))
                     return 0
@@ -311,7 +363,7 @@ def run_proof(args):
                     rc = proc.wait()
             fh.write("\n# vpproof end %s rc=%s timed_out=%s\n" % (utc_ms(), rc, timed_out))
         text = log_path.read_text(encoding="utf-8", errors="replace")
-        status, counts = _classify(rc, text, timed_out)
+        status, counts = (_classify_vitest if args.proof_kind == "portal" else _classify)(rc, text, timed_out)
         counts["started"] = started
         counts["ended"] = utc_ms()
         counts["paths"] = paths
@@ -320,7 +372,7 @@ def run_proof(args):
                 "counts": counts, "log": str(log_path), "notes": notes,
                 "argv": argv, "cwd": cwd}
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-        st.proof_record(args.proof_id, status, counts=counts, artifacts=str(meta_path))
+        _rec(args, st, args.proof_id, status, counts=counts, artifacts=str(meta_path))
         print(json.dumps({"status": status, "counts": counts, "log": str(log_path)}))
         return 0
     finally:
@@ -344,6 +396,8 @@ def main(argv=None):
     r.add_argument("--wait-max-min", type=int, default=None)
     r.add_argument("--workers", type=int, default=4)
     r.add_argument("--cn", default=None)
+    r.add_argument("--no-record", action="store_true",
+                   help="do not write the proof row (the driver aggregates several kinds)")
     ls = sub.add_parser("lock-status")
     ls.add_argument("--cn", default=vpstore.DEFAULT_CN)
     args = ap.parse_args(argv)

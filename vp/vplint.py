@@ -204,9 +204,10 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
             out.append("ERROR benchmark: no [%s] line" % k)
     for r in rows:
         if r["kind"] == "test":
-            m = re.search(r"([\w./-]+\.py)(::\S+)?", r["text"])
+            # .py for platform/agent/deploy proofs; .ts/.tsx for portal (vitest) proofs.
+            m = re.search(r"([\w./-]+\.(?:py|tsx?))(::\S+)?", r["text"])
             if not m:
-                out.append("ERROR benchmark: %s [test] names no .py path" % r["id"])
+                out.append("ERROR benchmark: %s [test] names no .py/.ts/.tsx path" % r["id"])
             elif tests and not any(m.group(1) == t or m.group(1).startswith(t)
                                    for t in tests):
                 out.append("WARN benchmark: %s test path %s is not in header test_paths"

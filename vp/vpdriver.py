@@ -69,7 +69,10 @@ SENIOR_PROMPT = (
     "You are the Senior reviewer. Read .vp/REVIEW_REQUEST.json (item, subject, "
     "base, candidate, reviewer, benchmark_ids), then .vp/PACKET.md, "
     ".vp/BENCHMARK.md, .vp/RESULT.json and .vp/FINDINGS.json. Inspect "
-    "`git diff <base>..<candidate>` and every file it touches. Verify each "
+    "`git diff <base>..<candidate>` and every file it touches. Token budget: "
+    "read ONLY the diff, the touched files, the packet's owned_files and "
+    "test_paths, and the specific callers/callees a finding needs; do not "
+    "walk the repository or read unrelated modules or docs. Verify each "
     "benchmark id YOURSELF with file:line evidence; never trust FINDINGS.json. "
     "Record a finding for any defect, missing or adjacent-path test, "
     "forbidden-file change, or benchmark line not met; severity "
@@ -196,6 +199,9 @@ class Store(object):
     def block(self, item, reason):
         return self.call(["item", "block", item, "--reason", reason[:400]],
                          allow=(0, 3))
+
+    def item_pause(self, item):
+        return self.call(["item", "pause", item], allow=(0, 3))
 
     def turn_start(self, item, kind, session, server, agent, model, variant,
                    runner, driver_pid):
@@ -381,6 +387,8 @@ class Driver(object):
         self._reconciled = False
         self._trunk_sha_seen = None
         self._alerted = set()
+        self._proof_backoff = {}
+        self._proof_infra_n = {}
         self._union_lock = threading.Lock()
         self._last_union_mono = time.monotonic()
         self._proofs_paused = False
@@ -710,6 +718,12 @@ class Driver(object):
             return (0 if h.get("critical") else 1, r.get("ts") or "")
 
         n = 0
+        wip_cap = int(self.conc.get("wip_per_group", 2))
+        active = ("ASSIGNED", "BUILDING", "GRADING", "JUNIOR_SATISFIED")
+        wip = {}
+        for r in items:
+            if r.get("status") in active and r.get("group_no") is not None:
+                wip[str(r["group_no"])] = wip.get(str(r["group_no"]), 0) + 1
         for r in sorted(ready, key=key):
             hdr = self.packet_header(r)
             deps = hdr.get("depends_on") or []
@@ -727,13 +741,19 @@ class Driver(object):
             server = self.server_for_group(group)
             if not server or self._parked(self.servers[server]):
                 continue
+            if wip.get(str(group), 0) >= wip_cap:
+                continue  # group full; try next tick, no store call, no log line
             rc, data = self.store.assign(r["item"], group)
             if rc == 0:
                 self.store.pin(r["item"], server)
                 self.log("ASSIGN %s -> group %s (%s)" % (r["item"], group, server))
+                wip[str(group)] = wip.get(str(group), 0) + 1
                 n += 1
             else:
-                self.log("assign refused %s: %s" % (r["item"], json.dumps(data)[:200]))
+                key_ = "assign-refused:%s" % r["item"]
+                if key_ not in self._alerted:
+                    self._alerted.add(key_)
+                    self.log("assign refused %s: %s" % (r["item"], json.dumps(data)[:200]))
         return n
 
     # -- the tick -------------------------------------------------------------
@@ -1451,64 +1471,130 @@ class Driver(object):
         wt = Path(union["worktree"]) if union else Path(rec.get("worktree") or self.worktree_path(item))
         pid = rec.get("open_proof")
         hdr = self.packet_header(rec)
-        paths = []
+        # paths grouped by proof kind: a union may carry platform + portal + deploy items
+        by_kind = {}
         if union:
             by = {r["item"]: r for r in self.store.report_items()}
             for it in union["items"]:
-                paths += self.packet_header(by.get(it, {})).get("test_paths") or []
+                h = self.packet_header(by.get(it, {}))
+                k = h.get("proof_kind") or "platform"
+                by_kind.setdefault(k, set()).update(h.get("test_paths") or [])
         else:
-            paths = hdr.get("test_paths") or []
-        paths = sorted(set(paths))
+            by_kind[hdr.get("proof_kind") or "platform"] = set(hdr.get("test_paths") or [])
+        by_kind = {k: sorted(v) for k, v in by_kind.items() if k != "docs" or not v}
+        paths = sorted(set(p for v in by_kind.values() for p in v))
         base = union["base_sha"] if union else rec.get("base_sha")
         kind = self.proof_cfg.get("union_kind", "targeted") if union else "targeted"
+        # infra backoff: never hammer the box for the same candidate
+        bo = self._proof_backoff.get(cand)
+        if bo and time.monotonic() < bo:
+            return
         if not pid:
             pid = self.store.proof_request(cand, base, kind, paths)
-        proof_kind = hdr.get("proof_kind") or "platform"
-        if proof_kind == "docs":
+        run_kinds = [k for k in by_kind if k != "docs"]
+        if not run_kinds:
             counts = self.run_root / "proofs" / ("%s-docs.json" % pid)
             counts.parent.mkdir(parents=True, exist_ok=True)
             counts.write_text(json.dumps({"reason": "docs: no proof"}), encoding="utf-8")
             self.store.proof_record(pid, "PASS", counts)
             return
-        argv = [sys.executable, str(self.here / "vpproof.py"), "run",
-                "--run-root", str(self.run_root), "--worktree", str(wt), "--sha", cand,
-                "--proof-id", pid, "--kind", kind, "--proof-kind", proof_kind,
-                "--paths", ",".join(paths), "--cn", str(self.cn)]
-        # thread name lets the tick see a live proof for this candidate
         threading.current_thread().name = "vp-proof-%s" % cand
-        self.log("PROOF %s %s %s paths=%d" % (item, pid, cand[:12], len(paths)))
-        attempt_id = self.store.turn_start(item, "proof", None, None, "vpproof", proof_kind,
-                                           kind, "proof", os.getpid())
+        self.log("PROOF %s %s %s kinds=%s paths=%d" % (item, pid, cand[:12],
+                                                       ",".join(run_kinds), len(paths)))
+        attempt_id = self.store.turn_start(item, "proof", None, None, "vpproof",
+                                           "+".join(run_kinds), kind, "proof", os.getpid())
         timeout = float(self.proof_cfg.get("full_box_timeout_min" if kind == "full"
                                            else "targeted_timeout_min", 40)) * 60 + \
             float(self.conc.get("proof_wait_max_min", 90)) * 60 + 120
-        rc, out, err = self.exec.run(argv, cwd=str(self.here), timeout_s=timeout)
-        res = {}
-        try:
-            res = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
-        except ValueError:
+        multi = len(run_kinds) > 1
+        results = {}
+        rc_last, err_last, out_last = 0, "", ""
+        for pk in run_kinds:
+            sub_id = ("%s-%s" % (pid, pk)) if multi else pid
+            argv = [sys.executable, str(self.here / "vpproof.py"), "run",
+                    "--run-root", str(self.run_root), "--worktree", str(wt), "--sha", cand,
+                    "--proof-id", sub_id, "--kind", kind, "--proof-kind", pk,
+                    "--paths", ",".join(by_kind[pk]), "--cn", str(self.cn)]
+            if multi:
+                argv.append("--no-record")
+            rc, out, err = self.exec.run(argv, cwd=str(self.here), timeout_s=timeout)
+            rc_last, err_last, out_last = rc, err, out
             res = {}
-        status = res.get("status") or "UNKNOWN"
+            try:
+                res = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
+            except ValueError:
+                res = {}
+            results[pk] = (rc, res)
+            if rc == 124 or not res:
+                break
+        # aggregate
+        status, failed, logs, counts_all = "PASS", [], [], {}
+        for pk, (rc, res) in results.items():
+            st = res.get("status") or "UNKNOWN"
+            counts_all[pk] = res.get("counts", {})
+            if res.get("log"):
+                logs.append(res["log"])
+            failed += (res.get("counts") or {}).get("failed_nodes") or []
+            if st == "FAIL_PRODUCT":
+                status = "FAIL_PRODUCT"
+            elif st in ("FAIL_INFRA", "UNKNOWN") and status != "FAIL_PRODUCT":
+                status = st
+        if any(rc == 124 or not res for rc, res in results.values()) or not results:
+            status = "UNKNOWN"
         self.store.turn_end(attempt_id, "DONE" if status in ("PASS", "FAIL_PRODUCT") else
-                            "STALLED", res.get("log"), None,
-                            "%s %s" % (status, json.dumps(res.get("counts", {}))[:300]))
-        if rc == 124 or not res:
+                            "STALLED", logs[0] if logs else None, None,
+                            "%s %s" % (status, json.dumps(counts_all)[:300]))
+        if status == "UNKNOWN" and (rc_last == 124 or not any(r for _, r in results.values())):
             try:
                 self.store.proof_record(pid, "UNKNOWN")
             except StoreError:
                 pass
-            self.store.alert("PROOF_FAIL", "%s proof %s produced no result (rc %s): %s"
-                             % (item, pid, rc, (err or out)[:200]), item)
+            self._note_proof_infra(cand, union, rec, pid, "no result (rc %s): %s"
+                                   % (rc_last, (err_last or out_last)[:200]))
             return
+        if multi:
+            cpath = self.run_root / "proofs" / ("%s-union.json" % pid)
+            cpath.parent.mkdir(parents=True, exist_ok=True)
+            cpath.write_text(json.dumps({"status": status, "kinds": counts_all,
+                                         "failed_nodes": failed, "logs": logs},
+                                        indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                self.store.proof_record(pid, status, cpath)
+            except StoreError as exc:
+                self.log("proof record refused for %s: %s" % (pid, exc))
         self.log("PROOF %s %s -> %s" % (item, pid, status))
         if status == "FAIL_PRODUCT":
-            failed = (res.get("counts") or {}).get("failed_nodes") or []
             self._proof_findings(union, rec, failed, pid)
-        elif status == "FAIL_INFRA":
-            self.store.alert("PROOF_INFRA", "%s proof %s FAIL_INFRA: %s"
-                             % (item, pid, json.dumps(res.get("counts", {}))[:200]), item)
-        elif status == "PASS" and union:
-            self.store.union_status(uid, "PROOF", "proof %s PASS" % pid)
+        elif status in ("FAIL_INFRA", "UNKNOWN"):
+            self._note_proof_infra(cand, union, rec, pid, json.dumps(counts_all)[:200])
+        elif status == "PASS":
+            self._proof_backoff.pop(cand, None)
+            self._proof_infra_n.pop(cand, None)
+            if union:
+                self.store.union_status(uid, "PROOF", "proof %s PASS" % pid)
+
+    def _note_proof_infra(self, cand, union, rec, pid, detail):
+        """FAIL_INFRA/UNKNOWN: back off 2/5/10 min, then pause the items and alert."""
+        n = self._proof_infra_n.get(cand, 0) + 1
+        self._proof_infra_n[cand] = n
+        waits = (120, 300, 600)
+        item = rec["item"]
+        if n >= 3:
+            items = union["items"] if union else [item]
+            for it in items:
+                try:
+                    self.store.item_pause(it)
+                except StoreError:
+                    pass
+            self.store.alert("PROOF_INFRA", "%s proof %s FAIL_INFRA x%d: items %s PAUSED "
+                             "until the Architect resumes them: %s"
+                             % (item, pid, n, ",".join(items), detail), item)
+            self._proof_backoff.pop(cand, None)
+            self._proof_infra_n.pop(cand, None)
+            return
+        self._proof_backoff[cand] = time.monotonic() + waits[min(n, len(waits)) - 1]
+        self.store.alert("PROOF_INFRA", "%s proof %s FAIL_INFRA (try %d, retry in %ds): %s"
+                         % (item, pid, n, waits[min(n, len(waits)) - 1], detail), item)
 
     def _proof_findings(self, union, rec, failed, pid):
         """Map failed node ids to items by test_paths; write FAIL lines; the
