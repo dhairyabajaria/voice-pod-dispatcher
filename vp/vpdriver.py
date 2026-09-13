@@ -1592,7 +1592,7 @@ class Driver(object):
                 self.log("proof record refused for %s: %s" % (pid, exc))
         self.log("PROOF %s %s -> %s" % (item, pid, status))
         if status == "FAIL_PRODUCT":
-            self._proof_findings(union, rec, failed, pid)
+            self._proof_findings(union, rec, failed, pid, self._proof_errors(logs, failed))
         elif status in ("FAIL_INFRA", "UNKNOWN"):
             self._note_proof_infra(cand, union, rec, pid, json.dumps(counts_all)[:200])
         elif status == "PASS":
@@ -1624,9 +1624,47 @@ class Driver(object):
         self.store.alert("PROOF_INFRA", "%s proof %s FAIL_INFRA (try %d, retry in %ds): %s"
                          % (item, pid, n, waits[min(n, len(waits)) - 1], detail), item)
 
-    def _proof_findings(self, union, rec, failed, pid):
+    @staticmethod
+    def _proof_errors(logs, failed):
+        """Per failed node, the pytest `E ` lines from its failure section so a
+        builder that cannot run pytest still sees the cause (SAFE-10 lesson:
+        five nodes red on one missing fixture import, findings said only
+        'failed')."""
+        out = {}
+        text = ""
+        for lp in logs:
+            try:
+                text += Path(lp).read_text(encoding="utf-8", errors="replace") + "\n"
+            except OSError:
+                continue
+        if not text:
+            return out
+        for node in failed:
+            name = node.rsplit("::", 1)[-1]
+            errs, active = [], False
+            for line in text.splitlines():
+                if line.startswith("___") and name in line:
+                    active, errs = True, []
+                elif active and line.startswith("___"):
+                    break
+                elif active and line.startswith("E "):
+                    errs.append(line[2:].strip())
+            if not errs:
+                errs = [l[2:].strip() for l in text.splitlines()
+                        if l.startswith("E ") and name in l]
+            seen, uniq = set(), []
+            for e in errs:
+                if e and e not in seen:
+                    seen.add(e)
+                    uniq.append(e)
+            if uniq:
+                out[node] = " | ".join(uniq[:4])[:600]
+        return out
+
+    def _proof_findings(self, union, rec, failed, pid, errors=None):
         """Map failed node ids to items by test_paths; write FAIL lines; the
         store already moved the items to GRADING."""
+        errors = errors or {}
         items = union["items"] if union else [rec["item"]]
         by = {r["item"]: r for r in self.store.report_items()}
         for it in items:
@@ -1639,7 +1677,11 @@ class Driver(object):
             iwt = Path(r.get("worktree") or self.worktree_path(it))
             fpath = iwt / ".vp" / "FINDINGS.json"
             lines = [{"id": "P-%d" % i, "kind": "test", "verdict": "FAIL",
-                      "evidence": "proof %s: %s failed" % (pid, f), "note": "vpproof"}
+                      "evidence": "proof %s: %s failed%s"
+                                  % (pid, f, (" — " + errors[f]) if errors.get(f) else ""),
+                      "note": "vpproof: the proof runner ran this node on the union "
+                              "candidate; fix the cause in your worktree (you cannot run "
+                              "pytest in the build box, so read the error text above)"}
                      for i, f in enumerate(mine)]
             out = {"item": it, "attempt": 0, "commit": r.get("candidate_sha") or "0" * 7,
                    "lines": lines, "all_pass": False}
