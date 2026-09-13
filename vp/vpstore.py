@@ -654,6 +654,16 @@ class Store:
             if new_status in ("GRADING", "BUILDING", "BLOCKED", "READY") and \
                     "union_id" not in fields and row["union_id"]:
                 sets.append("union_id=NULL")
+                # union_record overwrote candidate_sha with the union sha; a
+                # reviewer handed that sha sees every sibling's diff as scope
+                # violations (SEC-01b review-00059). Restore the item's own
+                # last submitted commit.
+                if "candidate_sha" not in fields:
+                    last = self.q1("SELECT ref FROM event WHERE item=? AND kind='SUBMIT_RESULT' "
+                                   "ORDER BY rowid DESC LIMIT 1", (item,))
+                    if last and last["ref"]:
+                        sets.append("candidate_sha=?")
+                        args.append(last["ref"])
                 self.ex("UPDATE union_ SET status='FAILED',note=COALESCE(note,'')||? "
                         "WHERE union_id=? AND status NOT IN ('APPROVED','PROMOTED')",
                         (f" item {item} -> {new_status};", row["union_id"]))
