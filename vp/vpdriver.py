@@ -99,6 +99,10 @@ FINAL_PROMPT = (
     "FINAL_REQUEST.json verbatim. No prose."
 )
 RESUME_PROMPT = "continue"
+# registry tests ride on every union proof (rendered artifacts belong to the
+# merged tree, see _regenerate_union_artifacts)
+UNION_ALWAYS_PATHS = ("platform/tests/test_environment_registry.py",
+                      "deploy/tests/test_worker_packaging.py")
 PROBE_PROMPT = "Reply with exactly PONG and nothing else."
 
 MAX_RESUMES = 3
@@ -1461,18 +1465,50 @@ class Driver(object):
             self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
             self.git(["-C", str(self.trunk), "branch", "-D", branch])
             return None
+        regen_note = self._regenerate_union_artifacts(wt, no)
         union_sha = self.head_sha(wt)
-        uid = self.store.union_record(merged, union_sha, base, wt, branch)
+        uid = self.store.union_record(merged, union_sha, base, wt, branch, note=regen_note)
         self._last_union_mono = time.monotonic()
         paths = []
         by = {r["item"]: r for r in prep}
         for it in merged:
             paths += self.packet_header(by[it]).get("test_paths") or []
+        # generated artifacts are a property of the union, not of any one item:
+        # every union proof carries the registry tests (SAFE-09 lesson: a new
+        # module alone reds them, and no item's targeted set would notice)
+        paths += list(self.proof_cfg.get("union_always_paths") or UNION_ALWAYS_PATHS)
         kind = self.proof_cfg.get("union_kind", "targeted")
         pid = self.store.proof_request(union_sha, base, kind, sorted(set(paths)))
         self.log("UNION %s %s base=%s items=%s proof=%s" % (uid, union_sha[:12], base[:12],
                                                             ",".join(merged), pid))
         return uid
+
+    def _regenerate_union_artifacts(self, wt, no):
+        """Integrator step (K-21): rendered artifacts are a property of the
+        merged tree. Run the registry writer on the union; commit the delta
+        as the integrator, not as any item. Returns a note or None."""
+        py = wt / "platform" / ".venv" / "bin" / "python"
+        script = wt / "deploy" / "environment_registry.py"
+        if not (py.exists() and script.exists()):
+            return None
+        rc, out, err = self.exec.run([str(py), str(script), "--write"], cwd=str(wt),
+                                     timeout_s=120)
+        if rc != 0:
+            self.log("UNION union-%d registry --write rc=%s: %s" % (no, rc, (err or out)[:200]))
+            return "registry --write failed rc=%s" % rc
+        rc, out, _ = self.git(["-C", str(wt), "status", "--porcelain", "--",
+                               "deploy/environment_registry.generated.json", "DEPLOYMENT.md"])
+        changed = [l[3:] for l in out.splitlines() if l.strip()]
+        if not changed:
+            return None
+        self.git(["-C", str(wt), "add", "--"] + changed)
+        rc, out, err = self.git(["-C", str(wt), "commit", "-q", "-m",
+                                 "union-%d: regenerate environment registry (integrator)" % no])
+        if rc != 0:
+            self.log("UNION union-%d registry commit failed: %s" % (no, (err or out)[:200]))
+            return "registry commit failed"
+        self.log("UNION union-%d integrator regenerated %s" % (no, ",".join(changed)))
+        return "integrator regenerated %s" % ",".join(changed)
 
     def _migration_collision(self, wt, base):
         rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "--diff-filter=A",
@@ -1507,6 +1543,11 @@ class Driver(object):
                 h = self.packet_header(by.get(it, {}))
                 k = h.get("proof_kind") or "platform"
                 by_kind.setdefault(k, set()).update(h.get("test_paths") or [])
+            # rendered artifacts belong to the merged tree: every union proof
+            # carries the registry tests (see _regenerate_union_artifacts)
+            for p in (self.proof_cfg.get("union_always_paths") or UNION_ALWAYS_PATHS):
+                by_kind.setdefault("deploy" if p.startswith("deploy/") else "platform",
+                                   set()).add(p)
         else:
             by_kind[hdr.get("proof_kind") or "platform"] = set(hdr.get("test_paths") or [])
         by_kind = {k: sorted(v) for k, v in by_kind.items() if k != "docs" or not v}
