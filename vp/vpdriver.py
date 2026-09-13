@@ -102,7 +102,17 @@ RESUME_PROMPT = "continue"
 # registry tests ride on every union proof (rendered artifacts belong to the
 # merged tree, see _regenerate_union_artifacts)
 UNION_ALWAYS_PATHS = ("platform/tests/test_environment_registry.py",
-                      "deploy/tests/test_worker_packaging.py")
+                      "deploy/tests/test_worker_packaging.py",
+                      # corpus meta-test over agent/*.py: any agent change can red it
+                      "agent/tests/test_log_privacy.py")
+
+
+def _kind_of_always_path(p):
+    if p.startswith("deploy/"):
+        return "deploy"
+    if p.startswith("agent/"):
+        return "agent"
+    return "platform"
 PROBE_PROMPT = "Reply with exactly PONG and nothing else."
 
 MAX_RESUMES = 3
@@ -1554,8 +1564,7 @@ class Driver(object):
             # rendered artifacts belong to the merged tree: every union proof
             # carries the registry tests (see _regenerate_union_artifacts)
             for p in (self.proof_cfg.get("union_always_paths") or UNION_ALWAYS_PATHS):
-                by_kind.setdefault("deploy" if p.startswith("deploy/") else "platform",
-                                   set()).add(p)
+                by_kind.setdefault(_kind_of_always_path(p), set()).add(p)
         else:
             by_kind[hdr.get("proof_kind") or "platform"] = set(hdr.get("test_paths") or [])
         by_kind = {k: sorted(v) for k, v in by_kind.items() if k != "docs" or not v}
