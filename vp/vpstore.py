@@ -807,6 +807,24 @@ class Store:
             self.event("UNBLOCK", item=item, detail={"to": to, "note": note})
         return to
 
+    def item_rebase(self, item, base_sha, why=None):
+        """D95: move an item that has not been built yet (READY/ASSIGNED, or
+        PAUSED from one of those) onto another base and keep its packet row in
+        step.  Refused once a worktree exists on the old base."""
+        with self.tx():
+            row = self.get_item(item)
+            st = row["paused_from"] if row["status"] == "PAUSED" else row["status"]
+            if st not in ("READY", "ASSIGNED"):
+                raise Refused(f"item {item} is {row['status']}; rebase needs READY/ASSIGNED")
+            old = row["base_sha"]
+            self.ex("UPDATE item SET base_sha=?,rev=rev+1,ts=? WHERE item=?",
+                    (base_sha, now_ts(), item))
+            self.ex("UPDATE packet SET base_sha=? WHERE item=? AND status IN ('READY','DRAFT')",
+                    (base_sha, item))
+            self.event("ITEM_REBASE", item=item, detail={"from": old, "to": base_sha,
+                                                          "why": why})
+        return base_sha
+
     def item_block(self, item, reason):
         with self.tx():
             row = self.get_item(item)

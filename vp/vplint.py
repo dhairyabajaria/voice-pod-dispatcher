@@ -220,6 +220,7 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
     rows, berrs = parse_benchmark(btxt)
     out += ["ERROR " + e for e in berrs]
     out += lint_benchmark_literals(rows, base)
+    out += lint_benchmark_vs_packet(rows, ptxt)
     kinds = {r["kind"] for r in rows}
     for k in KINDS:
         if k not in kinds:
@@ -260,6 +261,72 @@ def lint_benchmark_literals(rows, base_sha=""):
         if _WHOLE_DIFF.search(body):
             out.append("WARN benchmark: %s greps the whole diff; scope it to the item's "
                        "product-file diff (OPS-03b D35)" % r["id"])
+    return out
+
+
+_GREP_ZERO = re.compile(r"""grep\s+-c\s+(?:-[a-zA-Z]+\s+)*(['"])(.+?)\1\s+([\w./-]+|\.\.\.)\s*`?\s*(?:=|==|is)\s*0\b""")
+_QUOTED = re.compile(r'"([^"\n]{3,})"|`([^`\n]{3,})`')
+_EDIT_VERB = re.compile(r"\b(?:add|adds|added|edit|edits|change|changes|widen|widens|gain|gains|"
+                        r"insert|inserts|extend|extends|rewrite|rewrites|update|updates|append|"
+                        r"appends|replace|replaces|touch|touches|modif(?:y|ies)|create|creates)\b", re.I)
+_UNCHANGED = re.compile(r"\b(?:unchanged|untouched|byte-identical|not change|no other line|"
+                        r"exactly\s+\d+\s+(?:hits?|matches|occurrences?))\b", re.I)
+_FILE_TOKEN = re.compile(r"[\w./-]+/[\w.-]+\.[A-Za-z]{1,4}")
+
+
+def _quoted_copy(packet_text):
+    """Every double-quoted or backticked span in the packet BODY: the copy and
+    step text the builder is told to write verbatim."""
+    body = packet_text.split("---", 2)[-1] if packet_text.startswith("---") else packet_text
+    out = []
+    for m in _QUOTED.finditer(body):
+        out.append(m.group(1) or m.group(2))
+    return out
+
+
+def lint_benchmark_vs_packet(rows, packet_text):
+    """D90/D94/D96/D97 (four junior loops in one night):
+    ERROR  a `grep -c "PATTERN" FILE = 0` row whose PATTERN (any alternative)
+           already occurs in the packet's own quoted copy/step text -- the
+           builder writes the mandated sentence and the row reds by design
+           (A6-1p B4: "transcript" in the intro sentence).
+    WARN   a row that pins FILE as unchanged / byte-identical / exactly N hits
+           while ANOTHER row or a ## Steps line tells the builder to edit
+           that FILE."""
+    out = []
+    quoted = _quoted_copy(packet_text)
+    for r in rows:
+        for m in _GREP_ZERO.finditer(r["text"]):
+            pat, path = m.group(2), m.group(3)
+            for alt in re.split(r"\\\|", pat):
+                alt = alt.strip()
+                if not alt:
+                    continue
+                try:
+                    rx = re.compile(alt)
+                except re.error:
+                    rx = re.compile(re.escape(alt))
+                hit = next((q for q in quoted if rx.search(q)), None)
+                if hit:
+                    out.append("ERROR benchmark: %s expects zero hits of %r in %s but the packet's "
+                               "own quoted copy contains it (%r); the builder writes that text "
+                               "by instruction -- grep a field name, not prose (D97)"
+                               % (r["id"], alt, path, hit[:60]))
+                    break
+    steps = packet_text.split("## Steps", 1)[1].split("\n## ", 1)[0] if "## Steps" in packet_text else ""
+    edit_lines = [l for l in steps.splitlines() if _EDIT_VERB.search(l)]
+    for r in rows:
+        if not _UNCHANGED.search(r["text"]) or _EDIT_VERB.search(r["text"]):
+            continue          # a row that edits AND pins the rest is self-consistent
+        for path in set(_FILE_TOKEN.findall(r["text"])):
+            editors = [o["id"] for o in rows if o is not r and path in o["text"] and
+                       _EDIT_VERB.search(o["text"])]
+            in_steps = any(path in l for l in edit_lines)
+            if editors or in_steps:
+                out.append("WARN benchmark: %s pins %s as unchanged/exact-count while %s tells "
+                           "the builder to edit it; one of them is wrong before the build starts "
+                           "(D90/D94/D96)"
+                           % (r["id"], path, ", ".join(editors) or "a ## Steps line"))
     return out
 
 

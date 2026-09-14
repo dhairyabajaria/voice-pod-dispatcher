@@ -70,6 +70,11 @@ JUNIOR_PROMPT = (
     "If the write is refused, print the complete "
     "FINDINGS JSON in a single ```json fence as your final message and stop."
 )
+BUILDER_RETRY_HINT = (
+    " Your previous turn on this commit produced a .vp/RESULT.json that did not "
+    "validate: %s. Fix exactly that in .vp/RESULT.json (the schema is "
+    ".vp/RESULT_SCHEMA.json; keep the commit) and stop."
+)
 JUNIOR_RERUN_HINT = (
     " Your previous grading of this same commit left %s UNKNOWN (%s). Verify "
     "those lines now with Read/Grep/git and give PASS or FAIL with file:line "
@@ -524,6 +529,7 @@ class Driver(object):
         self._threads = []
         self._fail = {}
         self._unknown_rerun = {}      # item -> (rev, commit) already re-graded once
+        self._incomplete_hint = {}    # item -> (rev, detail) of the last INCOMPLETE builder turn (D105)
         self._delivery_failed = set() # items whose last DONE turn struck at delivery
         self._stopping = False
         self._stop_started = None
@@ -772,6 +778,7 @@ class Driver(object):
     def clear_item_failures(self, item):
         with self._lock:
             self._fail.pop(item, None)
+            self._incomplete_hint.pop(item, None)
 
     # -- git helpers --------------------------------------------------------
 
@@ -858,6 +865,28 @@ class Driver(object):
                     exclude.write_text(cur.rstrip("\n") + "\n.vp/\n", encoding="utf-8")
         except OSError:
             pass
+
+    def _claim_base_from_header(self, rec):
+        """D95: PACKET.md base_sha is what the builder and DEP_BASE_STALE read;
+        if the store row says another base, the header wins at CLAIM (store
+        row updated via `item rebase`, one log line, one event).  A header sha
+        that is not a commit in trunk is refused with an alert instead."""
+        hb = str(self.packet_header(rec).get("base_sha") or "").strip()
+        sb = str(rec.get("base_sha") or "")
+        if not hb or sb.startswith(hb) or hb.startswith(sb):
+            return rec
+        rc, full, _ = self.git(["-C", str(self.trunk), "rev-parse", "--verify", "--quiet",
+                                hb + "^{commit}"])
+        if rc != 0 or not full.strip():
+            raise StoreError("%s: PACKET.md base_sha %s is not a commit in trunk (store base %s)"
+                             % (rec["item"], hb, sb[:12]))
+        full = full.strip()
+        _rc, data = self.store.call(["item", "rebase", rec["item"], "--base", full,
+                                     "--why", "PACKET.md header (D95)"])
+        self.log("CLAIM %s base %s -> %s (PACKET.md header wins over the store row)"
+                 % (rec["item"], sb[:12], full[:12]))
+        rec = dict(rec, base_sha=full, rev=int(rec.get("rev", 0)) + 1)
+        return rec
 
     def packet_header(self, rec):
         p = rec.get("packet_path")
@@ -1087,6 +1116,7 @@ class Driver(object):
                 if self._proofs_paused:
                     continue
                 try:
+                    rec = self._claim_base_from_header(rec)
                     wt = self.ensure_worktree(rec)
                     self.store.claim(item, "builder%s" % rec.get("group_no"), wt, rec["rev"])
                     self.log("CLAIM %s %s" % (item, wt))
@@ -1291,6 +1321,12 @@ class Driver(object):
                 hint = self._unknown_rerun.get(item)
                 if hint and hint[0] == rec.get("rev"):
                     prompt += JUNIOR_RERUN_HINT % (", ".join(hint[2]), hint[3][:200])
+            if role in ("builder", "infra") and n == 1:
+                # D105: A3-3p burned three strikes on the same missing key;
+                # name it from strike 1 on.
+                hint = self._incomplete_hint.get(item)
+                if hint and hint[0] == rec.get("rev"):
+                    prompt += BUILDER_RETRY_HINT % hint[1][:300]
             spec = self._spec_for(rec, role, server, runner, wt, prompt, sid, attempt_id, n)
             outcome = self.runners[runner].run(spec, abort_flag=self._abort)
             sid = outcome.session_id or sid
@@ -1357,6 +1393,9 @@ class Driver(object):
             self.store.block(item, "item budget %.2f USD reached" % float(per_item_cap))
             self.store.alert("BUDGET", "%s reached its item budget" % item, item)
             return outcome
+        if status == STATUS_INCOMPLETE and role in ("builder", "infra"):
+            with self._lock:
+                self._incomplete_hint[item] = (rec.get("rev"), outcome.detail or "record invalid")
         self.note_item_failure(item, rec.get("rev"), "%s: %s" % (status, outcome.detail),
                                attempt_id, kind=status if status in
                                ("RUNNER_TIMEOUT", "RUNNER_CRASH", "RUNNER_REFUSED",

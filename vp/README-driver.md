@@ -448,6 +448,31 @@ grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
   true}`, and REVIEW_REQUEST.json carries `unverified_ids` for the senior to
   decide.  A record with any FAIL line reworks exactly as before.
 
+## Three small asks, 2026-09-14 night (D95, D105, D90/94/96/97)
+
+- **D95 — CLAIM base vs packet header.** `vpctl packet submit` refuses when
+  PACKET.md `base_sha` and `--base` name different commits (abbreviations of
+  the same commit are fine).  At CLAIM the driver compares the header with
+  the store row; when they differ and the header sha is a commit in trunk,
+  the header wins: `vpctl item rebase <item> --base <sha> --why …`
+  (READY/ASSIGNED only; packet row kept in step; `ITEM_REBASE` event), one
+  log line "CLAIM <item> base A -> B (PACKET.md header wins over the store
+  row)", worktree on B.  A header sha unknown to trunk is a StoreError (strike
+  + the usual alert path).  Tests:
+  `test_packet_submit_refuses_a_header_base_that_differs_from_the_flag`,
+  `test_claim_takes_the_packet_header_base_over_the_store_row`.
+- **D105 — INCOMPLETE names the missing key.** An INCOMPLETE builder/infra
+  turn stores the validator's message per (item, rev); the next builder
+  prompt on that rev appends `BUILDER_RETRY_HINT` ("…did not validate:
+  checks[0].name: missing. Fix exactly that…"); a DONE delivery clears it.
+  Test: `test_incomplete_record_names_the_missing_key_on_the_retry_prompt`.
+- **vplint `lint_benchmark_vs_packet`** (runs inside `lint_packet`):
+  ERROR when a `grep -c "PATTERN" FILE = 0` row's PATTERN (any alternative)
+  occurs in the packet's own double-quoted/backticked copy; WARN when a row
+  pins a file unchanged / byte-identical / exactly-N while another row or a
+  `## Steps` line edits that file (a row that edits and pins the rest of the
+  same file is self-consistent).  Test in test_vpstore.py.
+
 ## Proof routing: overflow / all + daily cap (D103)
 
 `proof.circleci.enabled` is the master switch (false: every proof on the

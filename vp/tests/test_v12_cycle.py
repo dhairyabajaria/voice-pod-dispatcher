@@ -788,6 +788,108 @@ def test_no_commit_strikes_accumulate_to_blocked():
         assert "FAIL M-NC 3/3" in log, log
 
 
+def builder_missing_check_name(spec):
+    """Commits, but writes a RESULT.json whose checks[0] lacks `name`
+    (A3-3p's shape, D105)."""
+    builder_ok(spec)
+    rec = json.loads(Path(spec.out_path).read_text())
+    del rec["checks"][0]["name"]
+    Path(spec.out_path).write_text(json.dumps(rec))
+    ok, errs = vpschema.validate_result_obj(rec)
+    assert not ok and any("name" in e for e in errs), errs
+    # the real runner validates the record itself and returns INCOMPLETE
+    return TurnOutcome(vprunners.STATUS_INCOMPLETE, "; ".join(errs[:8]),
+                       record_path=spec.out_path, runner="fake")
+
+
+def test_incomplete_record_names_the_missing_key_on_the_retry_prompt():
+    """D105: strike 1 is INCOMPLETE with the validator's message; the next
+    builder turn's prompt carries that exact message; a valid record clears
+    it (the third prompt is the plain BUILDER_PROMPT again)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-IH")
+        drv = make_driver(env, [builder_missing_check_name, builder_ok],
+                          [junior_pass_fence], [senior_approve], [final_approve])
+        saved = vpdriver.FAIL_BACKOFF_S
+        vpdriver.FAIL_BACKOFF_S = (0, 0, 0)
+        try:
+            pump(drv, 40)
+        finally:
+            vpdriver.FAIL_BACKOFF_S = saved
+        oc = drv.runners["opencode"]
+        prompts = [c.prompt for c in oc.calls if c.role == "builder"]
+        assert len(prompts) >= 2, prompts
+        assert "did not validate" not in prompts[0]
+        assert "did not validate" in prompts[1] and "name" in prompts[1], prompts[1]
+        log = (env.run_root / "driver.log").read_text()
+        assert "FAIL M-IH 1/3 INCOMPLETE" in log, log
+        assert env.item("M-IH")["status"] == "APPROVED", env.item("M-IH")
+        assert "M-IH" not in drv._incomplete_hint
+
+
+def test_packet_submit_refuses_a_header_base_that_differs_from_the_flag():
+    """D95: PACKET.md base_sha and --base must name the same commit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        (env.trunk / "platform" / "hello.py").write_text('def hello():\n    return "hello!"\n')
+        git(env.trunk, "commit", "-qam", "second")
+        other = git(env.trunk, "rev-parse", "HEAD")
+        pdir = env.run_root / "packets" / "M-HB"
+        pdir.mkdir(parents=True)
+        (pdir / "PACKET.md").write_text(PACKET.format(item="M-HB", base=env.base))
+        (pdir / "BENCHMARK.md").write_text(BENCHMARK)
+        rc, out = env.vpctl("packet", "submit", "M-HB", "--benchmark", str(pdir / "BENCHMARK.md"),
+                            "--packet", str(pdir / "PACKET.md"), "--base", other, ok=False)
+        assert rc == 3, (rc, out)                     # Refused
+        # abbreviated header sha of the same commit is accepted
+        (pdir / "PACKET.md").write_text(PACKET.format(item="M-HB", base=env.base[:12]))
+        rc, out = env.vpctl("packet", "submit", "M-HB", "--benchmark", str(pdir / "BENCHMARK.md"),
+                            "--packet", str(pdir / "PACKET.md"), "--base", env.base)
+        assert rc == 0, out
+
+
+def test_claim_takes_the_packet_header_base_over_the_store_row():
+    """D95: the store row says base A (an older commit) while PACKET.md says
+    base B; CLAIM rebases the item to B, the worktree is on B, one log line,
+    and the item builds to APPROVED on B."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        old_base = env.base
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        (env.trunk / "NOTE.md").write_text("second commit\n")
+        git(env.trunk, "add", "-A")
+        git(env.trunk, "commit", "-qm", "second")
+        new_base = git(env.trunk, "rev-parse", "HEAD")
+        pdir = env.run_root / "packets" / "M-CB"
+        pdir.mkdir(parents=True)
+        # submitted with the old base (header agrees), then the header is edited
+        # to the new base -- the store row is now stale (A3-3p's situation)
+        (pdir / "PACKET.md").write_text(PACKET.format(item="M-CB", base=old_base))
+        (pdir / "BENCHMARK.md").write_text(BENCHMARK)
+        _rc, d = env.vpctl("packet", "submit", "M-CB", "--benchmark", str(pdir / "BENCHMARK.md"),
+                           "--packet", str(pdir / "PACKET.md"), "--base", old_base,
+                           "--allowed-files", "platform/hello.py,platform/tests/test_hello.py")
+        env.vpctl("packet", "ready", d["packet_id"])
+        (pdir / "PACKET.md").write_text(PACKET.format(item="M-CB", base=new_base))
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [final_approve])
+        pump(drv)
+        row = env.item("M-CB")
+        assert row["status"] == "APPROVED", (row["status"], row.get("note"))
+        assert row["base_sha"] == new_base, (row["base_sha"], new_base)
+        assert (Path(row["worktree"]) / "NOTE.md").exists()
+        log = (env.run_root / "driver.log").read_text()
+        assert "PACKET.md header wins over the store row" in log, log
+        st = vpstore.Store(str(env.run_root))
+        assert st.q1("SELECT base_sha FROM packet WHERE item='M-CB'")["base_sha"] == new_base
+        assert st.q1("SELECT count(*) n FROM event WHERE kind='ITEM_REBASE'")["n"] == 1
+
+
 def test_stale_packet_base_behind_a_dependency_is_not_assigned():
     """D75: M-D1 is approved at candidate c1; M-D2 depends on it but its packet
     base is the old trunk -> not assigned, DEP_BASE_STALE once.  M-D3 with the

@@ -64,6 +64,17 @@ def packet_overlaps(st, item, packet_path):
     return vplint.owned_overlap(item, hdr, others, shared)
 
 
+def packet_header_base(path):
+    """base_sha from the PACKET.md front-matter (full or abbreviated), or None."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            hdr, _ = vplint.parse_front_matter(fh.read())
+    except OSError:
+        return None
+    b = (hdr or {}).get("base_sha")
+    return str(b).strip() if b else None
+
+
 def packet_says_critical(path):
     """`critical: true` in the PACKET.md front-matter routes the item to
     model_critical without the submitter remembering --critical."""
@@ -132,9 +143,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # item verbs (K-07) ----------------------------------------------------
     itm = sub.add_parser("item").add_subparsers(dest="sub", required=True)
-    for name in ("pause", "resume", "unblock", "block", "unassign", "pin"):
+    for name in ("pause", "resume", "unblock", "block", "unassign", "pin", "rebase"):
         ip = itm.add_parser(name)
         ip.add_argument("item")
+        if name == "rebase":
+            ip.add_argument("--base", required=True)
+            ip.add_argument("--why", default=None)
         if name in ("pause", "unblock"):
             ip.add_argument("--note", default=None)
         if name == "unblock":
@@ -386,7 +400,8 @@ def dispatch(args, st: Store):
               "unblock": lambda: st.item_unblock(args.item, args.note, args.to),
               "block": lambda: st.item_block(args.item, args.reason),
               "unassign": lambda: st.item_unassign(args.item),
-              "pin": lambda: st.item_pin(args.item, args.server)}[s]
+              "pin": lambda: st.item_pin(args.item, args.server),
+              "rebase": lambda: st.item_rebase(args.item, args.base, args.why)}[s]
         res = fn()
         return out(args, {"item": args.item, "status": res}, f"{args.item} {res}")
 
@@ -422,6 +437,13 @@ def dispatch(args, st: Store):
     if c == "packet":
         if s == "submit":
             critical = args.critical or packet_says_critical(args.packet)
+            hb = packet_header_base(args.packet)
+            if hb and not (args.base.startswith(hb) or hb.startswith(args.base)):
+                # D95: A3-3p/A3-2a were claimed on the store base while the
+                # header named another; the header is what the builder and
+                # DEP_BASE_STALE read.  One sha per packet.
+                raise Refused("PACKET.md base_sha %s != --base %s -- fix the header or the "
+                              "flag; they must name the same commit" % (hb, args.base))
             overlaps = packet_overlaps(st, args.item, args.packet)
             if overlaps and not args.allow_overlap:
                 raise Refused("owned_files overlap a live packet with no depends_on path: "

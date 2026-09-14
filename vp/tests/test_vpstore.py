@@ -927,5 +927,29 @@ def test_benchmark_literal_rules_name_the_ops03b_class_only():
     assert ids("whole diff") == ["B7"], out
     assert not [o for o in out if "B2" in o or "B5" in o or "B6" in o], out
 
+@test
+def test_lint_benchmark_vs_packet_catches_self_contradicting_rows():
+    """D90/D94/D96/D97: a grep -c = 0 row whose pattern is in the packet's own
+    quoted copy is an ERROR (A6-1p B4 'transcript'); a row pinning a file
+    unchanged while another row edits it is a WARN; a row that edits AND pins
+    the rest of the same file is self-consistent; a field-name grep is quiet."""
+    import vplint
+    rows = [
+        {"id": "B4", "text": 'carries the exact intro sentence — check: `grep -c "transcript\\|matched_quote\\|\\.values" portal/src/legal/DisclosureReviews.tsx` = 0'},
+        {"id": "B5", "text": '`grep -c "transcript_text\\|matched_quote" portal/src/legal/DisclosureReviews.tsx` = 0'},
+        {"id": "B1", "text": '`portal/src/lib/types.ts` gains two interfaces; no other line changes — check: grep -c "export interface" portal/src/lib/types.ts = 2'},
+        {"id": "B7", "text": '`portal/src/lib/types.ts` is byte-identical to base — check: git diff'},
+        {"id": "B8", "text": '`portal/src/lib/api.ts` unchanged — check: git diff'},
+    ]
+    packet = ("---\nitem: X\n---\n## Goal\n## Witnesses\n## Steps\n"
+              '1. Render the intro sentence "Review each transcript excerpt before recording." above the table.\n'
+              "2. edit portal/src/lib/types.ts\n## Prohibitions\n")
+    out = vplint.lint_benchmark_vs_packet(rows, packet)
+    errs = [o for o in out if o.startswith("ERROR")]
+    warns = [o for o in out if o.startswith("WARN")]
+    assert [e.split()[2] for e in errs] == ["B4"] and "'transcript'" in errs[0], out
+    assert [w.split()[2] for w in warns] == ["B7"] and "B1" in warns[0], out
+
+
 if __name__ == "__main__":
     sys.exit(main())
