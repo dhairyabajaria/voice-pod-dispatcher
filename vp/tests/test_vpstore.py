@@ -38,6 +38,9 @@ def test(fn):
     return fn
 
 
+test.__test__ = False   # a registrar, not a test: keep pytest from collecting it
+
+
 def new_root(tmp, name, roster=None):
     root = os.path.join(tmp, name)
     os.makedirs(root, exist_ok=True)
