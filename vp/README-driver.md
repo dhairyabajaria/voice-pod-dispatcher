@@ -328,6 +328,29 @@ schema test.
     not declare the flag; the driver keeps appending it unconditionally rather
     than maintaining a second list of which verbs support it.
 
+## Cost telemetry (K-08) — runners that report tokens but no USD
+
+Claude (`total_cost_usd`) and OpenCode (`cost`) report dollars; Codex reports
+only tokens. `vpdriver.estimate_cost` prices such a turn from the roster:
+
+```json
+"pricing": {
+  "codex": {
+    "billing": "subscription",
+    "models": {"gpt-5.6-sol": {"input_per_1m": 0, "cached_input_per_1m": 0, "output_per_1m": 0}}
+  }
+}
+```
+
+Every `costs.jsonl` line carries `cost` (what the budget counts), `est_cost_usd`
+and `cost_basis`: `reported` (the runner said), `estimated` (`billing: "api"`,
+the estimate is the spend), `subscription` (tokens priced, spend counted as 0 —
+the K-08 rule), or `unpriced` (no table for the model: cost stays null and an
+`UNPRICED` owner alert fires once per model). `attempt.cost` gets the same
+number. Codex `output_tokens` already include reasoning; cached input is priced
+once at the cached rate. Measured on run-v12-20260913: 139 Codex reviews,
+mean 962k input (882k cached) / 8k output, every `cost` null before this.
+
 ## Store-surface items — resolved
 
 Both earlier blockers are closed and the driver now uses the real verbs:

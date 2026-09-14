@@ -640,6 +640,33 @@ def test_claude_spec_schema_follows_role():
         assert js.out_path.endswith("FINDINGS.json") and ss.out_path.endswith("REVIEW.json")
 
 
+def test_codex_cost_is_estimated_from_roster_pricing():
+    """A6.2: 144 Codex reviews in run-v12-20260913 carried full token counts
+    and cost NULL, so spent_usd never saw them."""
+    usage = {"tokens_in": 872259, "cache_read": 786560, "tokens_out": 5246,
+             "tokens_reason": 2787, "cost": None}
+    models = {"gpt-x": {"input_per_1m": 2.0, "cached_input_per_1m": 0.5, "output_per_1m": 8.0}}
+    expected = round(((872259 - 786560) * 2.0 + 786560 * 0.5 + 5246 * 8.0) / 1e6, 6)
+    # api billing: the estimate is the spend
+    cost, est, basis = vpdriver.estimate_cost(
+        {"codex": {"billing": "api", "models": models}}, "codex", "gpt-x", usage)
+    assert (cost, est, basis) == (expected, expected, "estimated")
+    # subscription (the default): tokens are priced, the budget counts 0
+    cost, est, basis = vpdriver.estimate_cost(
+        {"codex": {"models": models}}, "codex", "gpt-x", usage)
+    assert (cost, est, basis) == (0.0, expected, "subscription")
+    # no table for the model: nothing is invented
+    assert vpdriver.estimate_cost({}, "codex", "gpt-x", usage) == (None, None, "unpriced")
+    # a runner that reports USD (claude, opencode) is left alone
+    assert vpdriver.estimate_cost({"codex": {"models": models}}, "claude", "opus",
+                                  {"tokens_in": 10, "cost": 0.42}) == (0.42, None, "reported")
+    # cached input can never exceed input
+    cost, est, _ = vpdriver.estimate_cost(
+        {"codex": {"billing": "api", "models": models}}, "codex", "gpt-x",
+        {"tokens_in": 100, "cache_read": 500, "tokens_out": 0})
+    assert cost == round(100 * 0.5 / 1e6, 6)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

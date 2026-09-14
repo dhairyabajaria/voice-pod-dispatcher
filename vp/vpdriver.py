@@ -154,6 +154,31 @@ def utc_ms():
     return vprunners.utc_ms()
 
 
+def estimate_cost(pricing, runner, model, usage):
+    """K-08: a runner that reports tokens but no USD (Codex) is priced from the
+    roster `pricing` table. Returns (cost, est_cost, basis); `cost` is what the
+    budget counts, `basis` says where it came from: reported | estimated |
+    subscription (tokens priced, spend counted as 0) | unpriced.
+    Codex output_tokens already include reasoning_output_tokens; cached input
+    is a subset of input, so it is priced once at the cached rate."""
+    usage = usage or {}
+    if usage.get("cost") is not None:
+        return usage["cost"], None, "reported"
+    cfg = (pricing or {}).get(runner) or {}
+    price = (cfg.get("models") or {}).get(model)
+    if not price or usage.get("tokens_in") is None:
+        return None, None, "unpriced"
+    tin = float(usage.get("tokens_in") or 0)
+    cached = min(float(usage.get("cache_read") or 0), tin)
+    tout = float(usage.get("tokens_out") or 0)
+    est = round(((tin - cached) * float(price.get("input_per_1m", 0))
+                 + cached * float(price.get("cached_input_per_1m", 0))
+                 + tout * float(price.get("output_per_1m", 0))) / 1e6, 6)
+    if cfg.get("billing", "subscription") == "api":
+        return est, est, "estimated"
+    return 0.0, est, "subscription"
+
+
 def sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -370,6 +395,7 @@ class Driver(object):
         self.night = self.roster.get("night", {})
         self.conc = self.roster.get("concurrency", {})
         self.budget = self.roster.get("budget", {})
+        self.pricing = self.roster.get("pricing", {})
         self.backoff = self.roster.get("backoff", {})
         self.roles = self.roster.get("roles", {})
         self.proof_cfg = self.roster.get("proof", {})
@@ -1037,6 +1063,7 @@ class Driver(object):
         self.roster = data
         self.roles = data.get("roles", {})
         self.budget = data.get("budget", {})
+        self.pricing = data.get("pricing", {})
         self.conc = data.get("concurrency", {})
         self.proof_cfg = data.get("proof", {})
         self.log("roster reloaded (mtime changed)")
@@ -1131,10 +1158,21 @@ class Driver(object):
             sid = outcome.session_id or sid
             if self._stopping and outcome.status != STATUS_DONE:
                 outcome.status, outcome.detail = STATUS_ABORTED, "STOP"
+            cost, est_cost, basis = estimate_cost(self.pricing, runner, spec.model,
+                                                  outcome.usage)
+            if basis != "reported" and outcome.usage is not None:
+                outcome.usage["cost"] = cost
+            if basis == "unpriced" and (outcome.usage or {}).get("tokens_in") is not None:
+                self.alert_once("pricing:%s:%s" % (runner, spec.model), "UNPRICED",
+                                "%s model %s reports tokens but no USD and the roster has "
+                                "no pricing.%s.models[%s]; its spend counts as nothing "
+                                "toward the run budget" % (runner, spec.model, runner,
+                                                            spec.model))
             self._write_turn_record(rec, attempt_id, n, role, runner, server, spec, outcome)
             self._append_cost({"ts": utc_ms(), "item": item, "attempt": attempt_id, "n": n,
                                "role": role, "runner": runner, "model": spec.model,
-                               "server": server, "cost": (outcome.usage or {}).get("cost") or 0.0,
+                               "server": server, "cost": cost or 0.0,
+                               "est_cost_usd": est_cost, "cost_basis": basis,
                                "tokens_in": (outcome.usage or {}).get("tokens_in"),
                                "tokens_out": (outcome.usage or {}).get("tokens_out"),
                                "cache_read": (outcome.usage or {}).get("cache_read"),
