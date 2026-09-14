@@ -931,6 +931,57 @@ class Store:
                                                              "note": note})
         return status
 
+    UNION_CANCEL_FROM = ("PREPARED", "PROOF_PENDING", "FINAL_REVIEW", "APPROVED")
+
+    def union_cancel(self, union_id, cause):
+        """Speculative chain (D83): union_id was stacked on a predecessor that is
+        FAILED / FINDINGS / BLOCKED / CANCELLED, so its tree carries a rejected
+        change.  Every item still on the union path goes back to PREPARING with
+        union_id NULL and its own last submitted commit restored -- no strike,
+        no round; an open proof for the union sha is CANCELLED; the union row
+        is CANCELLED with the cause.  Items that already left the union
+        (GRADING, BUILDING, BLOCKED, ...) are untouched.  Refused if any item
+        is PROMOTED (a promoted union is trunk, not a candidate).  Deliberately
+        bypasses ITEM_TRANSITIONS: no other path returns to PREPARING from
+        PREPARED/PROOF_PENDING/FINAL_REVIEW/APPROVED, and this one is the
+        driver's alone.  Returns the items reset."""
+        with self.tx():
+            u = self.q1("SELECT * FROM union_ WHERE union_id=?", (union_id,))
+            if not u:
+                raise Refused(f"unknown union {union_id}")
+            if u["status"] == "CANCELLED":
+                raise Refused(f"{union_id} is already CANCELLED")
+            items = _jload(u["items"], [])
+            rows = {it: self.q1("SELECT * FROM item WHERE item=?", (it,)) for it in items}
+            for it, row in rows.items():
+                if row is not None and row["status"] == "PROMOTED":
+                    raise Refused(f"{union_id}: item {it} is PROMOTED; cancel refused")
+            reset = []
+            for it, row in rows.items():
+                if row is None or row["union_id"] != union_id:
+                    continue
+                if row["status"] not in self.UNION_CANCEL_FROM:
+                    continue
+                last = self.q1("SELECT ref FROM event WHERE item=? AND kind='SUBMIT_RESULT' "
+                               "ORDER BY rowid DESC LIMIT 1", (it,))
+                cand = (last["ref"] if last and last["ref"] else row["candidate_sha"])
+                self.ex("UPDATE item SET status='PREPARING',union_id=NULL,candidate_sha=?,"
+                        "rev=rev+1,ts=? WHERE item=?", (cand, now_ts(), it))
+                self.event("UNION_CANCELLED", item=it, ref=union_id,
+                           detail={"cause": cause, "from": row["status"]})
+                reset.append(it)
+            for pr in self.q("SELECT proof_id FROM proof WHERE candidate_sha=? AND status IN "
+                             "('REQUESTED','RUNNING')", (u["union_sha"],)):
+                self.ex("UPDATE proof SET status='CANCELLED',ts_done=? WHERE proof_id=?",
+                        (now_ts(), pr["proof_id"]))
+                self.event("PROOF_RECORD", ref=pr["proof_id"],
+                           detail={"status": "CANCELLED", "cause": cause})
+            self.ex("UPDATE union_ SET status='CANCELLED',note=COALESCE(note,'')||? "
+                    "WHERE union_id=?", (f" cancelled: {cause};", union_id))
+            self.event("UNION_STATUS", ref=union_id,
+                       detail={"status": "CANCELLED", "cause": cause, "reset": reset})
+        return reset
+
     def unions(self, status=None):
         if status:
             rows = self.q("SELECT * FROM union_ WHERE status=? ORDER BY no", (status,))
@@ -1300,6 +1351,25 @@ class Store:
                                                        "items": items})
         return pid
 
+    def _chain_predecessor_unpromoted(self, union_sha):
+        """The union whose sha is the base of `union_sha`'s union, if that
+        predecessor's items are not all PROMOTED: a reason string, else None."""
+        u = self.q1("SELECT * FROM union_ WHERE union_sha=? ORDER BY no DESC LIMIT 1",
+                    (union_sha,))
+        if not u:
+            return None
+        pred = self.q1("SELECT * FROM union_ WHERE union_sha=? AND union_id!=? "
+                       "ORDER BY no DESC LIMIT 1", (u["base_sha"], u["union_id"]))
+        if not pred:
+            return None
+        for it in _jload(pred["items"], []):
+            row = self.q1("SELECT status FROM item WHERE item=?", (it,))
+            if row is None or row["status"] != "PROMOTED":
+                return (f"chain order: {pred['union_id']} ({pred['union_sha'][:12]}) is the "
+                        f"base of {u['union_id']} and its item {it} is "
+                        f"{row['status'] if row else 'unknown'}, not PROMOTED")
+        return None
+
     def promote_prepare(self, items, union_sha, base, review_id, proof_id):
         with self.tx():
             r = self._require_run()
@@ -1326,6 +1396,11 @@ class Store:
                 reason = f"proof status is {pf['status']}"
             elif pf["candidate_sha"] != union_sha:
                 reason = f"proof candidate {pf['candidate_sha']} != union {union_sha}"
+            elif self._chain_predecessor_unpromoted(union_sha):
+                # speculative chain (D83): union N+1 contains union N; a
+                # fast-forward to N+1 would land N's items without N's
+                # promotion row.  Promote in chain order.
+                reason = self._chain_predecessor_unpromoted(union_sha)
             else:
                 for it in items:
                     row = self.q1("SELECT * FROM item WHERE item=?", (it,))

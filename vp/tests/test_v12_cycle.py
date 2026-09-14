@@ -582,6 +582,9 @@ class FakeCircle(object):
             if path.endswith("/pipeline/pl-1/workflow"):
                 return cp(argv, 0, json.dumps({"items": [
                     {"id": "wf-1", "name": "full-suite", "status": self.workflow_status}]}), "")
+            if path.endswith("/workflow/wf-1/cancel"):
+                self.workflow_status = "canceled"
+                return cp(argv, 0, json.dumps({"message": "Accepted."}), "")
             if path.endswith("/workflow/wf-1/job"):
                 return cp(argv, 0, json.dumps({"items": self.jobs}), "")
             if "/tests" in path:
@@ -1050,6 +1053,225 @@ def test_union_blocks_when_the_registry_writer_refuses():
         assert not (env.worktrees / "union-1").exists()
         alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
         assert "UNION_REGISTRY_FAILED" in alerts and "UNION_REGISTRY_STALE" not in alerts, alerts
+
+
+# --------------------------------------------------------------------------
+# speculative union chain (D83)
+# --------------------------------------------------------------------------
+
+class HeldProofDriver(FakeProofDriver):
+    """Like FakeProofDriver, but a proof whose union number is in `hold` blocks
+    until the test releases it, and the outcome can be chosen per union."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.hold = {}          # union_id -> threading.Event (set = released)
+        self.outcome = {}       # union_id -> status
+        self.seen = []
+
+    def run_proof(self, rec):
+        uid = rec.get("union_id")
+        self.seen.append(uid)
+        ev = self.hold.get(uid)
+        if ev is not None:
+            ev.wait(30)
+        if self._proof_cancelled(rec.get("candidate_sha")):
+            # mirrors the real run_proof / run_proof_circleci discard (D83);
+            # the real branch is exercised by test_chain_cancel_aborts_a_running_circleci_proof
+            self.discarded = getattr(self, "discarded", []) + [uid]
+            return
+        self.proof_status = self.outcome.get(uid, "PASS")
+        return super().run_proof(rec)
+
+
+def pump_fast(drv, ticks, until=None):
+    for _ in range(ticks):
+        drv.tick()
+        drv.join(timeout=0.2)
+        if until and until():
+            return True
+    return until is None
+
+
+def _add_overlap_item(env, item):
+    pdir = env.run_root / "packets" / item
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "PACKET.md").write_text(PACKET.format(item=item, base=env.base))
+    (pdir / "BENCHMARK.md").write_text(BENCHMARK)
+    _rc, d = env.vpctl("packet", "submit", item, "--benchmark", str(pdir / "BENCHMARK.md"),
+                       "--packet", str(pdir / "PACKET.md"), "--base", env.base,
+                       "--allowed-files", "platform/hello.py,platform/tests/test_hello.py",
+                       "--allow-overlap")
+    env.vpctl("packet", "ready", d["packet_id"])
+
+
+def _chain_env(tmp):
+    env = Env(tmp)
+    env.roster["concurrency"]["max_unions_in_flight"] = 2
+    env.roster["concurrency"]["max_proofs_in_flight"] = 2
+    env.roster["concurrency"]["union_trigger_items"] = 1
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    os.environ.update(env.env)
+    env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+    return env
+
+
+def _unions(drv):
+    return {u["union_id"]: u for u in drv.store.unions()}
+
+
+def test_chain_of_two_unions_passes_and_promotes_in_order():
+    """max_unions_in_flight 2: union-2 is built on union-1's sha while union-1
+    is still proving; both pass; the store refuses union-2's promotion until
+    union-1's items are PROMOTED, then accepts it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _chain_env(tmp)
+        _add_overlap_item(env, "M-1")
+        drv = make_driver(env, [builder_ok, builder_ok], [junior_pass_fence, junior_pass_fence],
+                          [senior_approve, senior_approve], [final_approve, final_approve],
+                          driver_cls=HeldProofDriver)
+        drv.hold["union-1"] = threading.Event()
+        assert pump_fast(drv, 40, lambda: "union-1" in _unions(drv)), _unions(drv)
+        u1 = _unions(drv)["union-1"]
+        assert u1["status"] == "BUILT", u1
+        # a second item becomes PREPARING while union-1 is in flight
+        _add_overlap_item(env, "M-2")
+        assert pump_fast(drv, 60, lambda: "union-2" in _unions(drv)), _unions(drv)
+        u2 = _unions(drv)["union-2"]
+        assert u2["base_sha"] == u1["union_sha"], (u1, u2)        # stacked on the tip
+        assert _unions(drv)["union-1"]["status"] == "BUILT"        # still proving
+        drv.hold["union-1"].set()
+        assert pump_fast(drv, 80, lambda: all(env.item(i)["status"] == "APPROVED"
+                                              for i in ("M-1", "M-2"))), \
+            {i: env.item(i)["status"] for i in ("M-1", "M-2")}
+        st = vpstore.Store(str(env.run_root))
+        def ids(item):
+            rv = st.q1("SELECT review_id FROM review WHERE item=? AND subject='code' "
+                       "ORDER BY rowid DESC LIMIT 1", (item,))["review_id"]
+            pf = st.q1("SELECT proof_id FROM proof WHERE candidate_sha=? AND status='PASS'",
+                       (env.item(item)["candidate_sha"],))["proof_id"]
+            return rv, pf
+        r2, p2 = ids("M-2")
+        u1, u2 = _unions(drv)["union-1"], _unions(drv)["union-2"]
+        try:
+            st.promote_prepare(["M-2"], u2["union_sha"], u2["base_sha"], r2, p2)
+            assert False, "union-2 promoted before union-1"
+        except vpstore.Refused as exc:
+            assert "chain order" in str(exc) and "union-1" in str(exc), exc
+        r1, p1 = ids("M-1")
+        promo = st.promote_prepare(["M-1"], u1["union_sha"], u1["base_sha"], r1, p1)
+        st.promote_commit(promo, u1["union_sha"])
+        assert env.item("M-1")["status"] == "PROMOTED"
+        promo2 = st.promote_prepare(["M-2"], u2["union_sha"], u2["base_sha"], r2, p2)
+        assert promo2.startswith("promo-")
+
+
+def test_chain_predecessor_fail_cancels_dependent_and_rebuilds():
+    """union-1 (M-1) fails its proof after union-2 (M-2) was stacked on it:
+    union-2 is CANCELLED, M-2 goes back to PREPARING with its own candidate,
+    no strike and no round, the owner sees UNION_CANCELLED naming union-1, and
+    M-2 is rebuilt as union-3 on the new tip (trunk) and approved."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _chain_env(tmp)
+        _add_overlap_item(env, "M-1")
+        drv = make_driver(env, [builder_ok, builder_ok, builder_ok],
+                          [junior_pass_fence] * 4, [senior_approve] * 3, [final_approve] * 2,
+                          driver_cls=HeldProofDriver)
+        drv.hold["union-1"] = threading.Event()
+        drv.outcome["union-1"] = "FAIL_PRODUCT"
+        assert pump_fast(drv, 40, lambda: "union-1" in _unions(drv))
+        _add_overlap_item(env, "M-2")
+        assert pump_fast(drv, 60, lambda: "union-2" in _unions(drv)), _unions(drv)
+        u2 = _unions(drv)["union-2"]
+        own_cand = None
+        drv.hold["union-2"] = threading.Event()      # union-2's proof never finishes
+        drv.hold["union-1"].set()
+        assert pump_fast(drv, 80, lambda: _unions(drv).get("union-2", {}).get("status") == "CANCELLED"), \
+            _unions(drv)
+        m2 = env.item("M-2")
+        assert m2["status"] in ("PREPARING", "PREPARED", "PROOF_PENDING", "FINAL_REVIEW",
+                                "APPROVED"), m2
+        assert m2.get("union_id") != "union-2"
+        assert int(m2["round"]) == 0, m2
+        assert m2["candidate_sha"] != u2["union_sha"]
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert "UNION_CANCELLED" in alerts and "union-1 is FAILED" in alerts, alerts
+        st = vpstore.Store(str(env.run_root))
+        pr = st.q1("SELECT status FROM proof WHERE candidate_sha=?", (u2["union_sha"],))
+        assert pr is None or pr["status"] == "CANCELLED", dict(pr) if pr else pr
+        drv.hold["union-2"].set()                     # the held thread must discard
+        assert pump_fast(drv, 80, lambda: env.item("M-2")["status"] == "APPROVED"), env.item("M-2")
+        assert "union-2" in getattr(drv, "discarded", []), getattr(drv, "discarded", None)
+        m2 = env.item("M-2")
+        assert m2["union_id"] not in (None, "union-2"), m2
+        u3 = _unions(drv)[m2["union_id"]]
+        assert u3["base_sha"] == env.base, (u3, env.base)   # union-1 is dead: tip is trunk
+        assert _unions(drv)["union-2"]["status"] == "CANCELLED"
+        # the discarded proof-2 result never reached the store as a verdict
+        pr = st.q1("SELECT status FROM proof WHERE candidate_sha=?", (u2["union_sha"],))
+        assert pr is None or pr["status"] == "CANCELLED", dict(pr)
+
+
+def test_chain_cancel_aborts_a_running_circleci_proof():
+    """The real off-box path: union-1's CircleCI proof is polling a running
+    workflow when the union is cancelled.  poll() stops at the next check,
+    the workflow gets a cancel POST, the thread records nothing but a
+    CANCELLED turn, and the proof row is CANCELLED (by union_cancel)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        env.roster["concurrency"]["max_unions_in_flight"] = 2
+        env.roster["concurrency"]["union_trigger_items"] = 1
+        (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-CC")
+        fake = FakeCircle(workflow_status="running")
+        import vpcircle
+        runner = vpcircle.Runner(run=fake, binary="circleci-fake")
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve],
+                          [final_approve], driver_cls=vpdriver.Driver, circle_runner=runner)
+        assert pump_fast(drv, 60, lambda: any("pipeline/run" in " ".join(c) for c in fake.calls)), \
+            [c[-3:] for c in fake.calls]
+        u1 = _unions(drv)["union-1"]
+        assert drv._cancel_union(u1, "test: predecessor dead")
+        drv.join(timeout=10)
+        assert any(c[-1].endswith("/workflow/wf-1/cancel") or "/workflow/wf-1/cancel" in " ".join(c)
+                   for c in fake.calls), [c[-2:] for c in fake.calls[-6:]]
+        st = vpstore.Store(str(env.run_root))
+        pr = st.q1("SELECT status FROM proof WHERE candidate_sha=?", (u1["union_sha"],))
+        assert pr["status"] == "CANCELLED", dict(pr)
+        row = env.item("M-CC")
+        assert row["status"] == "PREPARING" and row["union_id"] is None, row
+        assert _unions(drv)["union-1"]["status"] == "CANCELLED"
+        log = (env.run_root / "driver.log").read_text()
+        assert "CANCELLED (union cancelled; circleci pipeline pl-1" in log, log[-800:]
+        # the branch cleanup still ran
+        assert any("--delete" in c for c in fake.git_calls), fake.git_calls
+
+
+def test_chain_is_off_at_max_unions_in_flight_one():
+    """At the default cap of 1 the base rule is the old one: a BUILT union is
+    not a tip and no second union is built while it proves."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.roster["concurrency"]["max_unions_in_flight"] = 1
+        env.roster["concurrency"]["union_trigger_items"] = 1
+        (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        _add_overlap_item(env, "M-1")
+        drv = make_driver(env, [builder_ok, builder_ok], [junior_pass_fence, junior_pass_fence],
+                          [senior_approve, senior_approve], [final_approve, final_approve],
+                          driver_cls=HeldProofDriver)
+        drv.hold["union-1"] = threading.Event()
+        assert pump_fast(drv, 40, lambda: "union-1" in _unions(drv))
+        _add_overlap_item(env, "M-2")
+        assert pump_fast(drv, 30, lambda: env.item("M-2")["status"] == "PREPARING")
+        pump_fast(drv, 10)
+        assert "union-2" not in _unions(drv), _unions(drv)
+        assert not drv.chain_mode()
+        drv.hold["union-1"].set()
+        assert pump_fast(drv, 80, lambda: "union-2" in _unions(drv))
+        assert _unions(drv)["union-2"]["base_sha"] == _unions(drv)["union-1"]["union_sha"]
 
 
 def test_fence_extraction():

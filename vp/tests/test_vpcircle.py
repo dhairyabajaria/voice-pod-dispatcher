@@ -254,6 +254,35 @@ class PollTests(unittest.TestCase):
         self.assertEqual([t["name"] for t in result["failed_tests"][42]],
                          ["test_x", "test_w"])
 
+    def test_poll_abort_raises_cancelled_before_the_next_sleep(self):
+        sleeps = []
+        flips = iter([False, True])
+
+        def handler(account, path, argv):
+            return 0, json.dumps({"items": [{"id": "wf-1", "status": "running"}]}), ""
+        runner = vc.Runner(run=FakeRun(handler))
+        with self.assertRaises(vc.Cancelled):
+            vc.poll("pipe-1", interval=60, deadline_s=5400, runner=runner, account="1",
+                    sleep=lambda s: sleeps.append(s), clock=lambda: 0.0,
+                    abort=lambda: next(flips))
+        self.assertEqual(sleeps, [60])
+
+    def test_cancel_pipeline_posts_cancel_on_non_terminal_workflows_only(self):
+        posted = []
+
+        def handler(account, path, argv):
+            if path == "api/v2/pipeline/pipe-1/workflow":
+                return 0, json.dumps({"items": [{"id": "wf-run", "status": "running"},
+                                                {"id": "wf-done", "status": "success"}]}), ""
+            if path.endswith("/cancel"):
+                posted.append((path, "POST" in argv or "-X" in argv or True))
+                return 0, json.dumps({"message": "Accepted."}), ""
+            raise AssertionError(path)
+        runner = vc.Runner(run=FakeRun(handler))
+        done = vc.cancel_pipeline("pipe-1", runner=runner, account="1")
+        self.assertEqual(done, ["wf-run"])
+        self.assertEqual([p for p, _ in posted], ["api/v2/workflow/wf-run/cancel"])
+
     def test_poll_raises_timeout_error_past_deadline(self):
         def handler(account, path, argv):
             return 0, json.dumps({"items": [{"id": "wf-1", "status": "running"}]}), ""

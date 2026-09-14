@@ -388,6 +388,10 @@ class Store(object):
             args += ["--note", note[:300]]
         return self.call(args)
 
+    def union_cancel(self, union_id, cause):
+        _rc, data = self.call(["union", "cancel", union_id, "--cause", cause[:300]])
+        return (data or {}).get("reset", []) if isinstance(data, dict) else []
+
     def proof_request(self, candidate, base, kind, paths):
         args = ["proof", "request", candidate, "--base", base, "--kind", kind]
         if paths:
@@ -505,7 +509,8 @@ class Driver(object):
                       "parked_until": 0.0, "park_reason": None},
             "claude": {"active": 0, "max": int(self.conc.get("claude_max", 2)),
                        "parked_until": 0.0, "park_reason": None},
-            "proof": {"active": 0, "max": 1, "parked_until": 0.0, "park_reason": None},
+            "proof": {"active": 0, "max": int(self.conc.get("max_proofs_in_flight", 1)),
+                      "parked_until": 0.0, "park_reason": None},
         }
         self.runners = runners or {
             "opencode": vprunners.OpenCodeRunner(self.exec, self.bins.get("opencode", "opencode")),
@@ -528,6 +533,7 @@ class Driver(object):
         self._alerted = set()
         self._proof_backoff = {}
         self._proof_infra_n = {}
+        self._proof_cancel = set()    # union shas whose proof result must be discarded (D83)
         self._union_lock = threading.Lock()
         self._last_union_mono = time.monotonic()
         self._proofs_paused = False
@@ -1108,6 +1114,7 @@ class Driver(object):
             if self._spawn_role(rec, role):
                 spawned += 1
         if may_start and not self._stopping:
+            self._reconcile_chain()
             self._maybe_build_union(items)
         return spawned
 
@@ -1190,6 +1197,8 @@ class Driver(object):
         self.pricing = data.get("pricing", {})
         self.conc = data.get("concurrency", {})
         self.proof_cfg = data.get("proof", {})
+        with self._lock:
+            self.runner_state["proof"]["max"] = int(self.conc.get("max_proofs_in_flight", 1))
         self.log("roster reloaded (mtime changed)")
 
     def _spec_for(self, rec, role, server, runner, wt, prompt, session_id, tag, n):
@@ -1672,6 +1681,76 @@ class Driver(object):
 
     # -- union (K-21) -----------------------------------------------------------
 
+    # -- speculative union chain (D83) --------------------------------------------
+    #
+    # With concurrency.max_unions_in_flight > 1 the driver behaves like a merge
+    # queue: union N+1 is built on union N's sha while N is still proving, so
+    # every union contains its predecessors and promotion stays one
+    # fast-forward per union, in chain order (the store refuses N+1 before N).
+    # If a predecessor dies (FAILED / FINDINGS / BLOCKED / CANCELLED) every
+    # union stacked on it is CANCELLED: its proof result is discarded (the
+    # CircleCI workflow is cancelled; a box proof runs out but is ignored), its
+    # items go back to PREPARING with no strike, and the next tick rebuilds them
+    # on the new tip.  At max_unions_in_flight == 1 none of this can trigger
+    # and the base rule is the pre-D83 one (last APPROVED union).
+
+    UNION_LIVE = ("BUILT", "PROOF", "APPROVED")
+    UNION_DEAD = ("FAILED", "FINDINGS", "BLOCKED", "CANCELLED")
+
+    def chain_mode(self):
+        return int(self.conc.get("max_unions_in_flight", 2)) > 1
+
+    def _chain_tip(self):
+        unions = self.store.unions()
+        if self.chain_mode():
+            live = [u for u in unions if u.get("status") in self.UNION_LIVE]
+        else:
+            live = [u for u in unions if u.get("status") == "APPROVED"]
+        return live[-1] if live else None
+
+    def _reconcile_chain(self):
+        if not self.chain_mode():
+            return []
+        try:
+            unions = self.store.unions()
+        except StoreError:
+            return []
+        by_sha = {u["union_sha"]: u for u in unions}
+        cancelled = []
+        for u in unions:                      # ordered by no: a cascade resolves in one pass
+            if u.get("status") not in self.UNION_LIVE:
+                continue
+            pred = by_sha.get(u.get("base_sha"))
+            if not pred or pred["union_id"] == u["union_id"]:
+                continue
+            if pred.get("status") in self.UNION_DEAD:
+                if self._cancel_union(u, "%s is %s" % (pred["union_id"], pred["status"])):
+                    u["status"] = "CANCELLED"
+                    cancelled.append(u["union_id"])
+        return cancelled
+
+    def _cancel_union(self, u, cause):
+        uid, cand = u["union_id"], u["union_sha"]
+        with self._lock:
+            self._proof_cancel.add(cand)
+        try:
+            reset = self.store.union_cancel(uid, cause)
+        except StoreError as exc:
+            self.log("UNION %s cancel refused: %s" % (uid, exc))
+            self.store.alert("UNION_CANCEL_REFUSED", "%s stacked on a dead predecessor (%s) "
+                             "could not be cancelled: %s" % (uid, cause, str(exc)[:200]))
+            return False
+        self.log("UNION %s CANCELLED (%s): %s -> PREPARING" % (uid, cause, ",".join(reset)))
+        self.store.alert("UNION_CANCELLED", "%s cancelled: %s. Items %s back to PREPARING "
+                         "(no strike); rebuilt on the new chain tip next tick"
+                         % (uid, cause, ",".join(reset) or "-"))
+        self._last_union_mono = 0.0           # rebuild without waiting for the trigger window
+        return True
+
+    def _proof_cancelled(self, cand):
+        with self._lock:
+            return cand in self._proof_cancel
+
     def _maybe_build_union(self, items):
         prep = [r for r in items if r.get("status") == "PREPARING" and not r.get("union_id")]
         if not prep:
@@ -1692,9 +1771,10 @@ class Driver(object):
 
     def build_union(self, prep):
         base = self.trunk_sha()
-        approved = [u for u in self.store.unions() if u.get("status") == "APPROVED"]
-        if approved:
-            base = approved[-1]["union_sha"]      # stack on the last approved union
+        tip = self._chain_tip()
+        if tip:
+            base = tip["union_sha"]      # stack on the last approved union (or, in chain
+                                         # mode, the last live one: see _chain_tip)
         no = len(self.store.unions()) + 1
         branch = "vp/union-%d" % no
         wt = self.worktrees_root / ("union-%d" % no)
@@ -1925,6 +2005,8 @@ class Driver(object):
                     "--paths", ",".join(by_kind[pk]), "--cn", str(self.cn)]
             if multi:
                 argv.append("--no-record")
+            if self._proof_cancelled(cand):
+                break
             rc, out, err = self.exec.run(argv, cwd=str(self.here), timeout_s=timeout)
             rc_last, err_last, out_last = rc, err, out
             res = {}
@@ -1935,6 +2017,13 @@ class Driver(object):
             results[pk] = (rc, res)
             if rc == 124 or not res:
                 break
+        if self._proof_cancelled(cand):
+            # D83: the union was cancelled while this ran; the result is for a
+            # tree nobody will promote.  The subprocess was NOT killed (a killed
+            # pytest leaves Postgres/shm behind on the shared box); it ran out.
+            self.store.turn_end(attempt_id, "STALLED", None, None, "CANCELLED (union chain)")
+            self.log("PROOF %s %s -> CANCELLED (union cancelled; result discarded)" % (item, pid))
+            return
         # aggregate
         status, failed, logs, counts_all = "PASS", [], [], {}
         for pk, (rc, res) in results.items():
@@ -2023,7 +2112,16 @@ class Driver(object):
                          % (item, pid, pipeline_id, account))
                 res = vpcircle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
                                     deadline_s=int(cc.get("deadline_min", 90)) * 60,
-                                    runner=runner, account=account)
+                                    runner=runner, account=account,
+                                    abort=lambda: self._proof_cancelled(cand))
+            except vpcircle.Cancelled:
+                # D83: the union was cancelled under us; stop the spend, discard
+                done = vpcircle.cancel_pipeline(pipeline_id, runner, account)
+                self.store.turn_end(attempt_id, "STALLED", None, None,
+                                    "CANCELLED (union chain) circleci %s" % pipeline_id)
+                self.log("PROOF %s %s -> CANCELLED (union cancelled; circleci pipeline %s, "
+                         "workflows cancelled: %s)" % (item, pid, pipeline_id, ",".join(done) or "-"))
+                return
             except Exception as exc:           # any off-box failure is UNKNOWN + backoff, never a crash
                 counts = {"reason": "circleci: %s: %s" % (type(exc).__name__, str(exc)[:300]),
                           "pipeline_id": pipeline_id,
@@ -2039,6 +2137,11 @@ class Driver(object):
                                     "UNKNOWN %s" % counts["reason"][:200])
                 self.log("PROOF %s %s -> UNKNOWN (circleci: %s)" % (item, pid, str(exc)[:200]))
                 self._note_proof_infra(cand, union, rec, pid, counts["reason"])
+                return
+            if self._proof_cancelled(cand):
+                self.store.turn_end(attempt_id, "STALLED", None, None,
+                                    "CANCELLED (union chain) circleci %s" % pipeline_id)
+                self.log("PROOF %s %s -> CANCELLED (union cancelled; result discarded)" % (item, pid))
                 return
             cls = vpcircle.classify(res["jobs"], res["failed_tests"])
             status = cls["status"]

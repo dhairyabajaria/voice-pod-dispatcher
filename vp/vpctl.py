@@ -163,6 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("union_id")
     us.add_argument("--status", required=True)
     us.add_argument("--note", default=None)
+    uc = un.add_parser("cancel")
+    uc.add_argument("union_id")
+    uc.add_argument("--cause", required=True)
     ul = un.add_parser("list")
     ul.add_argument("--status", default=None)
     ul.add_argument("--json", action="store_true")
@@ -401,6 +404,10 @@ def dispatch(args, st: Store):
                               "status": st.union_status(args.union_id, args.status,
                                                         args.note)},
                        f"{args.union_id} {args.status}")
+        if s == "cancel":
+            reset = st.union_cancel(args.union_id, args.cause)
+            return out(args, {"union_id": args.union_id, "reset": reset},
+                       f"{args.union_id} CANCELLED reset={','.join(reset) or '-'}")
         if s == "list":
             rows = st.unions(args.status)
             return out(args, {"unions": rows}, "\n".join(

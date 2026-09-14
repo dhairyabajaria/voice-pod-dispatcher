@@ -231,8 +231,32 @@ def _get_json(runner, account, path):
         ) from None
 
 
+class Cancelled(Exception):
+    """poll() stopped because the caller's `abort()` returned true."""
+
+
+def cancel_pipeline(pipeline_id, runner=None, account=None):
+    """Best effort: POST cancel on every non-terminal workflow of the
+    pipeline (a cancelled chain union should not keep burning credits).
+    Returns the workflow ids cancelled; never raises."""
+    runner = runner or Runner()
+    acct = account or ACCOUNTS[0]
+    done = []
+    try:
+        wfs = _get_json(runner, acct, f"api/v2/pipeline/{pipeline_id}/workflow").get("items", [])
+        for w in wfs:
+            if w.get("status") in WORKFLOW_TERMINAL or not w.get("id"):
+                continue
+            r = runner.circleci_api(acct, f"api/v2/workflow/{w['id']}/cancel", method="POST")
+            if r.returncode == 0:
+                done.append(w["id"])
+    except Exception:
+        pass
+    return done
+
+
 def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
-         sleep=time.sleep, clock=time.monotonic):
+         sleep=time.sleep, clock=time.monotonic, abort=None):
     """Walk pipeline -> workflows -> jobs until every workflow is terminal,
     then fetch failed tests for every failed job with a job_number.
 
@@ -240,6 +264,7 @@ def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
     failed_tests maps job_number -> [test dict, ...] (result != success).
 
     `sleep`/`clock` are injectable so tests never actually sleep.
+    `abort()` is checked before every sleep; true raises Cancelled.
     """
     runner = runner or Runner()
     acct = account or ACCOUNTS[0]
@@ -292,6 +317,8 @@ def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
             raise TimeoutError(
                 f"poll: deadline of {deadline_s}s exceeded for pipeline {pipeline_id}"
             )
+        if abort is not None and abort():
+            raise Cancelled(f"poll: aborted by caller for pipeline {pipeline_id}")
         sleep(interval)
 
 

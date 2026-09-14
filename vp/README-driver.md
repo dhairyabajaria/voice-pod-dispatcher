@@ -448,6 +448,53 @@ grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
   true}`, and REVIEW_REQUEST.json carries `unverified_ids` for the senior to
   decide.  A record with any FAIL line reworks exactly as before.
 
+## Speculative union chain (D83) — `concurrency.max_unions_in_flight > 1`
+
+Owner goal (2026-09-14): off-box proofs take no box/portal lock, so several
+unions can prove at once.  The orchestrator's ruling: a merge queue.
+
+- **Base = chain tip.** `build_union` stacks union N+1 on the last union whose
+  status is APPROVED, BUILT or PROOF (`_chain_tip`), so every union contains
+  its predecessors and promotion stays one fast-forward per union.  At the cap
+  of 1 the rule is the old one (last APPROVED union) and nothing below can
+  trigger.  NOTE: the roster key's default when absent is 2 (pre-existing);
+  the live roster says 1 explicitly.
+- **Proof slots.** `concurrency.max_proofs_in_flight` (default 1, hot-reloaded)
+  sizes the proof runner; parallel proofs need it ≥ `max_unions_in_flight`.
+  The box lock still serialises box proofs; only CircleCI ones overlap.
+- **Cancellation.** Each tick, before building, `_reconcile_chain` looks for a
+  live union (BUILT/PROOF/APPROVED) whose `base_sha` is the sha of a union
+  that is FAILED / FINDINGS / BLOCKED / CANCELLED and cancels it, cascading in
+  one pass (`vpctl union cancel <id> --cause …` → `Store.union_cancel`):
+  items still on the union path (PREPARED, PROOF_PENDING, FINAL_REVIEW,
+  APPROVED) go back to **PREPARING** with `union_id` NULL and their own last
+  submitted commit restored — no strike, no round; an open proof for the union
+  sha becomes CANCELLED; the union row becomes CANCELLED with the cause; one
+  `UNION_CANCELLED` alert names the dead predecessor.  `_last_union_mono` is
+  zeroed so the rebuild does not wait for the trigger window.  Items that had
+  already left the union (GRADING etc.) are untouched; a union with a PROMOTED
+  item is refused (it is trunk).
+- **Proof abort.** The union sha goes into `_proof_cancel`.  A CircleCI proof
+  stops at its next poll (`vpcircle.poll(abort=…)` raises `Cancelled`), POSTs
+  cancel on the pipeline's non-terminal workflows (`cancel_pipeline`, best
+  effort, stops the credit burn), records a CANCELLED turn and writes NO
+  verdict; the branch cleanup still runs.  A box proof is NOT killed (a killed
+  pytest leaves Postgres/shm on the shared box): it stops before the next
+  kind, runs the current one out, and its result is discarded.
+- **Promotion order.** `Store.promote_prepare` refuses union N+1 while the
+  union whose sha is N+1's base has any item not PROMOTED ("chain order: …").
+  This is in the store, so it also applies at cap 1 when a union was built on
+  an APPROVED-but-unpromoted one — the fast-forward would otherwise carry the
+  predecessor's items without a promotion row, so the refusal is right there
+  too.
+
+Tests (cycle): `test_chain_of_two_unions_passes_and_promotes_in_order`,
+`test_chain_predecessor_fail_cancels_dependent_and_rebuilds`,
+`test_chain_cancel_aborts_a_running_circleci_proof` (real
+`run_proof_circleci` against FakeCircle), `test_chain_is_off_at_max_unions_in_flight_one`;
+vpcircle: `test_poll_abort_raises_cancelled_before_the_next_sleep`,
+`test_cancel_pipeline_posts_cancel_on_non_terminal_workflows_only`.
+
 ## Union registry failure BLOCKs the union (D80 follow-up)
 
 `_regenerate_union_artifacts` runs `deploy/environment_registry.py --write` on
