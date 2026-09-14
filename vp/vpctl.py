@@ -9,11 +9,59 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 import vplint
 import vpstore
 from vpstore import Conflict, Refused, Store, Usage
+
+
+LIVE_ITEM_STATUSES_EXCLUDED = ("PROMOTED", "STOPPED", "CANCELLED")
+
+
+def _packet_header(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    hdr, _ = vplint.parse_front_matter(text)
+    return hdr
+
+
+def _resolve_packet_path(p):
+    """packet_path rows are recorded as given (usually CN-relative)."""
+    if os.path.isabs(p) and os.path.exists(p):
+        return p
+    for root in (os.getcwd(), os.environ.get("VP_CN", ""), vpstore.DEFAULT_CN):
+        if root and os.path.exists(os.path.join(root, p)):
+            return os.path.join(root, p)
+    return None
+
+
+def packet_overlaps(st, item, packet_path):
+    """Unordered owned_files overlap between this packet and every live item's
+    READY packet (vplint.owned_overlap).  Empty when the packet has no
+    readable header, so a missing file at submit stays allowed."""
+    hdr = _packet_header(packet_path)
+    if not hdr or not hdr.get("owned_files"):
+        return []
+    shared = vplint.DEFAULT_SHARED_FILES
+    try:
+        with open(os.path.join(st.root, "roster.json"), encoding="utf-8") as fh:
+            shared = tuple((json.load(fh).get("packet") or {}).get("shared_files") or shared)
+    except (OSError, ValueError):
+        pass
+    others = {}
+    for row in st.report("items")["items"]:
+        if row["item"] == item or row.get("status") in LIVE_ITEM_STATUSES_EXCLUDED:
+            continue
+        p = _resolve_packet_path(row.get("packet_path") or "")
+        oh = _packet_header(p) if p else None
+        if oh:
+            others[row["item"]] = oh
+    return vplint.owned_overlap(item, hdr, others, shared)
 
 
 def packet_says_critical(path):
@@ -139,6 +187,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--submitted-by", default=None)
     ps.add_argument("--critical", action="store_true")
     ps.add_argument("--allowed-files", default=None)
+    ps.add_argument("--allow-overlap", action="store_true",
+                    help="submit even though owned_files overlap a live packet's")
     packet.add_parser("ready").add_argument("packet_id")
     pb = packet.add_parser("block")
     pb.add_argument("packet_id")
@@ -363,10 +413,20 @@ def dispatch(args, st: Store):
     if c == "packet":
         if s == "submit":
             critical = args.critical or packet_says_critical(args.packet)
+            overlaps = packet_overlaps(st, args.item, args.packet)
+            if overlaps and not args.allow_overlap:
+                raise Refused("owned_files overlap a live packet with no depends_on path: "
+                              + "; ".join("%s (%s)" % (o, ", ".join(f)) for o, f in overlaps)
+                              + " -- add depends_on, or --allow-overlap to accept the "
+                              "union-time conflict")
             pid = st.packet_submit(args.item, args.benchmark, args.packet, args.base,
                                    args.submitted_by, critical,
                                    csv(args.allowed_files) if args.allowed_files else None)
-            return out(args, {"packet_id": pid}, pid)
+            if overlaps:
+                st.event("PACKET_OVERLAP_ACK", item=args.item, ref=pid,
+                         detail={"overlaps": [[o, f] for o, f in overlaps]})
+            return out(args, {"packet_id": pid, "overlaps": [[o, f] for o, f in overlaps]},
+                       pid)
         if s == "ready":
             return out(args, {"packet_id": st.packet_ready(args.packet_id)},
                        f"{args.packet_id} READY")

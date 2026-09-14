@@ -841,5 +841,88 @@ def main() -> int:
     return 0 if not FAILURES else 1
 
 
+@test
+def test_packet_submit_refuses_unordered_owned_files_overlap():
+    """D49 follow-up: two live packets owning the same non-shared file with no
+    depends_on path meet for the first time in build_union (A5-2 on app.py,
+    union-55).  Refuse at submit; shared inventory files never count."""
+    import vplint
+    with tempfile.TemporaryDirectory() as tmp:
+        root = new_root(tmp, "ovl")
+        env = dict(os.environ, VP_RUN_ROOT=root,
+                   VP_STOP_FILE=os.path.join(root, "STOP"))
+
+        def run(*a):
+            return subprocess.run([sys.executable, os.path.join(VP, "vpctl.py"), *a],
+                                  capture_output=True, text=True, env=env, cwd=tmp)
+
+        def packet(item, owned, deps=()):
+            p = os.path.join(tmp, item + ".md")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("---\nitem: %s\ndepends_on: [%s]\nowned_files:\n%s---\n## Goal\nx\n"
+                         % (item, ", ".join(deps), "".join("  - %s\n" % f for f in owned)))
+            return p
+
+        def submit(item, pkt, *extra):
+            return run("packet", "submit", item, "--benchmark", "B.md", "--packet", pkt,
+                       "--base", "base000", *extra)
+
+        assert run("run", "init", "run-ovl").returncode == 0
+        r = submit("I-1", packet("I-1", ["platform/api/app.py", "TECHNICAL.md"]))
+        assert r.returncode == 0, r.stderr
+        assert run("packet", "ready", r.stdout.strip()).returncode == 0
+        # shared-by-convention file only: allowed
+        r = submit("I-2", packet("I-2", ["TECHNICAL.md", "platform/core/x.py"]))
+        assert r.returncode == 0, r.stderr
+        assert run("packet", "ready", r.stdout.strip()).returncode == 0
+        # app.py again, no ordering: refused, names the pair and the file
+        r = submit("I-3", packet("I-3", ["platform/api/app.py"]))
+        assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+        assert "I-1" in r.stderr and "platform/api/app.py" in r.stderr, r.stderr
+        assert "I-2" not in r.stderr
+        # a depends_on path orders the pair: allowed
+        r = submit("I-3", packet("I-3", ["platform/api/app.py"], deps=["I-1"]))
+        assert r.returncode == 0, r.stderr
+        # the override records the acknowledgement
+        r = submit("I-4", packet("I-4", ["platform/api/app.py"]), "--allow-overlap", "--json")
+        assert r.returncode == 0, r.stderr
+        doc = json.loads(r.stdout)
+        assert doc["overlaps"] and doc["overlaps"][0][0] == "I-1", doc
+        st = vpstore.Store(root)
+        kinds = [e["kind"] for e in st.q("SELECT kind FROM event WHERE item='I-4'")]
+        assert "PACKET_OVERLAP_ACK" in kinds, kinds
+        # a packet file that does not exist at submit is still accepted (as before)
+        r = submit("I-5", os.path.join(tmp, "missing.md"))
+        assert r.returncode == 0, r.stderr
+        # the pure function: the promoted item's packet is not a live overlap
+        hdr = {"owned_files": ["a.py"], "depends_on": []}
+        assert vplint.owned_overlap("N", hdr, {"O": {"owned_files": ["a.py"]}}) == [("O", ["a.py"])]
+        assert vplint.owned_overlap("N", hdr, {"O": {"owned_files": ["a.py"],
+                                                     "depends_on": ["N"]}}) == []
+
+
+@test
+def test_benchmark_literal_rules_name_the_ops03b_class_only():
+    """OPS-03b D33: B11/B12 named base bddef4a3, B3 'five members', B2 whole-diff
+    grep.  The rule fires on the packet's own base sha and on an absolute
+    inventory value, and stays quiet on a lane sha, a delta, and an HTTP code."""
+    import vplint
+    base = "bddef4a3" + "0" * 32
+    rows = [
+        {"id": "B1", "text": "RESULT.json `base` equals `bddef4a3` — check: jq"},
+        {"id": "B2", "text": "byte-identical to `git show 8ed84d57:platform/x.py` — check: diff"},
+        {"id": "B3", "text": "`test_permission_matrix.py` counts read `502` / `214` — check: grep"},
+        {"id": "B4", "text": "`test_permission_matrix.py` `499`→`501` — check: grep"},
+        {"id": "B5", "text": "`GATED_INVENTORY` gains the two rows and both gated counts move +2 — check: diff"},
+        {"id": "B6", "text": "`test_capability_route_gate.py` answers `403` VP-CAP on POST — check: curl"},
+        {"id": "B7", "text": "grep the whole diff for `quarantine` — check: grep"},
+    ]
+    out = vplint.lint_benchmark_literals(rows, base)
+    ids = lambda pat: sorted(o.split()[2] for o in out if pat in o)
+    assert ids("base_sha literally") == ["B1"], out
+    assert ids("absolute value") == ["B3", "B4"], out
+    assert ids("whole diff") == ["B7"], out
+    assert not [o for o in out if "B2" in o or "B5" in o or "B6" in o], out
+
 if __name__ == "__main__":
     sys.exit(main())

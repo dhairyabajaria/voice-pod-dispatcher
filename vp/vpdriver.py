@@ -41,6 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vplint     # noqa: E402
+import vpmerge    # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
 from vprunners import (STATUS_DONE, STATUS_INCOMPLETE, STATUS_PROGRESS_STOP,  # noqa: E402
@@ -1540,21 +1541,39 @@ class Driver(object):
                     os.symlink(str(self.trunk / rel), str(wt / rel))
             except OSError:
                 pass
-        merged, conflicted = [], []
+        merged, conflicted, automerged = [], [], {}
         order = sorted(prep, key=lambda r: (len(self.packet_header(r).get("depends_on") or []),
                                             r.get("ts") or ""))
         for r in order:
             cand = r.get("candidate_sha")
+            ours = self.head_sha(wt)
             rc, out, err = self.git(["-C", str(wt), "merge", "--no-ff", "--no-edit", "-m",
                                      "union-%d: %s" % (no, r["item"]), cand])
             if rc != 0:
-                self.git(["-C", str(wt), "merge", "--abort"])
-                conflicted.append(r["item"])
-                self.store.block(r["item"], "union-%d merge conflict on %s: %s"
-                                 % (no, cand[:12], (out or err)[:200]))
-                self.store.alert("UNION_CONFLICT", "%s conflicts in union-%d" % (r["item"], no),
-                                 r["item"])
-                continue
+                # D49: the additive-inventory class (TECHNICAL.md route tuple,
+                # the closed-count asserts, the enumerating dicts) is merged
+                # by arithmetic; anything else is a real conflict as before.
+                done = self._automerge(wt, no, r["item"], ours, cand)
+                if done is None:
+                    self.git(["-C", str(wt), "merge", "--abort"])
+                    conflicted.append(r["item"])
+                    self.store.block(r["item"], "union-%d merge conflict on %s: %s"
+                                     % (no, cand[:12], (out or err)[:200]))
+                    self.store.alert("UNION_CONFLICT", "%s conflicts in union-%d"
+                                     % (r["item"], no), r["item"])
+                    continue
+                automerged[r["item"]] = done
+            else:
+                fixed = vpmerge.fix_clean_merge(self.git, wt, ours, cand)
+                if fixed:
+                    rc2, out2, err2 = self.git(["-C", str(wt), "commit", "--amend",
+                                               "--no-edit"])
+                    if rc2 != 0:
+                        self.log("union-%d amend after re-sum failed for %s: %s"
+                                 % (no, r["item"], (err2 or out2)[:200]))
+                    else:
+                        automerged[r["item"]] = fixed
+                        self.log("UNION-%d re-summed %s: %s" % (no, r["item"], json.dumps(fixed)))
             merged.append(r["item"])
         if not merged:
             self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
@@ -1582,11 +1601,33 @@ class Driver(object):
         # every union proof carries the registry tests (SAFE-09 lesson: a new
         # module alone reds them, and no item's targeted set would notice)
         paths += list(self.proof_cfg.get("union_always_paths") or UNION_ALWAYS_PATHS)
+        if automerged:
+            # the arithmetic is only as good as the proof that checks it
+            paths += list(vpmerge.PROOF_PATHS)
+            self.store.alert("UNION_AUTOMERGE", "union-%d merged the inventory class by "
+                             "arithmetic: %s" % (no, json.dumps(automerged)[:400]))
         kind = self.proof_cfg.get("union_kind", "targeted")
         pid = self.store.proof_request(union_sha, base, kind, sorted(set(paths)))
         self.log("UNION %s %s base=%s items=%s proof=%s" % (uid, union_sha[:12], base[:12],
                                                             ",".join(merged), pid))
         return uid
+
+    def _automerge(self, wt, no, item, ours, cand):
+        """Resolve a failed merge when every conflict is in vpmerge's class.
+        Returns {path: note} and leaves the merge committed, or None with
+        the index untouched (the caller aborts)."""
+        try:
+            done = vpmerge.resolve_merge(self.git, wt, ours, cand)
+        except vpmerge.Refused as exc:
+            self.log("union-%d %s: automerge refused: %s" % (no, item, exc))
+            return None
+        rc, out, err = self.git(["-C", str(wt), "commit", "--no-edit"])
+        if rc != 0:
+            self.log("union-%d %s: commit after automerge failed: %s"
+                     % (no, item, (err or out)[:200]))
+            return None
+        self.log("UNION-%d automerged %s: %s" % (no, item, json.dumps(done)))
+        return done
 
     def _regenerate_union_artifacts(self, wt, no):
         """Integrator step (K-21): rendered artifacts are a property of the

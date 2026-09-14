@@ -25,6 +25,7 @@ sys.path.insert(0, str(VP))
 import vpdriver   # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
+import vpstore    # noqa: E402
 from vprunners import TurnOutcome, STATUS_DONE  # noqa: E402
 
 PY = sys.executable
@@ -361,6 +362,75 @@ def test_thin_cycle_ready_to_approved():
         # union worktree exists and is a merge on base
         uwt = Path(unions[0]["worktree"])
         assert (uwt / "platform" / "hello.py").read_text().endswith('"hi"\n')
+
+
+PACKET_TECH = PACKET.replace("owned_files:\n", "owned_files:\n  - TECHNICAL.md\n")
+
+
+def tech_text(n, extra=""):
+    return ("Platform tests run against real Postgres.\n"
+            "the catalogue), `test_permission_matrix.py` (discovers all %d routes from\n"
+            "`app.routes`; 34 unauthenticated or externally authenticated routes, each\n"
+            "named; 212 refused to Viewer; 246 cookie-authenticated writes; 118 `/admin` routes).\n"
+            "%sMore prose.\n" % (n, extra))
+
+
+def builder_routes(n_add, tag):
+    """A builder that adds n_add routes: bumps the TECHNICAL.md tuple and
+    inserts its own line under it (both sides insert at the same place)."""
+    def fn(spec):
+        wt = Path(spec.cwd)
+        (wt / "TECHNICAL.md").write_text(tech_text(500 + n_add, "- %s added %d\n" % (tag, n_add)))
+        return builder_ok(spec)
+    return fn
+
+
+def test_union_merges_the_inventory_class_by_arithmetic():
+    """D49: two items both bump the route tuple; git conflicts (or, for an
+    identical bump, silently keeps ONE bump).  build_union sums the deltas
+    and unions the inserted lines instead of BLOCKing the second item."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        (env.trunk / "TECHNICAL.md").write_text(tech_text(500))
+        git(env.trunk, "add", "-A")
+        git(env.trunk, "commit", "-q", "-m", "tech")
+        env.base = git(env.trunk, "rev-parse", "HEAD")
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        for it in ("M-A", "M-B"):
+            pdir = env.run_root / "packets" / it
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "PACKET.md").write_text(PACKET_TECH.format(item=it, base=env.base))
+            (pdir / "BENCHMARK.md").write_text(BENCHMARK)
+            _rc, d = env.vpctl("packet", "submit", it, "--benchmark", str(pdir / "BENCHMARK.md"),
+                               "--packet", str(pdir / "PACKET.md"), "--base", env.base,
+                               "--allow-overlap")
+            env.vpctl("packet", "ready", d["packet_id"])
+        drv = make_driver(env, [builder_routes(2, "A"), builder_routes(1, "B")],
+                          [junior_pass_fence, junior_pass_fence],
+                          [senior_approve, senior_approve], [final_approve, final_approve])
+        requested, real_req = [], drv.store.proof_request
+
+        def proof_request(candidate, base, kind, paths):
+            requested.append(list(paths or []))
+            return real_req(candidate, base, kind, paths)
+        drv.store.proof_request = proof_request
+        pump(drv, 120)
+        rows = {it: env.item(it) for it in ("M-A", "M-B")}
+        assert all(r["status"] == "APPROVED" for r in rows.values()), \
+            {k: (v["status"], v.get("note")) for k, v in rows.items()}
+        unions = drv.store.unions()
+        last = unions[-1]
+        text = (Path(last["worktree"]) / "TECHNICAL.md").read_text()
+        import vpmerge
+        assert vpmerge.numbers("TECHNICAL.md", text) == [[503, 34, 212, 246, 118]], text
+        assert "- A added 2" in text and "- B added 1" in text and "<<<<<<<" not in text
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert "UNION_AUTOMERGE" in alerts, alerts
+        assert "UNION_CONFLICT" not in alerts, alerts
+        # the union that carried the automerge proves the inventory tests
+        assert any("platform/tests/test_permission_matrix.py" in ps and
+                   "platform/tests/test_docs_truth.py" in ps for ps in requested), requested
 
 
 def test_junior_fail_loops_to_building_then_senior_findings():

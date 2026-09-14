@@ -351,6 +351,53 @@ number. Codex `output_tokens` already include reasoning; cached input is priced
 once at the cached rate. Measured on run-v12-20260913: 139 Codex reviews,
 mean 962k input (882k cached) / 8k output, every `cost` null before this.
 
+## Union automerge of the inventory class (D49) — `vpmerge.py`
+
+Every route-adding item bumps the same closed inventories: the TECHNICAL.md
+route 5-tuple (`test_docs_truth` parses it), `assert n == N` and the three
+`len(_VIEWER_REFUSED|_COOKIE_WRITES|_ADMIN_ROUTES) == N` lines in
+`test_permission_matrix.py`, `len(gated) == N` in `test_capability_contract.py`,
+`len(derived) == len(GATED_INVENTORY) == N` in `test_capability_route_gate.py`,
+and the dict/set entries those tests enumerate.  Two such items conflict on every
+one of those lines, and when both bump a number by the SAME amount git merges the
+"identical" edit as one bump (502+2 on both sides -> 504, the tree has 506).
+
+`build_union` now handles exactly that class and nothing else:
+
+- On a failed merge, `vpmerge.resolve_merge` re-derives every number as
+  `theirs + (ours - base)` from the merge base, rewrites it on all three sides so
+  git sees the numeric lines as unchanged, merges the rest with
+  `git merge-file --diff3`, and accepts only both-side insertions (ours first,
+  then theirs) from the conflict blocks.  Any conflicted file outside the class,
+  or any block that is not a pure insertion, is REFUSED: nothing is written, the
+  merge is aborted and the item is BLOCKED with the same `union-N merge conflict`
+  note as before.
+- On a clean merge, `vpmerge.fix_clean_merge` re-sums class files both sides
+  changed and amends the merge commit (the identical-bump case).
+- Whenever it fired: `UNION_AUTOMERGE` in OWNER-ALERTS.md with `{item: {path: note}}`,
+  and the union proof additionally runs `test_docs_truth`, `test_permission_matrix`,
+  `test_capability_contract` and `test_capability_route_gate` on the merged tree —
+  the arithmetic is only as good as the proof that checks it.
+
+By hand, mid-merge in any worktree: `python3 vpmerge.py resolve --cwd <wt>` then
+`git commit --no-edit`.
+
+Two `packet submit` guards from the same incident class:
+
+- `vplint packet` ERRORs on a benchmark row that names the packet's own
+  `base_sha` (a rebase onto the union tip moves it — OPS-03b B11/B12) or states a
+  shared inventory's absolute post-state (`502`, `499→501`, `001..255` — every
+  other promotion moves it; say `+2`), and WARNs on "whole diff" greps (D35).
+  Measured on the 132 packets of run-v12: 48 base-sha rows in 28 packets, 11
+  absolute-inventory rows (6 clear, 5 debatable), 0 warns.
+- `packet submit` REFUSES (rc 3) when the packet's `owned_files` overlap a live
+  item's READY packet outside the shared-by-convention set and no `depends_on`
+  path orders the pair (A5-2 met A3-x on `platform/api/app.py` in union-55, 30
+  minutes and one BLOCKED item later).  `--allow-overlap` accepts it and records
+  `PACKET_OVERLAP_ACK`.  Shared set: `roster.json` `"packet": {"shared_files": [...]}`,
+  default TECHNICAL.md + the four inventory tests.  A packet path that does not
+  exist at submit is still accepted, as before.
+
 ## Store-surface items — resolved
 
 Both earlier blockers are closed and the driver now uses the real verbs:

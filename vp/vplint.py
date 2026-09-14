@@ -53,6 +53,27 @@ LIST_KEYS = ("depends_on", "releases", "owned_files", "forbidden_files", "test_p
 KINDS = ("invariant", "test", "negative", "forbidden", "evidence")
 _BENCH_RE = re.compile(r"^\s*-\s+(B\d+)\s+\[(\w+)\]\s+(.+)$")
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
+_HEX7 = re.compile(r"\b[0-9a-f]{7,40}\b")
+# the closed inventories every route-adding item moves (OPS-03b D33/D35: a
+# benchmark that states their absolute post-state goes stale on any rebase)
+_INVENTORY = re.compile(
+    r"test_permission_matrix|test_capability_contract|test_capability_route_gate|"
+    r"test_docs_truth|route inventory|discovers all|GATED_INVENTORY|len\(gated\)|"
+    r"len\(derived\)|_VIEWER_REFUSED|_COOKIE_WRITES|_ADMIN_ROUTES|"
+    r"append-only and numbered|contiguous from")
+_ABSOLUTE = re.compile(
+    r"`\d{2,4}`|\d+\s*(?:→|->)\s*`?\d+|\b\d{3}\.\.\d{3}\b|"
+    r"\b(?:total|reads|is now|==)\s*`?\d{2,4}\b")
+_HTTP_STATUS = re.compile(r"^`?(?:20[0-9]|30[0-9]|4[0-2][0-9]|5[0-9][0-9])`?$")
+_WHOLE_DIFF = re.compile(r"\b(?:whole|entire|full)\s+diff\b", re.I)
+# owned_files that are additive by convention: every route-adding item edits
+# them and the union merges them by arithmetic (vpmerge), so overlap on them
+# is not a conflict.  Overridable per run: roster.json "packet": {"shared_files": [...]}.
+DEFAULT_SHARED_FILES = ("TECHNICAL.md",
+                        "platform/tests/test_permission_matrix.py",
+                        "platform/tests/test_capability_contract.py",
+                        "platform/tests/test_capability_route_gate.py",
+                        "platform/tests/test_docs_truth.py")
 
 
 def parse_front_matter(text):
@@ -198,6 +219,7 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
         out.append("ERROR body: Witnesses has no file:line citation")
     rows, berrs = parse_benchmark(btxt)
     out += ["ERROR " + e for e in berrs]
+    out += lint_benchmark_literals(rows, base)
     kinds = {r["kind"] for r in rows}
     for k in KINDS:
         if k not in kinds:
@@ -212,6 +234,65 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
                                    for t in tests):
                 out.append("WARN benchmark: %s test path %s is not in header test_paths"
                            % (r["id"], m.group(1)))
+    return out
+
+
+def lint_benchmark_literals(rows, base_sha=""):
+    """OPS-03b (D29/D33/D35): three stale-literal FAILs, zero product defects,
+    two round-cap hits.  A row that names the packet's own base sha, or the
+    absolute post-state of a shared inventory, is wrong the moment the
+    candidate is rebased onto a union tip; say "base" and "+N" instead."""
+    out = []
+    base = str(base_sha or "")
+    for r in rows:
+        body = r["text"]
+        stale = [t for t in _HEX7.findall(body) if base and base.startswith(t)]
+        if stale:
+            out.append("ERROR benchmark: %s names the packet base_sha literally (%s); "
+                       "write 'base' -- a rebase onto the union tip moves it (OPS-03b)"
+                       % (r["id"], stale[0][:12]))
+        absolute = [m for m in _ABSOLUTE.findall(body) if not _HTTP_STATUS.match(m)]
+        if _INVENTORY.search(body) and absolute:
+            out.append("ERROR benchmark: %s states a shared inventory's absolute value "
+                       "(%s); state the delta relative to base (+N) -- every other "
+                       "promoted item moves the absolute (OPS-03b)"
+                       % (r["id"], absolute[0]))
+        if _WHOLE_DIFF.search(body):
+            out.append("WARN benchmark: %s greps the whole diff; scope it to the item's "
+                       "product-file diff (OPS-03b D35)" % r["id"])
+    return out
+
+
+def owned_overlap(item, hdr, others, shared=DEFAULT_SHARED_FILES):
+    """Pairs (other_item, [files]) whose owned_files overlap `hdr`'s outside
+    `shared` and that no depends_on path (either direction, transitive over
+    `others`) orders.  Such a pair meets for the first time in build_union,
+    30 minutes and a BLOCKED item later; refuse it at submit instead."""
+    shared = set(shared or ())
+    hdrs = dict(others)
+    hdrs[item] = hdr
+    deps = {k: set((v or {}).get("depends_on") or []) for k, v in hdrs.items()}
+
+    def reaches(a, b):
+        seen, todo = set(), [a]
+        while todo:
+            x = todo.pop()
+            if x == b:
+                return True
+            if x in seen:
+                continue
+            seen.add(x)
+            todo += list(deps.get(x, ()))
+        return False
+
+    mine = set(hdr.get("owned_files") or []) - shared
+    out = []
+    for other, oh in sorted(others.items()):
+        if other == item:
+            continue
+        ov = mine & (set((oh or {}).get("owned_files") or []) - shared)
+        if ov and not (reaches(item, other) or reaches(other, item)):
+            out.append((other, sorted(ov)))
     return out
 
 
