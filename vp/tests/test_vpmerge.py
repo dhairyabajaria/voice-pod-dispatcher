@@ -48,14 +48,23 @@ def tech(n, ua, vr, cw, ad, extra=""):
             "%sMore prose.\n" % (n, ua, vr, cw, ad, extra))
 
 
-def pm(n, vr, cw, ad, viewer_rows):
+def pm(n, vr, cw, ad, viewer_rows, ledger=""):
+    """The real two-line shape: the count on the assert AND on its message."""
     return ("_VIEWER_REFUSED = [\n%s]\n\n"
             "def test_inventory():\n"
             '    assert n == %d, f"discovered {n} routes; the reviewed route inventory is %d"\n'
-            "    assert len(_VIEWER_REFUSED) == %d, (\n        'moved')\n"
-            "    assert len(_COOKIE_WRITES) == %d, (\n        'moved')\n"
-            "    assert len(_ADMIN_ROUTES) == %d, (\n        'moved')\n"
-            % ("".join("    %s,\n" % r for r in viewer_rows), n, n, vr, cw, ad))
+            "%s"
+            "    assert len(_VIEWER_REFUSED) == %d, (\n"
+            '        f"found {len(_VIEWER_REFUSED)} routes gated above viewer\'s permission "\n'
+            '        "set; the reviewed permission matrix contains %d"\n    )\n'
+            "    assert len(_COOKIE_WRITES) == %d, (\n"
+            '        f"found {len(_COOKIE_WRITES)} cookie-authenticated writes; the "\n'
+            '        "reviewed CSRF matrix contains %d"\n    )\n'
+            "    assert len(_ADMIN_ROUTES) == %d, (\n"
+            '        f"found {len(_ADMIN_ROUTES)} /admin routes; the reviewed admin "\n'
+            '        "route inventory contains %d"\n    )\n'
+            % ("".join("    %s,\n" % r for r in viewer_rows), n, n, ledger,
+               vr, vr, cw, cw, ad, ad))
 
 
 def rg(n, rows):
@@ -116,7 +125,7 @@ def test_conflicting_bumps_are_summed_and_entries_unioned():
         t = (r.d / TECH).read_text()
         assert vpmerge.numbers(TECH, t) == [[503, 34, 214, 248, 119]], t
         p = (r.d / PM).read_text()
-        assert vpmerge.numbers(PM, p) == [[503, 503], [214], [248], [119]], p
+        assert vpmerge.numbers(PM, p) == [[503, 503], [214], [248], [119], [214], [248], [119]], p
         for row in ('("GET", "/a")', '("GET", "/x1")', '("GET", "/x2")', '("GET", "/y")'):
             assert row in p, row
         g = (r.d / RG).read_text()
@@ -127,6 +136,33 @@ def test_conflicting_bumps_are_summed_and_entries_unioned():
         assert rc == 0, err
         rc, out, _ = sh(r.d, "diff", "--name-only", "--diff-filter=U")
         assert out.strip() == ""
+
+
+def test_union_61_shape_ledger_comment_plus_two_line_assert():
+    """union-61 (A6-1 vs A3-1a): each side adds its own ledger comment above
+    the assert and bumps BOTH the assert and the message line.  Refused before
+    the message-line regexes existed; now the numbers agree on all sides and
+    the block is a both-side comment insertion."""
+    with tempfile.TemporaryDirectory() as tmp:
+        r, base = base_repo(tmp)
+        git(r.d, "checkout", "-q", "-b", "ours")
+        r.write(PM, pm(502, 214, 248, 118, ['("GET", "/a")', '("GET", "/x1")', '("GET", "/x2")'],
+                       ledger="    # 212 -> 214: A6-1 adds two legal routes.\n"))
+        ours = r.commit("ours")
+        git(r.d, "checkout", "-q", "-b", "theirs", base)
+        r.write(PM, pm(501, 213, 247, 118, ['("GET", "/a")', '("GET", "/y")'],
+                       ledger="    # 212 -> 213: A3-1a adds PUT states.\n"))
+        theirs = r.commit("theirs")
+        git(r.d, "checkout", "-q", "ours")
+        rc, _, _ = sh(r.d, "merge", "--no-ff", "--no-edit", "-m", "u", theirs)
+        assert rc != 0
+        done = vpmerge.resolve_merge(gitfn, r.d, ours, theirs)
+        assert PM in done, done
+        p = (r.d / PM).read_text()
+        assert "<<<<<<<" not in p
+        assert vpmerge.numbers(PM, p) == [[503, 503], [215], [249], [118], [215], [249], [118]], p
+        assert "A6-1 adds two legal routes" in p and "A3-1a adds PUT states" in p
+        assert p.index("A6-1 adds") < p.index("A3-1a adds")
 
 
 def test_identical_bumps_merged_clean_by_git_are_resummed():

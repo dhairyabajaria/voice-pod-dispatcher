@@ -46,6 +46,11 @@ SPECS = {
         re.compile(r"assert len\(_VIEWER_REFUSED\) == (\d+)"),
         re.compile(r"assert len\(_COOKIE_WRITES\) == (\d+)"),
         re.compile(r"assert len\(_ADMIN_ROUTES\) == (\d+)"),
+        # the same counts again on the assert messages' second line (union-61:
+        # the message line kept the conflict alive after the assert was summed)
+        re.compile(r"set; the reviewed permission matrix contains (\d+)"),
+        re.compile(r"reviewed CSRF matrix contains (\d+)"),
+        re.compile(r"route inventory contains (\d+)"),
     ],
     "platform/tests/test_capability_contract.py": [
         re.compile(r"assert len\(gated\) == (\d+)"),
