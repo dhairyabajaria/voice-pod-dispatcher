@@ -400,6 +400,16 @@ first-run-validation on every pushed branch; (4) a full suite is 8 shards on
 2-vCPU mediums against a 10-core M5 -- measure one before believing it
 relieves the box.  Turning it on is a roster edit (hot-reloaded).
 
+### Skipped is not red (pipeline 206, 2026-09-14)
+
+`vpcircle.poll` kept every `tests` entry with `result != success`; pytest's
+junit also reports `skipped` (and xfail as skipped), so the first real
+off-box proof handed the builder 269 failed nodes for 14 real failures
+(238 of them `test_vendor_opacity.py` skips).  `poll` now keeps only
+`failure`/`error` (`RED_RESULTS`) and `circle_failed_nodes` drops anything
+else it is handed.  Tests: `test_poll_ends_when_all_workflows_terminal`,
+`test_circle_failed_nodes_maps_classname_when_file_is_missing`.
+
 ## Box shared memory (D69) — `vpproof.py`
 
 macOS `kern.sysv.shmmni` is 32.  Every killed xdist worker / test-postgres

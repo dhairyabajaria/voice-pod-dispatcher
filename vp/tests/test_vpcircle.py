@@ -234,6 +234,8 @@ class PollTests(unittest.TestCase):
                 return 0, json.dumps({"items": [
                     {"name": "test_x", "result": "failure"},
                     {"name": "test_y", "result": "success"},
+                    {"name": "test_z", "result": "skipped"},
+                    {"name": "test_w", "result": "error"},
                 ]}), ""
             raise AssertionError(f"unexpected path {path}")
 
@@ -248,8 +250,9 @@ class PollTests(unittest.TestCase):
         self.assertEqual(result["pipeline_id"], "pipe-1")
         self.assertEqual(len(result["jobs"]), 2)
         self.assertIn(42, result["failed_tests"])
-        self.assertEqual(len(result["failed_tests"][42]), 1)
-        self.assertEqual(result["failed_tests"][42][0]["name"], "test_x")
+        # skipped is not red (pipeline 206: 255 skips were counted as reds)
+        self.assertEqual([t["name"] for t in result["failed_tests"][42]],
+                         ["test_x", "test_w"])
 
     def test_poll_raises_timeout_error_past_deadline(self):
         def handler(account, path, argv):

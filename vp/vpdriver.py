@@ -163,6 +163,8 @@ def circle_failed_nodes(failed_tests):
     nodes, errors = set(), {}
     for _job, items in (failed_tests or {}).items():
         for t in items or []:
+            if str(t.get("result") or "failure") not in ("failure", "error"):
+                continue        # skipped/success never become nodes (belt and braces)
             name = str(t.get("name") or "").strip()
             path = str(t.get("file") or "").strip()
             cls = str(t.get("classname") or "").strip()

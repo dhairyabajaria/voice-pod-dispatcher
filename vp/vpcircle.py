@@ -14,7 +14,7 @@ SPEC.md Sec. "CircleCI bridge (vpcircle.py)":
       pipeline -> workflows (api/v2/pipeline/<id>/workflow) -> jobs
       (api/v2/workflow/<wid>/job); for each failed job with a job_number,
       fetch api/v2/project/<slug>/<job_number>/tests and keep only entries
-      with result != success.
+      with result failure or error (never skipped).
   classify(jobs, failed_tests) -> {"status": ..., "reds": [...]}
       FAIL_PRODUCT: >=1 job failed with >=1 failed test.
       FAIL_INFRA:   a job failed with zero failed tests, or a job's status
@@ -135,6 +135,9 @@ def project_visible(runner=None, account=None):
     if result.returncode != 0:
         return False, f"account {acct} cannot read project {SLUG}: {text[:200]}"
     return True, acct
+
+
+RED_RESULTS = ("failure", "error")
 
 
 def _looks_like_credit_error(text):
@@ -269,8 +272,13 @@ def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
                         f"api/v2/project/{SLUG}/{j['job_number']}/tests",
                     )
                     items = tests_resp.get("items", [])
+                    # pytest junit results are success | failure | error |
+                    # skipped (and CircleCI reports "skipped" for xfail).
+                    # Pipeline 206 (2026-09-14): "!= success" turned 255
+                    # skips into reds and handed the builder 269 nodes for
+                    # 14 real failures.  Only failure/error are red.
                     failed_tests[j["job_number"]] = [
-                        t for t in items if t.get("result") != "success"
+                        t for t in items if t.get("result") in RED_RESULTS
                     ]
 
             return {

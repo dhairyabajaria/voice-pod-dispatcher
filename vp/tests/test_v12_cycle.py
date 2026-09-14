@@ -711,7 +711,9 @@ def test_circle_failed_nodes_maps_classname_when_file_is_missing():
     nodes, errs = vpdriver.circle_failed_nodes({
         7: [{"file": "platform/tests/test_x.py", "name": "test_a", "message": "E1"},
             {"classname": "platform.tests.test_y.TestFoo", "name": "test_b"},
-            {"classname": "agent.tests.test_z", "name": "test_c", "message": ""}]})
+            {"classname": "agent.tests.test_z", "name": "test_c", "message": ""},
+            {"file": "platform/tests/test_x.py", "name": "test_skip", "result": "skipped"},
+            {"file": "platform/tests/test_x.py", "name": "test_ok", "result": "success"}]})
     assert nodes == ["agent/tests/test_z.py::test_c", "platform/tests/test_x.py::test_a",
                      "platform/tests/test_y.py::TestFoo::test_b"], nodes
     assert errs == {"platform/tests/test_x.py::test_a": "E1"}, errs
