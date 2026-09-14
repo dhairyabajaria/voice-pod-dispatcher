@@ -596,7 +596,7 @@ class FakeCircle(object):
 def circle_env(tmp):
     env = Env(tmp)
     env.roster["proof"] = {"union_kind": "targeted",
-                           "circleci": {"enabled": True, "kinds": ["targeted"],
+                           "circleci": {"enabled": True, "mode": "all", "kinds": ["targeted"],
                                         "poll_interval_s": 0, "deadline_min": 1}}
     (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
     return env
@@ -1258,28 +1258,28 @@ def _route_driver(tmp, cc, box_slots=1):
     return env, drv
 
 
-def test_proof_routing_modes_off_swap_overflow_agent_and_cap():
-    """D103 routing table.  off: box.  swap (enabled, no mode): circleci for
-    the configured kinds.  overflow: box while a box slot is free, circleci
-    once it is busy.  Always box: an agent leg; a kind not in circleci.kinds;
-    the daily pipeline cap (with one CIRCLECI_DAILY_CAP alert)."""
+def test_proof_routing_modes_off_all_overflow_and_cap():
+    """D103 routing table.  enabled false: box.  enabled + mode all (alias
+    swap): circleci for the configured kinds.  enabled + no mode = overflow:
+    box while a box slot is free, circleci once it is busy.  Always box: a kind
+    not in circleci.kinds; the daily pipeline cap (one PIPELINE_CAP alert).
+    No per-kind (agent) split."""
     with tempfile.TemporaryDirectory() as tmp:
         env, drv = _route_driver(tmp, {"enabled": False})
         assert drv._route_proof("targeted", ["platform"], {})[0] == "box"
-        assert drv._route_proof("targeted", ["platform"], {"enabled": False})[0] == "box"
-        swap = {"enabled": True, "kinds": ["targeted"]}
-        assert drv._route_proof("targeted", ["platform"], swap) == ("circleci", "mode swap")
-        assert drv._route_proof("full", ["platform"], swap)[0] == "box"          # kind filter
-        assert drv._route_proof("targeted", ["platform", "agent"], swap)[0] == "box"  # agent leg
-        ov = {"mode": "overflow", "kinds": ["targeted"]}
+        assert drv._route_proof("targeted", ["platform"], {"enabled": False, "mode": "all"})[0] == "box"
+        al = {"enabled": True, "mode": "all", "kinds": ["targeted"]}
+        assert drv._route_proof("targeted", ["platform"], al) == ("circleci", "mode all")
+        assert drv._route_proof("targeted", ["platform", "agent"], al)[0] == "circleci"
+        assert drv._route_proof("targeted", ["platform"], dict(al, mode="swap"))[0] == "circleci"
+        assert drv._route_proof("full", ["platform"], al)[0] == "box"          # kind filter
+        ov = {"enabled": True, "kinds": ["targeted"]}                           # default overflow
         where, why = drv._route_proof("targeted", ["platform"], ov)
         assert where == "box" and "slot free" in why, (where, why)
         drv._box_active = 1
         where, why = drv._route_proof("targeted", ["platform"], ov)
         assert where == "circleci" and "box busy" in why, (where, why)
-        assert drv._route_proof("targeted", ["platform", "agent"], ov)[0] == "box"
-        # "off" wins even with enabled true
-        assert drv._route_proof("targeted", ["platform"], {"enabled": True, "mode": "off"})[0] == "box"
+        assert drv._route_proof("targeted", ["agent"], ov)[0] == "circleci"
         # daily cap: two pipelines noted today, cap 2 -> box + one alert
         drv._note_pipeline("proof-1", "pl-a", "3", "a" * 40)
         drv._note_pipeline("proof-2", "pl-b", "3", "b" * 40)
@@ -1289,7 +1289,7 @@ def test_proof_routing_modes_off_swap_overflow_agent_and_cap():
         assert where == "box" and "daily cap" in why, (where, why)
         drv._route_proof("targeted", ["platform"], capped)
         alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
-        assert alerts.count("CIRCLECI_DAILY_CAP") == 1, alerts
+        assert alerts.count("PIPELINE_CAP") == 1, alerts
         # a line from another day does not count
         p = env.run_root / "proofs" / "circleci-pipelines.jsonl"
         p.write_text(p.read_text() + json.dumps({"ts": "2000-01-01T00:00:00Z", "proof": "x",
@@ -1305,7 +1305,7 @@ def test_overflow_sends_the_proof_off_box_only_while_the_box_is_busy():
     needs the real vpproof harness)."""
     with tempfile.TemporaryDirectory() as tmp:
         env = circle_env(tmp)
-        env.roster["proof"]["circleci"] = {"mode": "overflow", "kinds": ["targeted"],
+        env.roster["proof"]["circleci"] = {"enabled": True, "kinds": ["targeted"],
                                            "poll_interval_s": 0, "deadline_min": 1}
         (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
         os.environ.update(env.env)
@@ -1349,6 +1349,96 @@ def test_chain_is_off_at_max_unions_in_flight_one():
         drv.hold["union-1"].set()
         assert pump_fast(drv, 80, lambda: "union-2" in _unions(drv))
         assert _unions(drv)["union-2"]["base_sha"] == _unions(drv)["union-1"]["union_sha"]
+
+
+def _floor_env(tmp):
+    """Trunk with a fake platform venv python, a fake
+    scripts/ci_collection_floor.py whose `rebaseline` rewrites the suite's
+    collected count to the number of test files, and a baseline file."""
+    env = Env(tmp)
+    venv_bin = env.trunk / "platform" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    os.symlink(sys.executable, str(venv_bin / "python"))
+    (env.trunk / "scripts").mkdir()
+    (env.trunk / "scripts" / "ci_collection_floor.py").write_text(
+        "import json, sys, glob\n"
+        "a = sys.argv\n"
+        "assert a[1] == 'rebaseline', a\n"
+        "suite = a[a.index('--suite') + 1]; f = a[a.index('--baseline-file') + 1]\n"
+        "d = json.load(open(f))\n"
+        "n = sum(open(p).read().count('def test_') for p in glob.glob('platform/tests/test_*.py')) if suite == 'platform' else 0\n"
+        "d['suites'].setdefault(suite, {})['collected'] = n\n"
+        "d['suites'][suite]['measured_commit'] = 'rebaselined'\n"
+        "json.dump(d, open(f, 'w'), indent=2)\n")
+    (env.trunk / "platform" / "tests" / "collection_baseline.json").write_text(json.dumps(
+        {"growth_band_percent": 1, "suites": {"platform": {"collected": 0, "measured_commit": "old"}}},
+        indent=2))
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "floor tooling")
+    env.base = git(env.trunk, "rev-parse", "HEAD")
+    env.roster["proof"]["floor_rebaseline"] = True
+    env.roster["proof"]["floor_suites"] = ["platform"]
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    os.environ.update(env.env)
+    env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+    return env
+
+
+builder_adds_test_file = builder_ok      # builder_ok adds test_hi to test_hello.py
+
+
+def builder_touches_no_tests(spec):
+    """Same as builder_ok but leaves platform/tests untouched (edits only hello.py)."""
+    wt = Path(spec.cwd)
+    (wt / "platform" / "hello.py").write_text('def hello():\n    return "hi"\n')
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "--allow-empty", "-m", "hi")
+    head = git(wt, "rev-parse", "HEAD")
+    base = (wt / ".vp" / "BASE").read_text().strip()
+    rec = {"item": spec.item, "attempt": 1, "commit": head, "base": base,
+           "diff_stat": {"files": 1, "insertions": 1, "deletions": 1},
+           "checks": [{"name": "pytest", "command": "pytest platform/tests/test_hello.py",
+                       "exit": 0, "log": "1 passed"}],
+           "disputes": [], "blocked": None, "notes": ""}
+    Path(spec.out_path).write_text(json.dumps(rec))
+    return TurnOutcome(STATUS_DONE, "", record_path=spec.out_path, runner="fake")
+
+
+def test_union_rebaselines_the_collection_floor_when_tests_change():
+    """FLOOR-01 hook: a union that adds a test leaves a fresh, committed
+    baseline (collected 0 -> 1, measured_commit rewritten) on the union sha;
+    the union note says so."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _floor_env(tmp)
+        env.add_item("M-F1")
+        drv = make_driver(env, [builder_adds_test_file], [junior_pass_fence], [senior_approve],
+                          [final_approve])
+        pump(drv)
+        row = env.item("M-F1")
+        assert row["status"] == "APPROVED", (row["status"], row.get("note"))
+        u = drv.store.unions()[0]
+        text = git(Path(u["worktree"]), "show", "%s:platform/tests/collection_baseline.json" % u["union_sha"])
+        d = json.loads(text)
+        assert d["suites"]["platform"] == {"collected": 1, "measured_commit": "rebaselined"}, d
+        log = (env.run_root / "driver.log").read_text()
+        assert "union-1 integrator re-baselined collection floors" in log, log[-600:]
+        subject = git(Path(u["worktree"]), "log", "-1", "--format=%s", u["union_sha"])
+        assert "re-baseline collection floors (integrator)" in subject, subject
+
+
+def test_union_leaves_the_baseline_alone_when_no_tests_change():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _floor_env(tmp)
+        env.add_item("M-F2")
+        drv = make_driver(env, [builder_touches_no_tests], [junior_pass_fence], [senior_approve],
+                          [final_approve])
+        pump(drv)
+        row = env.item("M-F2")
+        assert row["status"] == "APPROVED", (row["status"], row.get("note"))
+        u = drv.store.unions()[0]
+        text = git(Path(u["worktree"]), "show", "%s:platform/tests/collection_baseline.json" % u["union_sha"])
+        assert json.loads(text)["suites"]["platform"]["measured_commit"] == "old", text
+        assert "re-baselined" not in (env.run_root / "driver.log").read_text()
 
 
 def test_fence_extraction():

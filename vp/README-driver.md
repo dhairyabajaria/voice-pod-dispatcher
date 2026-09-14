@@ -448,31 +448,45 @@ grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
   true}`, and REVIEW_REQUEST.json carries `unverified_ids` for the senior to
   decide.  A record with any FAIL line reworks exactly as before.
 
-## Proof routing: off / swap / overflow + daily cap (D103)
+## Proof routing: overflow / all + daily cap (D103)
 
-`proof.circleci.mode`:
-- `off` (default; also `enabled: false` with no mode): every proof on the box.
-- `swap` (`enabled: true` with no mode — the trial adapter): every proof whose
-  kind is in `proof.circleci.kinds` goes off-box; the box idles.
-- `overflow`: the box takes the proof when a box slot is free
+`proof.circleci.enabled` is the master switch (false: every proof on the
+box).  When enabled, `proof.circleci.mode`:
+- `overflow` (default): the box takes the proof when a box slot is free
   (`proof.box_slots`, default 1), otherwise CircleCI.  Real parallelism needs
   `concurrency.max_proofs_in_flight` > `box_slots` (3 = 1 box + 2 CircleCI).
+- `all` (alias `swap` — the trial adapter): every proof whose kind is in
+  `proof.circleci.kinds` goes off-box; the box idles.
 
-Always box, in every mode: a union carrying an item whose own `proof_kind`
-is `agent` (the CI image lacks the agent venv; the agent test in
-`UNION_ALWAYS_PATHS` does not count or nothing would ever leave the box); a
-kind not in `circleci.kinds`; docs-only proofs (already PASS without a run).
+Always box: a kind not in `circleci.kinds`; docs-only proofs (already PASS
+without a run).  No per-kind split beyond that (ruling: CI runs the agent
+job itself; the platform test that shells out to agent/.venv is CI-IMAGE-01).
 
-`proof.circleci.max_pipelines_per_day` (default 60): pipelines this driver
+`proof.circleci.max_pipelines_per_day` (default 40): pipelines this driver
 triggered today (UTC) come from the append-only ledger
 `RUN_ROOT/proofs/circleci-pipelines.jsonl` (one line per trigger, survives
-restarts).  Past the cap the proof runs on the box and the owner gets one
-`CIRCLECI_DAILY_CAP` alert per day.  The route decision is logged:
+restarts).  Past the cap the proof falls back to the box and the owner gets
+one `PIPELINE_CAP` alert per day — this is the routine-mode safety instead of
+a flip-off watcher.  The route decision is logged:
 `PROOF <item> <proof> route=circleci (overflow: box busy (1/1))`.
 
-Tests: `test_proof_routing_modes_off_swap_overflow_agent_and_cap` (table),
+Tests: `test_proof_routing_modes_off_all_overflow_and_cap` (table),
 `test_overflow_sends_the_proof_off_box_only_while_the_box_is_busy` (real
 `run_proof_circleci` with the box slot held).
+
+### Collection-floor rebaseline on the union (FLOOR-01 hook)
+
+Behind roster `proof.floor_rebaseline: true` (default off; turn on once
+FLOOR-01's `scripts/ci_collection_floor.py rebaseline` is on trunk).  After
+the registry writer, when the union diff against its base touches any
+`tests/` path, `build_union` runs `rebaseline --suite S --baseline-file
+platform/tests/collection_baseline.json` for each of `proof.floor_suites`
+(default platform, agent, portal; the driver's env puts Node 22 first) and
+commits the delta as the integrator ("union-N: re-baseline collection floors
+(integrator)").  A failure is a `FLOOR_REBASELINE_FAILED` alert + note, not a
+block — the proof then reds on the floor as before.  Tests:
+`test_union_rebaselines_the_collection_floor_when_tests_change`,
+`test_union_leaves_the_baseline_alone_when_no_tests_change`.
 
 ## Speculative union chain (D83) — `concurrency.max_unions_in_flight > 1`
 

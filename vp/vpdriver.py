@@ -1855,6 +1855,9 @@ class Driver(object):
             self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
             self.git(["-C", str(self.trunk), "branch", "-D", branch])
             return None
+        floor_note = self._rebaseline_union_floors(wt, no, base)
+        if floor_note:
+            regen_note = "; ".join(x for x in (regen_note, floor_note) if x)
         union_sha = self.head_sha(wt)
         uid = self.store.union_record(merged, union_sha, base, wt, branch, note=regen_note)
         self._last_union_mono = time.monotonic()
@@ -1924,6 +1927,54 @@ class Driver(object):
                                   % (",".join(changed), (err or out).strip()[:200]))
         self.log("UNION union-%d integrator regenerated %s" % (no, ",".join(changed)))
         return "integrator regenerated %s" % ",".join(changed)
+
+    FLOOR_SUITES = ("platform", "agent", "portal")
+    FLOOR_BASELINE = "platform/tests/collection_baseline.json"
+
+    def _rebaseline_union_floors(self, wt, no, base):
+        """FLOOR-01 (D103 §4): the collected-test floor is a property of the
+        merged tree, like the registry.  Behind roster proof.floor_rebaseline
+        (default off).  When the union diff against its base touches any
+        tests/ path, run the gate's own rebaseline for each suite
+        (`scripts/ci_collection_floor.py rebaseline --suite S --baseline-file F`,
+        integrator-run, never a CI check) and commit the delta as the
+        integrator.  A failure is a note + FLOOR_REBASELINE_FAILED alert, not a
+        block: the proof then reds on the floor, which is the old behaviour."""
+        if not self.proof_cfg.get("floor_rebaseline"):
+            return None
+        rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "%s..HEAD" % base])
+        if rc != 0 or not any("/tests/" in l or l.startswith("tests/") for l in out.splitlines()):
+            return None
+        py = wt / "platform" / ".venv" / "bin" / "python"
+        script = wt / "scripts" / "ci_collection_floor.py"
+        if not (py.exists() and script.exists()):
+            return None
+        for suite in self.proof_cfg.get("floor_suites") or self.FLOOR_SUITES:
+            rc, out, err = self.exec.run([str(py), str(script), "rebaseline", "--suite", suite,
+                                          "--baseline-file", self.FLOOR_BASELINE],
+                                         env=self.exec.env_for(), cwd=str(wt), timeout_s=900)
+            if rc != 0:
+                self.log("UNION union-%d floor rebaseline %s rc=%s: %s"
+                         % (no, suite, rc, (err or out)[-200:]))
+                self.store.alert("FLOOR_REBASELINE_FAILED",
+                                 "union-%d: collection floor rebaseline for %s failed rc=%s; "
+                                 "the proof runs on the old baseline: %s"
+                                 % (no, suite, rc, (err or out)[-200:]))
+                return "floor rebaseline %s failed rc=%s" % (suite, rc)
+        rc, out, _ = self.git(["-C", str(wt), "status", "--porcelain", "--", self.FLOOR_BASELINE])
+        if not out.strip():
+            return None
+        self.git(["-C", str(wt), "add", "--", self.FLOOR_BASELINE])
+        rc, out, err = self.git(["-C", str(wt), "commit", "-q", "-m",
+                                 "union-%d: re-baseline collection floors (integrator)" % no])
+        if rc != 0:
+            self.log("UNION union-%d floor baseline commit failed: %s" % (no, (err or out)[:200]))
+            self.store.alert("FLOOR_REBASELINE_FAILED",
+                             "union-%d: fresh collection baseline could not be committed: %s"
+                             % (no, (err or out)[:200]))
+            return "floor baseline commit failed"
+        self.log("UNION union-%d integrator re-baselined collection floors" % no)
+        return "integrator re-baselined collection floors"
 
     def _migration_collision(self, wt, base):
         rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "--diff-filter=A",
@@ -2004,25 +2055,26 @@ class Driver(object):
 
     # -- proof routing (D103) -----------------------------------------------------
     #
-    # roster proof.circleci.mode:
-    #   "off"      (default, or enabled false and no mode)  every proof on the box
-    #   "swap"     (enabled true and no mode: the trial adapter)  every proof whose
-    #              kind is in proof.circleci.kinds goes off-box; the box idles
-    #   "overflow" the box takes a proof when it has a free box slot
+    # roster proof.circleci.enabled is the master switch (false: every proof on
+    # the box).  proof.circleci.mode, when enabled:
+    #   "overflow" (default) the box takes a proof when it has a free box slot
     #              (proof.box_slots, default 1); otherwise CircleCI.  Real
     #              parallelism: max_proofs_in_flight must be > box_slots.
-    # In every mode: a proof carrying an agent-KIND ITEM stays on the box until
-    # the CI image carries the agent venv (pipeline 206: 255 skips "agent
-    # interpreter not present"); the agent test in UNION_ALWAYS_PATHS does not
-    # count, or nothing would ever leave the box.  And
-    # proof.circleci.max_pipelines_per_day (default 60) is a hard cap -- past it
-    # the proof runs on the box and the owner is alerted once per day.
+    #   "all"      (alias "swap": the trial adapter)  every proof whose kind is
+    #              in proof.circleci.kinds goes off-box; the box idles.
+    # No per-kind split beyond circleci.kinds (D103 ruling: CI runs the agent
+    # job itself; the one platform test that shells out to agent/.venv is
+    # CI-IMAGE-01).  proof.circleci.max_pipelines_per_day (default 40) is the
+    # hard cap in routine mode -- past it the proof falls back to the box and
+    # the owner gets one PIPELINE_CAP alert per UTC day.
 
     def _circle_mode(self, cc):
-        mode = cc.get("mode")
-        if mode in ("off", "swap", "overflow"):
-            return mode
-        return "swap" if cc.get("enabled") else "off"
+        if not cc.get("enabled"):
+            return "off"
+        mode = cc.get("mode") or "overflow"
+        if mode == "swap":
+            mode = "all"
+        return mode if mode in ("all", "overflow") else "overflow"
 
     def _pipelines_today(self):
         """Pipelines this driver triggered today (UTC), from the append-only
@@ -2046,25 +2098,24 @@ class Driver(object):
                                  "sha": cand}) + "\n")
 
     def _route_proof(self, kind, item_kinds, cc):
-        """-> ("box"|"circleci", reason).  item_kinds = the items' own proof_kind values."""
+        """-> ("box"|"circleci", reason).  item_kinds: the items' own proof_kind
+        values (logged only; no per-kind routing since the D103 ruling)."""
         mode = self._circle_mode(cc)
         if mode == "off":
             return "box", ""
         if kind not in (cc.get("kinds") or ["full"]):
             return "box", "kind %s not in circleci.kinds" % kind
-        if "agent" in item_kinds:
-            return "box", "agent-kind item stays on the box (CI image lacks the agent venv)"
-        cap = int(cc.get("max_pipelines_per_day", 60))
+        cap = int(cc.get("max_pipelines_per_day", 40))
         n = self._pipelines_today()
         if n >= cap:
             day = time.strftime("%Y-%m-%d", time.gmtime())
-            self.alert_once("circleci-cap-%s" % day, "CIRCLECI_DAILY_CAP",
+            self.alert_once("circleci-cap-%s" % day, "PIPELINE_CAP",
                             "proof.circleci.max_pipelines_per_day=%d reached (%d today, UTC); "
-                            "proofs run on the box until midnight UTC or a roster change"
+                            "proofs fall back to the box until midnight UTC or a roster change"
                             % (cap, n))
             return "box", "daily cap %d reached (%d today)" % (cap, n)
-        if mode == "swap":
-            return "circleci", "mode swap"
+        if mode == "all":
+            return "circleci", "mode all"
         with self._lock:
             busy = self._box_active
         slots = int(self.proof_cfg.get("box_slots", 1))
