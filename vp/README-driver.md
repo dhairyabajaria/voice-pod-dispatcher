@@ -448,6 +448,32 @@ grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
   true}`, and REVIEW_REQUEST.json carries `unverified_ids` for the senior to
   decide.  A record with any FAIL line reworks exactly as before.
 
+## Proof routing: off / swap / overflow + daily cap (D103)
+
+`proof.circleci.mode`:
+- `off` (default; also `enabled: false` with no mode): every proof on the box.
+- `swap` (`enabled: true` with no mode — the trial adapter): every proof whose
+  kind is in `proof.circleci.kinds` goes off-box; the box idles.
+- `overflow`: the box takes the proof when a box slot is free
+  (`proof.box_slots`, default 1), otherwise CircleCI.  Real parallelism needs
+  `concurrency.max_proofs_in_flight` > `box_slots` (3 = 1 box + 2 CircleCI).
+
+Always box, in every mode: a union carrying an item whose own `proof_kind`
+is `agent` (the CI image lacks the agent venv; the agent test in
+`UNION_ALWAYS_PATHS` does not count or nothing would ever leave the box); a
+kind not in `circleci.kinds`; docs-only proofs (already PASS without a run).
+
+`proof.circleci.max_pipelines_per_day` (default 60): pipelines this driver
+triggered today (UTC) come from the append-only ledger
+`RUN_ROOT/proofs/circleci-pipelines.jsonl` (one line per trigger, survives
+restarts).  Past the cap the proof runs on the box and the owner gets one
+`CIRCLECI_DAILY_CAP` alert per day.  The route decision is logged:
+`PROOF <item> <proof> route=circleci (overflow: box busy (1/1))`.
+
+Tests: `test_proof_routing_modes_off_swap_overflow_agent_and_cap` (table),
+`test_overflow_sends_the_proof_off_box_only_while_the_box_is_busy` (real
+`run_proof_circleci` with the box slot held).
+
 ## Speculative union chain (D83) — `concurrency.max_unions_in_flight > 1`
 
 Owner goal (2026-09-14): off-box proofs take no box/portal lock, so several

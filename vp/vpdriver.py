@@ -534,6 +534,7 @@ class Driver(object):
         self._proof_backoff = {}
         self._proof_infra_n = {}
         self._proof_cancel = set()    # union shas whose proof result must be discarded (D83)
+        self._box_active = 0          # box proof legs running (D103 overflow routing)
         self._union_lock = threading.Lock()
         self._last_union_mono = time.monotonic()
         self._proofs_paused = False
@@ -1951,17 +1952,20 @@ class Driver(object):
         hdr = self.packet_header(rec)
         # paths grouped by proof kind: a union may carry platform + portal + deploy items
         by_kind = {}
+        item_kinds = set()          # the items' OWN proof kinds (not the always-paths)
         if union:
             by = {r["item"]: r for r in self.store.report_items()}
             for it in union["items"]:
                 h = self.packet_header(by.get(it, {}))
                 k = h.get("proof_kind") or "platform"
+                item_kinds.add(k)
                 by_kind.setdefault(k, set()).update(h.get("test_paths") or [])
             # rendered artifacts belong to the merged tree: every union proof
             # carries the registry tests (see _regenerate_union_artifacts)
             for p in (self.proof_cfg.get("union_always_paths") or UNION_ALWAYS_PATHS):
                 by_kind.setdefault(_kind_of_always_path(p), set()).add(p)
         else:
+            item_kinds.add(hdr.get("proof_kind") or "platform")
             by_kind[hdr.get("proof_kind") or "platform"] = set(hdr.get("test_paths") or [])
         by_kind = {k: sorted(v) for k, v in by_kind.items() if k != "docs" or not v}
         paths = sorted(set(p for v in by_kind.values() for p in v))
@@ -1973,12 +1977,6 @@ class Driver(object):
             return
         if not pid:
             pid = self.store.proof_request(cand, base, kind, paths)
-        cc = self.proof_cfg.get("circleci") or {}
-        if cc.get("enabled") and kind in (cc.get("kinds") or ["full"]) and \
-                any(k != "docs" for k in by_kind):
-            # off-box: the whole suite on CircleCI (workflow full-suite); the
-            # box lock is not taken, so these run in parallel with box proofs
-            return self.run_proof_circleci(rec, union, uid, pid, cand, wt, kind, paths, cc)
         run_kinds = [k for k in by_kind if k != "docs"]
         if not run_kinds:
             counts = self.run_root / "proofs" / ("%s-docs.json" % pid)
@@ -1986,6 +1984,96 @@ class Driver(object):
             counts.write_text(json.dumps({"reason": "docs: no proof"}), encoding="utf-8")
             self.store.proof_record(pid, "PASS", counts)
             return
+        cc = self.proof_cfg.get("circleci") or {}
+        where, why = self._route_proof(kind, sorted(item_kinds), cc)
+        if where == "circleci":
+            # off-box: the whole suite on CircleCI (workflow full-suite); the
+            # box lock is not taken, so these run in parallel with box proofs
+            self.log("PROOF %s %s route=circleci (%s)" % (item, pid, why))
+            return self.run_proof_circleci(rec, union, uid, pid, cand, wt, kind, paths, cc)
+        if why:
+            self.log("PROOF %s %s route=box (%s)" % (item, pid, why))
+        with self._lock:
+            self._box_active += 1
+        try:
+            return self._run_proof_box(rec, union, uid, pid, cand, wt, kind, paths, by_kind,
+                                       run_kinds, item)
+        finally:
+            with self._lock:
+                self._box_active = max(0, self._box_active - 1)
+
+    # -- proof routing (D103) -----------------------------------------------------
+    #
+    # roster proof.circleci.mode:
+    #   "off"      (default, or enabled false and no mode)  every proof on the box
+    #   "swap"     (enabled true and no mode: the trial adapter)  every proof whose
+    #              kind is in proof.circleci.kinds goes off-box; the box idles
+    #   "overflow" the box takes a proof when it has a free box slot
+    #              (proof.box_slots, default 1); otherwise CircleCI.  Real
+    #              parallelism: max_proofs_in_flight must be > box_slots.
+    # In every mode: a proof carrying an agent-KIND ITEM stays on the box until
+    # the CI image carries the agent venv (pipeline 206: 255 skips "agent
+    # interpreter not present"); the agent test in UNION_ALWAYS_PATHS does not
+    # count, or nothing would ever leave the box.  And
+    # proof.circleci.max_pipelines_per_day (default 60) is a hard cap -- past it
+    # the proof runs on the box and the owner is alerted once per day.
+
+    def _circle_mode(self, cc):
+        mode = cc.get("mode")
+        if mode in ("off", "swap", "overflow"):
+            return mode
+        return "swap" if cc.get("enabled") else "off"
+
+    def _pipelines_today(self):
+        """Pipelines this driver triggered today (UTC), from the append-only
+        ledger run_root/proofs/circleci-pipelines.jsonl (survives restarts)."""
+        p = self.run_root / "proofs" / "circleci-pipelines.jsonl"
+        if not p.exists():
+            return 0
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        n = 0
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if line.startswith('{"ts": "%s' % today):
+                n += 1
+        return n
+
+    def _note_pipeline(self, pid, pipeline_id, account, cand):
+        p = self.run_root / "proofs" / "circleci-pipelines.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                 "proof": pid, "pipeline": pipeline_id, "account": account,
+                                 "sha": cand}) + "\n")
+
+    def _route_proof(self, kind, item_kinds, cc):
+        """-> ("box"|"circleci", reason).  item_kinds = the items' own proof_kind values."""
+        mode = self._circle_mode(cc)
+        if mode == "off":
+            return "box", ""
+        if kind not in (cc.get("kinds") or ["full"]):
+            return "box", "kind %s not in circleci.kinds" % kind
+        if "agent" in item_kinds:
+            return "box", "agent-kind item stays on the box (CI image lacks the agent venv)"
+        cap = int(cc.get("max_pipelines_per_day", 60))
+        n = self._pipelines_today()
+        if n >= cap:
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            self.alert_once("circleci-cap-%s" % day, "CIRCLECI_DAILY_CAP",
+                            "proof.circleci.max_pipelines_per_day=%d reached (%d today, UTC); "
+                            "proofs run on the box until midnight UTC or a roster change"
+                            % (cap, n))
+            return "box", "daily cap %d reached (%d today)" % (cap, n)
+        if mode == "swap":
+            return "circleci", "mode swap"
+        with self._lock:
+            busy = self._box_active
+        slots = int(self.proof_cfg.get("box_slots", 1))
+        if busy < slots:
+            return "box", "overflow: box slot free (%d/%d busy)" % (busy, slots)
+        return "circleci", "overflow: box busy (%d/%d)" % (busy, slots)
+
+    def _run_proof_box(self, rec, union, uid, pid, cand, wt, kind, paths, by_kind, run_kinds,
+                       item):
         threading.current_thread().name = "vp-proof-%s" % cand
         self.log("PROOF %s %s %s kinds=%s paths=%d" % (item, pid, cand[:12],
                                                        ",".join(run_kinds), len(paths)))
@@ -2107,6 +2195,7 @@ class Driver(object):
                 vpcircle.push_branch(wt, branch, runner)
                 trig = vpcircle.trigger(branch, {param: True}, runner, cc.get("account"))
                 pipeline_id, account = trig["pipeline_id"], trig["account"]
+                self._note_pipeline(pid, pipeline_id, account, cand)
                 self.store.proof_record(pid, "RUNNING", pipeline_id=pipeline_id)
                 self.log("PROOF %s %s circleci pipeline %s (account %s)"
                          % (item, pid, pipeline_id, account))

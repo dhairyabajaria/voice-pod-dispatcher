@@ -1248,6 +1248,83 @@ def test_chain_cancel_aborts_a_running_circleci_proof():
         assert any("--delete" in c for c in fake.git_calls), fake.git_calls
 
 
+def _route_driver(tmp, cc, box_slots=1):
+    env = Env(tmp)
+    env.roster["proof"] = {"union_kind": "targeted", "box_slots": box_slots, "circleci": cc}
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    os.environ.update(env.env)
+    env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+    drv = make_driver(env, [], [], [], [], driver_cls=vpdriver.Driver)
+    return env, drv
+
+
+def test_proof_routing_modes_off_swap_overflow_agent_and_cap():
+    """D103 routing table.  off: box.  swap (enabled, no mode): circleci for
+    the configured kinds.  overflow: box while a box slot is free, circleci
+    once it is busy.  Always box: an agent leg; a kind not in circleci.kinds;
+    the daily pipeline cap (with one CIRCLECI_DAILY_CAP alert)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, drv = _route_driver(tmp, {"enabled": False})
+        assert drv._route_proof("targeted", ["platform"], {})[0] == "box"
+        assert drv._route_proof("targeted", ["platform"], {"enabled": False})[0] == "box"
+        swap = {"enabled": True, "kinds": ["targeted"]}
+        assert drv._route_proof("targeted", ["platform"], swap) == ("circleci", "mode swap")
+        assert drv._route_proof("full", ["platform"], swap)[0] == "box"          # kind filter
+        assert drv._route_proof("targeted", ["platform", "agent"], swap)[0] == "box"  # agent leg
+        ov = {"mode": "overflow", "kinds": ["targeted"]}
+        where, why = drv._route_proof("targeted", ["platform"], ov)
+        assert where == "box" and "slot free" in why, (where, why)
+        drv._box_active = 1
+        where, why = drv._route_proof("targeted", ["platform"], ov)
+        assert where == "circleci" and "box busy" in why, (where, why)
+        assert drv._route_proof("targeted", ["platform", "agent"], ov)[0] == "box"
+        # "off" wins even with enabled true
+        assert drv._route_proof("targeted", ["platform"], {"enabled": True, "mode": "off"})[0] == "box"
+        # daily cap: two pipelines noted today, cap 2 -> box + one alert
+        drv._note_pipeline("proof-1", "pl-a", "3", "a" * 40)
+        drv._note_pipeline("proof-2", "pl-b", "3", "b" * 40)
+        assert drv._pipelines_today() == 2
+        capped = dict(ov, max_pipelines_per_day=2)
+        where, why = drv._route_proof("targeted", ["platform"], capped)
+        assert where == "box" and "daily cap" in why, (where, why)
+        drv._route_proof("targeted", ["platform"], capped)
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert alerts.count("CIRCLECI_DAILY_CAP") == 1, alerts
+        # a line from another day does not count
+        p = env.run_root / "proofs" / "circleci-pipelines.jsonl"
+        p.write_text(p.read_text() + json.dumps({"ts": "2000-01-01T00:00:00Z", "proof": "x",
+                                                 "pipeline": "y"}) + "\n")
+        assert drv._pipelines_today() == 2
+
+
+def test_overflow_sends_the_proof_off_box_only_while_the_box_is_busy():
+    """Cycle: overflow mode, box slot held -> the real run_proof_circleci path
+    fires (FakeCircle sees the trigger), the pipeline is written to the daily
+    ledger, and the box counter is untouched.  With the slot free the same
+    proof is routed to the box (checked via _route_proof, since the box leg
+    needs the real vpproof harness)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        env.roster["proof"]["circleci"] = {"mode": "overflow", "kinds": ["targeted"],
+                                           "poll_interval_s": 0, "deadline_min": 1}
+        (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-OV")
+        fake = FakeCircle()
+        import vpcircle
+        runner = vpcircle.Runner(run=fake, binary="circleci-fake")
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve],
+                          [final_approve], driver_cls=vpdriver.Driver, circle_runner=runner)
+        drv._box_active = 1                      # a box proof is running elsewhere
+        assert pump_fast(drv, 80, lambda: env.item("M-OV")["status"] == "APPROVED"), env.item("M-OV")
+        assert any("pipeline/run" in " ".join(c) for c in fake.calls)
+        assert drv._pipelines_today() == 1
+        assert drv._box_active == 1              # the off-box leg never touched the box counter
+        log = (env.run_root / "driver.log").read_text()
+        assert "route=circleci (overflow: box busy (1/1))" in log, log[-600:]
+
+
 def test_chain_is_off_at_max_unions_in_flight_one():
     """At the default cap of 1 the base rule is the old one: a BUILT union is
     not a tip and no second union is built while it proves."""
