@@ -54,6 +54,7 @@ import circleaccount as _circleaccount  # noqa: E402
 
 __all__ = [
     "Runner",
+    "project_visible",
     "SLUG",
     "DEFINITION_ID",
     "ACCOUNTS",
@@ -120,6 +121,20 @@ class Runner:
         prefix, env, _identity = _circleaccount.verified_env(
             account, run=self._run, binary=self._binary)
         return self._run(prefix + command, env=env, capture_output=True, text=True)
+
+
+def project_visible(runner=None, account=None):
+    """GET api/v2/project/<slug> under `account`: (ok, detail).  A 404 here
+    means the credential is not a member of the project's org (trial
+    attempt 1: account 1 vs "Pareen Calling"), and no branch should be
+    pushed for it."""
+    runner = runner or Runner()
+    acct = account or ACCOUNTS[0]
+    result = runner.circleci_api(acct, f"api/v2/project/{SLUG}", method="GET")
+    text = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode != 0:
+        return False, f"account {acct} cannot read project {SLUG}: {text[:200]}"
+    return True, acct
 
 
 def _looks_like_credit_error(text):

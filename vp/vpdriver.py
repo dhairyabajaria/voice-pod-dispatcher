@@ -1987,6 +1987,12 @@ class Driver(object):
         status, failed, errors, counts = "UNKNOWN", [], {}, {}
         try:
             try:
+                # preflight: the chosen account must see the project BEFORE a
+                # branch is pushed (a push alone fires the project's all-pushes
+                # probe; trial attempt 1 paid that for a 404 from the wrong account)
+                ok, why = vpcircle.project_visible(runner, cc.get("account"))
+                if not ok:
+                    raise RuntimeError("preflight: %s" % why)
                 rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
                 if rc != 0:
                     raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))

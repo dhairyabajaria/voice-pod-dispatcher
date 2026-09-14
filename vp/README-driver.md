@@ -366,7 +366,12 @@ proof ran on the box under `box.lock.d`, one at a time, which is the
 ```
 
 When enabled and the proof `kind` is listed, `run_proof` routes the proof
-off-box instead of spawning vpproof: the candidate sha becomes branch
+off-box instead of spawning vpproof.  First a preflight: `GET
+api/v2/project/<slug>` under `proof.circleci.account` must succeed, or the
+proof is UNKNOWN with no push (trial attempt 1, 2026-09-14: account 1 is not
+a member of the project's org, the trigger 404'd AFTER the push, and the push
+alone fired the project's all-pushes probe; account 3 holds "Pareen Calling").
+Then the candidate sha becomes branch
 `<branch_prefix><proof-id>-<sha12>` (the branch carries `.circleci/config.yml`
 from trunk, so the config's location on `main` does not matter for API
 triggers), `vpcircle.push_branch` pushes it, `vpcircle.trigger` POSTs the

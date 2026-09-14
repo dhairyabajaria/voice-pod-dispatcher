@@ -542,7 +542,7 @@ class FakeCircle(object):
     push/delete with rc 0 (recorded).  Never a real process."""
 
     def __init__(self, workflow_status="success", jobs=None, tests=None,
-                 trigger_rc=0, trigger_body=None):
+                 trigger_rc=0, trigger_body=None, project_rc=0):
         import circleaccount as c
         self.expected = c.EXPECTED
         self.calls = []
@@ -554,6 +554,7 @@ class FakeCircle(object):
         self.tests = tests or {}
         self.trigger_rc = trigger_rc
         self.trigger_body = trigger_body
+        self.project_rc = project_rc
 
     def __call__(self, argv, **kw):
         argv = list(argv)
@@ -570,6 +571,10 @@ class FakeCircle(object):
             return cp(argv, 0, json.dumps({"id": self.expected[acct]}), "")
         if "api" in argv:
             path = argv[argv.index("api") + 1]
+            if path == "api/v2/project/" + __import__("vpcircle").SLUG:
+                if self.project_rc:
+                    return cp(argv, self.project_rc, "", "error: GET /api/v2/project/x: 404 Not Found")
+                return cp(argv, 0, json.dumps({"slug": path.split("project/")[1], "name": "voice-pod-NEW"}), "")
             if path.endswith("/pipeline/run"):
                 if self.trigger_rc:
                     return cp(argv, self.trigger_rc, "", self.trigger_body or "boom")
@@ -677,6 +682,29 @@ def test_circleci_trigger_failure_is_unknown_with_backoff_not_findings():
         assert row["status"] in ("PREPARED", "PROOF_PENDING"), row["status"]   # backoff, no findings
         assert not (Path(row["worktree"]) / ".vp" / "FINDINGS.json").read_text().count("P-0")
         assert any("--delete" in a for a in fake.git_calls), fake.git_calls   # branch cleaned up
+
+
+def test_circleci_preflight_refuses_before_any_push_when_account_cannot_see_project():
+    """Trial attempt 1: account 1 got 404 on the trigger AFTER the branch was
+    pushed (and the push fired the all-pushes probe).  Now the project is read
+    first; a 404 means UNKNOWN with no git push at all."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-C4")
+        import vpcircle
+        fake = FakeCircle(project_rc=4)
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [],
+                          driver_cls=vpdriver.Driver,
+                          circle_runner=vpcircle.Runner(run=fake, binary="circleci-fake"))
+        pump(drv, 30)
+        st = vpstore.Store(str(env.run_root))
+        proofs = [dict(r) for r in st.q("SELECT * FROM proof ORDER BY proof_id")]
+        assert proofs and proofs[0]["status"] == "UNKNOWN", proofs
+        reason = json.loads(proofs[0]["counts"])["reason"]
+        assert "preflight" in reason and "cannot read project" in reason, reason
+        assert not [a for a in fake.git_calls if "push" in a and "--delete" not in a], fake.git_calls
 
 
 def test_circle_failed_nodes_maps_classname_when_file_is_missing():
