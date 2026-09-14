@@ -511,6 +511,7 @@ class Driver(object):
         self._threads = []
         self._fail = {}
         self._unknown_rerun = {}      # item -> (rev, commit) already re-graded once
+        self._delivery_failed = set() # items whose last DONE turn struck at delivery
         self._stopping = False
         self._stop_started = None
         self._abort = threading.Event()
@@ -882,6 +883,8 @@ class Driver(object):
                     break
             if not ok:
                 continue
+            if not self._deps_in_base(r, hdr, deps, by_item):
+                continue
             group = hdr.get("group") or r.get("group_no")
             if group is None:
                 continue
@@ -902,6 +905,34 @@ class Driver(object):
                     self._alerted.add(key_)
                     self.log("assign refused %s: %s" % (r["item"], json.dumps(data)[:200]))
         return n
+
+    def _deps_in_base(self, r, hdr, deps, by_item):
+        """D75: a packet whose base_sha predates a PROMOTED/APPROVED
+        dependency's candidate sends the builder into a precondition STOP
+        (A3-3 looped six times).  Refuse to assign, alert DEP_BASE_STALE
+        once per (item, dep, base); the orchestrator re-bases by hand with a
+        BASE NOTE (packets carry measured line numbers and counts, so an
+        automatic base swap would only move the staleness into the literals)."""
+        base = str(hdr.get("base_sha") or r.get("base_sha") or "")
+        if not base:
+            return True
+        for d in deps:
+            cand = (by_item.get(d) or {}).get("candidate_sha")
+            if not cand:
+                continue
+            rc, _out, err = self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor",
+                                      cand, base])
+            if rc == 0:
+                continue
+            if rc != 1:
+                self.log("dep base check %s/%s rc=%s: %s" % (r["item"], d, rc, (err or "")[:120]))
+                continue
+            self.alert_once("dep-base:%s:%s:%s" % (r["item"], d, base[:12]), "DEP_BASE_STALE",
+                            "%s: packet base %s does not contain %s's candidate %s; not "
+                            "assigning -- re-base the packet (BASE NOTE) and re-submit"
+                            % (r["item"], base[:12], d, cand[:12]))
+            return False
+        return True
 
     # -- the tick -------------------------------------------------------------
 
@@ -1108,8 +1139,13 @@ class Driver(object):
                 self.run_proof(rec)
                 self.clear_item_failures(item)
             else:
+                self._delivery_failed.discard(item)
                 out = self.run_turn(rec, role, server, runner)
-                if out is not None and out.status == STATUS_DONE:
+                # a DONE turn whose delivery struck (no commit, invalid record)
+                # must keep its count, or three strikes never arrive (A3-3
+                # looped on 1/3 for six attempts)
+                if out is not None and out.status == STATUS_DONE and \
+                        item not in self._delivery_failed:
                     self.clear_item_failures(item)
         except Exception as exc:          # never kill the daemon
             try:
@@ -1437,17 +1473,30 @@ class Driver(object):
     def _deliver(self, rec, role, wt, record, attempt_id, outcome):
         item = rec["item"]
         if role in ("builder", "infra"):
-            commit = None
+            commit, blocked = None, None
             try:
-                commit = json.loads(record.read_text(encoding="utf-8")).get("commit")
+                doc = json.loads(record.read_text(encoding="utf-8"))
+                commit = doc.get("commit")
+                blocked = doc.get("blocked")
             except (OSError, ValueError):
                 commit = None
             head = self.head_sha(wt)
+            if blocked and (not head or head == rec.get("base_sha")):
+                # the packet told the builder to STOP (a precondition on its
+                # base failed): that is a packet/base problem for the
+                # orchestrator, not a retry (A3-3: six identical attempts)
+                self._delivery_failed.add(item)
+                self.store.block(item, "builder blocked: %s" % str(blocked)[:300])
+                self.store.alert("BUILDER_BLOCKED", "%s: the builder stopped as the packet "
+                                 "instructs: %s -- fix the packet/base and unblock"
+                                 % (item, str(blocked)[:200]), item)
+                self.log("BLOCKED %s builder: %s" % (item, str(blocked)[:200]))
+                return
             if commit and head and not head.startswith(commit) and not commit.startswith(head):
                 self.log("RESULT commit %s != HEAD %s; using HEAD" % (commit, head))
             commit = head or commit
             if not commit or commit == rec.get("base_sha"):
-                self.store.turn_end  # (already ended) -- no diff: treat as empty
+                self._delivery_failed.add(item)
                 self.note_item_failure(item, rec.get("rev"), "builder produced no commit",
                                        attempt_id, kind="RUNNER_EMPTY")
                 return
@@ -1463,6 +1512,7 @@ class Driver(object):
             lint = vplint.lint_findings(record, wt / ".vp" / "BENCHMARK.md", wt)
             errs = [l for l in lint if l.startswith("ERROR")]
             if errs:
+                self._delivery_failed.add(item)
                 self.store.escalate("RECORD_INVALID", item, attempt_id, "; ".join(errs)[:400])
                 self.note_item_failure(item, rec.get("rev"), "findings invalid: %s"
                                        % "; ".join(errs)[:300], attempt_id, kind="RECORD_INVALID")
@@ -1513,6 +1563,7 @@ class Driver(object):
         lint = vplint.lint_review(record, wt / ".vp" / "BENCHMARK.md")
         errs = [l for l in lint if l.startswith("ERROR")]
         if errs:
+            self._delivery_failed.add(item)
             self.store.escalate("RECORD_INVALID", item, attempt_id, "; ".join(errs)[:400])
             self.note_item_failure(item, rec.get("rev"), "review invalid: %s"
                                    % "; ".join(errs)[:300], attempt_id, kind="RECORD_INVALID")

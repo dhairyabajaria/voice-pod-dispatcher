@@ -689,6 +689,110 @@ def test_circle_failed_nodes_maps_classname_when_file_is_missing():
     assert errs == {"platform/tests/test_x.py::test_a": "E1"}, errs
 
 
+def builder_blocked(spec):
+    """The packet's precondition failed; the builder STOPs as instructed."""
+    wt = Path(spec.cwd)
+    base = (wt / ".vp" / "BASE").read_text().strip()
+    rec = {"item": spec.item, "attempt": 1, "commit": base, "base": base,
+           "diff_stat": {"files": 0, "insertions": 0, "deletions": 0}, "checks": [],
+           "disputes": [], "blocked": "A3-3 base lacks A3-1a", "notes": ""}
+    Path(spec.out_path).write_text(json.dumps(rec))
+    return TurnOutcome(STATUS_DONE, "", record_path=spec.out_path, runner="fake")
+
+
+def builder_no_commit(spec):
+    wt = Path(spec.cwd)
+    base = (wt / ".vp" / "BASE").read_text().strip()
+    rec = {"item": spec.item, "attempt": 1, "commit": base, "base": base,
+           "diff_stat": {"files": 0, "insertions": 0, "deletions": 0}, "checks": [],
+           "disputes": [], "blocked": None, "notes": "forgot to commit"}
+    Path(spec.out_path).write_text(json.dumps(rec))
+    return TurnOutcome(STATUS_DONE, "", record_path=spec.out_path, runner="fake")
+
+
+def test_builder_blocked_result_blocks_the_item_once():
+    """A3-3: the packet said STOP with blocked when the base lacks the
+    dependency; the driver retried six times.  One attempt, BLOCKED, alert."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-BL")
+        drv = make_driver(env, [builder_blocked, builder_blocked, builder_blocked], [], [], [])
+        pump(drv, 20)
+        row = env.item("M-BL")
+        assert row["status"] == "BLOCKED", row["status"]
+        assert "A3-3 base lacks A3-1a" in (row.get("note") or ""), row.get("note")
+        oc = drv.runners["opencode"]
+        assert len([c for c in oc.calls if c.role == "builder"]) == 1, [c.role for c in oc.calls]
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert "BUILDER_BLOCKED" in alerts, alerts
+        assert "FAIL M-BL" not in (env.run_root / "driver.log").read_text()
+
+
+def test_no_commit_strikes_accumulate_to_blocked():
+    """The strike count survives a DONE outcome whose delivery struck; three
+    no-commit builders BLOCK instead of looping at 1/3."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-NC")
+        drv = make_driver(env, [builder_no_commit] * 6, [], [], [])
+        saved = vpdriver.FAIL_BACKOFF_S
+        vpdriver.FAIL_BACKOFF_S = (0, 0, 0)          # 60/120/300 s live; not in a test
+        try:
+            pump(drv, 40)
+        finally:
+            vpdriver.FAIL_BACKOFF_S = saved
+        row = env.item("M-NC")
+        assert row["status"] == "BLOCKED", (row["status"], row.get("note"))
+        assert "consecutive failures" in (row.get("note") or ""), row.get("note")
+        oc = drv.runners["opencode"]
+        n = len([c for c in oc.calls if c.role == "builder"])
+        assert n == vpdriver.FAIL_CAP, (n, vpdriver.FAIL_CAP)
+        log = (env.run_root / "driver.log").read_text()
+        assert "FAIL M-NC 3/3" in log, log
+
+
+def test_stale_packet_base_behind_a_dependency_is_not_assigned():
+    """D75: M-D1 is approved at candidate c1; M-D2 depends on it but its packet
+    base is the old trunk -> not assigned, DEP_BASE_STALE once.  M-D3 with the
+    same dependency and base c1 is assigned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-D1")
+        drv = make_driver(env, [builder_ok, builder_ok], [junior_pass_fence, junior_pass_fence],
+                          [senior_approve, senior_approve], [final_approve, final_approve])
+        pump(drv, 40)
+        d1 = env.item("M-D1")
+        assert d1["status"] == "APPROVED", d1["status"]
+        c1 = d1["candidate_sha"]
+
+        def dep_item(item, base):
+            pdir = env.run_root / "packets" / item
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "PACKET.md").write_text(PACKET.format(item=item, base=base)
+                                            .replace("depends_on: []", "depends_on: [M-D1]"))
+            (pdir / "BENCHMARK.md").write_text(BENCHMARK)
+            _rc, d = env.vpctl("packet", "submit", item, "--benchmark", str(pdir / "BENCHMARK.md"),
+                               "--packet", str(pdir / "PACKET.md"), "--base", base,
+                               "--allow-overlap")
+            env.vpctl("packet", "ready", d["packet_id"])
+
+        dep_item("M-D2", env.base)          # predates c1
+        pump(drv, 10)
+        assert env.item("M-D2")["status"] == "READY", env.item("M-D2")["status"]
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert alerts.count("DEP_BASE_STALE") == 1 and "M-D2" in alerts and "M-D1" in alerts, alerts
+        dep_item("M-D3", c1)                # contains c1
+        pump(drv, 10)
+        assert env.item("M-D3")["status"] not in ("READY",), env.item("M-D3")["status"]
+        assert (env.run_root / "OWNER-ALERTS.md").read_text().count("DEP_BASE_STALE") == 1
+
+
 def test_junior_fail_loops_to_building_then_senior_findings():
     with tempfile.TemporaryDirectory() as tmp:
         env = Env(tmp)
