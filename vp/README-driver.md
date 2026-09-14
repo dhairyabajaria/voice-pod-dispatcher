@@ -351,6 +351,50 @@ number. Codex `output_tokens` already include reasoning; cached input is priced
 once at the cached rate. Measured on run-v12-20260913: 139 Codex reviews,
 mean 962k input (882k cached) / 8k output, every `cost` null before this.
 
+## CircleCI proof adapter — roster `proof.circleci` (off by default)
+
+`vpcircle.py` has carried the bridge since v9 (push_branch, trigger, poll,
+classify, record; tests in tests/test_vpcircle.py) but nothing called it: every
+proof ran on the box under `box.lock.d`, one at a time, which is the
+`max_unions_in_flight` ceiling.  `Driver.run_proof_circleci` is the adapter:
+
+```json
+"proof": {"circleci": {"enabled": false, "kinds": ["full"], "param": "run_full_suite",
+                       "branch_prefix": "vp/proof/", "account": null,
+                       "poll_interval_s": 60, "deadline_min": 90,
+                       "delete_branch_after": true}}
+```
+
+When enabled and the proof `kind` is listed, `run_proof` routes the proof
+off-box instead of spawning vpproof: the candidate sha becomes branch
+`<branch_prefix><proof-id>-<sha12>` (the branch carries `.circleci/config.yml`
+from trunk, so the config's location on `main` does not matter for API
+triggers), `vpcircle.push_branch` pushes it, `vpcircle.trigger` POSTs the
+pipeline with `{param: true}` (a JSON boolean; account rotation on a
+credit/plan refusal is vpcircle's), the proof row is set RUNNING with the
+pipeline id, `vpcircle.poll` waits for every workflow to end, `vpcircle.classify`
+gives PASS / FAIL_PRODUCT / FAIL_INFRA / UNKNOWN, `vpcircle.record` writes
+proofs/<sha>/{pipeline,jobs,tests-failed,classified}.json and the driver writes
+proofs/<proof-id>-circleci.json.  Downstream is identical to a box proof: the
+proof record (with pipeline and workflow ids), FAIL_PRODUCT -> findings on the
+items (junit `file`/`classname` + `name` mapped to pytest node ids, the junit
+message as the error text), FAIL_INFRA/UNKNOWN -> the 2/5/10-minute backoff,
+PASS -> union PROOF.  Any exception in the off-box path (CLI missing, keychain,
+push refused, deadline) is an UNKNOWN proof with backoff, never a crash.  The
+box lock is not taken, so CircleCI proofs run in parallel with box proofs;
+raising `concurrency.max_unions_in_flight` is what then lets unions overlap.
+The branch is deleted from origin afterwards unless `delete_branch_after` is
+false.  Full-suite reds outside every item's `test_paths` now reach every item
+in the union (before, the store moved them to GRADING with stale findings).
+
+Not the driver's decisions, and why it ships off: (1) pushing candidate
+branches to origin is a new class of push (the standing grants cover
+backup/trunk and circleci-pilot only); (2) every trigger spends CircleCI
+credits (O7); (3) the project's `all-pushes` preset also fires the 35 s
+first-run-validation on every pushed branch; (4) a full suite is 8 shards on
+2-vCPU mediums against a 10-core M5 -- measure one before believing it
+relieves the box.  Turning it on is a roster edit (hot-reloaded).
+
 ## Box shared memory (D69) — `vpproof.py`
 
 macOS `kern.sysv.shmmni` is 32.  Every killed xdist worker / test-postgres

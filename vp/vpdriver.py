@@ -40,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vpcircle   # noqa: E402
 import vplint     # noqa: E402
 import vpmerge    # noqa: E402
 import vprunners  # noqa: E402
@@ -148,6 +149,34 @@ OUTPUT_OF_ROLE = {"builder": "RESULT.json", "junior": "FINDINGS.json",
 PROMPT_OF_ROLE = {"builder": BUILDER_PROMPT, "junior": JUNIOR_PROMPT,
                   "infra": BUILDER_PROMPT, "senior": SENIOR_PROMPT,
                   "final": FINAL_PROMPT}
+def circle_failed_nodes(failed_tests):
+    """CircleCI `tests` items (junit xunit1 from pytest: file, classname,
+    name, message) -> (sorted node ids, {node: message}).  `file` is the
+    repo-relative path when the junit carried it; otherwise the dotted
+    classname is unfolded (platform.tests.test_x[.TestFoo] -> path[::TestFoo])."""
+    nodes, errors = set(), {}
+    for _job, items in (failed_tests or {}).items():
+        for t in items or []:
+            name = str(t.get("name") or "").strip()
+            path = str(t.get("file") or "").strip()
+            cls = str(t.get("classname") or "").strip()
+            if not path and cls:
+                parts = cls.split(".")
+                mod = [x for x in parts if x[:1].islower() or x[:1] == "_"]
+                path = "/".join(mod) + ".py" if mod else ""
+                klass = [x for x in parts[len(mod):] if x]
+                if klass:
+                    name = "::".join(klass + [name]) if name else "::".join(klass)
+            node = ("%s::%s" % (path, name)) if path and name else (path or name or cls)
+            if not node:
+                continue
+            nodes.add(node)
+            msg = str(t.get("message") or "").strip()
+            if msg and node not in errors:
+                errors[node] = msg[:600]
+    return sorted(nodes), errors
+
+
 def findings_verdicts(path):
     """(doc, fail_ids, unknown_ids) of a FINDINGS.json, with all_pass RECOMPUTED
     from the per-line verdicts and written back.  The junior's own summary is
@@ -358,12 +387,17 @@ class Store(object):
         _rc, data = self.call(args)
         return (data or {}).get("proof_id")
 
-    def proof_record(self, proof_id, status, counts_path=None, artifacts=None):
+    def proof_record(self, proof_id, status, counts_path=None, artifacts=None,
+                     pipeline_id=None, workflow_id=None):
         args = ["proof", "record", proof_id, "--status", status]
         if counts_path:
             args += ["--counts", str(counts_path)]
         if artifacts:
             args += ["--artifacts", str(artifacts)]
+        if pipeline_id:
+            args += ["--pipeline-id", str(pipeline_id)]
+        if workflow_id:
+            args += ["--workflow-id", str(workflow_id)]
         return self.call(args)
 
     def escalate(self, kind, item, attempt, detail):
@@ -406,7 +440,7 @@ class Store(object):
 class Driver(object):
 
     def __init__(self, roster_path, exec_=None, vpctl_cmd=None, store=None,
-                 runners=None, interval=DEFAULT_INTERVAL, bins=None,
+                 runners=None, interval=DEFAULT_INTERVAL, bins=None, circle_runner=None,
                  auto_assign=False, exit_on_stop=True, clock=None):
         self.roster_path = Path(roster_path).resolve()
         self.run_root = self.roster_path.parent
@@ -443,6 +477,7 @@ class Driver(object):
         self.backoff = self.roster.get("backoff", {})
         self.roles = self.roster.get("roles", {})
         self.proof_cfg = self.roster.get("proof", {})
+        self.circle_runner = circle_runner        # tests inject a fake; None -> vpcircle.Runner()
         self.groups = {str(k): (v if isinstance(v, dict) else {"server": v})
                        for k, v in self.roster.get("groups", {}).items()}
 
@@ -1788,6 +1823,12 @@ class Driver(object):
             return
         if not pid:
             pid = self.store.proof_request(cand, base, kind, paths)
+        cc = self.proof_cfg.get("circleci") or {}
+        if cc.get("enabled") and kind in (cc.get("kinds") or ["full"]) and \
+                any(k != "docs" for k in by_kind):
+            # off-box: the whole suite on CircleCI (workflow full-suite); the
+            # box lock is not taken, so these run in parallel with box proofs
+            return self.run_proof_circleci(rec, union, uid, pid, cand, wt, kind, paths, cc)
         run_kinds = [k for k in by_kind if k != "docs"]
         if not run_kinds:
             counts = self.run_root / "proofs" / ("%s-docs.json" % pid)
@@ -1874,6 +1915,102 @@ class Driver(object):
             if union:
                 self.store.union_status(uid, "PROOF", "proof %s PASS" % pid)
 
+    def run_proof_circleci(self, rec, union, uid, pid, cand, wt, kind, paths, cc):
+        """Proof adapter for CircleCI (roster proof.circleci).  Push the
+        candidate as its own branch, trigger the pipeline with the full-suite
+        parameter, poll to completion, classify with vpcircle, and record the
+        proof exactly as a box proof is recorded (same downstream: findings,
+        infra backoff, union PROOF).  Every subprocess goes through
+        vpcircle.Runner so tests never touch git remotes or the network."""
+        item = rec["item"]
+        runner = self.circle_runner or vpcircle.Runner()
+        prefix = cc.get("branch_prefix", "vp/proof/")
+        branch = "%s%s-%s" % (prefix, pid, cand[:12])
+        param = cc.get("param") or self.proof_cfg.get("circleci_param", "run_full_suite")
+        threading.current_thread().name = "vp-proof-%s" % cand
+        self.log("PROOF %s %s %s -> circleci branch=%s paths=%d"
+                 % (item, pid, cand[:12], branch, len(paths)))
+        attempt_id = self.store.turn_start(item, "proof", None, None, "circleci",
+                                           "full-suite", kind, "proof", os.getpid())
+        pipeline_id, account, workflow_id, res = None, None, None, None
+        status, failed, errors, counts = "UNKNOWN", [], {}, {}
+        try:
+            try:
+                rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
+                if rc != 0:
+                    raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
+                vpcircle.push_branch(wt, branch, runner)
+                trig = vpcircle.trigger(branch, {param: True}, runner, cc.get("account"))
+                pipeline_id, account = trig["pipeline_id"], trig["account"]
+                self.store.proof_record(pid, "RUNNING", pipeline_id=pipeline_id)
+                self.log("PROOF %s %s circleci pipeline %s (account %s)"
+                         % (item, pid, pipeline_id, account))
+                res = vpcircle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
+                                    deadline_s=int(cc.get("deadline_min", 90)) * 60,
+                                    runner=runner, account=account)
+            except Exception as exc:           # any off-box failure is UNKNOWN + backoff, never a crash
+                counts = {"reason": "circleci: %s: %s" % (type(exc).__name__, str(exc)[:300]),
+                          "pipeline_id": pipeline_id,
+                          "account": account, "branch": branch}
+                cpath = self.run_root / "proofs" / ("%s-circleci.json" % pid)
+                cpath.parent.mkdir(parents=True, exist_ok=True)
+                cpath.write_text(json.dumps(counts, indent=2, sort_keys=True), encoding="utf-8")
+                try:
+                    self.store.proof_record(pid, "UNKNOWN", cpath, pipeline_id=pipeline_id)
+                except StoreError:
+                    pass
+                self.store.turn_end(attempt_id, "STALLED", None, None,
+                                    "UNKNOWN %s" % counts["reason"][:200])
+                self.log("PROOF %s %s -> UNKNOWN (circleci: %s)" % (item, pid, str(exc)[:200]))
+                self._note_proof_infra(cand, union, rec, pid, counts["reason"])
+                return
+            cls = vpcircle.classify(res["jobs"], res["failed_tests"])
+            status = cls["status"]
+            workflow_id = (res["workflows"][0].get("id") if res.get("workflows") else None)
+            failed, errors = circle_failed_nodes(res["failed_tests"])
+            out_dir = vpcircle.record(self.run_root, cand,
+                                      {"pipeline_id": pipeline_id, "account": account,
+                                       "branch": branch, "proof_id": pid,
+                                       "workflows": res["workflows"]},
+                                      res["jobs"], res["failed_tests"], cls)
+            counts = {"status": status, "reds": cls["reds"], "failed_nodes": failed,
+                      "pipeline_id": pipeline_id, "workflow_id": workflow_id,
+                      "account": account, "branch": branch, "paths": paths,
+                      "jobs": [{"name": j.get("name"), "status": j.get("status"),
+                                "job_number": j.get("job_number")} for j in res["jobs"]]}
+            cpath = self.run_root / "proofs" / ("%s-circleci.json" % pid)
+            cpath.write_text(json.dumps(counts, indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                self.store.proof_record(pid, status, cpath, str(out_dir),
+                                        pipeline_id=pipeline_id, workflow_id=workflow_id)
+            except StoreError as exc:
+                self.log("proof record refused for %s: %s" % (pid, exc))
+                self.store.alert("PROOF_RECORD_REFUSED",
+                                 "%s: circleci proof %s came out %s but the store refused the "
+                                 "record (%s)" % (item, pid, status, str(exc)[:200]), item)
+            self.store.turn_end(attempt_id, "DONE" if status in ("PASS", "FAIL_PRODUCT")
+                                else "STALLED", str(cpath), None,
+                                "%s circleci %s" % (status, pipeline_id))
+            self.log("PROOF %s %s -> %s (circleci pipeline %s, %d reds)"
+                     % (item, pid, status, pipeline_id, len(cls["reds"])))
+            if status == "FAIL_PRODUCT":
+                self._proof_findings(union, rec, failed, pid, errors)
+            elif status in ("FAIL_INFRA", "UNKNOWN"):
+                self._note_proof_infra(cand, union, rec, pid, json.dumps(cls["reds"])[:200])
+            elif status == "PASS":
+                self._proof_backoff.pop(cand, None)
+                self._proof_infra_n.pop(cand, None)
+                if union:
+                    self.store.union_status(uid, "PROOF", "proof %s PASS (circleci %s)"
+                                            % (pid, pipeline_id))
+        finally:
+            if cc.get("delete_branch_after", True):
+                try:
+                    runner.git(["push", "origin", "--delete", branch], cwd=wt)
+                except Exception as exc:          # cleanup must never change the verdict
+                    self.log("circleci branch cleanup %s: %s" % (branch, exc))
+                self.git(["-C", str(wt), "branch", "-D", branch])
+
     def _note_proof_infra(self, cand, union, rec, pid, detail):
         """FAIL_INFRA/UNKNOWN: back off 2/5/10 min, then pause the items and alert."""
         n = self._proof_infra_n.get(cand, 0) + 1
@@ -1940,11 +2077,17 @@ class Driver(object):
         errors = errors or {}
         items = union["items"] if union else [rec["item"]]
         by = {r["item"]: r for r in self.store.report_items()}
+        owned = {it: (self.packet_header(by.get(it) or rec).get("test_paths") or [])
+                 for it in items}
+        claimed = set(f for f in failed for ps in owned.values() if any(f.startswith(p) for p in ps))
+        # a full-suite red outside every item's test_paths (a shared registry,
+        # a neighbour file) is nobody's by prefix; every item in the union
+        # sees it, otherwise the store has moved them to GRADING with stale findings
+        orphans = [f for f in failed if f not in claimed]
         for it in items:
             r = by.get(it) or rec
-            paths = self.packet_header(r).get("test_paths") or []
-            mine = [f for f in failed if any(f.startswith(p) for p in paths)] or \
-                (failed if len(items) == 1 else [])
+            paths = owned[it]
+            mine = [f for f in failed if any(f.startswith(p) for p in paths)] + orphans
             if not mine:
                 continue
             iwt = Path(r.get("worktree") or self.worktree_path(it))

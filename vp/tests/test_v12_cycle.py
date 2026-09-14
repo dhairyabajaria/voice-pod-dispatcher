@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 VP = HERE.parent
 sys.path.insert(0, str(VP))
+sys.path.insert(0, str(VP.parent))   # circleaccount, for the CircleCI fakes
 
 import vpdriver   # noqa: E402
 import vprunners  # noqa: E402
@@ -308,7 +310,8 @@ class FakeProofDriver(vpdriver.Driver):
             self.store.union_status(rec["union_id"], "PROOF", "ok")
 
 
-def make_driver(env, builder, junior, senior, final, proof="PASS", auto=True):
+def make_driver(env, builder, junior, senior, final, proof="PASS", auto=True,
+                driver_cls=None, circle_runner=None):
     runners = {"opencode": None, "codex": FakeRunner(senior), "claude": FakeRunner(final)}
     oc = FakeRunner([])
     # one opencode runner serves builder and junior by role
@@ -319,8 +322,10 @@ def make_driver(env, builder, junior, senior, final, proof="PASS", auto=True):
         return fn(spec)
     oc.run = oc_run
     runners["opencode"] = oc
-    drv = FakeProofDriver(str(env.run_root / "roster.json"), runners=runners, interval=0.05,
-                          auto_assign=auto, vpctl_cmd=[PY, str(VP / "vpctl.py")])
+    cls = driver_cls or FakeProofDriver
+    drv = cls(str(env.run_root / "roster.json"), runners=runners, interval=0.05,
+              auto_assign=auto, vpctl_cmd=[PY, str(VP / "vpctl.py")],
+              circle_runner=circle_runner)
     drv.proof_status = proof
     drv.runner_state["codex"]["max"] = 2
     return drv
@@ -525,6 +530,163 @@ def test_junior_validator_recomputes_all_pass_from_lines():
         assert json.loads(p.read_text())["all_pass"] is False
         _d, fails, unknown = vpdriver.findings_verdicts(p)
         assert fails == [] and unknown == ["B2"]
+
+
+# --------------------------------------------------------------------------
+# CircleCI proof adapter (proof.circleci) -- fake circleci CLI + fake git push
+# --------------------------------------------------------------------------
+
+class FakeCircle(object):
+    """subprocess.run stand-in for vpcircle.Runner: answers circleaccount's
+    identity checks, the circleci api calls from a script, and every git
+    push/delete with rc 0 (recorded).  Never a real process."""
+
+    def __init__(self, workflow_status="success", jobs=None, tests=None,
+                 trigger_rc=0, trigger_body=None):
+        import circleaccount as c
+        self.expected = c.EXPECTED
+        self.calls = []
+        self.git_calls = []
+        self.workflow_status = workflow_status
+        self.jobs = jobs if jobs is not None else [
+            {"id": "j1", "name": "platform-shard", "status": "success", "job_number": 11},
+            {"id": "j2", "name": "portal", "status": "success", "job_number": 12}]
+        self.tests = tests or {}
+        self.trigger_rc = trigger_rc
+        self.trigger_body = trigger_body
+
+    def __call__(self, argv, **kw):
+        argv = list(argv)
+        self.calls.append(argv)
+        cp = subprocess.CompletedProcess
+        if argv[0] == "git":
+            self.git_calls.append(argv)
+            return cp(argv, 0, "", "")
+        if argv[0] == "security":
+            return cp(argv, 0, "fake-secret\n", "")
+        if "auth" in argv and "me" in argv:
+            acct = next(re.search(r"circleci-account-(\d+)", a).group(1)
+                        for a in argv if "circleci-account-" in a)
+            return cp(argv, 0, json.dumps({"id": self.expected[acct]}), "")
+        if "api" in argv:
+            path = argv[argv.index("api") + 1]
+            if path.endswith("/pipeline/run"):
+                if self.trigger_rc:
+                    return cp(argv, self.trigger_rc, "", self.trigger_body or "boom")
+                return cp(argv, 0, json.dumps({"id": "pl-1", "number": 7}), "")
+            if path.endswith("/pipeline/pl-1/workflow"):
+                return cp(argv, 0, json.dumps({"items": [
+                    {"id": "wf-1", "name": "full-suite", "status": self.workflow_status}]}), "")
+            if path.endswith("/workflow/wf-1/job"):
+                return cp(argv, 0, json.dumps({"items": self.jobs}), "")
+            if "/tests" in path:
+                n = int(path.split("/")[-2])
+                return cp(argv, 0, json.dumps({"items": self.tests.get(n, [])}), "")
+        raise AssertionError("unexpected argv in FakeCircle: %s" % argv)
+
+
+def circle_env(tmp):
+    env = Env(tmp)
+    env.roster["proof"] = {"union_kind": "targeted",
+                           "circleci": {"enabled": True, "kinds": ["targeted"],
+                                        "poll_interval_s": 0, "deadline_min": 1}}
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    return env
+
+
+def test_circleci_proof_pass_records_pipeline_and_approves():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-C1")
+        import vpcircle
+        fake = FakeCircle()
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [final_approve],
+                          driver_cls=vpdriver.Driver, circle_runner=vpcircle.Runner(run=fake, binary="circleci-fake"))
+        pump(drv, 60)
+        row = env.item("M-C1")
+        assert row["status"] == "APPROVED", (row["status"], row.get("note"))
+        st = vpstore.Store(str(env.run_root))
+        proofs = [dict(r) for r in st.q("SELECT * FROM proof ORDER BY proof_id")]
+        assert proofs and proofs[0]["status"] == "PASS" and proofs[0]["pipeline_id"] == "pl-1" \
+            and proofs[0]["workflow_id"] == "wf-1", proofs
+        # the candidate went up as its own branch, run_full_suite was a real JSON
+        # boolean, and the branch was deleted afterwards
+        pushes = [a for a in fake.git_calls if "push" in a]
+        assert any(a[-1].startswith("vp/proof/proof-00001-") and ":" in a[-1] for a in pushes), pushes
+        assert any("--delete" in a for a in pushes), pushes
+        trig = next(a for a in fake.calls if "api" in a and a[a.index("api") + 1].endswith("/pipeline/run"))
+        body = json.loads(trig[trig.index("-d") + 1])
+        assert body["parameters"] == {"run_full_suite": True} and \
+            body["config"]["branch"].startswith("vp/proof/"), body
+        assert (env.run_root / "proofs" / row["candidate_sha"] / "classified.json").exists()
+        assert not (env.run_root / "proofs" / "proof-00001-union.json").exists()
+        log = (env.run_root / "driver.log").read_text()
+        assert "-> circleci branch=" in log and "-> PASS (circleci pipeline pl-1" in log
+
+
+def test_circleci_proof_fail_product_maps_junit_to_findings():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-C2")
+        import vpcircle
+        fake = FakeCircle(workflow_status="failed",
+                          jobs=[{"id": "j1", "name": "platform-shard", "status": "failed",
+                                 "job_number": 11}],
+                          tests={11: [{"file": "platform/tests/test_hello.py", "name": "test_hi",
+                                       "classname": "platform.tests.test_hello",
+                                       "result": "failure", "message": "AssertionError: not hi"},
+                                      {"classname": "platform.tests.test_other",
+                                       "name": "test_far", "result": "failure",
+                                       "message": "KeyError: 'x'"}]})
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [],
+                          driver_cls=vpdriver.Driver, circle_runner=vpcircle.Runner(run=fake, binary="circleci-fake"))
+        pump(drv, 40)
+        row = env.item("M-C2")
+        st = vpstore.Store(str(env.run_root))
+        proofs = [dict(r) for r in st.q("SELECT * FROM proof ORDER BY proof_id")]
+        assert proofs[0]["status"] == "FAIL_PRODUCT" and proofs[0]["pipeline_id"] == "pl-1", proofs
+        doc = json.loads((Path(row["worktree"]) / ".vp" / "FINDINGS.json").read_text())
+        ev = " | ".join(l["evidence"] for l in doc["lines"])
+        assert "platform/tests/test_hello.py::test_hi failed" in ev and "AssertionError: not hi" in ev, ev
+        # a red outside the item's test_paths still reaches the item (orphan rule)
+        assert "platform/tests/test_other.py::test_far" in ev, ev
+        assert row["status"] in ("GRADING", "BUILDING", "BLOCKED"), row["status"]
+        assert (env.run_root / "proofs" / proofs[0]["candidate_sha"] / "tests-failed.json").exists()
+
+
+def test_circleci_trigger_failure_is_unknown_with_backoff_not_findings():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-C3")
+        import vpcircle
+        fake = FakeCircle(trigger_rc=1, trigger_body="403 forbidden")
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [],
+                          driver_cls=vpdriver.Driver, circle_runner=vpcircle.Runner(run=fake, binary="circleci-fake"))
+        pump(drv, 30)
+        row = env.item("M-C3")
+        st = vpstore.Store(str(env.run_root))
+        proofs = [dict(r) for r in st.q("SELECT * FROM proof ORDER BY proof_id")]
+        assert proofs and proofs[0]["status"] == "UNKNOWN", proofs
+        assert json.loads(proofs[0]["counts"])["reason"].startswith("circleci: RuntimeError: trigger"), proofs[0]["counts"]
+        assert row["status"] in ("PREPARED", "PROOF_PENDING"), row["status"]   # backoff, no findings
+        assert not (Path(row["worktree"]) / ".vp" / "FINDINGS.json").read_text().count("P-0")
+        assert any("--delete" in a for a in fake.git_calls), fake.git_calls   # branch cleaned up
+
+
+def test_circle_failed_nodes_maps_classname_when_file_is_missing():
+    nodes, errs = vpdriver.circle_failed_nodes({
+        7: [{"file": "platform/tests/test_x.py", "name": "test_a", "message": "E1"},
+            {"classname": "platform.tests.test_y.TestFoo", "name": "test_b"},
+            {"classname": "agent.tests.test_z", "name": "test_c", "message": ""}]})
+    assert nodes == ["agent/tests/test_z.py::test_c", "platform/tests/test_x.py::test_a",
+                     "platform/tests/test_y.py::TestFoo::test_b"], nodes
+    assert errs == {"platform/tests/test_x.py::test_a": "E1"}, errs
 
 
 def test_junior_fail_loops_to_building_then_senior_findings():
