@@ -438,6 +438,27 @@ grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
   true}`, and REVIEW_REQUEST.json carries `unverified_ids` for the senior to
   decide.  A record with any FAIL line reworks exactly as before.
 
+## Union registry failure BLOCKs the union (D80 follow-up)
+
+`_regenerate_union_artifacts` runs `deploy/environment_registry.py --write` on
+the merged tree (K-21).  Before this change a non-zero rc, or a delta that
+could not be committed, was a *note* (`UNION_REGISTRY_STALE`) and the union
+was proved on whatever registry the merge left — a tree no candidate carries
+(union-64, 2026-09-14: "reachable production modules cannot be excluded:
+platform/core/sources.py", proved anyway).
+
+Now the helper returns a `RegistryFailed` and `build_union` treats it like a
+migration collision: every merged item is BLOCKed with the writer's message
+(`union-N environment registry: …`), no proof is requested, the worktree and
+branch are removed, and the owner sees one `UNION_REGISTRY_FAILED` alert.  The
+union number is consumed.  Clearing the block is the ordinary path: fix the
+item (the registry message names the module), re-approve, next union.
+
+Test: `test_union_blocks_when_the_registry_writer_refuses` plants a refusing
+writer under `deploy/` plus a `platform/.venv/bin/python` in trunk (the union
+worktree symlinks the venv from trunk) and asserts BLOCKED, no proof request,
+no worktree, the alert.
+
 ## Union automerge of the inventory class (D49) — `vpmerge.py`
 
 Every route-adding item bumps the same closed inventories: the TECHNICAL.md

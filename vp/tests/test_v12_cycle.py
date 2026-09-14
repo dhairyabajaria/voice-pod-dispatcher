@@ -1008,6 +1008,48 @@ def test_opencode_log_classifier():
         assert st == "QUOTA_WEEKLY"
 
 
+def test_union_blocks_when_the_registry_writer_refuses():
+    """D80 follow-up: `environment_registry.py --write` rc != 0 on the union
+    is a build failure.  Every merged item is BLOCKed with the writer's
+    message, no proof is requested, the union worktree is removed, and the
+    owner sees UNION_REGISTRY_FAILED (not the old UNION_REGISTRY_STALE
+    note-and-proceed)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        venv_bin = env.trunk / "platform" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, str(venv_bin / "python"))
+        (env.trunk / "deploy").mkdir()
+        (env.trunk / "deploy" / "environment_registry.py").write_text(
+            "import sys\n"
+            "sys.stderr.write('environment registry error: reachable production modules "
+            "cannot be excluded: platform/core/sources.py\\n')\n"
+            "sys.exit(1)\n")
+        git(env.trunk, "add", "-A")
+        git(env.trunk, "commit", "-q", "-m", "registry writer that refuses")
+        env.base = git(env.trunk, "rev-parse", "HEAD")
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-1")
+        drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [final_approve])
+        requested = []
+        real_req = drv.store.proof_request
+
+        def proof_request(candidate, base, kind, paths):
+            requested.append(candidate)
+            return real_req(candidate, base, kind, paths)
+        drv.store.proof_request = proof_request
+        pump(drv, 60)
+        row = env.item("M-1")
+        assert row["status"] == "BLOCKED", (row["status"], row.get("note"))
+        assert "environment registry" in (row.get("note") or "") and \
+            "platform/core/sources.py" in (row.get("note") or ""), row.get("note")
+        assert requested == [], requested
+        assert not (env.worktrees / "union-1").exists()
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert "UNION_REGISTRY_FAILED" in alerts and "UNION_REGISTRY_STALE" not in alerts, alerts
+
+
 def test_fence_extraction():
     txt = "prose\n```json\n{\"a\": 1}\n```\nmore\n```json\n{\"b\": 2}\n```\n"
     assert vprunners.extract_json_fence(txt) == {"b": 2}

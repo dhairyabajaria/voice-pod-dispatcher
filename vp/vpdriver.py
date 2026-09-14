@@ -113,6 +113,12 @@ FINAL_PROMPT = (
 RESUME_PROMPT = "continue"
 # registry tests ride on every union proof (rendered artifacts belong to the
 # merged tree, see _regenerate_union_artifacts)
+class RegistryFailed(str):
+    """Returned by _regenerate_union_artifacts when the environment registry
+    writer refused or its delta could not be committed: build_union BLOCKs the
+    union instead of proving a tree with a stale generated registry."""
+
+
 UNION_ALWAYS_PATHS = ("platform/tests/test_environment_registry.py",
                       "deploy/tests/test_worker_packaging.py",
                       # corpus meta-test over agent/*.py: any agent change can red it
@@ -1751,6 +1757,21 @@ class Driver(object):
             self.git(["-C", str(self.trunk), "branch", "-D", branch])
             return None
         regen_note = self._regenerate_union_artifacts(wt, no)
+        if isinstance(regen_note, RegistryFailed):
+            # D80 follow-up: a registry writer that refuses (rc != 0) or whose
+            # delta cannot be committed is a BUILD failure of the union, not a
+            # note on it.  Proving "whatever registry the merge left" measures
+            # a tree no candidate carries.  BLOCK every merged item with the
+            # writer's message and cut no proof; the union number is consumed.
+            for r in order:
+                if r["item"] in merged:
+                    self.store.block(r["item"], "union-%d environment registry: %s"
+                                     % (no, str(regen_note)[:300]))
+            self.store.alert("UNION_REGISTRY_FAILED",
+                             "union-%d not proved: %s" % (no, str(regen_note)[:300]))
+            self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
+            self.git(["-C", str(self.trunk), "branch", "-D", branch])
+            return None
         union_sha = self.head_sha(wt)
         uid = self.store.union_record(merged, union_sha, base, wt, branch, note=regen_note)
         self._last_union_mono = time.monotonic()
@@ -1793,7 +1814,9 @@ class Driver(object):
     def _regenerate_union_artifacts(self, wt, no):
         """Integrator step (K-21): rendered artifacts are a property of the
         merged tree. Run the registry writer on the union; commit the delta
-        as the integrator, not as any item. Returns a note or None."""
+        as the integrator, not as any item. Returns a note, None, or a
+        RegistryFailed (the writer refused or its delta could not be
+        committed) which build_union turns into a BLOCK of the union."""
         py = wt / "platform" / ".venv" / "bin" / "python"
         script = wt / "deploy" / "environment_registry.py"
         if not (py.exists() and script.exists()):
@@ -1802,11 +1825,8 @@ class Driver(object):
                                      timeout_s=120)
         if rc != 0:
             self.log("UNION union-%d registry --write rc=%s: %s" % (no, rc, (err or out)[:200]))
-            self.store.alert("UNION_REGISTRY_STALE",
-                             "union-%d: environment registry --write failed rc=%s; the union "
-                             "proof runs on whatever registry the merge left: %s"
-                             % (no, rc, (err or out)[:200]))
-            return "registry --write failed rc=%s" % rc
+            return RegistryFailed("registry --write failed rc=%s: %s"
+                                  % (rc, (err or out).strip()[:200]))
         rc, out, _ = self.git(["-C", str(wt), "status", "--porcelain", "--",
                                "deploy/environment_registry.generated.json", "DEPLOYMENT.md"])
         changed = [l[3:] for l in out.splitlines() if l.strip()]
@@ -1817,11 +1837,8 @@ class Driver(object):
                                  "union-%d: regenerate environment registry (integrator)" % no])
         if rc != 0:
             self.log("UNION union-%d registry commit failed: %s" % (no, (err or out)[:200]))
-            self.store.alert("UNION_REGISTRY_STALE",
-                             "union-%d: regenerated registry (%s) could not be committed; "
-                             "the union sha does not carry it: %s"
-                             % (no, ",".join(changed), (err or out)[:200]))
-            return "registry commit failed"
+            return RegistryFailed("regenerated registry (%s) could not be committed: %s"
+                                  % (",".join(changed), (err or out).strip()[:200]))
         self.log("UNION union-%d integrator regenerated %s" % (no, ",".join(changed)))
         return "integrator regenerated %s" % ",".join(changed)
 
