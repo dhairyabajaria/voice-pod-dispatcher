@@ -63,12 +63,20 @@ BUILDER_PROMPT = (
 JUNIOR_PROMPT = (
     "Grade the current HEAD commit of this worktree against .vp/BENCHMARK.md "
     "line by line. Write .vp/FINDINGS.json per .vp/FINDINGS_SCHEMA.json with "
-    "file:line evidence and stop. If the write is refused, print the complete "
+    "file:line evidence and stop. all_pass is true ONLY when every line is PASS; "
+    "an UNKNOWN verdict is not PASS. Use UNKNOWN only for a line you genuinely "
+    "cannot verify with the tools you have, and say why in its note. "
+    "If the write is refused, print the complete "
     "FINDINGS JSON in a single ```json fence as your final message and stop."
+)
+JUNIOR_RERUN_HINT = (
+    " Your previous grading of this same commit left %s UNKNOWN (%s). Verify "
+    "those lines now with Read/Grep/git and give PASS or FAIL with file:line "
+    "evidence; leave UNKNOWN only if it truly cannot be checked from this worktree."
 )
 SENIOR_PROMPT = (
     "You are the Senior reviewer. Read .vp/REVIEW_REQUEST.json (item, subject, "
-    "base, candidate, reviewer, benchmark_ids), then .vp/PACKET.md, "
+    "base, candidate, reviewer, benchmark_ids, unverified_ids), then .vp/PACKET.md, "
     ".vp/BENCHMARK.md, .vp/RESULT.json and .vp/FINDINGS.json. Inspect "
     "`git diff <base>..<candidate>` and every file it touches. Token budget: "
     "read ONLY the diff, the touched files, the packet's owned_files and "
@@ -83,7 +91,9 @@ SENIOR_PROMPT = (
     "higher carries a reproduce command; otherwise FINDINGS; BLOCKED only when "
     "the packet itself is wrong. Output ONLY the JSON object per the schema, "
     "copying item, subject, base, candidate and reviewer from "
-    "REVIEW_REQUEST.json verbatim. No prose."
+    "REVIEW_REQUEST.json verbatim. No prose. Any id in unverified_ids was left "
+    "UNKNOWN by the junior twice (it could not verify it with read-only tools); "
+    "you must give it a PASS or FAIL verdict yourself with evidence."
 )
 FINAL_PROMPT = (
     "You are the Final reviewer of a union. Read .vp/FINAL_REQUEST.json "
@@ -138,9 +148,39 @@ OUTPUT_OF_ROLE = {"builder": "RESULT.json", "junior": "FINDINGS.json",
 PROMPT_OF_ROLE = {"builder": BUILDER_PROMPT, "junior": JUNIOR_PROMPT,
                   "infra": BUILDER_PROMPT, "senior": SENIOR_PROMPT,
                   "final": FINAL_PROMPT}
+def findings_verdicts(path):
+    """(doc, fail_ids, unknown_ids) of a FINDINGS.json, with all_pass RECOMPUTED
+    from the per-line verdicts and written back.  The junior's own summary is
+    never trusted: 7 of 109 junior records said all_pass true over an UNKNOWN
+    line, each one an INCOMPLETE strike (SHIP-01 x4 -> BLOCKED, A2-1, CAT-01,
+    A4-3, A3-1a)."""
+    path = Path(path)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    lines = doc.get("lines") if isinstance(doc, dict) else None
+    if not isinstance(lines, list):
+        return doc, [], []
+    fails = [str(l.get("id")) for l in lines if isinstance(l, dict) and l.get("verdict") == "FAIL"]
+    unknown = [str(l.get("id")) for l in lines
+               if isinstance(l, dict) and l.get("verdict") == "UNKNOWN"]
+    computed = all(isinstance(l, dict) and l.get("verdict") == "PASS" for l in lines)
+    if doc.get("all_pass") is not computed:
+        doc["all_pass"] = computed
+        path.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+    return doc, fails, unknown
+
+
+def validate_findings_recomputed(path):
+    """The junior's validator: recompute all_pass first, then the schema."""
+    try:
+        findings_verdicts(path)
+    except (OSError, ValueError):
+        pass
+    return vpschema.validate_findings(path)
+
+
 VALIDATOR_OF_ROLE = {"builder": vpschema.validate_result,
                      "infra": vpschema.validate_result,
-                     "junior": vpschema.validate_findings,
+                     "junior": validate_findings_recomputed,
                      "senior": vpschema.validate_review,
                      "final": vpschema.validate_review}
 # claude --json-schema must match the record the role's validator expects
@@ -280,8 +320,11 @@ class Store(object):
         return self.call(["submit-result", item, "--commit", commit,
                           "--result", str(result_path)])
 
-    def findings(self, item, path):
-        _rc, data = self.call(["findings", item, "--path", str(path)])
+    def findings(self, item, path, unverified_to_senior=False):
+        args = ["findings", item, "--path", str(path)]
+        if unverified_to_senior:
+            args.append("--unverified-to-senior")
+        _rc, data = self.call(args)
         return data or {}
 
     def review_record(self, item, subject, base, candidate, reviewer, reviewer_ref,
@@ -432,6 +475,7 @@ class Driver(object):
         self._live_items = set()
         self._threads = []
         self._fail = {}
+        self._unknown_rerun = {}      # item -> (rev, commit) already re-graded once
         self._stopping = False
         self._stop_started = None
         self._abort = threading.Event()
@@ -1154,6 +1198,10 @@ class Driver(object):
         while True:
             n += 1
             prompt = PROMPT_OF_ROLE[role] if n == 1 else RESUME_PROMPT
+            if role == "junior" and n == 1:
+                hint = self._unknown_rerun.get(item)
+                if hint and hint[0] == rec.get("rev"):
+                    prompt += JUNIOR_RERUN_HINT % (", ".join(hint[2]), hint[3][:200])
             spec = self._spec_for(rec, role, server, runner, wt, prompt, sid, attempt_id, n)
             outcome = self.runners[runner].run(spec, abort_flag=self._abort)
             sid = outcome.session_id or sid
@@ -1279,9 +1327,15 @@ class Driver(object):
         runner_name = rcfg.get("runner", "codex")
         if runner_name == "claude":
             runner_name = "claude-fallback"       # O10: independence reduced, alerted
+        unverified = []
+        try:
+            _doc, _fails, unverified = findings_verdicts(wt / ".vp" / "FINDINGS.json")
+        except (OSError, ValueError):
+            pass
         req = {"item": rec["item"], "subject": "item", "base": base, "candidate": cand,
                "reviewer": "%s:%s" % (runner_name, model),
                "benchmark_ids": self._benchmark_ids(wt),
+               "unverified_ids": unverified,
                "files": {"packet": ".vp/PACKET.md", "benchmark": ".vp/BENCHMARK.md",
                          "result": ".vp/RESULT.json", "findings": ".vp/FINDINGS.json"},
                "ts": utc_ms()}
@@ -1370,6 +1424,7 @@ class Driver(object):
                 self._append_findings_fail(record, "B-forbidden-driver", "forbidden",
                                            "files outside owned_files changed: %s"
                                            % ", ".join(bad[:10]))
+            doc, fails, unknown = findings_verdicts(record)
             lint = vplint.lint_findings(record, wt / ".vp" / "BENCHMARK.md", wt)
             errs = [l for l in lint if l.startswith("ERROR")]
             if errs:
@@ -1377,6 +1432,26 @@ class Driver(object):
                 self.note_item_failure(item, rec.get("rev"), "findings invalid: %s"
                                        % "; ".join(errs)[:300], attempt_id, kind="RECORD_INVALID")
                 return
+            if unknown and not fails:
+                # an UNKNOWN-only record is a grader gap, not a defect: no
+                # strike, no rework round.  Re-grade the same commit once
+                # with the ids named; if they stay UNKNOWN the senior decides.
+                key = (rec.get("rev"), doc.get("commit") or rec.get("candidate_sha"))
+                prev = self._unknown_rerun.get(item)
+                if not prev or prev[:2] != key:
+                    why = "; ".join("%s: %s" % (l.get("id"), (l.get("note") or l.get("evidence") or "")[:80])
+                                    for l in doc.get("lines", []) if l.get("verdict") == "UNKNOWN")
+                    self._unknown_rerun[item] = key + (list(unknown), why)
+                    self.store.escalate("JUNIOR_UNKNOWN", item, attempt_id,
+                                        "junior left %s UNKNOWN; re-grading once" % ", ".join(unknown))
+                    self.log("UNKNOWN %s %s -> junior re-run once" % (item, ",".join(unknown)))
+                    return
+                res = self.store.findings(item, record, unverified_to_senior=True)
+                self._unknown_rerun.pop(item, None)
+                self.log("FINDINGS %s unverified=%s -> %s (senior decides)"
+                         % (item, ",".join(unknown), res.get("status")))
+                return
+            self._unknown_rerun.pop(item, None)
             res = self.store.findings(item, record)
             self.log("FINDINGS %s all_pass=%s -> %s" % (item, res.get("all_pass"), res.get("status")))
             return

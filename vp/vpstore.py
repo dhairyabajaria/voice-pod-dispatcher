@@ -608,7 +608,8 @@ class Store:
     # ------------------------------------------------------------------
 
     ESCALATE_KINDS = {"STUCK", "STALLED", "QUOTA", "AUTH", "INCOMPLETE", "BLOCKED",
-                      "ROUND_CAP", "DELIVERY_INCIDENT", "INHIBIT"} | RUNNER_ESCALATIONS
+                      "ROUND_CAP", "DELIVERY_INCIDENT", "INHIBIT",
+                      "JUNIOR_UNKNOWN"} | RUNNER_ESCALATIONS
 
     def escalate(self, kind, item, attempt=None, detail=None):
         """Write one escalation event (the driver calls this)."""
@@ -987,7 +988,7 @@ class Store:
             return False, "result.checks must be a list"
         return True, ""
 
-    def findings(self, item, path):
+    def findings(self, item, path, unverified_to_senior=False):
         with open(path, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
         ok, why = self.validate_findings(doc)
@@ -995,6 +996,11 @@ class Store:
             raise Usage(why)
         # all_pass is computed from the lines, never trusted from the file
         all_pass = all(ln["verdict"] == "PASS" for ln in doc["lines"])
+        unknown = [str(ln.get("id")) for ln in doc["lines"] if ln["verdict"] == "UNKNOWN"]
+        fails = [ln for ln in doc["lines"] if ln["verdict"] == "FAIL"]
+        # UNKNOWN-only + the driver says the junior already re-graded once:
+        # the senior decides those ids; no round is charged (D67)
+        to_senior = bool(unverified_to_senior and unknown and not fails)
         with self.tx():
             row = self.get_item(item)
             if row["status"] not in ("GRADING", "FINAL_REVIEW"):
@@ -1002,12 +1008,14 @@ class Store:
             cap = int(self.roster().get("round_cap", 8))
             rnd = int(row["round"] or 0)
             attempt = doc.get("attempt")
+            detail = {"all_pass": all_pass, "round": rnd, "lines": len(doc["lines"])}
+            if to_senior:
+                detail["unverified"] = unknown
+                detail["to_senior"] = True
             self.event("FINDINGS", item=item, attempt=attempt,
                        ref=doc.get("commit") or row["candidate_sha"],
-                       detail={"all_pass": all_pass, "round": rnd,
-                               "lines": len(doc["lines"])},
-                       idempotent=True)
-            if all_pass:
+                       detail=detail, idempotent=True)
+            if all_pass or to_senior:
                 self._set_item(item, "JUNIOR_SATISFIED")
                 new_status = "JUNIOR_SATISFIED"
             else:
@@ -1021,7 +1029,8 @@ class Store:
                     self._set_item(item, "BUILDING", round=rnd)
                     new_status = "BUILDING"
         return {"all_pass": all_pass, "status": new_status,
-                "round": self.get_item(item)["round"]}
+                "round": self.get_item(item)["round"],
+                "unverified": unknown if to_senior else []}
 
     # ------------------------------------------------------------------
     # deliveries and messages (communication matrix)

@@ -243,6 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
     fd = sub.add_parser("findings")
     fd.add_argument("item")
     fd.add_argument("--path", required=True)
+    fd.add_argument("--unverified-to-senior", action="store_true",
+                    help="UNKNOWN-only record after one re-grade: senior decides, no round")
 
     sub.add_parser("mark-available").add_argument("role_id")
 
@@ -465,7 +467,7 @@ def dispatch(args, st: Store):
                    f"{args.item} GRADING")
 
     if c == "findings":
-        res = st.findings(args.item, args.path)
+        res = st.findings(args.item, args.path, args.unverified_to_senior)
         return out(args, res, f"{args.item} {res['status']} all_pass={res['all_pass']}")
 
     if c == "mark-available":

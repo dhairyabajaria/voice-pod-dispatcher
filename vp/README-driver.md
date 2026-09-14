@@ -351,6 +351,26 @@ number. Codex `output_tokens` already include reasoning; cached input is priced
 once at the cached rate. Measured on run-v12-20260913: 139 Codex reviews,
 mean 962k input (882k cached) / 8k output, every `cost` null before this.
 
+## Junior UNKNOWN verdicts (D67)
+
+Measured over run-v12: 7 of 109 junior records carried an UNKNOWN line with
+`all_pass: true` (the junior reads all_pass as "no FAIL"); each one was an
+INCOMPLETE strike, and three strikes BLOCKed SHIP-01.  Twice the junior set
+all_pass false on an UNKNOWN-only record and a builder was sent back for a
+grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
+
+- `all_pass` is RECOMPUTED by the driver from the per-line verdicts
+  (`findings_verdicts`) both in the junior's runner-side validator and at
+  delivery; the junior's own summary is never read.  The prompt now says
+  UNKNOWN is not PASS.
+- A record whose only non-PASS lines are UNKNOWN is a grader gap, not a
+  defect: no strike, no rework round.  The junior re-grades the SAME commit
+  once (`JUNIOR_UNKNOWN` event; the prompt names the ids and the junior's own
+  reasons).  If they stay UNKNOWN, `findings --unverified-to-senior` moves the
+  item to JUNIOR_SATISFIED with `FINDINGS` detail `{unverified: [...], to_senior:
+  true}`, and REVIEW_REQUEST.json carries `unverified_ids` for the senior to
+  decide.  A record with any FAIL line reworks exactly as before.
+
 ## Union automerge of the inventory class (D49) — `vpmerge.py`
 
 Every route-adding item bumps the same closed inventories: the TECHNICAL.md

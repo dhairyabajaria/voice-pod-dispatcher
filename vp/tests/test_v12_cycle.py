@@ -433,6 +433,100 @@ def test_union_merges_the_inventory_class_by_arithmetic():
                    "platform/tests/test_docs_truth.py" in ps for ps in requested), requested
 
 
+def junior_unknown_on(bid, with_fail=False):
+    """The junior as it really behaves: one line UNKNOWN ("could not verify"),
+    all_pass true anyway (it reads all_pass as "no FAIL")."""
+    def fn(spec):
+        wt = Path(spec.cwd)
+        head = git(wt, "rev-parse", "HEAD")
+        lines = []
+        for b, k in (("B1", "invariant"), ("B2", "test"), ("B3", "negative"),
+                     ("B4", "forbidden"), ("B5", "evidence")):
+            v = "UNKNOWN" if b == bid else ("FAIL" if (with_fail and b == "B1") else "PASS")
+            lines.append({"id": b, "kind": k, "verdict": v, "evidence": "platform/hello.py:2",
+                          "note": "Bash was denied; could not re-run" if v == "UNKNOWN" else ""})
+        doc = {"item": spec.item, "attempt": 1, "commit": head, "lines": lines,
+               "all_pass": not with_fail}
+        Path(spec.out_path).write_text(json.dumps(doc))
+        return TurnOutcome(STATUS_DONE, "", record_path=spec.out_path, runner="fake")
+    return fn
+
+
+def test_unknown_only_findings_regrade_once_then_senior_decides():
+    """D67: an UNKNOWN-only record is a grader gap, not a defect.  No
+    INCOMPLETE strike, no rework round: the junior re-grades the same commit
+    once (told which ids), then the senior gets the record with the ids."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-U")
+        drv = make_driver(env, [builder_ok], [junior_unknown_on("B3"), junior_unknown_on("B3")],
+                          [senior_approve], [final_approve])
+        pump(drv, 60)
+        row = env.item("M-U")
+        assert row["status"] == "APPROVED", (row["status"], row.get("note"))
+        assert int(row["round"]) == 0, row["round"]          # no round charged
+        oc = drv.runners["opencode"]
+        juniors = [c for c in oc.calls if c.role == "junior"]
+        assert len(juniors) == 2, [c.role for c in oc.calls]
+        assert "B3" not in juniors[0].prompt and "B3 UNKNOWN" in juniors[1].prompt, juniors[1].prompt
+        assert "UNKNOWN verdict is not PASS" in juniors[0].prompt
+        # the record on disk carries the recomputed all_pass, never the junior's
+        doc = json.loads((Path(row["worktree"]) / ".vp" / "FINDINGS.json").read_text())
+        assert doc["all_pass"] is False and [l["id"] for l in doc["lines"] if l["verdict"] == "UNKNOWN"] == ["B3"]
+        req = json.loads((Path(row["worktree"]) / ".vp" / "REVIEW_REQUEST.json").read_text())
+        assert req["unverified_ids"] == ["B3"], req
+        st = vpstore.Store(str(env.run_root))
+        kinds = [r["kind"] for r in st.q("SELECT kind FROM event WHERE item='M-U' ORDER BY ts")]
+        assert "JUNIOR_UNKNOWN" in kinds and "INCOMPLETE" not in kinds and \
+            "RECORD_INVALID" not in kinds, kinds
+        fin = [json.loads(r["detail"]) for r in st.q(
+            "SELECT detail FROM event WHERE item='M-U' AND kind='FINDINGS'")]
+        assert any(d.get("to_senior") and d.get("unverified") == ["B3"] for d in fin), fin
+        assert "FAIL M-U" not in (env.run_root / "driver.log").read_text()
+
+
+def test_unknown_with_a_real_fail_still_reworks():
+    """Control: UNKNOWN never shields a FAIL line; the builder goes back."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+        env.add_item("M-UF")
+        drv = make_driver(env, [builder_ok], [junior_unknown_on("B3", with_fail=True)], [], [])
+        pump(drv, 12)
+        row = env.item("M-UF")
+        # BUILDING (round 1); the exhausted builder script may then BLOCK it,
+        # but never for the UNKNOWN line
+        assert int(row["round"]) == 1 and row["status"] in ("BUILDING", "BLOCKED"), \
+            (row["status"], row["round"])
+        assert "UNKNOWN" not in (row.get("note") or "")
+        oc = drv.runners["opencode"]
+        assert len([c for c in oc.calls if c.role == "junior"]) == 1
+        st = vpstore.Store(str(env.run_root))
+        fin = [json.loads(r["detail"]) for r in st.q(
+            "SELECT detail FROM event WHERE item='M-UF' AND kind='FINDINGS'")]
+        assert fin and fin[0]["all_pass"] is False and not fin[0].get("to_senior"), fin
+
+
+def test_junior_validator_recomputes_all_pass_from_lines():
+    """Constraint (1): the runner-side validator never trusts the junior's
+    summary; the exact live record shape (UNKNOWN + all_pass true) validates."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "FINDINGS.json"
+        doc = {"item": "X", "attempt": 1, "commit": "a" * 40, "all_pass": True,
+               "lines": [{"id": "B1", "kind": "invariant", "verdict": "PASS", "evidence": "x:1", "note": ""},
+                         {"id": "B2", "kind": "evidence", "verdict": "UNKNOWN", "evidence": "n/a", "note": "hosted only"}]}
+        p.write_text(json.dumps(doc))
+        assert vpschema.validate_findings(str(p))[0] is False          # as the runner saw it
+        ok, errs = vpdriver.VALIDATOR_OF_ROLE["junior"](str(p))
+        assert ok, errs
+        assert json.loads(p.read_text())["all_pass"] is False
+        _d, fails, unknown = vpdriver.findings_verdicts(p)
+        assert fails == [] and unknown == ["B2"]
+
+
 def test_junior_fail_loops_to_building_then_senior_findings():
     with tempfile.TemporaryDirectory() as tmp:
         env = Env(tmp)
