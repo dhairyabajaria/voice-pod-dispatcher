@@ -2326,12 +2326,38 @@ class Driver(object):
             status = cls["status"]
             workflow_id = (res["workflows"][0].get("id") if res.get("workflows") else None)
             failed, errors = circle_failed_nodes(res["failed_tests"])
+            flake = None
+            if status == "FAIL_PRODUCT" and failed:
+                # D108: an off-box red in a file NO union item touches is
+                # FLAKE_SUSPECT (the CI runner's own races: pipeline 206 had
+                # four, 58a95fde three, none reproduced on the box).  Re-run
+                # exactly those nodes on the box, serially; all green -> PASS
+                # + a TRUNK_FLAKE_SUSPECT alert naming them; any red -> FAIL.
+                base = union["base_sha"] if union else rec.get("base_sha")
+                nodes = self._untouched_red_nodes(wt, base, cand, failed, cc)
+                if nodes:
+                    self.log("PROOF %s %s circleci %d reds in untouched files -> box re-run"
+                             % (item, pid, len(nodes)))
+                    st2, failed2 = self._box_rerun(pid, cand, wt, nodes)
+                    flake = {"nodes": nodes, "rerun": st2, "still_red": failed2}
+                    if st2 == "PASS":
+                        status = "PASS"
+                        failed, errors = [], {}
+                        self.store.alert("TRUNK_FLAKE_SUSPECT",
+                                         "%s: circleci pipeline %s red on %d node(s) in files no "
+                                         "union item touches; all green on a serial box re-run -> "
+                                         "PASS. Nodes: %s" % (pid, pipeline_id, len(nodes),
+                                                              ", ".join(nodes)))
+                    else:
+                        self.log("PROOF %s %s box re-run %s: %s" % (item, pid, st2,
+                                                                     ", ".join(failed2)[:200]))
             out_dir = vpcircle.record(self.run_root, cand,
                                       {"pipeline_id": pipeline_id, "account": account,
                                        "branch": branch, "proof_id": pid,
                                        "workflows": res["workflows"]},
                                       res["jobs"], res["failed_tests"], cls)
             counts = {"status": status, "reds": cls["reds"], "failed_nodes": failed,
+                      "flake_suspect": flake,
                       "pipeline_id": pipeline_id, "workflow_id": workflow_id,
                       "account": account, "branch": branch, "paths": paths,
                       "jobs": [{"name": j.get("name"), "status": j.get("status"),
@@ -2368,6 +2394,69 @@ class Driver(object):
                 except Exception as exc:          # cleanup must never change the verdict
                     self.log("circleci branch cleanup %s: %s" % (branch, exc))
                 self.git(["-C", str(wt), "branch", "-D", branch])
+
+    RERUN_KINDS = {"platform": "platform/", "deploy": "deploy/", "agent": "agent/"}
+
+    def _untouched_red_nodes(self, wt, base, cand, failed, cc):
+        """The failed node ids, repo-relative, when EVERY one lives in a file the
+        union diff (base..cand) does not touch, is a pytest kind, and there are
+        at most proof.circleci.flake_rerun_max (10) of them; else None."""
+        cap = int(cc.get("flake_rerun_max", 10))
+        if not failed or len(failed) > cap:
+            return None
+        rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "%s..%s" % (base, cand)])
+        if rc != 0:
+            return None
+        touched = set(l.strip() for l in out.splitlines() if l.strip())
+        nodes = []
+        for node in failed:
+            f = node.split("::", 1)[0]
+            rest = node[len(f):]
+            full = None
+            for cand_f in (f, "platform/" + f):
+                if (wt / cand_f).exists():
+                    full = cand_f
+                    break
+            if full is None or full in touched:
+                return None
+            if not any(full.startswith(p) for p in self.RERUN_KINDS.values()):
+                return None                    # portal (vitest) nodes: no pytest re-run
+            nodes.append(full + rest)
+        return sorted(set(nodes))
+
+    def _box_rerun(self, pid, cand, wt, nodes):
+        """Serial box re-run of exactly `nodes`, per pytest kind, under the box
+        lock via vpproof (no store record).  -> (status, still_red_nodes)."""
+        by_kind = {}
+        for n in nodes:
+            k = next(k for k, p in self.RERUN_KINDS.items() if n.startswith(p))
+            by_kind.setdefault(k, []).append(n)
+        status, still = "PASS", []
+        for k, ns in by_kind.items():
+            argv = [sys.executable, str(self.here / "vpproof.py"), "run",
+                    "--run-root", str(self.run_root), "--worktree", str(wt), "--sha", cand,
+                    "--proof-id", "%s-rerun-%s" % (pid, k), "--kind", "targeted",
+                    "--proof-kind", k, "--paths", ",".join(ns), "--cn", str(self.cn),
+                    "--workers", "1", "--no-record"]
+            with self._lock:
+                self._box_active += 1
+            try:
+                rc, out, err = self.exec.run(argv, cwd=str(self.here),
+                                             timeout_s=float(self.proof_cfg.get(
+                                                 "targeted_timeout_min", 40)) * 60 +
+                                             float(self.conc.get("proof_wait_max_min", 90)) * 60)
+            finally:
+                with self._lock:
+                    self._box_active = max(0, self._box_active - 1)
+            try:
+                res = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
+            except ValueError:
+                res = {}
+            st = res.get("status") or "UNKNOWN"
+            if rc == 124 or st != "PASS":
+                status = st if st in ("FAIL_PRODUCT", "FAIL_INFRA") else "UNKNOWN"
+                still += (res.get("counts") or {}).get("failed_nodes") or ns
+        return status, still
 
     def _note_proof_infra(self, cand, union, rec, pid, detail):
         """FAIL_INFRA/UNKNOWN: back off 2/5/10 min, then pause the items and alert."""

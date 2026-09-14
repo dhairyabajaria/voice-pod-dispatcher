@@ -473,6 +473,28 @@ grader gap.  UNKNOWN is structural: the junior grades with Read/Grep/git only.
   `## Steps` line edits that file (a row that edits and pins the rest of the
   same file is self-consistent).  Test in test_vpstore.py.
 
+## Off-box red in an untouched file = FLAKE_SUSPECT (D108)
+
+Pipelines 206 and 58a95fde each carried reds (four, then three) in files no
+union item touches, none reproducible on the box: CI-runner races (a sweep
+between POST and SELECT, a leaked advisory lock).  Under the chain every such
+red would cancel every union stacked above it.  So in `run_proof_circleci`,
+when the classification is FAIL_PRODUCT and EVERY failed node lives in a file
+outside the union diff (base..candidate), is a pytest kind (platform, deploy,
+agent — never portal/vitest), and there are at most
+`proof.circleci.flake_rerun_max` (10) of them: log `PROOF <item> <proof>
+circleci N reds in untouched files -> box re-run`, run exactly those node ids
+on the box serially (`vpproof … --workers 1 --no-record`, box lock, counts
+toward the box slot), and
+- all green → the proof records PASS, `counts.flake_suspect` names the nodes,
+  one `TRUNK_FLAKE_SUSPECT` alert lists them for the D-log / TRUNK packet,
+  no findings;
+- any red → FAIL_PRODUCT as today (findings carry the original nodes).
+Node ids from CircleCI's junit lack the `platform/` prefix; they are
+normalised against the worktree.  Tests:
+`test_circleci_red_in_untouched_file_is_rerun_on_the_box_and_passes`,
+`…_that_stays_red_on_the_box_is_a_fail`, `test_untouched_red_nodes_rules`.
+
 ## Proof routing: overflow / all + daily cap (D103)
 
 `proof.circleci.enabled` is the master switch (false: every proof on the

@@ -666,6 +666,104 @@ def test_circleci_proof_fail_product_maps_junit_to_findings():
         assert (env.run_root / "proofs" / proofs[0]["candidate_sha"] / "tests-failed.json").exists()
 
 
+def _flake_setup(tmp, rerun_status, still=()):
+    """A CircleCI FAIL on one node in platform/tests/test_far.py, a file that
+    exists at base and that the item does not touch.  The box re-run is
+    stubbed to `rerun_status`."""
+    env = circle_env(tmp)
+    (env.trunk / "platform" / "tests" / "test_far.py").write_text("def test_far():\n    pass\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "far")
+    env.base = git(env.trunk, "rev-parse", "HEAD")
+    os.environ.update(env.env)
+    env.vpctl("run", "init", "run-v12-test", "--trunk-head", env.base)
+    env.add_item("M-FL")
+    import vpcircle
+    fake = FakeCircle(workflow_status="failed",
+                      jobs=[{"id": "j1", "name": "platform-shard", "status": "failed",
+                             "job_number": 11}],
+                      tests={11: [{"file": "tests/test_far.py", "name": "test_far",
+                                   "classname": "tests.test_far", "result": "failure",
+                                   "message": "409 Conflict"}]})
+    drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve], [final_approve],
+                      driver_cls=vpdriver.Driver,
+                      circle_runner=vpcircle.Runner(run=fake, binary="circleci-fake"))
+    calls = []
+
+    def box_rerun(pid, cand, wt, nodes):
+        calls.append(nodes)
+        return rerun_status, list(still)
+    drv._box_rerun = box_rerun
+    return env, drv, calls
+
+
+def test_circleci_red_in_untouched_file_is_rerun_on_the_box_and_passes():
+    """D108: the CI-only red lives in a file the union does not touch; the
+    driver re-runs exactly that node on the box; green -> proof PASS, item
+    proceeds to APPROVED, TRUNK_FLAKE_SUSPECT names the node, no findings."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, drv, calls = _flake_setup(tmp, "PASS")
+        pump(drv, 40)
+        assert calls == [["platform/tests/test_far.py::test_far"]], calls
+        row = env.item("M-FL")
+        assert row["status"] == "APPROVED", (row["status"], row.get("note"))
+        st = vpstore.Store(str(env.run_root))
+        pr = dict(st.q1("SELECT * FROM proof WHERE pipeline_id='pl-1'"))
+        assert pr["status"] == "PASS", pr
+        counts = json.loads(pr["counts"])
+        assert counts["flake_suspect"]["rerun"] == "PASS" and counts["failed_nodes"] == [], counts
+        alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+        assert "TRUNK_FLAKE_SUSPECT" in alerts and "test_far.py::test_far" in alerts, alerts
+        log = (env.run_root / "driver.log").read_text()
+        assert "circleci 1 reds in untouched files -> box re-run" in log, log[-500:]
+        assert not (Path(row["worktree"]) / ".vp" / "FINDINGS.json").read_text().count("P-0")
+
+
+def test_circleci_red_in_untouched_file_that_stays_red_on_the_box_is_a_fail():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, drv, calls = _flake_setup(tmp, "FAIL_PRODUCT",
+                                       still=["platform/tests/test_far.py::test_far"])
+        pump(drv, 40)
+        assert len(calls) == 1
+        st = vpstore.Store(str(env.run_root))
+        pr = dict(st.q1("SELECT * FROM proof WHERE pipeline_id='pl-1'"))
+        assert pr["status"] == "FAIL_PRODUCT", pr
+        assert "TRUNK_FLAKE_SUSPECT" not in (env.run_root / "OWNER-ALERTS.md").read_text()
+        row = env.item("M-FL")
+        assert row["status"] in ("GRADING", "BUILDING", "BLOCKED"), row["status"]
+        doc = json.loads((Path(row["worktree"]) / ".vp" / "FINDINGS.json").read_text())
+        assert any("test_far.py::test_far" in l["evidence"] for l in doc["lines"]), doc
+
+
+def test_untouched_red_nodes_rules():
+    """Touched file -> None; >cap -> None; portal node -> None; platform node
+    without the platform/ prefix is normalised."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = circle_env(tmp)
+        (env.trunk / "platform" / "tests" / "test_far.py").write_text("def test_far():\n    pass\n")
+        (env.trunk / "portal").mkdir()
+        (env.trunk / "portal" / "x.test.ts").write_text("")
+        git(env.trunk, "add", "-A")
+        git(env.trunk, "commit", "-q", "-m", "far")
+        base = git(env.trunk, "rev-parse", "HEAD")
+        (env.trunk / "platform" / "tests" / "test_hello.py").write_text("def test_hi():\n    pass\n")
+        git(env.trunk, "commit", "-qam", "touch hello")
+        cand = git(env.trunk, "rev-parse", "HEAD")
+        os.environ.update(env.env)
+        env.vpctl("run", "init", "run-v12-test", "--trunk-head", base)
+        drv = make_driver(env, [], [], [], [], driver_cls=vpdriver.Driver)
+        wt = env.trunk
+        u = drv._untouched_red_nodes
+        assert u(wt, base, cand, ["tests/test_far.py::test_far"], {}) == ["platform/tests/test_far.py::test_far"]
+        assert u(wt, base, cand, ["tests/test_hello.py::test_hi"], {}) is None            # touched
+        assert u(wt, base, cand, ["tests/test_far.py::test_far", "tests/test_hello.py::test_hi"], {}) is None
+        assert u(wt, base, cand, ["portal/x.test.ts::t"], {}) is None                    # vitest
+        assert u(wt, base, cand, ["tests/test_far.py::t%d" % i for i in range(11)], {}) is None  # > cap
+        assert u(wt, base, cand, ["tests/test_far.py::t%d" % i for i in range(11)],
+                 {"flake_rerun_max": 20}) is not None
+        assert u(wt, base, cand, ["tests/nope.py::t"], {}) is None                        # unknown file
+
+
 def test_circleci_trigger_failure_is_unknown_with_backoff_not_findings():
     with tempfile.TemporaryDirectory() as tmp:
         env = circle_env(tmp)
