@@ -184,6 +184,77 @@ _VITEST_TESTS_RE = re.compile(r"\bTests\s+(.*)\n")
 _VITEST_FAIL_RE = re.compile(r"^\s*(?:FAIL|\u00d7|\u2716)\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s*>\s*(.+?))?\s*$", re.M)
 
 
+# D69: a leg whose Postgres could not start is never a verdict on the product.
+# proof-00073/00074 hit kern.sysv.shmmni=32 exhausted by orphaned SysV segments
+# and were recorded FAIL_PRODUCT with 554 ERROR nodes.
+_INFRA_RE = re.compile(
+    r"could not create shared memory segment|No space left on device|"
+    r"Failed postgres command|CalledProcessError: Command '\['[^']*/initdb'|"
+    r"initdb: error:|pg_ctl: could not start server|could not bind IPv[46] address")
+
+
+def _ipcs_segments(text):
+    """Rows of `ipcs -m -a` (macOS): m ID KEY MODE OWNER GROUP CREATOR CGROUP
+    NATTCH SEGSZ CPID LPID ... -> [{id, nattch, cpid}]."""
+    out = []
+    for ln in text.splitlines():
+        f = ln.split()
+        if len(f) < 11 or f[0] != "m":
+            continue
+        try:
+            out.append({"id": int(f[1]), "nattch": int(f[8]), "cpid": int(f[10])})
+        except ValueError:
+            continue
+    return out
+
+
+def orphaned_shm(ipcs_text=None, alive=_pid_alive):
+    """SysV shm segments nobody is attached to whose creator pid is dead:
+    what a killed xdist worker / test-postgres cluster leaves behind."""
+    if ipcs_text is None:
+        try:
+            ipcs_text = subprocess.run(["ipcs", "-m", "-a"], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, universal_newlines=True,
+                                       timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return [], 0
+    segs = _ipcs_segments(ipcs_text)
+    return [s for s in segs if s["nattch"] == 0 and not alive(s["cpid"])], len(segs)
+
+
+def shm_limit():
+    try:
+        return int(subprocess.run(["sysctl", "-n", "kern.sysv.shmmni"], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, universal_newlines=True,
+                                  timeout=10).stdout.strip() or 32)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 32
+
+
+def shm_preflight(log, reap=False, run=subprocess.run, ipcs_text=None, alive=_pid_alive):
+    """Before a platform leg: count (and, only when the roster says
+    proof.shm_reap: true, remove with `ipcrm -m`) orphaned segments.  Returns
+    {"total", "orphans", "ids", "removed", "errors", "limit"}."""
+    orphans, total = orphaned_shm(ipcs_text, alive)
+    res = {"total": total, "orphans": len(orphans), "ids": [o["id"] for o in orphans],
+           "removed": 0, "errors": [], "limit": shm_limit()}
+    if orphans and reap:
+        for o in orphans:
+            try:
+                cp = run(["ipcrm", "-m", str(o["id"])], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, universal_newlines=True, timeout=30)
+                if cp.returncode == 0:
+                    res["removed"] += 1
+                else:
+                    res["errors"].append("%s: %s" % (o["id"], (cp.stdout or "").strip()[:80]))
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                res["errors"].append("%s: %s" % (o["id"], exc))
+    log("shm preflight: %d segments, %d orphaned (dead creator, NATTCH 0), %d removed, "
+        "limit %d%s" % (res["total"], res["orphans"], res["removed"], res["limit"],
+                        "" if reap else " (reap off: roster proof.shm_reap)"))
+    return res
+
+
 def _classify_vitest(rc, log_text, timed_out):
     """vitest run: 'Test Files  N passed (N)' / 'Tests  N passed (N)' summary lines;
     a failing file prints ' FAIL  path > name' lines. rc 1 with
@@ -225,6 +296,12 @@ def _classify(rc, log_text, timed_out):
               "timed_out": timed_out}
     if timed_out:
         return "FAIL_INFRA", counts
+    infra = _INFRA_RE.search(log_text)
+    if infra:
+        return "FAIL_INFRA", dict(counts, reason="postgres could not start: %s"
+                                  % infra.group(0)[:80])
+    if collected == 0:
+        return "FAIL_INFRA", dict(counts, reason="no tests collected")
     if rc == 0 and marker:
         return "PASS", counts
     if rc == 0 and not marker and collected == 0:
@@ -319,12 +396,24 @@ def run_proof(args):
                 argv += ["platform/tests"]
             cwd = str(wt)
             pre = None
+        shm = None
+        if args.proof_kind == "platform":
+            shm = shm_preflight(log, reap=bool(proof_cfg.get("shm_reap", False)))
+            left = shm["orphans"] - shm["removed"]
+            if left and left >= max(8, shm["limit"] // 2):
+                st.alert("SHM_ORPHANS", "%d of %d SysV shm slots held by orphaned segments "
+                         "(dead creator, NATTCH 0); postgres cannot start when full. Owner: "
+                         "`ipcrm -m` them (ids %s), or set roster proof.shm_reap: true so "
+                         "vpproof removes them before each platform leg"
+                         % (left, shm["limit"], " ".join(str(i) for i in shm["ids"][:40])))
         started = utc_ms()
         timed_out = False
         with open(log_path, "w", encoding="utf-8") as fh:
             fh.write("# vpproof %s %s sha=%s kind=%s proof_kind=%s\n"
                      % (started, args.proof_id, args.sha, args.kind, args.proof_kind))
             fh.write("# cwd=%s\n# argv=%s\n" % (cwd, json.dumps(argv)))
+            if shm is not None:
+                fh.write("# shm preflight: %s\n" % json.dumps(shm))
             if pre:
                 try:
                     v = subprocess.run(pre, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -367,6 +456,8 @@ def run_proof(args):
         counts["started"] = started
         counts["ended"] = utc_ms()
         counts["paths"] = paths
+        if shm is not None:
+            counts["shm_preflight"] = shm
         meta = {"ts": utc_ms(), "proof_id": args.proof_id, "sha": args.sha,
                 "kind": args.kind, "proof_kind": args.proof_kind, "status": status,
                 "counts": counts, "log": str(log_path), "notes": notes,

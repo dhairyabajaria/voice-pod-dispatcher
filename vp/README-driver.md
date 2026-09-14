@@ -351,6 +351,24 @@ number. Codex `output_tokens` already include reasoning; cached input is priced
 once at the cached rate. Measured on run-v12-20260913: 139 Codex reviews,
 mean 962k input (882k cached) / 8k output, every `cost` null before this.
 
+## Box shared memory (D69) — `vpproof.py`
+
+macOS `kern.sysv.shmmni` is 32.  Every killed xdist worker / test-postgres
+cluster leaves a 56-byte SysV segment (NATTCH 0, dead creator); at 32 the next
+`initdb` fails with `could not create shared memory segment: No space left on
+device` and every test ERRORs at fixture time (proof-00073/00074, 554 errors,
+recorded FAIL_PRODUCT).
+
+- `_classify`: a log carrying a Postgres start failure (`_INFRA_RE`) or 0
+  collected tests is FAIL_INFRA whatever the rc -- re-requested with backoff,
+  no item findings.  The failed nodes stay in `counts` for the reader.
+- Before each platform leg `shm_preflight` counts orphaned segments (`ipcs -m
+  -a`, NATTCH 0, creator pid dead) into the log header and `counts.shm_preflight`.
+  It REMOVES them (`ipcrm -m`) only when the roster says `"proof": {"shm_reap":
+  true}`; the default is off (removing IPC segments is the owner's call: the
+  classifier refused `ipcrm` to the orchestrator's session).  When half or more
+  of the slots are orphaned an `SHM_ORPHANS` alert names the ids.
+
 ## Junior UNKNOWN verdicts (D67)
 
 Measured over run-v12: 7 of 109 junior records carried an UNKNOWN line with
