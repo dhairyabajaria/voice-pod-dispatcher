@@ -2237,6 +2237,40 @@ class LaneDriver(object):
                  "evidence": str(l.get("evidence") or "")[:300]}
                 for l in doc.get("lines") or [] if isinstance(l, dict) and l.get("verdict") != "PASS"]
 
+    def _rebind_result(self, wt, head, task):
+        """The autofix commit sits on top of the builder's commit, so the
+        RESULT.json the builder wrote names the pre-autofix sha while 54
+        packets' [evidence] rows require `commit` == `git rev-parse HEAD`.
+        The record is the graded head's: rebind commit (keeping the builder's
+        under pre_autofix_commit) and refresh diff_stat from git."""
+        rp = Path(wt) / ".vp" / "RESULT.json"
+        try:
+            doc = json.loads(rp.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(doc, dict) or doc.get("commit") == head:
+            return False
+        doc["pre_autofix_commit"] = doc.get("commit")
+        doc["commit"] = head
+        base = doc.get("base") or self._base_of(wt)
+        if base:
+            rc, out, _ = self.git(["-C", str(wt), "diff", "--numstat", "%s..%s" % (base, head)])
+            if rc == 0:
+                ins = dele = files = 0
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) == 3:
+                        files += 1
+                        ins += int(parts[0]) if parts[0].isdigit() else 0
+                        dele += int(parts[1]) if parts[1].isdigit() else 0
+                doc["diff_stat"] = {"files": files, "insertions": ins, "deletions": dele}
+        try:
+            rp.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            return False
+        self.log("AUTOFIX %s RESULT.json commit rebound %s -> %s" % (task, str(doc["pre_autofix_commit"])[:12], head[:12]))
+        return True
+
     PY_EXT = (".py",)
     PORTAL_EXT = (".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".scss", ".md")
 
@@ -2302,6 +2336,7 @@ class LaneDriver(object):
                 steps.append({"tool": "git-commit", "rc": rc2, "stderr": (e2 or o2)[-500:]})
             else:
                 self.log("AUTOFIX %s committed %s (%d files)" % (task, committed[:12], len(files)))
+                self._rebind_result(wt, committed, task)
         rec = {"ts": utc_ms(), "task": task, "base": base, "changed": changed, "py": py, "portal": portal,
                "steps": steps, "tsc_rc": tsc_rc, "committed": committed}
         if tdir is not None:

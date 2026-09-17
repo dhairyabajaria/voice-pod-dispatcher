@@ -1006,6 +1006,12 @@ def test_autofix_runs_ruff_and_prettier_and_commits_as_autofix(tmp_path):
     assert [s["tool"] for s in rec["steps"]] == ["ruff-fix", "ruff-format", "prettier", "tsc"]
     assert rec["tsc_rc"] == 2 and rec["committed"] == rows["L02"]["output_sha"]
     assert "tsc --noEmit rc=2" in (env.run_root / "driver.log").read_text()
+    # the RESULT.json the builder wrote named the pre-autofix sha; the graded
+    # record is rebound to HEAD (54 packets' rows require commit == HEAD)
+    res = json.loads((wt / ".vp" / "RESULT.json").read_text())
+    assert res["commit"] == git(wt, "rev-parse", "HEAD") and res["pre_autofix_commit"] == git(wt, "rev-parse", "HEAD~1")
+    assert res["diff_stat"]["files"] == 2 and res["diff_stat"]["insertions"] >= 3
+    assert "RESULT.json commit rebound" in (env.run_root / "driver.log").read_text()
     gitlog = (env.run_root / "git.jsonl").read_text()
     assert "autofix: ruff/prettier" in gitlog
     # design-kind tasks (no builder turn) never run the fixers
