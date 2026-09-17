@@ -1130,3 +1130,37 @@ def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     msgs = vplint.lint_roster_v13(bad)
     assert any("live servers" in m for m in msgs) and any("shm_reap" in m for m in msgs)
     assert any("kind operations has no role" in m for m in msgs)
+
+
+# -- item 11: a review-gate refusal parks the finished attempt, never re-runs it -------
+
+def test_item11_gate_hold_parks_the_attempt_and_retries_only_complete(tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    env.activate()
+    probe = FakeRunner(default=result_ok)
+    drv = env.driver({"opencode": probe, "codex": FakeRunner()})
+    real = drv.control.complete
+    refusals = {"n": 0}
+
+    def gated(task, attempt, outcome, *a, **k):
+        if task == "L00" and refusals["n"] < 2:
+            refusals["n"] += 1
+            raise lanedriver.ControlError("complete exited 1: RuntimeError: L00 requires --verdict "
+                                          "with validated junior evidence")
+        return real(task, attempt, outcome, *a, **k)
+    monkeypatch.setattr(drv.control, "complete", gated)
+    settle(drv, 3)
+    hold = next((env.run_root / "turns" / "L00").glob("*/gate-hold.json"))
+    rec = json.loads(hold.read_text())
+    assert rec["outcome"] == "VERIFIED" and "requires --verdict" in rec["refused"] and rec["output_sha"]
+    assert env.rows()["L00"]["state"] == "RUNNING", "the scheduler still holds the attempt"
+    assert len([c for c in probe.calls if c.item == "L00"]) == 1, "the turn is never re-run"
+    assert "REVIEW_GATE_HOLD" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert refusals["n"] == 2, "ticks 2-3: one immediate retry of `complete` inside the minute"
+    # the gate opens (the review packet recorded its verdict): the next retry retires the task
+    drv._gate_last.clear()
+    settle(drv, 1)
+    assert env.rows()["L00"]["state"] == "VERIFIED"
+    assert env.rows()["L01"]["state"] != "WAITING_DEPENDENCY", "the release unlocked the dependants"
+    assert not hold.exists() and hold.with_name("gate-hold.released.json").exists()
+    assert len([c for c in probe.calls if c.item == "L00"]) == 1

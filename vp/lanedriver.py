@@ -372,6 +372,7 @@ class LaneDriver(object):
         self.git_jsonl = self.run_root / "git.jsonl"
         self._sealed_day = None
         self.fake_runners = False
+        self._gate_last = {}
 
         self._apply_roster(self.roster)
         self.git_bin = self.bins.get("git", "git")
@@ -1288,6 +1289,9 @@ class LaneDriver(object):
             key = row.get("attempt_id")
             if self._backed_off(task, key):
                 continue
+            if key and (self.turns_root / task / key / "gate-hold.json").exists():
+                self._gate_hold_retry(task, key)
+                continue
             contract = self.control.contract(task, row)
             kind = contract.get("kind") or row.get("kind")
             rcfg = self.roles.get(kind)
@@ -1319,6 +1323,41 @@ class LaneDriver(object):
                         row.get("base_sha") or self.trunk_sha() or "", needs_start=needs_start)
             n += 1
         return n
+
+    GATE_RETRY_S = 60.0
+
+    def _gate_hold_retry(self, task, attempt):
+        """a finished attempt the review gate holds: re-offer `complete` at most
+        once a minute; success retires the task, refusal keeps the hold."""
+        path = self.turns_root / task / attempt / "gate-hold.json"
+        try:
+            hold = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        last = self._gate_last.get(attempt)
+        if last is not None and time.monotonic() - last < self.GATE_RETRY_S:
+            return
+        self._gate_last[attempt] = time.monotonic()
+        try:
+            _rc, data = self.control.complete(task, attempt, hold["outcome"], hold.get("evidence") or [],
+                                              hold.get("output_sha"), hold.get("tree_sha"),
+                                              hold.get("reason"), None, hold.get("unlock_dependents"))
+        except ControlError as exc:
+            hold["retries"] = int(hold.get("retries", 0)) + 1
+            hold["last_refusal"] = {"ts": utc_ms(), "error": str(exc)[:300]}
+            try:
+                path.write_text(json.dumps(hold, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError:
+                pass
+            return
+        newly = (data or {}).get("newly_ready") or []
+        self.log("COMPLETE %s %s -> %s (gate released after %d retries) newly_ready=%s"
+                 % (task, attempt, hold["outcome"], int(hold.get("retries", 0)), newly))
+        self.completed.append((task, attempt, hold["outcome"]))
+        try:
+            path.rename(path.with_name("gate-hold.released.json"))
+        except OSError:
+            pass
 
     def _spawn(self, task, attempt, row, contract, server, runner, base, needs_start=False):
         with self._lock:
@@ -1446,6 +1485,22 @@ class LaneDriver(object):
                 except ControlError as exc2:
                     self.alert("COMPLETE_REFUSED", "%s %s: %s" % (task, attempt, str(exc2)[:300]), task)
                     return False
+            elif "requires --verdict" in str(exc):
+                # the scheduler's review gate (junior / final) holds the completion:
+                # the work is done, the verdict is not.  Park the finished attempt
+                # under gate-hold.json; adoption retries only `complete` (never the
+                # turns) until the review packet records its verdict.  Found by the
+                # ladder: L35 looped builder->grader->proof 46 times in 3 minutes.
+                hold = dict(harvest, refused=str(exc)[:400], held_at=utc_ms(), retries=0)
+                try:
+                    (tdir / "gate-hold.json").write_text(json.dumps(hold, indent=2, sort_keys=True),
+                                                         encoding="utf-8")
+                except OSError:
+                    pass
+                self.alert_once("gate-hold:%s" % attempt, "REVIEW_GATE_HOLD",
+                                "%s %s finished but the scheduler holds it for its review: %s"
+                                % (task, attempt, str(exc)[:200]), task)
+                return False
             else:
                 self.alert("COMPLETE_REFUSED", "%s %s: %s" % (task, attempt, str(exc)[:300]), task)
                 return False
@@ -2002,6 +2057,52 @@ class LaneDriver(object):
             time.sleep(self.interval)
 
 
+class DryRunProof(object):
+    """Ladder / dry-run proof: no pytest, no CircleCI.  Answers PASS (or the
+    scripted status per task) after `delay_s`, records proofs/<pid>.json like
+    the real Proof, and keeps a live counter so concurrency is observable."""
+
+    def __init__(self, run_root, statuses=None, delay_s=0.0, log=None):
+        self.run_root = Path(run_root)
+        self.statuses = dict(statuses or {})
+        self.delay_s = float(delay_s)
+        self.log = log or (lambda m: None)
+        self.cfg = {}
+        self.calls = []
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def run(self, task, pid, wt, base, cand, kind, paths, abort=None):
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append({"task": task, "proof_id": pid, "sha": cand, "kind": kind, "ts": utc_ms()})
+        try:
+            end = time.monotonic() + self.delay_s
+            while time.monotonic() < end:
+                if abort and abort():
+                    break
+                time.sleep(0.05)
+            status = self.statuses.get(task, "PASS")
+            rec = {"status": status, "route": "dryrun", "proof_id": pid, "task": task, "sha": cand,
+                   "kind": kind, "paths": list(paths or []), "failed_nodes":
+                   ["control/dryrun/%s.txt::scripted" % task] if status == "FAIL_PRODUCT" else [],
+                   "errors": {}, "ts": utc_ms(), "note": "dry run, no proof harness"}
+            d = self.run_root / "proofs"
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                (d / ("%s.json" % pid)).write_text(json.dumps(rec, indent=2, sort_keys=True),
+                                                   encoding="utf-8")
+            except OSError:
+                pass
+            self.log("PROOF %s %s route=dryrun -> %s" % (task, pid, status))
+            return rec
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
 class DryRunRunner(object):
     """Ladder / dry-run runner: no model, no network.  Writes a valid record for
     the role (RESULT / FINDINGS / REVIEW), commits a marker file for build-like
@@ -2017,6 +2118,10 @@ class DryRunRunner(object):
 
     def _git(self, wt, *args):
         return self.exec.run(["git", "-C", str(wt)] + list(args), timeout_s=120)
+
+    def preopen(self, spec):
+        """codex-style pre-open: a fake thread id so `start` can bind it"""
+        return "dry-thread-%s" % spec.item, "dry run"
 
     def run(self, spec, abort_flag=None):
         self.calls.append((spec.role, spec.item))
@@ -2330,11 +2435,13 @@ def main(argv=None):
         if args.fake_runners:
             dry = DryRunRunner()
             runners = {"opencode": dry, "codex": dry, "claude": dry, "agy": dry}
-        drv = LaneDriver(args.roster, interval=args.interval, runners=runners,
+        proof = DryRunProof(Path(args.roster).resolve().parent) if args.fake_runners else None
+        drv = LaneDriver(args.roster, interval=args.interval, runners=runners, proof=proof,
                          bins={"osascript": shutil.which("osascript")} if shutil.which("osascript") else None)
         if args.fake_runners:
             drv.fake_runners = True
-            drv.log("FAKE RUNNERS in force: no model call will be made")
+            proof.log = drv.log
+            drv.log("FAKE RUNNERS in force: no model call, no proof harness, no network")
         drv.log("lanedriver start pid=%d roster=%s" % (os.getpid(), drv.roster_path))
         drv.comms("lanedriver", "audit", "start pid=%d fake_runners=%s" % (os.getpid(), args.fake_runners),
                   kind="lifecycle")
