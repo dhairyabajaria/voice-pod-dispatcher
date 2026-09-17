@@ -421,6 +421,80 @@ def lint_roster(path):
     for g, cfg in (r.get("groups") or {}).items():
         if cfg.get("server") not in (r.get("servers") or {}):
             out.append("ERROR roster: group %s names unknown server %s" % (g, cfg.get("server")))
+    out += lint_roster_v13(r)
+    return out
+
+
+V13_KINDS = ("builder", "control", "design", "final_review", "integration", "operations", "probe",
+             "provider", "security_build", "verification", "grader", "junior")
+RUNNERS = ("opencode", "codex", "claude", "agy")
+
+
+def lint_roster_v13(r):
+    """v13 (lanedriver) checks, applied when the roster carries a scheduler:
+    control paths exist; every catalog kind resolves to a role through
+    kind_map; each role names a known runner, and opencode roles a live,
+    unparked server; the go2-only / parked-fallback topology; the item-10
+    numbers (codex_max, claude_max, box_slots, shm_reap, pause_on_disk_gb,
+    circleci account 3)."""
+    run = r.get("run") or {}
+    if not (run.get("scheduler") or (r.get("control") or {}).get("script")):
+        return []
+    try:
+        import lanedriver
+    except ImportError:
+        return ["WARN roster: lanedriver not importable; v13 checks skipped"]
+    out = []
+    n = lanedriver.normalize_roster(r)
+    ctl = n.get("control") or {}
+    for key in ("script", "state", "catalog"):
+        p = ctl.get(key)
+        if not p:
+            out.append("ERROR roster: control.%s missing" % key)
+        elif key != "state" and not os.path.exists(os.path.expanduser(p)):
+            out.append("ERROR roster: control.%s does not exist: %s" % (key, p))
+    if run.get("pack_dir") and not os.path.isdir(os.path.expanduser(n["run"]["pack_dir"])):
+        out.append("ERROR roster: run.pack_dir does not exist: %s" % n["run"]["pack_dir"])
+    servers = n.get("servers") or {}
+    live = [s for s, cfg in servers.items() if not cfg.get("parked")]
+    if live != ["go2"]:
+        out.append("ERROR roster: live servers must be exactly [go2] (go1/go3 parked); got %s" % live)
+    go2 = servers.get("go2") or {}
+    if go2.get("max_concurrent") != 8 or not str(go2.get("url", "")).endswith(":4102"):
+        out.append("ERROR roster: go2 must be :4102 with max_concurrent 8; got %s" % json.dumps(go2))
+    roles = n.get("roles") or {}
+    for kind in V13_KINDS:
+        rc = roles.get(kind)
+        if not rc:
+            out.append("ERROR roster: kind %s has no role (kind_map -> %s)" % (kind, n["kind_map"].get(kind)))
+            continue
+        runner = rc.get("runner")
+        if runner not in RUNNERS:
+            out.append("ERROR roster: kind %s runner %r not in %s" % (kind, runner, list(RUNNERS)))
+        if runner == "opencode":
+            srv = rc.get("server")
+            if srv not in servers:
+                out.append("ERROR roster: kind %s names unknown server %r" % (kind, srv))
+            elif servers[srv].get("parked"):
+                out.append("ERROR roster: kind %s routes to parked server %s" % (kind, srv))
+            if not rc.get("model"):
+                out.append("ERROR roster: kind %s has no model" % kind)
+    b = (roles.get("builder") or {}).get("runner")
+    for kind in ("junior", "final_review", "security_build"):
+        if (roles.get(kind) or {}).get("runner") == b:
+            out.append("ERROR roster: %s runner equals builder runner (%s): independence lost" % (kind, b))
+    conc = n.get("concurrency") or {}
+    if conc.get("codex_max") != 3 or conc.get("claude_max") != 2:
+        out.append("ERROR roster: concurrency.codex_max 3 / claude_max 2 required; got %s / %s"
+                   % (conc.get("codex_max"), conc.get("claude_max")))
+    proof = n.get("proof") or {}
+    if proof.get("box_slots") != 1 or proof.get("shm_reap") is not True:
+        out.append("ERROR roster: proof.box_slots 1 and proof.shm_reap true required")
+    cc = proof.get("circleci") or {}
+    if str(cc.get("account", "3")) != "3":
+        out.append("ERROR roster: proof.circleci.account must be \"3\"; got %r" % cc.get("account"))
+    if (n.get("night") or {}).get("pause_on_disk_gb") != 25:
+        out.append("ERROR roster: night.pause_on_disk_gb 25 required")
     return out
 
 

@@ -1077,3 +1077,56 @@ def test_item8_missing_profiles_are_seeded_from_the_dispatcher_copy(tmp_path):
     for name in lanedriver.LaneDriver.PROFILES:
         if (src / ("%s.json" % name)).exists():
             assert (env.run_root / "claude-settings" / ("%s.json" % name)).exists()
+
+
+# -- item 10: roster-v13 vocabulary --------------------------------------------------
+
+def test_item10_normalize_roster_maps_architect_vocabulary_onto_the_driver():
+    r = {"run": {"trunk": "/t", "scheduler": "/x/orchestration_control.py", "run_state": "/x/s.json",
+                 "catalog": "/x/c.json", "packets_dir": "/p"},
+         "night": {"render_every_min": 15, "status_line_every_min": 30},
+         "servers": {"go2": {"url": "u", "role": "primary"}, "go1": {"url": "v", "role": "fallback"}},
+         "roles": {"builder": {"runner": "opencode", "server": "go2", "model": "opencode-go/muse"},
+                   "grader": {"runner": "opencode", "server": "go2", "model": "opencode-go/ds"},
+                   "final": {"runner": "codex", "model": "gpt-5.6-sol-1m"},
+                   "design": {"runner": "opencode", "server": "go2", "model": "explicit"}}}
+    n = lanedriver.normalize_roster(r)
+    assert n["control"] == {"script": "/x/orchestration_control.py", "cwd": "/x", "state": "/x/s.json",
+                            "catalog": "/x/c.json"}
+    assert n["run"]["pack_dir"] == "/p" and n["servers"]["go1"]["parked"] is True
+    assert "parked" not in n["servers"]["go2"]
+    assert n["alerts"] == {"render_every_s": 900.0, "idle_every_min": 30}
+    assert n["roles"]["verification"] is n["roles"]["grader"] or n["roles"]["verification"] == n["roles"]["grader"]
+    assert n["roles"]["final_review"]["model"] == "gpt-5.6-sol-1m"
+    assert n["roles"]["design"]["model"] == "explicit", "an explicit role beats the kind_map"
+    assert "operations" not in n["roles"], "no infra role -> no operations role (lint reports it)"
+    assert r.get("control") is None, "pure: the input is untouched"
+
+
+def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
+    import vplint
+    src = CONTROL_DIR / "v13-pack" / "roster-v13.json"
+    r = json.loads(src.read_text())
+    assert vplint.lint_roster_v13(r) == []
+    # the driver consumes it as-is (control derived from run.*, roles via kind_map)
+    env = Env(tmp_path)
+    env.activate()
+    r["run"].update({"trunk": str(env.trunk), "cn": str(env.tmp), "worktrees": str(env.tmp / "wt"),
+                     "run_state": str(env.state), "catalog": str(env.catalog),
+                     "packets_dir": str(env.tmp / "nopack")})
+    r["control"] = {"python": PY}
+    (env.run_root / "roster.json").write_text(json.dumps(r, indent=2))
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    assert drv.roles["verification"]["runner"] == "opencode" and drv.roles["final_review"]["runner"] == "codex"
+    assert drv.servers["go1"]["parked"] and not drv.servers["go2"]["parked"]
+    assert drv.control.script.endswith("orchestration_control.py")
+    settle(drv, 2)
+    assert env.rows()["L00"]["state"] == "VERIFIED"
+    # the v13 lint bites on the item-10 numbers
+    bad = json.loads(src.read_text())
+    bad["servers"]["go3"]["parked"] = False
+    bad["proof"]["shm_reap"] = False
+    bad["roles"].pop("infra")
+    msgs = vplint.lint_roster_v13(bad)
+    assert any("live servers" in m for m in msgs) and any("shm_reap" in m for m in msgs)
+    assert any("kind operations has no role" in m for m in msgs)

@@ -285,13 +285,59 @@ class Control(object):
 # the driver
 # --------------------------------------------------------------------------
 
+# catalog kind -> roster role (plan §2.2 names).  A roster may override any
+# entry under "kind_map"; a role named directly under "roles" always wins.
+KIND_MAP = {"builder": "builder", "design": "builder", "integration": "integrator",
+            "probe": "probe", "control": "probe", "verification": "grader", "grader": "grader",
+            "operations": "infra", "provider": "infra", "security_build": "security",
+            "junior": "junior", "final_review": "final", "adjudicator": "adjudicator",
+            "ruling": "ruling", "advisor": "advisor"}
+
+
+def normalize_roster(data):
+    """Accept the Architect's roster-v13 vocabulary next to the driver's own:
+    `run.scheduler/run_state/catalog/packets_dir` -> `control{}` + `run.pack_dir`;
+    `servers[].role == "fallback"` -> parked; `night.render_every_min` ->
+    `alerts.render_every_s`; kinds without a role resolve through `kind_map`.
+    Pure: returns a new dict, never writes the file."""
+    r = json.loads(json.dumps(data))
+    run = r.setdefault("run", {})
+    ctl = r.setdefault("control", {})
+    if run.get("scheduler") and not ctl.get("script"):
+        ctl["script"] = run["scheduler"]
+        ctl.setdefault("cwd", str(Path(os.path.expanduser(run["scheduler"])).parent))
+    if run.get("run_state") and not ctl.get("state"):
+        ctl["state"] = run["run_state"]
+    if run.get("catalog") and not ctl.get("catalog"):
+        ctl["catalog"] = run["catalog"]
+    if run.get("packets_dir") and not run.get("pack_dir"):
+        run["pack_dir"] = run["packets_dir"]
+    for srv in (r.get("servers") or {}).values():
+        if "parked" not in srv and srv.get("role") == "fallback":
+            srv["parked"] = True
+    night = r.get("night") or {}
+    alerts = r.setdefault("alerts", {})
+    if night.get("render_every_min") and "render_every_s" not in alerts:
+        alerts["render_every_s"] = float(night["render_every_min"]) * 60
+    if night.get("status_line_every_min") and "idle_every_min" not in alerts:
+        alerts["idle_every_min"] = night["status_line_every_min"]
+    kind_map = dict(KIND_MAP)
+    kind_map.update(r.get("kind_map") or {})
+    roles = r.setdefault("roles", {})
+    for kind, role in kind_map.items():
+        if kind not in roles and role in roles:
+            roles[kind] = roles[role]
+    r["kind_map"] = kind_map
+    return r
+
+
 class LaneDriver(object):
 
     def __init__(self, roster_path, exec_=None, runners=None, control=None,
                  interval=DEFAULT_INTERVAL, bins=None, clock=None, proof=None):
         self.roster_path = Path(roster_path).resolve()
         self.run_root = self.roster_path.parent
-        self.roster = json.loads(self.roster_path.read_text(encoding="utf-8"))
+        self.roster = normalize_roster(json.loads(self.roster_path.read_text(encoding="utf-8")))
         self._roster_mtime = self.roster_path.stat().st_mtime
         self.exec = exec_ or vprunners.Exec()
         self.interval = float(interval)
@@ -504,7 +550,7 @@ class LaneDriver(object):
         if m == self._roster_mtime:
             return
         try:
-            data = json.loads(self.roster_path.read_text(encoding="utf-8"))
+            data = normalize_roster(json.loads(self.roster_path.read_text(encoding="utf-8")))
         except ValueError:
             return
         self._roster_mtime = m
@@ -1695,7 +1741,10 @@ class LaneDriver(object):
         except OSError:
             pass
         mm = self.conc.get("max_minutes_per_turn", {})
-        timeout_s = float(mm.get(role, mm.get("default", 45))) * 60
+        # roster-v13 spells the per-turn ceilings by verb (build/grade/review/...)
+        alias = {"builder": "build", "grader": "grade", "junior": "review", "reviewer": "review",
+                 "integrator": "integrate", "final": "final", "security": "security"}.get(role)
+        timeout_s = float(mm.get(role, mm.get(alias, mm.get("default", 45)))) * 60
         n, resumes, outcome = 0, 0, None
         while True:
             n += 1
