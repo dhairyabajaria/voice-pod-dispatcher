@@ -274,3 +274,12 @@ def test_item9_flip_off_mid_poll_cancels_the_pipeline(tmp_path):
     rec = p.run("L35", "proof-9", wt, base, cand, "platform", [])
     assert rec["status"] == "CANCELLED" and rec["cancelled_workflows"] == ["w1"]
     assert ("cancel", "pipe-206") in circle.calls
+
+
+def test_docs_only_proof_passes_without_a_run(tmp_path):
+    logs = []
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), None, logs=logs)   # no exec: a run would blow up
+    rec = p.run("R-DOCS", "proof-docs-1", tmp_path, "b" * 40, "c" * 40, "docs", [])
+    assert rec["status"] == "PASS" and rec["route"] == "none" and rec["failed_nodes"] == []
+    assert (tmp_path / "run" / "proofs" / "proof-docs-1.json").exists()
+    assert any("docs-only" in m for m in logs)

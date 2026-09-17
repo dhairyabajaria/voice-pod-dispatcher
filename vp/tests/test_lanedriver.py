@@ -876,6 +876,85 @@ def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypat
     assert "PROOF_UNKNOWN" in (env.run_root / "OWNER-ALERTS.md").read_text()
 
 
+# -- D11: [hosted] rows never block; [box] UNKNOWNs -> proof, then one regrade --------------------
+
+def _with_hosted_row(monkeypatch):
+    orig = lanedriver.LaneDriver.render_benchmark
+
+    def render(contract):
+        return orig(contract) + "- B9 [invariant] [hosted] end to end on a live DB — check: CI shard (gate: CIRCLECI)\n"
+    monkeypatch.setattr(lanedriver.LaneDriver, "render_benchmark", staticmethod(render))
+
+
+def grader_unknown_on(ids, until_proof=False):
+    """PASS everywhere except UNKNOWN on `ids`; with until_proof, those flip to
+    PASS once .vp/PROOF.json exists (the regrade after the proof)"""
+    def fn(spec, abort_flag=None):
+        wt = Path(spec.cwd)
+        head = git(wt, "rev-parse", "HEAD")
+        proved = (wt / ".vp" / "PROOF.json").exists()
+        all_ids = [l.split()[1] for l in (wt / ".vp" / "BENCHMARK.md").read_text().splitlines()
+                   if l.startswith("- B")]
+        lines = []
+        for i in all_ids:
+            hosted = i == "B9"                    # the [hosted] row stays UNKNOWN on the box
+            v = "UNKNOWN" if (i in ids and (hosted or not (until_proof and proved))) else "PASS"
+            lines.append({"id": i, "kind": "evidence", "verdict": v, "evidence": "platform/a.py:1",
+                          "note": "proof log" if proved else "no proof yet"})
+        Path(spec.out_path).write_text(json.dumps({"item": spec.item, "attempt": 1, "commit": head,
+                                                   "lines": lines, "all_pass": False}))
+        return TurnOutcome(STATUS_DONE, "", session_id="ses_g", record_path=spec.out_path,
+                           usage={"tokens_in": 10, "tokens_out": 5, "cost": 0.001}, runner="fake")
+    return fn
+
+
+def test_d11_hosted_unknown_never_blocks_and_is_recorded_as_owed(tmp_path, monkeypatch):
+    _with_hosted_row(monkeypatch)
+    env = Env(tmp_path)
+    env.activate()
+    runner = by_role({"builder": result_ok, "grader": grader_unknown_on({"B9"}), "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    harvest = json.loads(next((env.run_root / "turns" / "L02").glob("*/harvest.json")).read_text())
+    assert harvest["hosted_owed"] == ["B9"]
+    assert "HOSTED_OWED" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert len([s for s in runner.calls if s.item == "L02" and s.role == "builder"]) == 1
+
+
+def test_d11_box_unknown_runs_the_proof_then_regrades_the_same_commit_once(tmp_path, monkeypatch):
+    _with_hosted_row(monkeypatch)
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
+    env.activate()
+    proof = FakeProof([{"status": "PASS"}])
+    runner = by_role({"builder": result_ok, "grader": grader_unknown_on({"B1", "B9"}, until_proof=True),
+                      "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    assert len(proof.calls) == 1, "proof ran once, on the graded head"
+    calls = [s for s in runner.calls if s.item == "L02"]
+    assert len([s for s in calls if s.role == "builder"]) == 1, "no rebuild: same commit regraded"
+    assert len([s for s in calls if s.role == "grader"]) == 2, "grade, proof, regrade"
+    assert (env.tmp / "wt" / "L02" / ".vp" / "PROOF.json").exists()
+    harvest = json.loads(next((env.run_root / "turns" / "L02").glob("*/harvest.json")).read_text())
+    assert harvest["hosted_owed"] == ["B9"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "-> proof, then one regrade" in log
+
+
+def test_d11_box_unknown_without_a_proof_is_ungradeable_after_the_rounds(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    runner = by_role({"builder": result_ok, "grader": grader_unknown_on({"B1"}), "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "REPAIR_REQUIRED" and "UNGRADEABLE B1" in rows["L02"]["blocker"]
+
+
 # -- item 6: deterministic fixers after every builder turn ----------------------------------------
 
 def fake_tool(path, body):
@@ -1110,6 +1189,14 @@ def test_item10_normalize_roster_maps_architect_vocabulary_onto_the_driver():
     assert n["roles"]["design"]["model"] == "explicit", "an explicit role beats the kind_map"
     assert "operations" not in n["roles"], "no infra role -> no operations role (lint reports it)"
     assert r.get("control") is None, "pure: the input is untouched"
+    # D11: a v13 roster (packets_dir) owes a proof for the building kinds unless it says otherwise
+    assert n["proof"]["require_for_kinds"] == ["builder", "integrator", "infra"]
+    r2 = dict(r, proof={"require_for_kinds": ["builder"]})
+    assert lanedriver.normalize_roster(r2)["proof"]["require_for_kinds"] == ["builder"]
+    r3 = {k: v for k, v in r.items() if k != "night"}
+    r3["run"] = {k: v for k, v in r["run"].items() if k != "packets_dir"}
+    assert "proof" not in lanedriver.normalize_roster(r3) or "require_for_kinds" not in \
+        lanedriver.normalize_roster(r3)["proof"], "a v12 roster keeps the v12 default"
 
 
 def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):

@@ -35,6 +35,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -288,6 +289,9 @@ class Control(object):
 
 # catalog kind -> roster role (plan §2.2 names).  A roster may override any
 # entry under "kind_map"; a role named directly under "roles" always wins.
+DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
+HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
+
 KIND_MAP = {"builder": "builder", "design": "builder", "integration": "integrator",
             "probe": "probe", "control": "probe", "verification": "grader", "grader": "grader",
             "operations": "infra", "provider": "infra", "security_build": "security",
@@ -329,6 +333,13 @@ def normalize_roster(data):
         if kind not in roles and role in roles:
             roles[kind] = roles[role]
     r["kind_map"] = kind_map
+    # v13: every packet names a proof_kind and 06-ROUTING §5 routes it (box targeted /
+    # CircleCI full), so the building roles owe a proof unless the roster says otherwise
+    # (the v12 default "integration" matches no v13 kind and silently ran none).
+    proof = dict(r.get("proof") or {})
+    if "require_for_kinds" not in proof and run.get("pack_dir"):
+        proof["require_for_kinds"] = DEFAULT_PROOF_KINDS
+        r["proof"] = proof
     return r
 
 
@@ -492,6 +503,7 @@ class LaneDriver(object):
         self.runner_state = rs
         self.max_tasks = int(self.conc.get("max_tasks_in_flight", 12))
         self.proof_cfg = data.get("proof", {})
+        self.regrade_once = bool((data.get("review") or {}).get("regrade_same_commit_on_unknown_once", True))
         if getattr(self, "proof", None) is not None:
             self.proof.cfg = dict(self.proof_cfg)
 
@@ -1944,7 +1956,7 @@ class LaneDriver(object):
         self._complete(task, attempt, result["outcome"], tdir, evidence=result.get("evidence") or [],
                        output_sha=result.get("output_sha"), tree_sha=result.get("tree_sha"),
                        reason=result.get("reason"), verdict=result.get("verdict"),
-                       fails=result.get("fails"), wt=wt, kind=kind)
+                       fails=result.get("fails"), wt=wt, kind=kind, hosted_owed=result.get("hosted_owed"))
 
     def _saved_session(self, tdir):
         try:
@@ -1961,12 +1973,13 @@ class LaneDriver(object):
                 pass
 
     def _complete(self, task, attempt, outcome, tdir, evidence=(), output_sha=None, tree_sha=None,
-                  reason=None, verdict=None, fails=None, wt=None, kind=None):
+                  reason=None, verdict=None, fails=None, wt=None, kind=None, hosted_owed=None):
         ev = [str(p) for p in evidence if p and Path(p).exists()]
         unlock = outcome == "VERIFIED" and bool(output_sha) and bool(ev)
         harvest = {"ts": utc_ms(), "task": task, "attempt": attempt, "outcome": outcome,
                    "output_sha": output_sha, "tree_sha": tree_sha, "evidence": ev,
-                   "reason": reason, "fails": fails or [], "unlock_dependents": unlock}
+                   "reason": reason, "fails": fails or [], "unlock_dependents": unlock,
+                   "hosted_owed": list(hosted_owed or [])}
         try:
             (tdir / "harvest.json").write_text(json.dumps(harvest, indent=2, sort_keys=True),
                                                encoding="utf-8")
@@ -2088,19 +2101,68 @@ class LaneDriver(object):
             if gout.status != STATUS_DONE:
                 return gout, None
             _doc, fails, unknown = findings_verdicts(fpath)
-            if not fails and not unknown:
+            hosted = self.hosted_rows(wt)
+            owed = [u for u in unknown if u in hosted]
+            blocking = [u for u in unknown if u not in hosted]
+            if owed:
+                self.alert_once("hosted-owed:%s" % task, "HOSTED_OWED",
+                                "%s: %s graded UNKNOWN on the box as 04-REVIEW-POLICY §2 allows; the "
+                                "<ID>-HOSTED twin owes the CircleCI/VPS evidence" % (task, ",".join(owed)), task)
+            if not fails and not blocking:
+                return self._accept_build(task, attempt, row, contract, wt, tdir, outcome, out_path, fpath,
+                                          needs_proof, owed)
+            if not fails and needs_proof and self.regrade_once and not self._proof_pending(tdir):
+                # only [box] rows the grader could not evaluate without the proof
+                # log remain: run the proof now and re-grade this exact commit once
+                # (review.regrade_same_commit_on_unknown_once)
+                self.log("ROUND %s %d/%d unknown=%s -> proof, then one regrade" % (task, rnd, max_rounds, blocking))
                 head = self.head_sha(wt)
-                if needs_proof:
-                    return self._proof_step(task, attempt, row, contract, wt, tdir, head,
-                                            self._base_of(wt), build_outcome=outcome)
-                return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
-                                 "evidence": [out_path, fpath, tdir / "record.json"]}
-            self.log("ROUND %s %d/%d fails=%s unknown=%s" % (task, rnd, max_rounds, fails, unknown))
+                pout, harvest = self._proof_step(task, attempt, row, contract, wt, tdir, head,
+                                                 self._base_of(wt), build_outcome=outcome)
+                if harvest is None or harvest.get("outcome") != "VERIFIED":
+                    return pout, harvest          # proof red or infra: as before
+                gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
+                                  JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, rnd + 100,
+                                  expect_fence=True)
+                if gout.status != STATUS_DONE:
+                    return gout, None
+                _doc, fails, unknown = findings_verdicts(fpath)
+                owed = [u for u in unknown if u in hosted]
+                blocking = [u for u in unknown if u not in hosted]
+                if not fails and not blocking:
+                    harvest["hosted_owed"] = owed
+                    return outcome, harvest
+                self.log("REGRADE %s after proof: fails=%s unknown=%s" % (task, fails, blocking))
+            self.log("ROUND %s %d/%d fails=%s unknown=%s%s" % (task, rnd, max_rounds, fails, blocking,
+                                                             " hosted_owed=%s" % owed if owed else ""))
         head = self.head_sha(wt)
+        reason = "%d rounds; FAIL %s" % (max_rounds, ",".join(fails)[:300])
+        if not fails and blocking:
+            reason = "%d rounds; UNGRADEABLE %s" % (max_rounds, ",".join(blocking)[:300])
         return outcome, {"outcome": "REPAIR_REQUIRED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                          "evidence": [out_path, fpath, tdir / "record.json"],
-                         "reason": "%d rounds; FAIL %s" % (max_rounds, ",".join(fails)[:300]),
-                         "fails": self._fail_lines(fpath)}
+                         "reason": reason, "fails": self._fail_lines(fpath), "hosted_owed": owed}
+
+    def _accept_build(self, task, attempt, row, contract, wt, tdir, outcome, out_path, fpath, needs_proof, owed):
+        head = self.head_sha(wt)
+        if needs_proof:
+            pout, harvest = self._proof_step(task, attempt, row, contract, wt, tdir, head,
+                                             self._base_of(wt), build_outcome=outcome)
+            if harvest is not None:
+                harvest["hosted_owed"] = owed
+            return pout, harvest
+        return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
+                         "evidence": [out_path, fpath, tdir / "record.json"], "hosted_owed": owed}
+
+    @staticmethod
+    def hosted_rows(wt):
+        """benchmark ids tagged [hosted] in <wt>/.vp/BENCHMARK.md (04-REVIEW-POLICY §2:
+        graded UNKNOWN on the parent item, never blocking; the twin task owns them)"""
+        try:
+            text = (Path(wt) / ".vp" / "BENCHMARK.md").read_text(encoding="utf-8")
+        except OSError:
+            return set()
+        return set(HOSTED_TAG_RE.findall(text))
 
     # -- proof step (F6 lives in laneproof) --------------------------------------------------
 
@@ -2133,6 +2195,11 @@ class LaneDriver(object):
         rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set())
         ppath = self.run_root / "proofs" / ("%s.json" % pid)
         status = rec.get("status")
+        try:                                      # the regrade reads it from .vp/
+            (wt / ".vp" / "PROOF.json").write_text(json.dumps(rec, indent=2, sort_keys=True, default=str),
+                                                   encoding="utf-8")
+        except OSError:
+            pass
         outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")
         evidence = [wt / ".vp" / "RESULT.json", wt / ".vp" / "FINDINGS.json", tdir / "record.json", ppath]
         if status == "PASS":

@@ -137,7 +137,8 @@ def test_parent_dependencies_parameters_and_closure_plan(tmp_path):
 def test_driver_binds_the_pack_retires_the_joint_closer_and_gates_and_rewires(tmp_path):
     pd = tiny_pack(tmp_path)
     env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
-                                      "packet": {"rewire": ["L04"]}})
+                                      "packet": {"rewire": ["L04"]},
+                                      "proof": {"require_for_kinds": []}})   # binding test, no proof harness
     env.roster["run"]["pack_dir"] = str(pd)
     (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
     # JX: a repair task already in REPAIR_REQUIRED (adopted before activation,
@@ -222,7 +223,8 @@ def test_review_packet_waits_for_a_candidate_then_carries_the_union_dispatch_rec
         (pd / "REVIEW-UNION" / "PACKET.md").read_text().replace(
             "  - control/evidence/REVIEW-UNION/v13/REGRADE.md",
             "  - control/evidence/REVIEW-UNION/<union>/verdict-packet.json"))
-    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0}})
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
     env.roster["run"]["pack_dir"] = str(pd)
     (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
     env.activate()
