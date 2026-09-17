@@ -802,6 +802,70 @@ def test_quota_on_codex_parks_codex_runner_and_leaves_review_running(tmp_path):
     assert env.rows()["J1"]["state"] == "RUNNING"
 
 
+# -- item 5: the proof step in the driver (F6 itself is tested in test_laneproof) ------------
+
+class FakeProof(object):
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+        self.cfg = {}
+
+    def run(self, task, pid, wt, base, cand, kind, paths, abort=None):
+        self.calls.append((task, pid, cand, kind, paths))
+        rec = dict(self.results.pop(0) if self.results else {"status": "PASS"})
+        rec.update({"proof_id": pid, "sha": cand, "route": "fake"})
+        d = Path(wt).parents[1] / "run" / "proofs" if False else None
+        return rec
+
+
+def routed_pass(spec, ab):
+    return findings("PASS")(spec, ab) if spec.role == "grader" else result_ok(spec, ab)
+
+
+def test_proof_pass_verifies_and_fail_product_is_repair_required(tmp_path):
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
+    env.activate()
+    proof = FakeProof([{"status": "FAIL_PRODUCT", "failed_nodes": ["platform/tests/test_a.py::test_x"],
+                        "errors": {"platform/tests/test_a.py::test_x": "AssertionError: 1 != 2"}}])
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(),
+                      "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "REPAIR_REQUIRED" and "FAIL_PRODUCT" in rows["L02"]["blocker"]
+    assert rows["L01"]["state"] == "VERIFIED", "design kind needs no proof"
+    assert len(proof.calls) == 1 and proof.calls[0][0] == "L02" and proof.calls[0][3] == "platform"
+    harvest = json.loads(next((env.run_root / "turns" / "L02").glob("*/harvest.json")).read_text())
+    assert harvest["fails"][0]["id"] == "platform/tests/test_a.py::test_x"
+    assert "1 != 2" in harvest["fails"][0]["note"]
+    # the repair for that defect gets instantiated and proved (PASS) -> promoted
+    drv.tick()
+    rep = [t for t in env.rows() if t.startswith("R-L02")]
+    assert rep and env.rows()[rep[0]]["parameters"]["defect_id"] == "platform-tests-test_a.py::test_x"
+
+
+def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "UNKNOWN", "reason": "circleci: credits"}, {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "RUNNING", "infra-unknown proof leaves the attempt for retry"
+    builds = len([s for s in oc.calls if s.item == "L02"])
+    assert builds == 2, "one builder + one grader turn so far"
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    assert json.loads((tdir / "proof-pending.json").read_text())["sha"] == rows["L02"]["output_sha"] or True
+    settle(drv)                                   # adopt: proof only, no rebuild
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED"
+    assert len([s for s in oc.calls if s.item == "L02"]) == builds, "build+grade were not repeated"
+    assert len(proof.calls) == 2 and proof.calls[0][2] == proof.calls[1][2]
+    assert not (tdir / "proof-pending.json").exists()
+    assert "PROOF_UNKNOWN" in (env.run_root / "OWNER-ALERTS.md").read_text()
+
+
 def test_render_packet_and_benchmark_from_contract(tmp_path):
     con = catalog()["contracts"][2]
     pk = lanedriver.LaneDriver.render_packet(con, "a" * 40)

@@ -45,6 +45,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import laneproof  # noqa: E402
 import vplint     # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
@@ -287,7 +288,7 @@ class Control(object):
 class LaneDriver(object):
 
     def __init__(self, roster_path, exec_=None, runners=None, control=None,
-                 interval=DEFAULT_INTERVAL, bins=None, clock=None):
+                 interval=DEFAULT_INTERVAL, bins=None, clock=None, proof=None):
         self.roster_path = Path(roster_path).resolve()
         self.run_root = self.roster_path.parent
         self.roster = json.loads(self.roster_path.read_text(encoding="utf-8"))
@@ -331,6 +332,10 @@ class LaneDriver(object):
             name: vprunners.runner_for(name, self.exec, self.bins, opencode_transport=transport)
             for name in ("opencode", "codex", "claude", "agy")
         }
+
+        self.proof = proof or laneproof.Proof(
+            self.run_root, self.here, self.cn, self.git, self.exec, self.log, self.alert,
+            self.roster.get("proof", {}), python=ctl.get("python") or sys.executable)
 
         self._lock = threading.Lock()
         self._live = {}                 # task -> attempt_id
@@ -378,6 +383,9 @@ class LaneDriver(object):
             rs[name] = st
         self.runner_state = rs
         self.max_tasks = int(self.conc.get("max_tasks_in_flight", 12))
+        self.proof_cfg = data.get("proof", {})
+        if getattr(self, "proof", None) is not None:
+            self.proof.cfg = dict(self.proof_cfg)
 
     # -- logging / alerts -------------------------------------------------------------
 
@@ -1181,6 +1189,14 @@ class LaneDriver(object):
         out_path = wt / ".vp" / "RESULT.json"
         fpath = wt / ".vp" / "FINDINGS.json"
         outcome, fails = None, []
+        kind = contract.get("kind") or row.get("kind")
+        needs_proof = kind in (self.proof_cfg.get("require_for_kinds") or ["integration"])
+        pending = self._proof_pending(tdir)
+        if needs_proof and pending and self.head_sha(wt) == pending.get("sha"):
+            # an earlier attempt built and graded this exact head; only the proof is owed
+            self.log("PROOF %s resumes on %s (build+grade skipped)" % (task, pending["sha"][:12]))
+            return self._proof_step(task, attempt, row, contract, wt, tdir, pending["sha"],
+                                    pending.get("base") or self._base_of(wt))
         for rnd in range(1, max_rounds + 1):
             outcome = self._turn(task, attempt, row, server, runner, rcfg, wt, tdir, "builder",
                                  BUILDER_PROMPT, out_path, vpschema.validate_result, sid, rnd)
@@ -1202,6 +1218,9 @@ class LaneDriver(object):
             _doc, fails, unknown = findings_verdicts(fpath)
             if not fails and not unknown:
                 head = self.head_sha(wt)
+                if needs_proof:
+                    return self._proof_step(task, attempt, row, contract, wt, tdir, head,
+                                            self._base_of(wt), build_outcome=outcome)
                 return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                                  "evidence": [out_path, fpath, tdir / "record.json"]}
             self.log("ROUND %s %d/%d fails=%s unknown=%s" % (task, rnd, max_rounds, fails, unknown))
@@ -1210,6 +1229,64 @@ class LaneDriver(object):
                          "evidence": [out_path, fpath, tdir / "record.json"],
                          "reason": "%d rounds; FAIL %s" % (max_rounds, ",".join(fails)[:300]),
                          "fails": self._fail_lines(fpath)}
+
+    # -- proof step (F6 lives in laneproof) --------------------------------------------------
+
+    @staticmethod
+    def _base_of(wt):
+        try:
+            return (Path(wt) / ".vp" / "BASE").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _proof_pending(tdir):
+        try:
+            return json.loads((Path(tdir) / "proof-pending.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _proof_step(self, task, attempt, row, contract, wt, tdir, cand, base, build_outcome=None):
+        hdr = {}
+        try:
+            hdr, _ = vplint.parse_front_matter((wt / ".vp" / "PACKET.md").read_text(encoding="utf-8"))
+            hdr = hdr or {}
+        except (OSError, ValueError):
+            pass
+        pkind = str(hdr.get("proof_kind") or self.proof_cfg.get("default_kind") or "platform")
+        paths = list(hdr.get("test_paths") or [])
+        pending = {"sha": cand, "base": base, "kind": pkind, "paths": paths, "ts": utc_ms()}
+        (tdir / "proof-pending.json").write_text(json.dumps(pending, indent=2), encoding="utf-8")
+        pid = "proof-%s-%s" % (task, attempt[-15:])
+        rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set())
+        ppath = self.run_root / "proofs" / ("%s.json" % pid)
+        status = rec.get("status")
+        outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")
+        evidence = [wt / ".vp" / "RESULT.json", wt / ".vp" / "FINDINGS.json", tdir / "record.json", ppath]
+        if status == "PASS":
+            try:
+                (tdir / "proof-pending.json").unlink()
+            except OSError:
+                pass
+            return outcome, {"outcome": "VERIFIED", "output_sha": cand, "tree_sha": self.tree_sha(wt),
+                             "evidence": evidence}
+        if status == "FAIL_PRODUCT":
+            try:
+                (tdir / "proof-pending.json").unlink()
+            except OSError:
+                pass
+            nodes = rec.get("failed_nodes") or []
+            errs = rec.get("errors") or {}
+            return outcome, {"outcome": "REPAIR_REQUIRED", "output_sha": cand, "tree_sha": self.tree_sha(wt),
+                             "evidence": evidence,
+                             "reason": "proof %s FAIL_PRODUCT: %s" % (pid, ", ".join(nodes)[:300]),
+                             "fails": [{"id": n, "note": (errs.get(n) or "red on %s" % rec.get("route"))[:300],
+                                        "evidence": n} for n in nodes]}
+        # FAIL_INFRA / UNKNOWN / CANCELLED: not the candidate's fault -- retry the
+        # proof alone after the backoff (proof-pending.json keeps the head)
+        return vprunners.TurnOutcome("PROOF_" + str(status), "proof %s %s: %s"
+                                     % (pid, status, str(rec.get("reason") or "")[:200]),
+                                     runner="proof"), None
 
     @staticmethod
     def _fail_lines(fpath):
