@@ -684,6 +684,124 @@ def test_cli_drain_and_undrain_write_the_state_row(tmp_path):
     assert not (env.run_root / "DRAIN").exists()
 
 
+# -- item 4: F3 cost basis, token caps, quota parks ----------------------------------------------
+
+def costs(env):
+    return [json.loads(l) for l in (env.run_root / "costs.jsonl").read_text().splitlines()]
+
+
+def test_f3_cost_rows_carry_basis_and_cache_read_per_runner(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    sha, tree = register_candidate(env)
+    params = env.tmp / "review.json"
+    params.write_text(json.dumps({"parent_contract_id": "L00", "candidate_sha": sha, "tree_sha": tree,
+                                  "diff_or_scope": "whole", "criteria": "catalog", "evidence": []}))
+    env.control_call("instantiate", "--template", "JUNIOR_REVIEW", "--task", "J1",
+                     "--parent-contract", "L00", "--chief", "B", "--parameters-json", str(params))
+
+    def oc_ok(spec, ab):
+        out = result_ok(spec, ab)
+        out.usage = {"tokens_in": 1000, "tokens_out": 200, "cache_read": 800, "cost": 0.0123}
+        return out
+
+    class Codex(FakeCodex):
+        def run(self, spec, abort_flag=None):
+            out = FakeCodex.run(self, spec, abort_flag)
+            out.usage = {"tokens_in": 962000, "tokens_out": 8000, "tokens_reason": 3000,
+                         "cache_read": 882000, "cache_write": None, "cost": None}
+            return out
+
+    drv = env.driver({"opencode": FakeRunner(default=oc_ok), "codex": Codex(), "claude": FakeRunner()})
+    settle(drv)
+    rows = {r["task"]: r for r in costs(env)}
+    oc = rows["L00"]
+    assert oc["cost_basis"] == "reported" and oc["cost"] == 0.0123 and oc["cache_read"] == 800
+    cx = rows["J1"]
+    assert cx["runner"] == "codex" and cx["cost_basis"] == "subscription"
+    assert cx["cost"] == 0.0 and cx["tokens_in"] == 962000 and cx["cache_read"] == 882000
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "UNPRICED" not in alerts, "codex on subscription is priced by tokens, not an UNPRICED alert"
+    hb = drv.write_heartbeat()
+    assert hb["budget"]["spent_usd"] == 0.0123
+    assert hb["budget"]["tokens"] == {"opencode": 1200, "codex": 970000}
+
+
+def test_f3_codex_api_billing_is_estimated_from_the_roster_table(tmp_path):
+    env = Env(tmp_path, roster_extra={"pricing": {"codex": {"billing": "api", "models": {
+        "gpt-5.6-luna": {"input_per_1m": 2.0, "cached_input_per_1m": 0.5, "output_per_1m": 8.0}}}}})
+    env.activate()
+    sha, tree = register_candidate(env)
+    params = env.tmp / "review.json"
+    params.write_text(json.dumps({"parent_contract_id": "L00", "candidate_sha": sha, "tree_sha": tree,
+                                  "diff_or_scope": "whole", "criteria": "catalog", "evidence": []}))
+    env.control_call("instantiate", "--template", "JUNIOR_REVIEW", "--task", "J1",
+                     "--parent-contract", "L00", "--chief", "B", "--parameters-json", str(params))
+
+    class Codex(FakeCodex):
+        def run(self, spec, abort_flag=None):
+            out = FakeCodex.run(self, spec, abort_flag)
+            out.usage = {"tokens_in": 1000000, "tokens_out": 10000, "cache_read": 500000, "cost": None}
+            return out
+
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": Codex(), "claude": FakeRunner()})
+    settle(drv)
+    cx = next(r for r in costs(env) if r["task"] == "J1")
+    # (1M-500k)*2 + 500k*0.5 + 10k*8 = 1.0 + 0.25 + 0.08
+    assert cx["cost_basis"] == "estimated" and cx["cost"] == 1.33 and cx["est_cost_usd"] == 1.33
+
+
+def test_f3_token_cap_parks_that_runner_only(tmp_path):
+    env = Env(tmp_path, roster_extra={"budget": {"max_cost_usd_per_run": 100,
+                                                  "max_tokens_per_runner": {"codex": 5000}}})
+    env.activate()
+    (env.run_root / "costs.jsonl").write_text(json.dumps(
+        {"task": "old", "runner": "codex", "tokens_in": 4900, "tokens_out": 200, "cost": 0.0}) + "\n")
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    n = drv.tick()
+    drv.join(timeout=60)
+    assert n == 1 and env.rows()["L00"]["state"] == "VERIFIED", "opencode roles keep running"
+    assert drv.runner_state["codex"]["park_status"] == "TOKEN_CAP"
+    assert drv.runner_state["opencode"]["park_status"] is None
+    assert drv._budget_stop is False
+    assert "**TOKEN_CAP**" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    # raising the cap in the roster (hot reload) unparks it
+    r = json.loads((env.run_root / "roster.json").read_text())
+    r["budget"]["max_tokens_per_runner"]["codex"] = 50000
+    (env.run_root / "roster.json").write_text(json.dumps(r))
+    import os as _os
+    _os.utime(env.run_root / "roster.json", (time.time() + 5, time.time() + 5))
+    drv.tick()
+    assert drv.runner_state["codex"]["park_status"] is None
+
+
+def test_quota_on_codex_parks_codex_runner_and_leaves_review_running(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    sha, tree = register_candidate(env)
+    params = env.tmp / "review.json"
+    params.write_text(json.dumps({"parent_contract_id": "L00", "candidate_sha": sha, "tree_sha": tree,
+                                  "diff_or_scope": "whole", "criteria": "catalog", "evidence": []}))
+    env.control_call("instantiate", "--template", "JUNIOR_REVIEW", "--task", "J1",
+                     "--parent-contract", "L00", "--chief", "B", "--parameters-json", str(params))
+
+    class Codex(FakeCodex):
+        def run(self, spec, abort_flag=None):
+            self.calls.append(spec)
+            return TurnOutcome("QUOTA_WEEKLY", "weekly usage limit reached", session_id=spec.session_id,
+                               runner="codex", usage={"tokens_in": 1, "tokens_out": 0, "cost": None})
+
+    cx = Codex()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": cx, "claude": FakeRunner()})
+    settle(drv)
+    rows = env.rows()
+    assert rows["J1"]["state"] == "RUNNING" and rows["L00"]["state"] == "VERIFIED"
+    assert drv.runner_state["codex"]["park_status"] == "QUOTA_WEEKLY"
+    settle(drv)
+    assert len(cx.calls) == 1, "parked codex: the RUNNING review is not re-adopted"
+    assert env.rows()["J1"]["state"] == "RUNNING"
+
+
 def test_render_packet_and_benchmark_from_contract(tmp_path):
     con = catalog()["contracts"][2]
     pk = lanedriver.LaneDriver.render_packet(con, "a" * 40)

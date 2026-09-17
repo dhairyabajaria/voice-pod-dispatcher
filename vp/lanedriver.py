@@ -463,17 +463,26 @@ class LaneDriver(object):
             self.log("disk recovered: %.1f GB" % gb)
         usd, tokens = self.spent()
         cap = self.budget.get("max_cost_usd_per_run")
-        over = cap is not None and usd >= float(cap)
-        for runner, tcap in (self.budget.get("max_tokens_per_runner") or {}).items():
-            if tokens.get(runner, 0) >= int(tcap):
-                over = True
-                self.alert_once("tokens:" + runner, "BUDGET",
-                                "%s used %d tokens >= cap %d: no new turns on it"
-                                % (runner, tokens.get(runner, 0), int(tcap)))
-        if over and not self._budget_stop:
+        if cap is not None and usd >= float(cap) and not self._budget_stop:
             self._budget_stop = True
             self.alert("BUDGET", "run budget reached (%.2f USD, tokens %s): no new turns"
                        % (usd, json.dumps(tokens)))
+        # F3: the weekly/monthly caps are token caps per runner -- the runner is
+        # parked (its roles wait), every other runner keeps going
+        for runner, tcap in (self.budget.get("max_tokens_per_runner") or {}).items():
+            st = self.runner_state.get(runner)
+            if st is None:
+                continue
+            used = tokens.get(runner, 0)
+            if used >= int(tcap) and st.get("park_status") != "TOKEN_CAP":
+                st["parked_until"] = float("inf")
+                st["park_reason"] = "%d tokens >= cap %d" % (used, int(tcap))
+                st["park_status"] = "TOKEN_CAP"
+                self.alert("TOKEN_CAP", "%s used %d tokens >= cap %d: parked until the cap is "
+                           "raised in the roster (other runners continue)" % (runner, used, int(tcap)))
+            elif used < int(tcap) and st.get("park_status") == "TOKEN_CAP":
+                st["parked_until"], st["park_reason"], st["park_status"] = 0.0, None, None
+                self.log("UNPARK runner %s: token cap raised" % runner)
         return not self._budget_stop and not self._disk_paused
 
     def _reload_roster_if_changed(self):
@@ -1318,6 +1327,14 @@ class LaneDriver(object):
             if self._stopping and outcome.status != STATUS_DONE:
                 outcome.status, outcome.detail = STATUS_ABORTED, "STOP"
             cost, est, basis = estimate_cost(self.pricing, runner, spec.model, outcome.usage)
+            if basis == "unpriced" and runner == "codex":
+                # F3: Codex is a subscription -- tokens are the spend, dollars are 0
+                cost, basis = 0.0, "subscription"
+            if basis == "unpriced" and (outcome.usage or {}).get("tokens_in") is not None:
+                self.alert_once("pricing:%s:%s" % (runner, spec.model), "UNPRICED",
+                                "%s model %s reports tokens but no USD and pricing.%s.models[%s] "
+                                "is missing; its spend counts 0 toward the USD cap"
+                                % (runner, spec.model, runner, spec.model))
             if basis != "reported" and outcome.usage is not None:
                 outcome.usage["cost"] = cost
             self._write_record(task, attempt, tdir, tag, role, runner, server, spec, outcome, rnd, n)
