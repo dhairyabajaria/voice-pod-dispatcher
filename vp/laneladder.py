@@ -344,20 +344,22 @@ def rung_q2(a, roots):
 
 
 def rung_q3(a, roots):
-    """HOLD -> one owned repair -> the repair's successor gets the review."""
+    """HOLD -> one owned repair -> the repair's successor gets the review.
+    (L02: a catalog task no packet owns -- pack-owned rows are repaired by
+    their packets, never by the frontier.)"""
     root = Root(roots, "q3", a.trunk, a.catalog, a.control, a.pack_dir)
-    drv = root.driver(verdicts={"L04": "FAIL"}, delay_s=0.3)
-    pump(drv, until=lambda: root.rows()["L04"]["state"] == "REPAIR_REQUIRED", max_ticks=120)
+    drv = root.driver(verdicts={"L02": "FAIL"}, delay_s=0.3)
+    pump(drv, until=lambda: root.rows()["L02"]["state"] == "REPAIR_REQUIRED", max_ticks=120)
     hold_ts = utc_ms()
     rows = root.rows()
-    if rows["L04"]["state"] != "REPAIR_REQUIRED":
-        return {"status": "FAIL", "reason": "L04 never held", "states": root.counts(), "ts": utc_ms()}
+    if rows["L02"]["state"] != "REPAIR_REQUIRED":
+        return {"status": "FAIL", "reason": "L02 never held", "states": root.counts(), "ts": utc_ms()}
     # let the frontier instantiate exactly one repair and run it green
-    drv.dry.verdicts.pop("L04", None)
+    drv.dry.verdicts.pop("L02", None)
     settle(drv, max_ticks=600)                   # the frontier runs once the catalog is idle
-    pump(drv, until=lambda: any(t.startswith("R-L04") and r["state"] == "VERIFIED"
+    pump(drv, until=lambda: any(t.startswith("R-L02") and r["state"] == "VERIFIED"
                                 for t, r in root.rows().items()), max_ticks=200)
-    repairs = sorted(t for t in root.rows() if t.startswith("R-L04"))
+    repairs = sorted(t for t in root.rows() if t.startswith("R-L02"))
     settle(drv, max_ticks=100)                   # idle again: the frontier promotes the parent
     rows = root.rows()
     if not (len(repairs) == 1 and rows[repairs[0]]["state"] == "VERIFIED"):
@@ -386,7 +388,7 @@ def rung_q3(a, roots):
     rows = root.rows()
     return {"status": "PASS" if review_dispatched else "FAIL", "hold_ts": hold_ts,
             "repairs": repairs, "repair_state": rows[repairs[0]]["state"], "repair_sha": sha,
-            "parent_state": rows["L04"]["state"],
+            "parent_state": rows["L02"]["state"],
             "review_task": review_task, "review_dispatched_ts": review_dispatched,
             "review_final": rows.get(review_task, {}).get("state"), "register_rc": rc0,
             "instantiate_rc": rc, "instantiate_error": err,
