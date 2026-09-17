@@ -319,7 +319,38 @@ def test_codex_preopen_returns_the_thread_id_before_start(tmp_path):
     # the review turn then resumes that thread
     argv = r.argv(TurnSpec("junior", "JR-1", wt, "review it", "gpt-5.6-luna", session_id=tid),
                   tmp_path / "last.txt")
-    assert argv[1:3] == ["exec", "resume"] and tid in argv
+    assert argv[1] == "exec" and argv[6] == "resume" and tid in argv
+
+
+def _codex_argv(session_id=None, tmp_path=None):
+    r = CodexRunner(binary="codex")
+    spec = TurnSpec("junior", "JR-1", "/wt", "do it", "gpt-5.6-luna", effort="xhigh",
+                    sandbox="workspace-write", schema_path="/s.json", session_id=session_id)
+    return r.argv(spec, "/last.txt")
+
+
+def test_codex_exec_argv_shape():
+    # fresh turn: `codex exec -C <cwd> -s <sandbox> <common> -m .. -c effort --output-schema -o PROMPT`
+    argv = _codex_argv()
+    assert argv[:6] == ["codex", "exec", "-C", "/wt", "-s", "workspace-write"]
+    assert "resume" not in argv
+    assert argv[-1] == "do it" and argv[-3:-1] == ["-o", "/last.txt"]
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-luna"
+    assert argv[argv.index("--output-schema") + 1] == "/s.json"
+    assert 'model_reasoning_effort="xhigh"' in argv
+
+
+def test_codex_exec_resume_argv_puts_cwd_and_sandbox_before_subcommand():
+    # `codex exec resume` rejects -C/-s (they are `exec`-level flags): they must
+    # precede `resume`, and SESSION_ID PROMPT stay positional at the end.
+    argv = _codex_argv(session_id="0199-thread-abc")
+    assert argv[:7] == ["codex", "exec", "-C", "/wt", "-s", "workspace-write", "resume"]
+    tail = argv[argv.index("resume") + 1:]
+    assert "-C" not in tail and "-s" not in tail
+    assert tail[-2:] == ["0199-thread-abc", "do it"]
+    assert tail[:7] == ["--json", "--skip-git-repo-check", "-c", "notify=[]",
+                        "-c", "memories.use_memories=false", "-c"]
+    assert "--output-schema" in tail and "-o" in tail and "-m" in tail
 
 
 def test_runner_for_defaults_to_http_transport():

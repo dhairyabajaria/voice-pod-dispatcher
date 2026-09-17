@@ -1053,11 +1053,13 @@ class CodexRunner(object):
         self.binary = binary
 
     def argv(self, spec, last_path):
-        base = [self.binary, "exec"]
+        # `-C`/`-s` belong to `codex exec` itself; the `resume` subcommand's
+        # parser rejects them, so they must precede it.  Everything else
+        # (--json, -c, -m, --output-schema, -o) is accepted by both.
+        base = [self.binary, "exec", "-C", spec.cwd, "-s", spec.sandbox]
         if spec.session_id:
             base.append("resume")
-        base += self.COMMON + ["-C", spec.cwd, "-m", spec.model,
-                               "-s", spec.sandbox]
+        base += self.COMMON + ["-m", spec.model]
         if spec.effort:
             base += ["-c", 'model_reasoning_effort="%s"' % spec.effort]
         if spec.schema_path:
