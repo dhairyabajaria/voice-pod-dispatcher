@@ -941,11 +941,17 @@ class LaneDriver(object):
         tasks = state.get("tasks") or {}
         candidate = state.get("candidate") or {}
         bound_now = 0
+        self._pack_restore(tasks)
         bindings = {pid: t for t, pid in self.pack_by_task.items()}
         for pid in vppack.topo_order(self.pack):
+            p = self.pack[pid]
+            retry = self._pack_retry_requested(pid)
+            if retry is not None:
+                if self._pack_retry(p, tasks, candidate, bindings, retry):
+                    bound_now += 1
+                continue
             if pid in bindings and bindings[pid] in tasks:
                 continue                          # bound once, bound for the run
-            p = self.pack[pid]
             mode = vppack.bind(p, tasks)
             if mode[0] == "hold":
                 if ("hold", pid) not in self._pack_logged:
@@ -961,54 +967,163 @@ class LaneDriver(object):
                                                                 {"state": tasks[task].get("state")}))
                 continue
             # dynamic and not yet instantiated
-            template = mode[2]
-            if not vppack.owner_gate_open(p, self.roster):
-                self._owner_gate_open(task) if task in self.pack_by_task else self.alert_once(
-                    "owner-gate:%s" % p["owner_gate"], "OWNER_GATE",
-                    "%s waits for %s (roster owner_gates.%s is not true)" % (pid, p["owner_gate"], p["owner_gate"]))
-                continue
-            deps = vppack.dependency_tasks(p, self.pack, tasks, bindings)
-            if deps is None:
-                continue                          # a dependency packet is not bound yet
-            parent, how = vppack.parent_for(p, tasks, self.pack)
-            if not parent:
-                self.alert_once("pack-parent:%s" % pid, "PACKET_NO_PARENT",
-                                "%s: no parent_contract derivable; add `parent_contract:` to its header" % pid)
-                continue
-            covered = self._covered_rows(tasks) if template in vppack.REVIEW_TEMPLATES else None
-            params = vppack.parameters_for(p, template, parent, candidate, covered)
-            if params is None:
-                if ("cand", pid) not in self._pack_logged:
-                    self._pack_logged.add(("cand", pid))
-                    self.log("PACK %s waits for a registered candidate" % pid)
-                continue
-            pdir = self.run_root / "packets"
-            pdir.mkdir(parents=True, exist_ok=True)
-            ppath = pdir / ("%s.params.json" % pid)
-            ppath.write_text(json.dumps(params, indent=2, sort_keys=True), encoding="utf-8")
-            try:
-                self.control.instantiate(template, task, parent, "B", ppath, deps)
-            except ControlError as exc:
-                self.alert_once("pack-inst:%s" % pid, "PACKET_INSTANTIATE_REFUSED",
-                                "%s as %s (%s, parent %s): %s" % (pid, task, template, parent, str(exc)[:240]))
-                continue
-            tasks[task] = {"state": "PLANNED", "parent_contract_id": parent, "dynamic": True}
-            self.pack_by_task[task] = pid
-            bindings[pid] = task
-            self._pack_record(p, vppack.dispatch_record(p, task, "dynamic", template, parent, p["base_sha"],
-                                                        {"parent_how": how, "depends_on_tasks": deps,
-                                                         "parameters": str(ppath), "covered_rows": covered}))
-            if how.startswith(vppack.GUESSED_PARENT):
-                self.alert_once("pack-guess:%s" % pid, "PACKET_PARENT_GUESSED",
-                                "%s parent %s derived by %s; pin `parent_contract:` in its header if wrong"
-                                % (pid, parent, how))
-            self.log("PACK %s -> %s (%s, parent %s via %s, deps %s)" % (pid, task, template, parent, how, deps))
-            bound_now += 1
+            if self._pack_instantiate(p, task, mode[2], tasks, candidate, bindings):
+                bound_now += 1
         for tid in (self.roster.get("packet") or {}).get("rewire", ["L42"]):
             self._pack_rewire(tid, tasks, bindings)
         if bound_now:
             self.log("PACK bound %d new task(s)" % bound_now)
         return bound_now
+
+    def _pack_instantiate(self, p, task, template, tasks, candidate, bindings, extra=None):
+        """instantiate packet `p` as dynamic scheduler task `task`:
+        True bound, False still waiting (gate/deps/candidate), None refused"""
+        pid = p["id"]
+        if not vppack.owner_gate_open(p, self.roster):
+            self._owner_gate_open(task) if task in self.pack_by_task else self.alert_once(
+                "owner-gate:%s" % p["owner_gate"], "OWNER_GATE",
+                "%s waits for %s (roster owner_gates.%s is not true)" % (pid, p["owner_gate"], p["owner_gate"]))
+            return False
+        deps = vppack.dependency_tasks(p, self.pack, tasks, bindings)
+        if deps is None:
+            return False                          # a dependency packet is not bound yet
+        parent, how = vppack.parent_for(p, tasks, self.pack)
+        if not parent:
+            self.alert_once("pack-parent:%s" % pid, "PACKET_NO_PARENT",
+                            "%s: no parent_contract derivable; add `parent_contract:` to its header" % pid)
+            return False
+        covered = self._covered_rows(tasks) if template in vppack.REVIEW_TEMPLATES else None
+        params = vppack.parameters_for(p, template, parent, candidate, covered)
+        if params is None:
+            if ("cand", pid) not in self._pack_logged:
+                self._pack_logged.add(("cand", pid))
+                self.log("PACK %s waits for a registered candidate" % pid)
+            return False
+        pdir = self.run_root / "packets"
+        pdir.mkdir(parents=True, exist_ok=True)
+        ppath = pdir / ("%s.params.json" % (pid if task in (pid, vppack.dynamic_id(p)) else task))
+        ppath.write_text(json.dumps(params, indent=2, sort_keys=True), encoding="utf-8")
+        try:
+            self.control.instantiate(template, task, parent, "B", ppath, deps)
+        except ControlError as exc:
+            self.alert_once("pack-inst:%s" % task, "PACKET_INSTANTIATE_REFUSED",
+                            "%s as %s (%s, parent %s): %s" % (pid, task, template, parent, str(exc)[:240]))
+            return None
+        tasks[task] = {"state": "PLANNED", "parent_contract_id": parent, "dynamic": True}
+        self.pack_by_task[task] = pid
+        bindings[pid] = task
+        rec = {"parent_how": how, "depends_on_tasks": deps, "parameters": str(ppath), "covered_rows": covered}
+        rec.update(extra or {})
+        self._pack_record(p, vppack.dispatch_record(p, task, "dynamic", template, parent, p["base_sha"], rec))
+        if how.startswith(vppack.GUESSED_PARENT):
+            self.alert_once("pack-guess:%s" % pid, "PACKET_PARENT_GUESSED",
+                            "%s parent %s derived by %s; pin `parent_contract:` in its header if wrong"
+                            % (pid, parent, how))
+        self.log("PACK %s -> %s (%s, parent %s via %s, deps %s)" % (pid, task, template, parent, how, deps))
+        return True
+
+    # -- retry of a wrongly-closed dynamic packet task ---------------------------------
+    RETRY_MARKER = "%s.retry.json"
+
+    def _pack_restore(self, tasks):
+        """seed pack_by_task from packets/<id>.json so a binding (incl. a retry
+        task) survives a driver restart; the current file wins over bind()"""
+        pdir = self.run_root / "packets"
+        if not pdir.is_dir():
+            return
+        for pid in self.pack:
+            if pid in self.pack_by_task.values():
+                continue
+            f = pdir / ("%s.json" % pid)
+            if not f.exists():
+                continue
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            t = rec.get("task")
+            if t in tasks and t not in self.pack_by_task:
+                self.pack_by_task[t] = pid
+
+    def _pack_retry_requested(self, pid):
+        f = self.run_root / "packets" / (self.RETRY_MARKER % pid)
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def request_packet_retry(self, pid, reason):
+        """CLI `retry-packet`: ask the loop to re-instantiate a packet whose
+        bound dynamic task ended without a real verdict (e.g. RUNNER_CRASH ->
+        INVALID_EVIDENCE).  Refused for unknown packets and for tasks that are
+        still running or accepted; the loop consumes the marker."""
+        p = self.pack.get(pid) if self.pack else None
+        if not p:
+            raise ValueError("unknown packet %s" % pid)
+        tasks = (self.control.state_view().get("tasks") or {})
+        self._pack_restore(tasks)
+        cur = {q: t for t, q in self.pack_by_task.items()}.get(pid) or vppack.bound_task(p, tasks)
+        row = tasks.get(cur) if cur else None
+        if not row:
+            raise ValueError("%s has no bound task to retry" % pid)
+        if row.get("state") in vppack.UNFINISHED or row.get("state") in vppack.ACCEPTED:
+            raise ValueError("%s is bound to %s which is %s; only a finished, unaccepted task can be retried"
+                             % (pid, cur, row.get("state")))
+        pdir = self.run_root / "packets"
+        pdir.mkdir(parents=True, exist_ok=True)
+        rec = {"packet": pid, "previous_task": cur, "previous_state": row.get("state"),
+               "reason": reason, "requested_at": utc_ms()}
+        (pdir / (self.RETRY_MARKER % pid)).write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+        _append_jsonl(pdir / "bindings.jsonl", dict(rec, op="retry-requested"), self._lock)
+        self.comms("lanedriver", "audit", "retry requested for %s (was %s %s): %s"
+                   % (pid, cur, row.get("state"), reason), kind="lifecycle", task=cur)
+        return rec
+
+    def _pack_retry(self, p, tasks, candidate, bindings, req):
+        """consume packets/<id>.retry.json: instantiate <id>-R<n> from the same
+        template/parent/params and rebind the packet to it.  The scheduler's
+        own duplicate-review rule decides (it admits a retry only when the
+        previous review is INVALID_EVIDENCE/CANCELLED)."""
+        pid = p["id"]
+        marker = self.run_root / "packets" / (self.RETRY_MARKER % pid)
+        prev = bindings.get(pid) or req.get("previous_task")
+        row = tasks.get(prev) or {}
+        if prev and (row.get("state") in vppack.UNFINISHED or row.get("state") in vppack.ACCEPTED):
+            self.alert("PACKET_RETRY_REFUSED",
+                       "%s: bound task %s is %s; retry marker ignored" % (pid, prev, row.get("state")), prev)
+            marker.unlink(missing_ok=True)
+            return False
+        mode = vppack.bind(p, tasks)
+        template = mode[2] if mode[0] == "dynamic" else vppack.template_for(p)
+        if not template:
+            self.alert("PACKET_RETRY_REFUSED", "%s: no template to retry from" % pid, prev)
+            marker.unlink(missing_ok=True)
+            return False
+        base = vppack.dynamic_id(p)
+        n = 1
+        while ("%s-R%d" % (base, n)) in tasks:
+            n += 1
+        task = "%s-R%d" % (base, n)
+        if prev in self.pack_by_task:
+            del self.pack_by_task[prev]
+        bindings.pop(pid, None)
+        ok = self._pack_instantiate(p, task, template, tasks, candidate, bindings,
+                                    {"retry_of": prev, "retry_reason": req.get("reason")})
+        if not ok:
+            if prev:
+                self.pack_by_task[prev] = pid     # keep the old binding until it works
+                bindings[pid] = prev
+            if ok is None:                        # scheduler refused: do not loop on it
+                marker.unlink(missing_ok=True)
+                _append_jsonl(self.run_root / "packets" / "bindings.jsonl",
+                              {"ts": utc_ms(), "packet": pid, "op": "retry-refused", "task": task}, self._lock)
+            return False                          # else marker stays: retried next reconcile
+        marker.unlink(missing_ok=True)
+        self.alert("PACKET_RETRIED", "%s re-instantiated as %s (was %s %s): %s"
+                   % (pid, task, prev, row.get("state"), req.get("reason")), task)
+        return True
 
     def _pack_rewire(self, tid, tasks, bindings=None):
         p = self.pack.get(tid)
@@ -2814,6 +2929,10 @@ def build_parser():
     se.add_argument("--day", help="IST day YYYY-MM-DD; default today")
     se.add_argument("--force", action="store_true", help="rewrite an existing manifest")
     sub.add_parser("render", help="F14: write LEDGER.md now (the loop also does it on a timer)")
+    rp = sub.add_parser("retry-packet", help="re-instantiate a packet whose task closed without a real "
+                                             "verdict (e.g. RUNNER_CRASH -> INVALID_EVIDENCE) as <id>-R<n>")
+    rp.add_argument("packet")
+    rp.add_argument("--reason", required=True)
     ir = sub.add_parser("init-run", help="copy v13-pack/roster-v13.json -> RUN_ROOT/roster.json (lint, snapshot)")
     ir.add_argument("--source", required=True, help="the pack roster, e.g. v13-pack/roster-v13.json")
     ir.add_argument("--run-root", help="override the roster's run.run_root")
@@ -2836,7 +2955,20 @@ def cmd_seal(drv, args):
     return 0
 
 
-SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run")
+def cmd_retry_packet(drv, args):
+    try:
+        rec = drv.request_packet_retry(args.packet, args.reason)
+    except ValueError as exc:
+        print(json.dumps({"status": "REFUSED", "error": str(exc)}))
+        return 2
+    print(json.dumps({"status": "REQUESTED", "retry": rec,
+                      "note": "the loop instantiates <packet>-R<n> on its next pack reconcile "
+                              "(alerts.pack_every_s, default 300 s)"}, indent=2))
+    return 0
+
+
+SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
+               "retry-packet")
 
 
 def main(argv=None):
@@ -2881,6 +3013,8 @@ def main(argv=None):
         return cmd_comms(drv, args)
     if args.cmd == "seal":
         return cmd_seal(drv, args)
+    if args.cmd == "retry-packet":
+        return cmd_retry_packet(drv, args)
     if args.cmd == "render":
         out = drv.render()
         print(json.dumps({"status": "OK" if out else "FAILED", "ledger": str(out or "")}))

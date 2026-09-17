@@ -243,3 +243,37 @@ def test_review_packet_waits_for_a_candidate_then_carries_the_union_dispatch_rec
     assert disp["union"] == "union-%s" % row["attempt_id"]
     # the fake verdict is refused by the gate (no native rollout): INVALID_EVIDENCE, never PASS
     assert row["state"] == "INVALID_EVIDENCE"
+
+    # -- retry-packet: the closed task was our bug, not a verdict -------------------
+    # a restart alone must not re-bind the packet to anything new
+    drv2 = env.driver({"opencode": FakeRunner(default=result_ok), "codex": codex})
+    drv2._pack_reconcile()
+    assert drv2.pack_by_task == {"REVIEW-UNION": "REVIEW-UNION"} and "REVIEW-UNION-R1" not in env.rows()
+    rec = drv2.request_packet_retry("REVIEW-UNION", "RUNNER_CRASH from the codex argv bug")
+    assert rec["previous_task"] == "REVIEW-UNION" and rec["previous_state"] == "INVALID_EVIDENCE"
+    marker = env.run_root / "packets" / "REVIEW-UNION.retry.json"
+    assert marker.exists()
+    settle(drv2, 3)
+    rows = env.rows()
+    new = rows["REVIEW-UNION-R1"]
+    assert new["template_id"] == "JUNIOR_REVIEW" and new["parameters"]["candidate_sha"] == sha
+    assert new["review_key"] == row["review_key"], "same candidate/role/scope; admitted because the old one is INVALID_EVIDENCE"
+    assert not marker.exists() and drv2.pack_by_task == {"REVIEW-UNION-R1": "REVIEW-UNION"}
+    prec = json.loads((env.run_root / "packets" / "REVIEW-UNION.json").read_text())
+    assert prec["task"] == "REVIEW-UNION-R1" and prec["retry_of"] == "REVIEW-UNION"
+    assert (env.run_root / "packets" / "REVIEW-UNION-R1.params.json").exists()
+    ops = [json.loads(l).get("op") for l in (env.run_root / "packets" / "bindings.jsonl").read_text().splitlines()]
+    assert "retry-requested" in ops
+    assert "PACKET_RETRIED" in (env.run_root / "alerts.jsonl").read_text()
+    # the retry ran (same fake verdict -> INVALID_EVIDENCE again) and a fresh driver keeps the R1 binding
+    assert new["state"] == "INVALID_EVIDENCE"
+    drv3 = env.driver({"opencode": FakeRunner(default=result_ok), "codex": codex})
+    drv3._pack_reconcile()
+    assert drv3.pack_by_task == {"REVIEW-UNION-R1": "REVIEW-UNION"} and "REVIEW-UNION-R2" not in env.rows()
+    # a second retry numbers R2; an accepted/unfinished task is refused up front
+    drv3.request_packet_retry("REVIEW-UNION", "again")
+    settle(drv3, 3)
+    assert "REVIEW-UNION-R2" in env.rows() and drv3.pack_by_task == {"REVIEW-UNION-R2": "REVIEW-UNION"}
+    import pytest
+    with pytest.raises(ValueError):
+        drv3.request_packet_retry("NOPE", "x")
