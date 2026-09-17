@@ -357,3 +357,33 @@ def test_runner_for_defaults_to_http_transport():
     assert isinstance(vprunners.runner_for("opencode"), OpenCodeHttpRunner)
     assert isinstance(vprunners.runner_for("opencode", opencode_transport="cli"), OpenCodeRunner)
     assert isinstance(vprunners.runner_for("agy"), AgyRunner)
+
+
+# -- D13: children always find uv/ruff/node ---------------------------------------------------
+
+def test_tool_path_prepends_tool_bins_once_and_keeps_node22_first(monkeypatch, tmp_path):
+    local = tmp_path / "local-bin"
+    node = tmp_path / "node-bin"
+    local.mkdir()
+    node.mkdir()
+    monkeypatch.setattr(vprunners, "NODE22_BIN", str(node))
+    monkeypatch.setattr(vprunners, "TOOL_BINS", (str(node), str(local), str(tmp_path / "absent")))
+    got = vprunners.tool_path("/usr/bin:%s:/bin" % local).split(os.pathsep)
+    assert got[:2] == [str(node), str(local)], "node22 first, then ~/.local/bin"
+    assert got.count(str(local)) == 1, "no duplicate"
+    assert str(tmp_path / "absent") not in got, "missing dirs are skipped"
+    assert got[2:] == ["/usr/bin", "/bin"]
+    without = vprunners.tool_path("/usr/bin", node22_first=False).split(os.pathsep)
+    assert str(node) not in without and without[0] == str(local)
+
+
+def test_exec_spawns_with_tool_path_when_no_env_is_given(monkeypatch, tmp_path):
+    local = tmp_path / "local-bin"
+    local.mkdir()
+    monkeypatch.setattr(vprunners, "TOOL_BINS", (str(local),))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    rc, out, _ = vprunners.Exec().run([sys.executable, "-c", "import os; print(os.environ['PATH'])"])
+    assert rc == 0 and out.strip().split(os.pathsep)[0] == str(local)
+    rc, out, _ = vprunners.Exec().run([sys.executable, "-c", "import os; print(os.environ['PATH'])"],
+                                      env={"PATH": "/x"})
+    assert out.strip() == "/x", "an explicit env is passed through untouched"

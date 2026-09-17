@@ -67,7 +67,24 @@ PARK_STATUSES = (STATUS_QUOTA_WEEKLY, STATUS_QUOTA_ROLLING, STATUS_RATE,
                  STATUS_DEGRADED, STATUS_AUTH)
 
 NODE22_BIN = str(Path.home() / ".local" / "node-v22.11.0-darwin-arm64" / "bin")
+# D13: every child (codex, opencode CLI, autofix tools, box proofs) must find
+# `uv`, `ruff` and node no matter how the driver itself was launched (7 rows
+# failed their ruff/collect-only checks with "uv: command not found" when the
+# spawning process had a launchd/minimal PATH).  Prepended in this order,
+# missing dirs skipped, never duplicated.
+TOOL_BINS = (NODE22_BIN, str(Path.home() / ".local" / "bin"), "/opt/homebrew/bin")
 RAW_HEAD_LINES = 20
+
+
+def tool_path(path=None, node22_first=True):
+    """PATH with TOOL_BINS in front (node22 only when asked), deduplicated."""
+    cur = [p for p in (path if path is not None else os.environ.get("PATH", "")).split(os.pathsep) if p]
+    front = [b for b in TOOL_BINS if os.path.isdir(b) and (node22_first or b != NODE22_BIN)]
+    out = []
+    for p in front + cur:
+        if p not in out:
+            out.append(p)
+    return os.pathsep.join(out)
 
 
 def utc_ms():
@@ -180,14 +197,15 @@ class Exec(object):
 
     def env_for(self, overrides=None, node22_first=True):
         env = dict(os.environ)
-        if node22_first and os.path.isdir(NODE22_BIN):
-            env["PATH"] = NODE22_BIN + os.pathsep + env.get("PATH", "")
+        env["PATH"] = tool_path(env.get("PATH", ""), node22_first=node22_first)
         if overrides:
             env.update({k: str(v) for k, v in overrides.items()})
         return env
 
     def stream(self, argv, env=None, cwd=None, timeout_s=None, on_line=None,
                abort_flag=None, log_fh=None):
+        if env is None:
+            env = self.env_for()
         try:
             popen = subprocess.Popen(
                 list(argv), env=env, cwd=cwd,
@@ -260,6 +278,8 @@ class Exec(object):
 
     def run(self, argv, env=None, cwd=None, timeout_s=120):
         """Blocking helper for short commands (git, export)."""
+        if env is None:
+            env = self.env_for()
         try:
             cp = subprocess.run(list(argv), env=env, cwd=cwd, timeout=timeout_s,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -273,6 +293,8 @@ class Exec(object):
 
     def run_to_file(self, argv, path, env=None, cwd=None, timeout_s=300):
         """K-04: stdout straight to a file (a pipe truncates at 65,536 bytes)."""
+        if env is None:
+            env = self.env_for()
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 cp = subprocess.run(list(argv), env=env, cwd=cwd,
