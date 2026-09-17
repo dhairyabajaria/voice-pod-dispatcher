@@ -1004,3 +1004,76 @@ def test_item7_comms_hook_appends_from_cli_and_alerts_mirror_into_it(tmp_path):
     rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "seal"])
     assert rc == 0
     assert list(env.run_root.glob("MANIFEST-*.json"))
+
+
+# -- item 8: F14 probes/ + render timer, F16 activation record ------------------------
+
+def test_item8_probes_are_written_to_disk_and_ledger_renders_on_a_timer(tmp_path, monkeypatch):
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30,
+                                                 "render_every_s": 3600}})
+    env.activate()
+    drv = env.driver({"opencode": by_role({"probe": status("RATE", "429 slow down")}),
+                      "codex": FakeRunner()})
+    settle(drv, 1)
+    assert drv.servers["go2"]["park_status"] == "RATE"
+    drv.servers["go2"]["parked_until"] = 0.0  # park elapsed: next tick probes the server
+    drv.tick()
+    probes = [json.loads(l) for l in (env.run_root / "probes" / "probes.jsonl").read_text().splitlines()]
+    assert probes and probes[-1]["server"] == "go2" and probes[-1]["ok"] is False
+    assert probes[-1]["why"] == "unpark" and "URLError" in probes[-1]["detail"]
+    latest = json.loads((env.run_root / "probes" / "go2.json").read_text())
+    assert latest["url"] == "http://127.0.0.1:1/session" and latest["ms"] >= 0
+    assert drv.servers["go2"]["park_reason"], "a failed probe keeps the server parked"
+    # render: LEDGER.md written on the first tick, then only when the timer elapses
+    ledger = env.run_root / "LEDGER.md"
+    text = ledger.read_text()
+    assert text.startswith("# LEDGER") and "| L00 | " in text and "| L04 | WAITING_DEPENDENCY |" in text
+    first = drv._last_render_mono
+    drv.tick()
+    assert drv._last_render_mono == first, "3600 s timer has not elapsed"
+    drv._last_render_mono -= 3601
+    drv.tick()
+    assert drv._last_render_mono != first
+    rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "render"])
+    assert rc == 0 and "states:" in ledger.read_text()
+
+
+def test_item8_activation_record_hashes_five_profiles_and_flags_an_edit_on_restart(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    sdir = env.run_root / "claude-settings"
+    sdir.mkdir()
+    for name in lanedriver.LaneDriver.PROFILES:
+        (sdir / ("%s.json" % name)).write_text('{"permissions": {"allow": ["%s"]}}' % name)
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    settle(drv, 1)
+    rec = json.loads((env.run_root / "activation-record.json").read_text())
+    assert sorted(rec["profiles"]) == sorted(lanedriver.LaneDriver.PROFILES)
+    assert rec["profiles"]["junior"] == hashlib.sha256((sdir / "junior.json").read_bytes()).hexdigest()
+    assert rec["inputs"]["roster"] and rec["inputs"]["catalog"] and rec["inputs"]["scheduler"]
+    assert rec["changed_since_previous"] == [] and rec["missing_profiles"] == []
+    # junior.json edited after activation (I-101): the restart re-hashes and alerts
+    (sdir / "junior.json").write_text('{"permissions": {"allow": ["junior", "Bash(rm:*)"]}}')
+    drv2 = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    settle(drv2, 1)
+    rec2 = json.loads((env.run_root / "activation-record.json").read_text())
+    assert rec2["changed_since_previous"] == ["profile:junior"] and rec2["previous_ts"] == rec["ts"]
+    assert rec2["profiles"]["junior"] != rec["profiles"]["junior"]
+    alerts = [json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()]
+    assert any(a["kind"] == "PROFILE_CHANGED" and "profile:junior" in a["text"] for a in alerts)
+    history = [json.loads(l) for l in (env.run_root / "activation-records.jsonl").read_text().splitlines()]
+    assert len(history) == 2
+
+
+def test_item8_missing_profiles_are_seeded_from_the_dispatcher_copy(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    settle(drv, 1)
+    rec = json.loads((env.run_root / "activation-record.json").read_text())
+    src = Path(lanedriver.__file__).resolve().parent / "claude-settings"
+    expected = [n for n in lanedriver.LaneDriver.PROFILES if not (src / ("%s.json" % n)).exists()]
+    assert rec["missing_profiles"] == expected
+    for name in lanedriver.LaneDriver.PROFILES:
+        if (src / ("%s.json" % name)).exists():
+            assert (env.run_root / "claude-settings" / ("%s.json" % name)).exists()

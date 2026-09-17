@@ -325,6 +325,7 @@ class LaneDriver(object):
         self.alerts_jsonl = self.run_root / "alerts.jsonl"
         self.git_jsonl = self.run_root / "git.jsonl"
         self._sealed_day = None
+        self.fake_runners = False
 
         self._apply_roster(self.roster)
         self.git_bin = self.bins.get("git", "git")
@@ -541,7 +542,8 @@ class LaneDriver(object):
     def _maybe_unpark(self):
         for name, srv in self.servers.items():
             if srv["park_reason"] and not self._parked(srv):
-                if self._http_ok(srv["url"] + "/session"):
+                ok = self.probe(name, srv["url"] + "/session", "unpark")
+                if ok:
                     self.log("UNPARK %s" % name)
                     srv["park_reason"] = srv["park_status"] = None
                 else:
@@ -551,11 +553,36 @@ class LaneDriver(object):
                 self.log("UNPARK runner %s" % name)
                 st["park_reason"] = st["park_status"] = None
 
+    def probe(self, server, url, why="probe"):
+        """F14: every liveness probe leaves a record under probes/ — a JSON line
+        per probe in probes/probes.jsonl plus the latest verdict per server in
+        probes/<server>.json — so an empty probes/ can no longer hide a dead box."""
+        t0 = time.monotonic()
+        self._probe_detail = ""
+        if self.fake_runners:
+            ok, self._probe_detail = True, "fake runners: network probe skipped"
+        else:
+            ok = self._http_ok(url)
+        rec = {"ts": utc_ms(), "server": server, "url": url, "why": why, "ok": ok,
+               "detail": self._probe_detail, "ms": int((time.monotonic() - t0) * 1000),
+               "tick": self.tick_count}
+        pdir = self.run_root / "probes"
+        try:
+            pdir.mkdir(parents=True, exist_ok=True)
+            _append_jsonl(pdir / "probes.jsonl", rec)
+            (pdir / ("%s.json" % server)).write_text(json.dumps(rec, indent=2, sort_keys=True),
+                                                     encoding="utf-8")
+        except OSError:
+            pass
+        return ok
+
     def _http_ok(self, url, timeout=5.0):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
+                self._probe_detail = "HTTP %s" % resp.status
                 return resp.status < 500
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 -- any failure is "not ok" with its reason
+            self._probe_detail = "%s: %s" % (type(exc).__name__, str(exc)[:200])
             return False
 
     def _try_acquire(self, server, runner):
@@ -886,6 +913,129 @@ class LaneDriver(object):
         self.log("SEAL %s files=%d sha256=%s" % (out.name, len(files), manifest_sha[:12]))
         return out
 
+    # -- F14 render on a timer ----------------------------------------------------------
+
+    def render(self):
+        """Write LEDGER.md from the scheduler's state view + the driver's own
+        books.  Called every alerts.render_every_s (default 300) and at finish,
+        so the ledger can never silently freeze while the run moves."""
+        try:
+            state = self.control.state_view()
+        except Exception as exc:  # noqa: BLE001 -- render never takes the tick down
+            self.log("render: state unreadable: %s" % exc)
+            return None
+        usd, tokens = self.spent()
+        with self._lock:
+            live = dict(self._live)
+            parked = {n: s["park_status"] for n, s in list(self.servers.items()) +
+                      list(self.runner_state.items()) if s.get("park_reason")}
+        tasks = state.get("tasks", {})
+        counts = {}
+        for row in tasks.values():
+            counts[row.get("state")] = counts.get(row.get("state"), 0) + 1
+        lines = ["# LEDGER", "",
+                 "run: %s  phase: %s  sequence: %s" % (state.get("run_id", "-"), state.get("phase", "-"),
+                                                        state.get("sequence", "-")),
+                 "generated: %s (tick %d, pid %d)" % (utc_ms(), self.tick_count, os.getpid()),
+                 "spend: $%.2f  tokens: %s" % (usd, json.dumps(tokens, sort_keys=True)),
+                 "live: %d  parked: %s" % (len(live), json.dumps(parked, sort_keys=True) if parked else "none"),
+                 "states: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())), "",
+                 "| task | state | kind | attempt | unlocks | updated | note |",
+                 "| --- | --- | --- | --- | --- | --- | --- |"]
+        for tid in sorted(tasks):
+            row = tasks[tid]
+            note = "LIVE" if tid in live else (row.get("blocker") or {}).get("reason", "") if isinstance(
+                row.get("blocker"), dict) else ""
+            lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+                tid, row.get("state", "-"), row.get("kind", "-"), row.get("attempt_id") or "-",
+                "yes" if row.get("unlocks_dependents") else "-", row.get("updated_at", "-"),
+                str(note)[:80]))
+        lines += ["", "## Alerts (last 20)", ""]
+        alerts = []
+        try:
+            if self.alerts_jsonl.exists():
+                alerts = [json.loads(l) for l in self.alerts_jsonl.read_text(encoding="utf-8").splitlines()
+                          if l.strip()][-20:]
+        except (OSError, ValueError):
+            pass
+        lines += ["- %s **%s** %s" % (a.get("ts"), a.get("kind"), str(a.get("text", ""))[:160])
+                  for a in alerts] or ["none"]
+        out = self.run_root / "LEDGER.md"
+        try:
+            tmp = out.with_suffix(".md.tmp")
+            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.replace(str(tmp), str(out))
+        except OSError:
+            return None
+        self._last_render_mono = time.monotonic()
+        return out
+
+    def _render_step(self):
+        every = float(self.alerts_cfg.get("render_every_s", 300))
+        last = getattr(self, "_last_render_mono", None)
+        if last is None or time.monotonic() - last >= every:
+            self.render()
+
+    # -- F16 activation record ----------------------------------------------------------
+
+    PROFILES = ("boss", "final", "integrator", "junior", "senior")
+
+    def write_activation_record(self):
+        """activation-record.json: sha256 of all five Claude profiles under
+        RUN_ROOT/claude-settings (seeded from dispatcher/vp/claude-settings when
+        missing), the roster, the catalog and the scheduler.  Rewritten on every
+        start; a profile whose hash moved since the previous record raises a
+        PROFILE_CHANGED alert so an edit after activation is never silent."""
+        sdir = self.run_root / "claude-settings"
+        src = self.here / "claude-settings"
+        try:
+            sdir.mkdir(parents=True, exist_ok=True)
+            for name in self.PROFILES:
+                if not (sdir / ("%s.json" % name)).exists() and (src / ("%s.json" % name)).exists():
+                    shutil.copy(str(src / ("%s.json" % name)), str(sdir / ("%s.json" % name)))
+        except OSError:
+            pass
+        profiles = {}
+        for name in self.PROFILES:
+            p = sdir / ("%s.json" % name)
+            profiles[name] = sha256_file(p) if p.exists() else None
+        ctl = self.roster.get("control", {})
+        inputs = {"roster": sha256_file(self.roster_path),
+                  "catalog": sha256_file(Path(ctl["catalog"])) if ctl.get("catalog") else None,
+                  "scheduler": sha256_file(Path(ctl["script"])) if ctl.get("script") else None}
+        out = self.run_root / "activation-record.json"
+        previous = None
+        try:
+            if out.exists():
+                previous = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
+        changed = []
+        if previous:
+            for name, digest in profiles.items():
+                if (previous.get("profiles") or {}).get(name) != digest:
+                    changed.append("profile:%s" % name)
+            for name, digest in inputs.items():
+                if (previous.get("inputs") or {}).get(name) != digest:
+                    changed.append(name)
+        rec = {"ts": utc_ms(), "pid": os.getpid(), "run_root": str(self.run_root),
+               "profiles": profiles, "inputs": inputs, "changed_since_previous": changed,
+               "previous_ts": previous.get("ts") if previous else None,
+               "missing_profiles": [n for n, d in profiles.items() if d is None]}
+        try:
+            tmp = out.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(str(tmp), str(out))
+            _append_jsonl(self.run_root / "activation-records.jsonl", rec)
+        except OSError:
+            pass
+        if changed:
+            self.alert("PROFILE_CHANGED", "since %s: %s" % (rec["previous_ts"], ", ".join(changed)))
+        if rec["missing_profiles"]:
+            self.alert_once("profiles-missing", "PROFILE_MISSING",
+                            "claude-settings lacks %s" % ", ".join(rec["missing_profiles"]))
+        return rec
+
     def _seal_step(self):
         """seal the previous IST day once its clock has rolled over, and the current
         day at most once per driver start (so a restart leaves a fresh manifest)"""
@@ -925,6 +1075,7 @@ class LaneDriver(object):
         except OSError:
             pass
         self.write_heartbeat({"finished": reason})
+        self.render()
         self.comms("lanedriver", "audit", "finish %s tick=%d" % (reason, self.tick_count), kind="lifecycle")
 
     # -- the tick ---------------------------------------------------------------------------
@@ -947,7 +1098,13 @@ class LaneDriver(object):
                 self._reconciled = True
                 self.log("RECONCILE %s" % json.dumps(res)[:300])
         self.write_heartbeat()
+        if self.tick_count == 1:
+            self.write_activation_record()
+            for name, srv in self.servers.items():
+                if not srv.get("parked"):
+                    self.probe(name, srv["url"] + "/session", "startup")
         self._seal_step()
+        self._render_step()
         if self._stopping:
             self._stop_step()
             return 0
@@ -2092,6 +2249,7 @@ def build_parser():
     se = sub.add_parser("seal", help="write MANIFEST-<day>.json (sha256 of every audit file)")
     se.add_argument("--day", help="IST day YYYY-MM-DD; default today")
     se.add_argument("--force", action="store_true", help="rewrite an existing manifest")
+    sub.add_parser("render", help="F14: write LEDGER.md now (the loop also does it on a timer)")
     return ap
 
 
@@ -2110,7 +2268,7 @@ def cmd_seal(drv, args):
     return 0
 
 
-SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal")
+SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render")
 
 
 def main(argv=None):
@@ -2126,6 +2284,7 @@ def main(argv=None):
         drv = LaneDriver(args.roster, interval=args.interval, runners=runners,
                          bins={"osascript": shutil.which("osascript")} if shutil.which("osascript") else None)
         if args.fake_runners:
+            drv.fake_runners = True
             drv.log("FAKE RUNNERS in force: no model call will be made")
         drv.log("lanedriver start pid=%d roster=%s" % (os.getpid(), drv.roster_path))
         drv.comms("lanedriver", "audit", "start pid=%d fake_runners=%s" % (os.getpid(), args.fake_runners),
@@ -2148,6 +2307,10 @@ def main(argv=None):
         return cmd_comms(drv, args)
     if args.cmd == "seal":
         return cmd_seal(drv, args)
+    if args.cmd == "render":
+        out = drv.render()
+        print(json.dumps({"status": "OK" if out else "FAILED", "ledger": str(out or "")}))
+        return 0 if out else 1
     return 1
 
 
