@@ -426,6 +426,7 @@ class LaneDriver(object):
         # §4(c): the packet layer -- loaded from run.pack_dir, bound to tasks by
         # _pack_reconcile (once after the scheduler reconcile, then every
         # alerts.pack_every_s to bind packets whose dependencies just appeared)
+        self._authority_stop = False
         self.pack, self.pack_lint = {}, []
         self.pack_by_task = {}
         self._pack_last_mono = None
@@ -599,7 +600,64 @@ class LaneDriver(object):
             elif used < int(tcap) and st.get("park_status") == "TOKEN_CAP":
                 st["parked_until"], st["park_reason"], st["park_status"] = 0.0, None, None
                 self.log("UNPARK runner %s: token cap raised" % runner)
-        return not self._budget_stop and not self._disk_paused
+        self._authority_check()
+        return not self._budget_stop and not self._disk_paused and not self._authority_stop
+
+    # -- §4(d) authority: the scheduler + review_gate the driver runs are the pinned ones ---
+
+    AUTHORITY_EVERY_S = 60.0
+
+    def _authority_check(self):
+        """CATALOG-AUTHORITY.json pins the scheduler, the catalog and the review
+        validator (the s3-adjacent review_gate.py with `_fork_cutoff`).  The
+        scheduler imports review_gate from its own directory, so that is the copy
+        L42 runs with.  A hash mismatch or a copy without `_fork_cutoff` /
+        `MODEL_ALIASES` stops every new dispatch (AUTHORITY_MISMATCH) -- the
+        activation rule says refuse startup, and a mid-run edit is the same
+        failure -- until the file or the pin is corrected."""
+        last = getattr(self, "_authority_last", None)
+        if last is not None and time.monotonic() - last < self.AUTHORITY_EVERY_S:
+            return
+        self._authority_last = time.monotonic()
+        problems = self.authority_problems()
+        if problems and not self._authority_stop:
+            self._authority_stop = True
+            self.alert("AUTHORITY_MISMATCH", "; ".join(problems)[:600])
+        elif not problems and self._authority_stop:
+            self._authority_stop = False
+            self.log("authority restored: scheduler/catalog/review_gate match CATALOG-AUTHORITY.json")
+
+    def authority_problems(self):
+        ctl_dir = Path(self.control.cwd) if getattr(self.control, "cwd", None) else Path(self.control.script).parent
+        gate = ctl_dir / "review_gate.py"
+        problems = []
+        try:
+            text = gate.read_text(encoding="utf-8")
+        except OSError:
+            return ["review_gate.py missing next to the scheduler (%s)" % gate]
+        for marker in ("def _fork_cutoff", "MODEL_ALIASES"):
+            if marker not in text:
+                problems.append("review_gate.py at %s lacks %s (older copy; L42 must not run with it)" % (gate, marker))
+        auth = Path(self.roster.get("control", {}).get("authority") or (ctl_dir / "CATALOG-AUTHORITY.json"))
+        if not auth.exists():
+            return problems + ["CATALOG-AUTHORITY.json not found at %s" % auth]
+        try:
+            pins = json.loads(auth.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            return problems + ["CATALOG-AUTHORITY.json unreadable: %s" % exc]
+        checks = [("review_validator_sha256", gate), ("scheduler_sha256", Path(self.control.script))]
+        cat = Path(self.control.catalog_path)
+        if cat.resolve().parent == ctl_dir.resolve():
+            checks.append(("catalog_sha256", cat))      # a throwaway catalog elsewhere is not the pinned one
+        for key, path in checks:
+            pinned = pins.get(key)
+            if not pinned:
+                continue
+            actual = sha256_file(path) if path.exists() else None
+            if actual != pinned:
+                problems.append("%s: %s is %s, authority pins %s" % (key, path.name, (actual or "missing")[:12],
+                                                                    pinned[:12]))
+        return problems
 
     def _reload_roster_if_changed(self):
         try:
@@ -1368,9 +1426,11 @@ class LaneDriver(object):
             p = sdir / ("%s.json" % name)
             profiles[name] = sha256_file(p) if p.exists() else None
         ctl = self.roster.get("control", {})
+        gate = (Path(ctl.get("cwd") or Path(ctl.get("script", "")).parent) / "review_gate.py") if ctl.get("script") else None
         inputs = {"roster": sha256_file(self.roster_path),
                   "catalog": sha256_file(Path(ctl["catalog"])) if ctl.get("catalog") else None,
-                  "scheduler": sha256_file(Path(ctl["script"])) if ctl.get("script") else None}
+                  "scheduler": sha256_file(Path(ctl["script"])) if ctl.get("script") else None,
+                  "review_gate": sha256_file(gate) if gate and gate.exists() else None}
         out = self.run_root / "activation-record.json"
         previous = None
         try:

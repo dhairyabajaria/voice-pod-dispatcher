@@ -1228,3 +1228,38 @@ def test_pack4a_worktrees_link_both_venvs_and_node_modules_and_alert_on_a_missin
     os.utime(str(env.run_root / "roster.json"), None)
     drv.tick()
     assert (env.run_root / "roster.1.json").exists()
+
+
+# -- pack §4(d): L42 runs with the pinned s3-adjacent review_gate.py ----------------------
+
+def test_pack4d_authority_mismatch_stops_dispatch_until_the_gate_copy_is_the_pinned_one(tmp_path, monkeypatch):
+    import shutil
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    assert drv.authority_problems() == [], "the real scheduler dir matches CATALOG-AUTHORITY.json"
+    rec_gate = sha256_file_of(CONTROL_DIR / "review_gate.py")
+    settle(drv, 1)
+    rec = json.loads((env.run_root / "activation-record.json").read_text())
+    assert rec["inputs"]["review_gate"] == rec_gate
+    # a control dir whose review_gate.py is an older copy (no _fork_cutoff): dispatch stops
+    ctl2 = tmp_path / "ctl2"
+    ctl2.mkdir()
+    for name in ("orchestration_control.py", "review_gate.py", "CATALOG-AUTHORITY.json"):
+        shutil.copy(str(CONTROL_DIR / name), str(ctl2 / name))
+    (ctl2 / "review_gate.py").write_text((ctl2 / "review_gate.py").read_text().replace("def _fork_cutoff", "def _old_cutoff"))
+    drv2 = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv2.control.cwd = str(ctl2)
+    drv2.control.script = str(ctl2 / "orchestration_control.py")
+    probs = drv2.authority_problems()
+    assert any("lacks def _fork_cutoff" in p for p in probs) and any("review_validator_sha256" in p for p in probs)
+    assert drv2._guards() is False and drv2._authority_stop
+    assert "AUTHORITY_MISMATCH" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    # the pinned copy restored: the stop lifts on the next check
+    shutil.copy(str(CONTROL_DIR / "review_gate.py"), str(ctl2 / "review_gate.py"))
+    drv2._authority_last = None
+    assert drv2._guards() is True and not drv2._authority_stop
+
+
+def sha256_file_of(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
