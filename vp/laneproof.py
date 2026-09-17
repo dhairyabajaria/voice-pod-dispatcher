@@ -148,7 +148,12 @@ class Proof(object):
 
     # -- box -------------------------------------------------------------------------------
 
-    def run_box(self, task, pid, wt, cand, kind, paths, no_record=False, workers=None):
+    def run_box(self, task, pid, wt, cand, kind, paths, no_record=True, workers=None):
+        # v13 keeps its proof records in RUN_ROOT/proofs/<pid>.json (self._write);
+        # vpproof's own store row needs a prior proof_request the lane driver
+        # never makes ("unknown proof <pid>" -> UNKNOWN on the very first live
+        # proof), so the store row is off unless the roster asks for it.
+        no_record = no_record and not bool(self.cfg.get("store_record"))
         argv = [self.python, str(self.here / "vpproof.py"), "run", "--run-root", str(self.run_root),
                 "--worktree", str(wt), "--sha", cand, "--proof-id", pid,
                 "--kind", "targeted" if paths else "full",

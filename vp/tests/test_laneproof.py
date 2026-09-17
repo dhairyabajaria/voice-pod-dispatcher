@@ -283,3 +283,17 @@ def test_docs_only_proof_passes_without_a_run(tmp_path):
     assert rec["status"] == "PASS" and rec["route"] == "none" and rec["failed_nodes"] == []
     assert (tmp_path / "run" / "proofs" / "proof-docs-1.json").exists()
     assert any("docs-only" in m for m in logs)
+
+
+def test_box_proof_skips_the_store_row_unless_the_roster_asks(tmp_path):
+    ex = FakeExec({})
+    cfg = {"circleci": {"enabled": False}}
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), ex, cfg=cfg)
+    rec = p.run("L02", "proof-L02-1", tmp_path, "b" * 40, "c" * 40, "platform", ["platform/tests/test_a.py"])
+    assert rec["status"] == "PASS" and rec["route"] == "box"
+    argv = ex.calls[-1]
+    assert "--no-record" in argv, "v13 records proofs in RUN_ROOT/proofs, not the vpstore row"
+    assert (tmp_path / "run" / "proofs" / "proof-L02-1.json").exists()
+    p2 = make_proof(tmp_path, FakeCircle(pipeline([])), ex, cfg=dict(cfg, store_record=True))
+    p2.run("L02", "proof-L02-2", tmp_path, "b" * 40, "c" * 40, "platform", ["platform/tests/test_a.py"])
+    assert "--no-record" not in ex.calls[-1]
