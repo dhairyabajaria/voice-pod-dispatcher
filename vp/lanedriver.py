@@ -77,10 +77,10 @@ FINISHED_STATES = ("VERIFIED", "INTEGRATED", "REPAIR_REQUIRED", "BLOCKED",
 ADOPTABLE_STATES = ("CLAIMED", "RUNNING", "DISPATCHED", "RESULT_RECEIVED")
 
 DEFAULT_ROUTE_BINDINGS = {
-    "BIND_APPROVED_GO_MUSE_ROUTE": ["go3/muse-spark-1.3-contributor", "xhigh",
-                                    "router_go3_muse_spark_1_3_contributor"],
-    "BIND_APPROVED_GO_DEEPSEEK_ROUTE": ["go1/deepseek-v4.1-flash", "high",
-                                        "router_go1_deepseek_v4_1_flash"],
+    "BIND_APPROVED_GO_MUSE_ROUTE": ["go2/muse-spark-1.3-contributor", "xhigh",
+                                    "router_go2_muse_spark_1_3_contributor"],
+    "BIND_APPROVED_GO_DEEPSEEK_ROUTE": ["go2/deepseek-v4.1-flash", "high",
+                                        "router_go2_deepseek_v4_1_flash"],
 }
 
 MAX_RESUMES = 3
@@ -325,10 +325,10 @@ class LaneDriver(object):
 
         self._apply_roster(self.roster)
         self.git_bin = self.bins.get("git", "git")
+        transport = run.get("opencode_transport", "http")
         self.runners = runners or {
-            "opencode": vprunners.OpenCodeRunner(self.exec, self.bins.get("opencode", "opencode")),
-            "codex": vprunners.CodexRunner(self.exec, self.bins.get("codex", "codex")),
-            "claude": vprunners.ClaudeRunner(self.exec, self.bins.get("claude", "claude")),
+            name: vprunners.runner_for(name, self.exec, self.bins, opencode_transport=transport)
+            for name in ("opencode", "codex", "claude", "agy")
         }
 
         self._lock = threading.Lock()
@@ -905,20 +905,26 @@ class LaneDriver(object):
             if not self._try_acquire(server, runner):
                 continue
             attempt = "%s-a%s" % (task, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3])
-            child = "lanedriver:%d:%s" % (os.getpid(), attempt)
-            model, effort, agent_type = self._route_for(contract)
             try:
                 self.control.claim(task, row["chief"], attempt, base, paths)
                 self.log("CLAIM %s %s base %s paths %s" % (task, attempt, base[:12], paths))
-                self.control.start(task, attempt, child, model, effort, agent_type)
-                self.log("START %s %s %s/%s" % (task, attempt, model, effort))
+                if runner != "codex":
+                    self._start(task, attempt, contract, "lanedriver:%d:%s" % (os.getpid(), attempt))
             except ControlError as exc:
                 self._release(server, runner)
                 self.note_failure(task, "ready:%s" % row.get("updated_at"), str(exc))
                 continue
-            self._spawn(task, attempt, row, contract, server, runner, base)
+            # codex kinds: the thread pre-opens the codex session and calls
+            # `start` with the real thread id (review_gate linkage)
+            self._spawn(task, attempt, row, contract, server, runner, base,
+                        needs_start=(runner == "codex"))
             n += 1
         return n
+
+    def _start(self, task, attempt, contract, child):
+        model, effort, agent_type = self._route_for(contract)
+        self.control.start(task, attempt, child, model, effort, agent_type)
+        self.log("START %s %s child=%s %s/%s" % (task, attempt, child, model, effort))
 
     def _adopt_orphans(self, state, draining):
         n = 0
@@ -943,38 +949,41 @@ class LaneDriver(object):
             attempt = row.get("attempt_id")
             if not attempt:
                 continue
+            needs_start = False
             if row["state"] == "CLAIMED":
                 if draining:
                     continue
-                model, effort, agent_type = self._route_for(contract)
-                child = "lanedriver:%d:%s" % (os.getpid(), attempt)
-                try:
-                    self.control.start(task, attempt, child, model, effort, agent_type)
-                except ControlError as exc:
-                    self.note_failure(task, key, str(exc))
-                    continue
+                if runner == "codex":
+                    needs_start = True
+                else:
+                    try:
+                        self._start(task, attempt, contract, "lanedriver:%d:%s" % (os.getpid(), attempt))
+                    except ControlError as exc:
+                        self.note_failure(task, key, str(exc))
+                        continue
             if not self._try_acquire(server, runner):
                 continue
             self.log("ADOPT %s %s (%s)" % (task, attempt, row["state"]))
             self._spawn(task, attempt, row, contract, server, runner,
-                        row.get("base_sha") or self.trunk_sha() or "")
+                        row.get("base_sha") or self.trunk_sha() or "", needs_start=needs_start)
             n += 1
         return n
 
-    def _spawn(self, task, attempt, row, contract, server, runner, base):
+    def _spawn(self, task, attempt, row, contract, server, runner, base, needs_start=False):
         with self._lock:
             self._live[task] = attempt
         th = threading.Thread(target=self._task_thread,
-                              args=(task, attempt, dict(row), contract, server, runner, base),
+                              args=(task, attempt, dict(row), contract, server, runner, base,
+                                    needs_start),
                               name="vp-%s" % task, daemon=True)
         self._threads.append(th)
         th.start()
 
     # -- one task attempt (thread) ------------------------------------------------------------
 
-    def _task_thread(self, task, attempt, row, contract, server, runner, base):
+    def _task_thread(self, task, attempt, row, contract, server, runner, base, needs_start=False):
         try:
-            self._run_attempt(task, attempt, row, contract, server, runner, base)
+            self._run_attempt(task, attempt, row, contract, server, runner, base, needs_start)
         except Exception as exc:          # never kill the daemon
             self.log("EXC %s: %s: %s" % (task, type(exc).__name__, exc))
             try:
@@ -991,7 +1000,7 @@ class LaneDriver(object):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _run_attempt(self, task, attempt, row, contract, server, runner, base):
+    def _run_attempt(self, task, attempt, row, contract, server, runner, base, needs_start=False):
         kind = contract.get("kind") or row.get("kind")
         rcfg = self.roles.get(kind) or {}
         wt = self.ensure_worktree(task, base)
@@ -999,6 +1008,18 @@ class LaneDriver(object):
         tdir = self._turn_dir(task, attempt)
         fkey = attempt
         sid = self._saved_session(tdir)
+        if needs_start:
+            if not sid:
+                pre = self._spec("reviewer", task, wt, "", rcfg, runner, server, None,
+                                 wt / ".vp" / "REVIEW.json", None, 180.0, tdir, "0-preopen", False, 0)
+                sid, detail = self.runners[runner].preopen(pre)
+                if not sid:
+                    self.note_failure(task, fkey, "codex preopen: %s" % detail, kind="STALLED")
+                    return
+                self._save_session(tdir, sid, runner)
+                self.log("PREOPEN %s %s codex thread %s" % (task, attempt, sid))
+            self._start(task, attempt, contract, sid)
+            row = dict(row, child_id=sid)
         if kind in BUILD_KINDS:
             outcome, result = self._build_pipeline(task, attempt, row, contract, server, runner,
                                                    rcfg, wt, tdir, sid)
@@ -1181,12 +1202,15 @@ class LaneDriver(object):
         cand = state.get("candidate") or {}
         target = (row.get("parameters") or {}).get("parent_contract_id") or task
         tcon = self.control.contract(target)
+        trow = (state.get("tasks") or {}).get(target) or {}
         crit = list(dict.fromkeys((tcon.get("verification") or []) + (tcon.get("acceptance") or [])))
         runtime = self._codex_rollout(outcome.session_id)
+        authors = [a for a in (trow.get("child_id"), "lanedriver:%d" % os.getpid())
+                   if a and a != outcome.session_id]
         packet = {"role": role, "verdict": "PASS", "candidate_sha": cand.get("sha"),
                   "tree_sha": cand.get("tree"), "catalog_sha256": (state.get("catalog") or {}).get("sha256"),
                   "review_task_id": task, "reviewer_session_id": outcome.session_id,
-                  "author_session_ids": [row.get("child_id") or "unknown"],
+                  "author_session_ids": authors,
                   "unresolved_blocking_findings": [],
                   "runtime_log": {"path": str(runtime) if runtime else "",
                                   "sha256": sha256_file(runtime) if runtime else ""},

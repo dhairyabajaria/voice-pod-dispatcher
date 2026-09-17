@@ -461,6 +461,82 @@ def test_control_jsonl_records_every_call_with_sequence(tmp_path):
     assert lines[2]["seq_after"] == lines[2]["seq_before"] + 1
 
 
+class FakeCodex(FakeRunner):
+    name = "codex"
+
+    def __init__(self, thread_id="0199-thread-xyz", verdict="APPROVE"):
+        FakeRunner.__init__(self)
+        self.thread_id = thread_id
+        self.verdict = verdict
+        self.preopened = []
+
+    def preopen(self, spec):
+        self.preopened.append(spec)
+        return self.thread_id, "INCOMPLETE"
+
+    def run(self, spec, abort_flag=None):
+        self.calls.append(spec)
+        wt = Path(spec.cwd)
+        req = json.loads((wt / ".vp" / "REVIEW_REQUEST.json").read_text())
+        doc = {"item": spec.item, "subject": "item", "base": req["base"], "candidate": req["candidate"],
+               "reviewer": req["reviewer"], "verdict": self.verdict,
+               "verdicts": [{"id": i, "verdict": "PASS", "evidence": "platform/a.py:1"} for i in req["benchmark_ids"]],
+               "findings": [], "evidence": ["platform/a.py:1"], "summary": "fake review"}
+        Path(spec.out_path).write_text(json.dumps(doc))
+        return TurnOutcome(STATUS_DONE, "", session_id=spec.session_id, record_path=spec.out_path,
+                           usage={"tokens_in": 9, "tokens_out": 2, "cost": None}, runner="codex",
+                           model_seen="gpt-5.6-luna")
+
+
+def register_candidate(env):
+    import hashlib
+    sha = git(env.trunk, "rev-parse", "HEAD")
+    tree = git(env.trunk, "rev-parse", "HEAD^{tree}")
+    art = env.tmp / "integration-record.json"
+    art.write_text('{"integration": true}\n')
+    packet = env.tmp / "candidate-packet.json"
+    packet.write_text(json.dumps({
+        "candidate_sha": sha, "tree_sha": tree,
+        "contract_revision": hashlib.sha256(env.catalog.read_bytes()).hexdigest(),
+        "artifact_manifest": {"record": {"path": art.name,
+                                         "sha256": hashlib.sha256(art.read_bytes()).hexdigest()}}}))
+    env.control_call("register-candidate", "--repo", str(env.trunk), "--packet", str(packet),
+                     "--artifact-root", str(env.tmp), "--actor", "test")
+    return sha, tree
+
+
+def test_codex_review_preopens_the_thread_and_starts_with_its_id(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    sha, tree = register_candidate(env)
+    params = env.tmp / "review.json"
+    params.write_text(json.dumps({"parent_contract_id": "L00", "candidate_sha": sha, "tree_sha": tree,
+                                  "diff_or_scope": "whole", "criteria": "catalog", "evidence": []}))
+    env.control_call("instantiate", "--template", "JUNIOR_REVIEW", "--task", "J1",
+                     "--parent-contract", "L00", "--chief", "B", "--parameters-json", str(params))
+    codex = FakeCodex()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": codex, "claude": FakeRunner()})
+    settle(drv)
+    rows = env.rows()
+    assert len(codex.preopened) == 1, "one pre-open turn before start"
+    assert rows["J1"]["child_id"] == "0199-thread-xyz"
+    start = next(l for l in env.control_lines() if l["verb"] == "start" and "J1" in l["argv"])
+    assert "0199-thread-xyz" in start["argv"] and "gpt-5.6-luna" in start["argv"]
+    assert codex.calls[0].session_id == "0199-thread-xyz", "the review resumes the pre-opened thread"
+    claim = next(l for l in env.control_lines() if l["verb"] == "claim" and "J1" in l["argv"])
+    assert sha in claim["argv"], "review claims bind the registered candidate sha"
+    # APPROVE -> complete --verdict; the gate refuses (no native codex rollout in
+    # a test box) -> the driver completes INVALID_EVIDENCE honestly, never VERIFIED
+    completes = [l for l in env.control_lines() if l["verb"] == "complete" and "J1" in l["argv"]]
+    assert "--verdict" in completes[0]["argv"] and completes[0]["rc"] != 0
+    assert rows["J1"]["state"] == "INVALID_EVIDENCE" and "verdict refused" in rows["J1"]["blocker"]
+    packet = json.loads(next((env.run_root / "turns" / "J1").glob("*/verdict-packet.json")).read_text())
+    assert packet["reviewer_session_id"] == "0199-thread-xyz"
+    assert "0199-thread-xyz" not in packet["author_session_ids"]
+    assert packet["coverage"]["L00"] == {"L00 verified": "PASS", "L00 accepted": "PASS"}
+    assert "VERDICT_REFUSED" in (env.run_root / "OWNER-ALERTS.md").read_text()
+
+
 def test_render_packet_and_benchmark_from_contract(tmp_path):
     con = catalog()["contracts"][2]
     pk = lanedriver.LaneDriver.render_packet(con, "a" * 40)
