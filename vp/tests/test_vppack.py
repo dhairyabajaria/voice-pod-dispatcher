@@ -412,3 +412,20 @@ def test_review_packet_reviews_the_subject_then_writes_the_verdict_and_grades(tm
     # the scheduler's own gate still runs on complete: no native rollout -> refused -> INVALID_EVIDENCE
     assert row["state"] == "INVALID_EVIDENCE" and "verdict refused" in row["blocker"]
     assert "VERDICT_REFUSED" in (env.run_root / "OWNER-ALERTS.md").read_text()
+
+
+def test_review_packet_union_placeholder_resolves_to_covered_rows():
+    from lanedriver import LaneDriver
+    import types
+    drv = types.SimpleNamespace()
+    drv.git = lambda args: (0, "", "")
+    drv.control = types.SimpleNamespace(contract=lambda t, row=None: {"verification": ["%s ok" % t], "acceptance": []})
+    drv.alert_once = lambda *a, **k: None
+    wt = Path(__import__("tempfile").mkdtemp()) / "wt"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / ".vp" / "PACKET.md").write_text("---\nitem: RJU\ncoverage_targets: [<union>, L99]\n---\nbody\n")
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B1 [evidence] [box] x — check: y\n")
+    row = {"parameters": {"parent_contract_id": "L42", "covered_rows": ["L06", "L07"], "diff_or_scope": "union:RJU"}}
+    plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, {"tasks": {}})
+    assert plan["targets"] == ["L42", "L06", "L07", "L99"] and plan["subject"] == "union"
+    assert "L06 ok" in plan["review_benchmark"] and "<union>" not in plan["review_benchmark"]

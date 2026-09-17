@@ -2855,8 +2855,17 @@ class LaneDriver(object):
                                 "%s: review_base %s is not a commit; reviewing from the row base %s"
                                 % (task, rbase[:12], base[:12]), task)
                 rbase = base
-        target = (row.get("parameters") or {}).get("parent_contract_id") or task
-        targets = [str(t) for t in (hdr.get("coverage_targets") or [])] or [target]
+        params = row.get("parameters") or {}
+        target = params.get("parent_contract_id") or task
+        targets = []
+        for t in (hdr.get("coverage_targets") or []):
+            if str(t).strip() == "<union>":
+                # the union's members: the review row's covered_rows (the
+                # INTEGRATED contracts the dispatch record lists)
+                targets += [str(c) for c in (params.get("covered_rows") or [])]
+            else:
+                targets.append(str(t).strip())
+        targets = list(dict.fromkeys(targets)) or [target]
         if target not in targets:
             targets.insert(0, target)
         criteria = {}
