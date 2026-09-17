@@ -73,6 +73,21 @@ def cmd_init(args):
     state = root / "control" / "orchestration-state" / "run-state.json"
     control = Path(args.control).resolve()
     ctl = ["python3", str(control), "--state", str(state), "--catalog", str(catalog)]
+    if getattr(args, "state_src", None) and not state.exists():
+        # a copy of a LIVE orchestration-state directory (run-state.json + its
+        # events/inbox publications): the dry run then sees the real rows
+        import shutil
+        src = Path(args.state_src).resolve()
+        src_dir = src.parent if src.is_file() else src
+        shutil.rmtree(state.parent, ignore_errors=True)
+        shutil.copytree(src_dir, state.parent, ignore=shutil.ignore_patterns("*.lock"))
+        live = json.loads(state.read_text())
+        # the copied catalog must be byte-identical to the one the state pins
+        import hashlib
+        actual = hashlib.sha256(catalog.read_bytes()).hexdigest()
+        if actual != live["catalog"]["sha256"]:
+            raise SystemExit("catalog %s (sha %s) is not the one the state pins (%s)"
+                             % (catalog, actual[:12], live["catalog"]["sha256"][:12]))
     if not state.exists():
         sh(ctl + ["init", "--run-id", args.run_id], cwd=str(control.parent))
         for chief in ("A", "B"):
@@ -101,6 +116,7 @@ def main(argv=None):
     i.add_argument("--pack-dir")
     i.add_argument("--run-id", default="dryrun")
     i.add_argument("--force-roster", action="store_true")
+    i.add_argument("--state-src", help="copy this live orchestration-state (dir or run-state.json) instead of init")
     i.set_defaults(func=cmd_init)
     args = ap.parse_args(argv)
     args.func(args)

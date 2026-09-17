@@ -47,6 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import laneproof  # noqa: E402
 import vplint     # noqa: E402
+import vppack     # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
 from vpdriver import (BUILDER_PROMPT, JUNIOR_PROMPT, RESUME_PROMPT,  # noqa: E402
@@ -422,6 +423,14 @@ class LaneDriver(object):
         self._sealed_day = None
         self.fake_runners = False
         self._gate_last = {}
+        # §4(c): the packet layer -- loaded from run.pack_dir, bound to tasks by
+        # _pack_reconcile (once after the scheduler reconcile, then every
+        # alerts.pack_every_s to bind packets whose dependencies just appeared)
+        self.pack, self.pack_lint = {}, []
+        self.pack_by_task = {}
+        self._pack_last_mono = None
+        self._pack_logged = set()
+        self._load_pack()
 
         self._apply_roster(self.roster)
         self.git_bin = self.bins.get("git", "git")
@@ -817,10 +826,252 @@ class LaneDriver(object):
                             "surface)" % ", ".join(missing), task)
         return made, missing
 
+    # -- §4(c) the packet layer -----------------------------------------------------------
+
+    def _load_pack(self):
+        if not self.pack_dir or not self.pack_dir.is_dir():
+            return
+        try:
+            self.pack, self.pack_lint = vppack.load_pack(self.pack_dir)
+        except Exception as exc:  # noqa: BLE001 -- a broken pack is reported, not fatal
+            self.pack, self.pack_lint = {}, ["ERROR pack: %s: %s" % (type(exc).__name__, exc)]
+        for line in self.pack_lint:
+            self.log("PACK %s" % line)
+
+    def packet_for(self, task):
+        pid = self.pack_by_task.get(task)
+        return self.pack.get(pid) if pid else None
+
+    def _owner_gate_open(self, task):
+        p = self.packet_for(task)
+        if not p or vppack.owner_gate_open(p, self.roster):
+            return True
+        self.alert_once("owner-gate:%s" % p["owner_gate"], "OWNER_GATE",
+                        "%s waits for %s (roster owner_gates.%s is not true); nothing dispatched behind it"
+                        % (p["id"], p["owner_gate"], p["owner_gate"]), task)
+        return False
+
+    def _pack_step(self):
+        if not self.pack:
+            return
+        every = float(self.alerts_cfg.get("pack_every_s", 300))
+        last = self._pack_last_mono
+        if last is not None and time.monotonic() - last < every:
+            return
+        self._pack_last_mono = time.monotonic()
+        try:
+            self._pack_reconcile()
+        except Exception as exc:  # noqa: BLE001 -- never take the tick down
+            self.log("PACK reconcile failed: %s: %s" % (type(exc).__name__, exc))
+
+    def _pack_record(self, packet, rec):
+        d = self.run_root / "packets"
+        d.mkdir(parents=True, exist_ok=True)
+        rec = dict(rec, ts=utc_ms())
+        (d / ("%s.json" % packet["id"])).write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+        _append_jsonl(d / "bindings.jsonl", rec, self._lock)
+        return rec
+
+    def _pack_reconcile(self):
+        """bind every packet to its scheduler task (vppack D9): direct packets
+        map onto existing rows; dynamic ones are instantiated once their
+        dependency packets are bound; reviews wait for a registered candidate;
+        owner-gated packets wait for the roster flag.  L42 (roster
+        packet.rewire, default ["L42"]) gets its depends_on rewired to the
+        pack's set.  Every binding is a packets/<id>.json record."""
+        state = self.control.state_view()
+        tasks = state.get("tasks") or {}
+        candidate = state.get("candidate") or {}
+        bound_now = 0
+        bindings = {pid: t for t, pid in self.pack_by_task.items()}
+        for pid in vppack.topo_order(self.pack):
+            if pid in bindings and bindings[pid] in tasks:
+                continue                          # bound once, bound for the run
+            p = self.pack[pid]
+            mode = vppack.bind(p, tasks)
+            if mode[0] == "hold":
+                if ("hold", pid) not in self._pack_logged:
+                    self._pack_logged.add(("hold", pid))
+                    self.log("PACK %s held: %s" % (pid, mode[1]))
+                continue
+            task = mode[1]
+            if task in tasks:
+                if self.pack_by_task.get(task) != pid:
+                    self.pack_by_task[task] = pid
+                    self._pack_record(p, vppack.dispatch_record(p, task, mode[0], mode[2] if len(mode) > 2 else None,
+                                                                tasks[task].get("parent_contract_id"), p["base_sha"],
+                                                                {"state": tasks[task].get("state")}))
+                continue
+            # dynamic and not yet instantiated
+            template = mode[2]
+            if not vppack.owner_gate_open(p, self.roster):
+                self._owner_gate_open(task) if task in self.pack_by_task else self.alert_once(
+                    "owner-gate:%s" % p["owner_gate"], "OWNER_GATE",
+                    "%s waits for %s (roster owner_gates.%s is not true)" % (pid, p["owner_gate"], p["owner_gate"]))
+                continue
+            deps = vppack.dependency_tasks(p, self.pack, tasks, bindings)
+            if deps is None:
+                continue                          # a dependency packet is not bound yet
+            parent, how = vppack.parent_for(p, tasks, self.pack)
+            if not parent:
+                self.alert_once("pack-parent:%s" % pid, "PACKET_NO_PARENT",
+                                "%s: no parent_contract derivable; add `parent_contract:` to its header" % pid)
+                continue
+            covered = self._covered_rows(tasks) if template in vppack.REVIEW_TEMPLATES else None
+            params = vppack.parameters_for(p, template, parent, candidate, covered)
+            if params is None:
+                if ("cand", pid) not in self._pack_logged:
+                    self._pack_logged.add(("cand", pid))
+                    self.log("PACK %s waits for a registered candidate" % pid)
+                continue
+            pdir = self.run_root / "packets"
+            pdir.mkdir(parents=True, exist_ok=True)
+            ppath = pdir / ("%s.params.json" % pid)
+            ppath.write_text(json.dumps(params, indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                self.control.instantiate(template, task, parent, "B", ppath, deps)
+            except ControlError as exc:
+                self.alert_once("pack-inst:%s" % pid, "PACKET_INSTANTIATE_REFUSED",
+                                "%s as %s (%s, parent %s): %s" % (pid, task, template, parent, str(exc)[:240]))
+                continue
+            tasks[task] = {"state": "PLANNED", "parent_contract_id": parent, "dynamic": True}
+            self.pack_by_task[task] = pid
+            bindings[pid] = task
+            self._pack_record(p, vppack.dispatch_record(p, task, "dynamic", template, parent, p["base_sha"],
+                                                        {"parent_how": how, "depends_on_tasks": deps,
+                                                         "parameters": str(ppath), "covered_rows": covered}))
+            if how.startswith(vppack.GUESSED_PARENT):
+                self.alert_once("pack-guess:%s" % pid, "PACKET_PARENT_GUESSED",
+                                "%s parent %s derived by %s; pin `parent_contract:` in its header if wrong"
+                                % (pid, parent, how))
+            self.log("PACK %s -> %s (%s, parent %s via %s, deps %s)" % (pid, task, template, parent, how, deps))
+            bound_now += 1
+        for tid in (self.roster.get("packet") or {}).get("rewire", ["L42"]):
+            self._pack_rewire(tid, tasks, bindings)
+        if bound_now:
+            self.log("PACK bound %d new task(s)" % bound_now)
+        return bound_now
+
+    def _pack_rewire(self, tid, tasks, bindings=None):
+        p = self.pack.get(tid)
+        row = tasks.get(tid)
+        if not p or not row or row.get("state") not in ("PLANNED", "WAITING_DEPENDENCY", "READY"):
+            return
+        deps = vppack.dependency_tasks(p, self.pack, tasks, bindings)
+        if deps is None or list(row.get("depends_on") or []) == deps:
+            return
+        try:
+            self.control.call("rewire", ["--task", tid, "--depends-on"] + deps +
+                              ["--reason", "v13 pack %s depends_on (PACK-COMPLETE §4.3)" % tid])
+        except ControlError as exc:
+            self.alert_once("rewire:%s" % tid, "REWIRE_REFUSED", "%s: %s" % (tid, str(exc)[:240]), tid)
+            return
+        row["depends_on"] = deps
+        self.log("PACK rewired %s.depends_on %s -> %s" % (tid, row.get("depends_on"), deps))
+        _append_jsonl(self.run_root / "packets" / "bindings.jsonl",
+                      {"ts": utc_ms(), "packet": tid, "op": "rewire", "depends_on": deps}, self._lock)
+
+    def _covered_rows(self, tasks):
+        """the implementation rows a union review covers: every INTEGRATED
+        non-review task without a current junior review (L42's REVIEW:* waits)"""
+        l42 = tasks.get("L42") or {}
+        waits = [w.split(":")[1] for w in (l42.get("waiting_for") or []) if str(w).startswith("REVIEW:")]
+        if waits:
+            return sorted(waits)
+        return sorted(t for t, r in tasks.items() if r.get("state") == "INTEGRATED"
+                      and (r.get("kind") or "") not in REVIEW_KINDS and t not in ("L35", "L42", "L44"))
+
+    def _pack_closure(self, task, harvest, wt):
+        """§6b after VERIFIED: retire the closes targets whose last closer this
+        is; promote the packet's own scheduler_task; leave the rest as
+        closes_pending in RESULT.json + harvest."""
+        p = self.packet_for(task)
+        if not p or not p["closes"]:
+            return None
+        tasks = (self.control.state_view() or {}).get("tasks") or {}
+        plan = vppack.closure_plan(p, self.pack, tasks, {pid: t for t, pid in self.pack_by_task.items()})
+        done = {"retired": [], "promoted": [], "pending": plan["pending"], "missing": plan["missing"], "refused": {}}
+        ev = [e for e in (harvest.get("evidence") or []) if Path(e).exists()][:1]
+        for target in plan["retire"]:
+            try:
+                self.control.call("retire", ["--task", target, "--closer", task, "--reason",
+                                             "closed by packet %s" % p["id"]] + sum((["--evidence", e] for e in ev), []))
+                done["retired"].append(target)
+            except ControlError as exc:
+                done["refused"][target] = str(exc)[:240]
+        for target in plan["promote"]:
+            try:
+                self.control.promote(target, harvest.get("output_sha"), harvest.get("tree_sha"), ev, supporting=[task])
+                done["promoted"].append(target)
+            except ControlError as exc:
+                done["refused"][target] = str(exc)[:240]
+        if plan["pending"]:
+            self._annotate_result(wt, {"closes_pending": plan["pending"]})
+        if done["refused"]:
+            self.alert("CLOSURE_REFUSED", "%s: %s" % (p["id"], json.dumps(done["refused"])[:300]), task)
+        self.log("PACK closure %s: %s" % (p["id"], json.dumps({k: v for k, v in done.items() if v})))
+        _append_jsonl(self.run_root / "packets" / "closures.jsonl",
+                      dict(done, ts=utc_ms(), packet=p["id"], task=task), self._lock)
+        return done
+
+    def _annotate_result(self, wt, extra):
+        rp = Path(wt) / ".vp" / "RESULT.json"
+        try:
+            doc = json.loads(rp.read_text(encoding="utf-8")) if rp.exists() else {}
+            doc.update(extra)
+            rp.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+    def _pack_record_review(self, task, verdict_path, role):
+        """union review: `record-review --task X --role <role>` for every covered
+        row named in the review task's parameters (REVIEW-* packets)"""
+        state = self.control.state_view() or {}
+        row = (state.get("tasks") or {}).get(task) or {}
+        covered = (row.get("parameters") or {}).get("covered_rows") or []
+        out = {"recorded": [], "refused": {}}
+        for x in covered:
+            try:
+                self.control.call("record-review", ["--task", x, "--role", role, "--verdict", str(verdict_path)])
+                out["recorded"].append(x)
+            except ControlError as exc:
+                out["refused"][x] = str(exc)[:200]
+        if covered:
+            self.log("PACK record-review %s role=%s: %d recorded, %d refused"
+                     % (task, role, len(out["recorded"]), len(out["refused"])))
+            _append_jsonl(self.run_root / "packets" / "reviews.jsonl",
+                          dict(out, ts=utc_ms(), task=task, role=role, verdict=str(verdict_path)), self._lock)
+        return out
+
+    def write_dispatch_record(self, wt, task, attempt, contract, base, row):
+        """<worktree>/.vp/DISPATCH.json -- the driver's dispatch record for the
+        turn (PACKET-FORMAT: REVIEW-* packets read their union id from it and
+        the `<union>` placeholder in owned_files is substituted here)."""
+        p = self.packet_for(task)
+        union = "union-%s" % attempt
+        rec = {"task": task, "attempt": attempt, "union": union, "base_sha": base, "kind": contract.get("kind"),
+               "candidate_sha": ((row.get("parameters") or {}).get("candidate_sha")),
+               "tree_sha": ((row.get("parameters") or {}).get("tree_sha")),
+               "covered_rows": ((row.get("parameters") or {}).get("covered_rows")),
+               "parent_contract_id": row.get("parent_contract_id"), "template": row.get("template_id"),
+               "review_task_id": task if (contract.get("kind") in REVIEW_KINDS) else None, "ts": utc_ms()}
+        if p:
+            rec.update({"packet": p["id"], "v13_kind": p["v13_kind"], "runner_role": p["runner_role"],
+                        "closes": list(p["closes"]), "proof_kind": p["proof_kind"], "owner_gate": p["owner_gate"],
+                        "hosted_owed": p["hosted_owed"], "owned_files": vppack.substitute_union(p, union),
+                        "packet_dir": p["dir"]})
+        try:
+            (Path(wt) / ".vp" / vppack.DISPATCH_RECORD).write_text(json.dumps(rec, indent=2, sort_keys=True),
+                                                                   encoding="utf-8")
+        except OSError:
+            pass
+        return rec
+
     def _pack_paths(self, task):
         if not self.pack_dir:
             return None, None
-        d = self.pack_dir / task
+        pid = self.pack_by_task.get(task, task)
+        d = self.pack_dir / pid
         p, b = d / "PACKET.md", d / "BENCHMARK.md"
         return (p if p.exists() and p.stat().st_size else None,
                 b if b.exists() and b.stat().st_size else None)
@@ -1215,6 +1466,8 @@ class LaneDriver(object):
                 self._reconciled = True
                 self.log("RECONCILE %s" % json.dumps(res)[:300])
         self.write_heartbeat()
+        if self._reconciled and not self._stopping:
+            self._pack_step()
         if self.tick_count == 1:
             self.write_activation_record()
             for name, srv in self.servers.items():
@@ -1309,6 +1562,8 @@ class LaneDriver(object):
             if not rcfg:
                 self.alert_once("role:%s" % kind, "ROSTER",
                                 "no roster role for kind %r (task %s); not dispatched" % (kind, task))
+                continue
+            if not self._owner_gate_open(task):
                 continue
             runner = rcfg.get("runner", "opencode")
             server = self._pick_server(rcfg) if runner == "opencode" else None
@@ -1465,6 +1720,7 @@ class LaneDriver(object):
         rcfg = self.roles.get(kind) or {}
         wt = self.ensure_worktree(task, base)
         self.write_vp_files(wt, task, contract, base, row)
+        self.write_dispatch_record(wt, task, attempt, contract, base, row)
         tdir = self._turn_dir(task, attempt)
         fkey = attempt
         sid = self._saved_session(tdir)
@@ -1513,7 +1769,7 @@ class LaneDriver(object):
         self._complete(task, attempt, result["outcome"], tdir, evidence=result.get("evidence") or [],
                        output_sha=result.get("output_sha"), tree_sha=result.get("tree_sha"),
                        reason=result.get("reason"), verdict=result.get("verdict"),
-                       fails=result.get("fails"))
+                       fails=result.get("fails"), wt=wt, kind=kind)
 
     def _saved_session(self, tdir):
         try:
@@ -1530,7 +1786,7 @@ class LaneDriver(object):
                 pass
 
     def _complete(self, task, attempt, outcome, tdir, evidence=(), output_sha=None, tree_sha=None,
-                  reason=None, verdict=None, fails=None):
+                  reason=None, verdict=None, fails=None, wt=None, kind=None):
         ev = [str(p) for p in evidence if p and Path(p).exists()]
         unlock = outcome == "VERIFIED" and bool(output_sha) and bool(ev)
         harvest = {"ts": utc_ms(), "task": task, "attempt": attempt, "outcome": outcome,
@@ -1577,6 +1833,14 @@ class LaneDriver(object):
         newly = (data or {}).get("newly_ready") or []
         self.log("COMPLETE %s %s -> %s unlock=%s newly_ready=%s" % (task, attempt, outcome, unlock, newly))
         self.completed.append((task, attempt, outcome))
+        if outcome == "VERIFIED":
+            try:
+                if verdict and kind in REVIEW_KINDS:
+                    self._pack_record_review(task, verdict, kind)
+                if self.packet_for(task):
+                    self._pack_closure(task, harvest, wt or (self.worktrees_root / task))
+            except Exception as exc:  # noqa: BLE001 -- closure never undoes a completion
+                self.alert("CLOSURE_FAILED", "%s: %s: %s" % (task, type(exc).__name__, str(exc)[:200]), task)
         return True
 
     # -- pipelines ----------------------------------------------------------------------
@@ -2028,8 +2292,24 @@ class LaneDriver(object):
                     acted += 1
         return acted
 
+    def _pack_owns(self, task):
+        """a task some packet drives or closes is the pack's business: the
+        frontier never auto-repairs it (the live run-state has 35 stale
+        REPAIR_REQUIRED review rows the pack retires; a review is never repaired)"""
+        if task in self.pack_by_task or task in self.pack:
+            return True
+        return any(task in p["closes"] or p["scheduler_task"] == task for p in self.pack.values())
+
     def _instantiate_repair(self, parent, tasks):
         prow = tasks.get(parent) or {}
+        if (prow.get("kind") in REVIEW_KINDS) or self._pack_owns(parent):
+            if ("norepair", parent) not in self._pack_logged:
+                self._pack_logged.add(("norepair", parent))
+                self.log("FRONTIER %s REPAIR_REQUIRED left to the pack / review flow (no auto-repair)" % parent)
+            return False
+        # a harvest-less hold (Chief-era row, no driver attempt) has nothing to repair from
+        if not self._last_harvest(parent):
+            return False
         for t, r in tasks.items():
             if r.get("template_id") != "REPAIR" or \
                     (r.get("parameters") or {}).get("parent_contract_id") != parent:

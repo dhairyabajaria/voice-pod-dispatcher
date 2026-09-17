@@ -107,14 +107,15 @@ def http_get(url, timeout=3.0):
 class Root(object):
     """one throwaway run root: trunk clone + control + run/roster.json"""
 
-    def __init__(self, base, name, trunk, catalog, control, pack_dir, roster_patch=None):
+    def __init__(self, base, name, trunk, catalog, control, pack_dir, roster_patch=None, state_src=None):
         self.dir = Path(base) / name
         if self.dir.exists():
             shutil.rmtree(self.dir)
         out = _capture(lambda: lanedryrun.cmd_init(Args(root=str(self.dir), trunk=str(trunk),
                                                         catalog=str(catalog), control=str(control),
                                                         pack_dir=str(pack_dir) if pack_dir else None,
-                                                        run_id="ladder-%s" % name, force_roster=True)))
+                                                        run_id="ladder-%s" % name, force_roster=True,
+                                                        state_src=str(state_src) if state_src else None)))
         self.init_out = json.loads(out) if out.strip().startswith("{") else {"raw": out}
         self.run_root = self.dir / "run"
         self.roster_path = self.run_root / "roster.json"
@@ -454,6 +455,63 @@ def rung_q5(a, roots):
             "run_root": str(root.run_root), "freed_gb": root.cleanup(), "ts": utc_ms()}
 
 
+def rung_p1(a, roots):
+    """pack §4(e): the real 64 packets against a COPY of the live run-state
+    (140 rows, seq 482, registered candidate s3), fake runners, no model."""
+    if not a.state_src:
+        return {"status": "NOT_RUN", "reason": "--state-src not given", "ts": utc_ms()}
+    root = Root(roots, "p1", a.trunk, a.catalog, a.control, a.pack_dir, state_src=a.state_src,
+                roster_patch={"alerts": {"pack_every_s": 0}})
+    before = root.counts()
+    head0 = sh(["git", "-C", str(root.trunk), "rev-parse", "HEAD"])[1].strip()
+    drv = root.driver(delay_s=0.2, proof_delay_s=0.2)
+    assert drv.pack, "no packets loaded from %s" % a.pack_dir
+    trace = []
+    t0 = utc_ms()
+    ticks = settle(drv, max_ticks=600, trace=trace)
+    drv._finish("ladder-p1")
+    head1 = sh(["git", "-C", str(root.trunk), "rev-parse", "HEAD"])[1].strip()
+    rows = root.rows()
+    pdir = root.run_root / "packets"
+    bindings = [json.loads(l) for l in (pdir / "bindings.jsonl").read_text().splitlines()] \
+        if (pdir / "bindings.jsonl").exists() else []
+    closures = [json.loads(l) for l in (pdir / "closures.jsonl").read_text().splitlines()] \
+        if (pdir / "closures.jsonl").exists() else []
+    alerts = []
+    try:
+        alerts = [json.loads(l) for l in (root.run_root / "alerts.jsonl").read_text().splitlines()]
+    except OSError:
+        pass
+    kinds = {}
+    for al in alerts:
+        kinds[al["kind"]] = kinds.get(al["kind"], 0) + 1
+    bound = {b["packet"]: b for b in bindings if "mode" in b}
+    per_packet = {}
+    for pid, p in sorted(drv.pack.items()):
+        t = next((t for t, q in drv.pack_by_task.items() if q == pid), None)
+        per_packet[pid] = {"task": t, "mode": bound.get(pid, {}).get("mode"),
+                           "state": rows.get(t, {}).get("state") if t else None,
+                           "parent": bound.get(pid, {}).get("parent_contract_id"),
+                           "parent_how": bound.get(pid, {}).get("parent_how"),
+                           "owner_gate": p["owner_gate"] if p["owner_gate"] != "none" else None}
+    unbound = sorted(pid for pid, v in per_packet.items() if not v["task"])
+    retired = sorted(set(sum((c.get("retired") or [] for c in closures), [])))
+    pending = {c["packet"]: c["pending"] for c in closures if c.get("pending")}
+    holds = sorted(p.parent.parent.name for p in root.run_root.glob("turns/*/*/gate-hold.json"))
+    ok = (head0 == head1 and not any(k in kinds for k in ("STUCK", "CONTROL_DOWN", "CLOSURE_FAILED"))
+          and len(bound) >= 40 and retired)
+    return {"status": "PASS" if ok else "FAIL", "run_root": str(root.run_root), "ticks": ticks,
+            "started": t0, "finished": utc_ms(), "states_before": before, "states_after": root.counts(),
+            "packets": len(drv.pack), "pack_lint": drv.pack_lint, "bound": len(bound),
+            "unbound": unbound, "per_packet": per_packet, "retired": retired, "closes_pending": pending,
+            "gate_holds": holds, "alerts": kinds, "turns": len(drv.dry.calls), "proofs": len(drv.dryproof.calls),
+            "trunk_head_before": head0, "trunk_head_after": head1, "model_calls": 0,
+            "candidate_sha": (json.loads(root.state.read_text()).get("candidate") or {}).get("sha"),
+            "l42": {"depends_on": rows.get("L42", {}).get("depends_on"), "state": rows.get("L42", {}).get("state"),
+                    "waiting_for": rows.get("L42", {}).get("waiting_for")},
+            "freed_gb": root.cleanup(), "ts": utc_ms()}
+
+
 def rung_l6(a):
     return {"status": "SKIPPED_FAKE_RUNNERS", "ts": utc_ms(),
             "note": "a real item needs a model turn; the work order forbids live turns on product lanes "
@@ -526,6 +584,7 @@ def main(argv=None):
     ap.add_argument("--pytest-python", default=sys.executable)
     ap.add_argument("--l7-seconds", type=int, default=90)
     ap.add_argument("--only", help="comma list of rungs to run (default all)")
+    ap.add_argument("--state-src", help="live orchestration-state dir for rung P1 (copied, never written)")
     a = ap.parse_args(argv)
     a.trunk, a.catalog, a.control = Path(a.trunk).resolve(), Path(a.catalog).resolve(), Path(a.control).resolve()
     a.pack_dir = Path(a.pack_dir).resolve() if a.pack_dir else None
@@ -571,6 +630,7 @@ def main(argv=None):
             print("%s %s" % (k, r[k]["status"]), flush=True)
         print("Q1 %s" % q1["status"], flush=True)
     run("L4", lambda: rung_l4(a), r)
+    run("P1", lambda: rung_p1(a, roots), r)
     run("L6", lambda: rung_l6(a), r)
     run("Q2", lambda: rung_q2(a, roots), q)
     run("Q3", lambda: rung_q3(a, roots), q)
