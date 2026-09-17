@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -41,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -290,6 +293,12 @@ class Control(object):
 # catalog kind -> roster role (plan §2.2 names).  A roster may override any
 # entry under "kind_map"; a role named directly under "roles" always wins.
 DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
+# D12 hot reload: RUN_ROOT/RELOAD (owner-created) -> quiesce new claims, wait for
+# active == 0, reload these helper modules in dependency order, load a fresh copy
+# of lanedriver.py and rebind every live object's class to it, resume.
+RELOAD_FILE = "RELOAD"
+RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "vpcircle", "vpdriver", "vpproof", "vpmerge",
+                "vprunners", "vppack", "laneproof", "lanedryrun")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
 
 KIND_MAP = {"builder": "builder", "design": "builder", "integration": "integrator",
@@ -438,6 +447,10 @@ class LaneDriver(object):
         # _pack_reconcile (once after the scheduler reconcile, then every
         # alerts.pack_every_s to bind packets whose dependencies just appeared)
         self._authority_stop = False
+        self._reload_pending = None      # {reason, requested_at} while quiescing for a reload
+        self._reload_failed = None       # error text after a failed reload (no new claims)
+        self._reload_count = 0
+        self._code_hashes = self.code_hashes()
         self.pack, self.pack_lint = {}, []
         self.pack_by_task = {}
         self._pack_last_mono = None
@@ -613,7 +626,8 @@ class LaneDriver(object):
                 st["parked_until"], st["park_reason"], st["park_status"] = 0.0, None, None
                 self.log("UNPARK runner %s: token cap raised" % runner)
         self._authority_check()
-        return not self._budget_stop and not self._disk_paused and not self._authority_stop
+        return (not self._budget_stop and not self._disk_paused and not self._authority_stop
+                and not self._reload_failed)
 
     # -- §4(d) authority: the scheduler + review_gate the driver runs are the pinned ones ---
 
@@ -1394,7 +1408,10 @@ class LaneDriver(object):
                               "stopped": self._budget_stop},
                    "disk_gb": round(self.disk_gb() or 0, 1), "disk_paused": self._disk_paused,
                    "sequence": self.control.sequence(), "ist": self.ist_now().strftime("%H:%M"),
-                   "idle_since": self._idle_since, "spawned_total": self.spawned_total}
+                   "idle_since": self._idle_since, "spawned_total": self.spawned_total,
+                   "code_version": self.code_version(), "reloads": self._reload_count,
+                   "reload_pending": self._reload_pending is not None,
+                   "reload_failed": bool(self._reload_failed)}
         if extra:
             payload.update(extra)
         try:
@@ -1420,7 +1437,7 @@ class LaneDriver(object):
         _append_jsonl(self.run_root / "comms.jsonl", row)
         return row
 
-    SEAL_SKIP = ("driver.heartbeat", "driver.heartbeat.tmp", "STOP", "DRAIN")
+    SEAL_SKIP = ("driver.heartbeat", "driver.heartbeat.tmp", "STOP", "DRAIN", "RELOAD")
 
     def seal(self, day=None, force=False):
         """Daily seal: MANIFEST-<day>.json listing sha256 + size of every file
@@ -1653,6 +1670,8 @@ class LaneDriver(object):
                 self._reconciled = True
                 self.log("RECONCILE %s" % json.dumps(res)[:300])
         self.write_heartbeat()
+        if self._reload_step():
+            return 0                      # reloaded this tick: the new code takes the next one
         if self._reconciled and not self._stopping:
             self._pack_step()
         if self.tick_count == 1:
@@ -1673,7 +1692,7 @@ class LaneDriver(object):
         if phase != self._phase_logged:
             self.log("PHASE %s" % phase)
             self._phase_logged = phase
-        draining = phase != "ACTIVE" or self.drain_requested()
+        draining = phase != "ACTIVE" or self.drain_requested() or self._reload_pending is not None
         spawned = 0
         spawned += self._adopt_orphans(state, draining)
         if not draining and may_start:
@@ -1689,6 +1708,186 @@ class LaneDriver(object):
         if spawned:
             self.write_heartbeat()
         return spawned
+
+    # -- D12 hot reload -------------------------------------------------------------------
+
+    def reload_targets(self):
+        """[(module_name, path)] of the code the running driver executes: the
+        loaded helper modules (RELOAD_ORDER) and lanedriver.py itself, last."""
+        out = []
+        for name in getattr(self, "reload_modules", RELOAD_ORDER):
+            mod = sys.modules.get(name)
+            f = getattr(mod, "__file__", None)
+            if f and Path(f).resolve().parent == self.here:
+                out.append((name, Path(f).resolve()))
+        for name in getattr(self, "reload_extra", []):
+            mod = sys.modules.get(name)
+            if mod is not None and getattr(mod, "__file__", None):
+                out.append((name, Path(mod.__file__).resolve()))
+        own = sys.modules.get(type(self).__module__)
+        own_file = Path(getattr(own, "__file__", None) or __file__).resolve()
+        out.append((type(self).__module__, own_file))
+        return out
+
+    def code_hashes(self):
+        return {name: sha256_file(path) for name, path in self.reload_targets()}
+
+    def code_version(self):
+        h = hashlib.sha256()
+        for name, digest in sorted(self._code_hashes.items()):
+            h.update(("%s=%s\n" % (name, digest)).encode())
+        return h.hexdigest()[:12]
+
+    def reload_requested(self):
+        return (self.run_root / RELOAD_FILE).exists()
+
+    def _reload_reason(self):
+        try:
+            raw = (self.run_root / RELOAD_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        if not raw:
+            return ""
+        try:
+            doc = json.loads(raw)
+            return str(doc.get("reason") or raw)[:300] if isinstance(doc, dict) else raw[:300]
+        except ValueError:
+            return raw[:300]
+
+    def _reload_step(self):
+        """RUN_ROOT/RELOAD -> quiesce (no new claims or adoptions) until active == 0,
+        then hot_reload().  True when a reload happened this tick."""
+        if self._stopping:
+            return False
+        if self._reload_pending is None:
+            if not self.reload_requested():
+                return False
+            self._reload_pending = {"reason": self._reload_reason(), "requested_at": utc_ms()}
+            self.log("RELOAD requested (%s): quiescing, no new claims until active == 0"
+                     % (self._reload_pending["reason"] or "no reason given"))
+            self.comms("lanedriver", "audit", "reload requested: %s" % self._reload_pending["reason"],
+                       kind="lifecycle")
+        self.join(timeout=0.0)
+        self._threads = [t for t in self._threads if t.is_alive()]
+        with self._lock:
+            live = len(self._live)
+        if live or self._threads:
+            return False
+        req = self._reload_pending
+        self._reload_pending = None
+        try:
+            (self.run_root / RELOAD_FILE).unlink()
+        except OSError:
+            pass
+        self.hot_reload(req.get("reason") or "")
+        return True
+
+    def hot_reload(self, reason=""):
+        """Reload the driver's code in place.  Every file is compiled first (a
+        syntax error changes nothing); helper modules are importlib.reload()ed
+        in dependency order; lanedriver.py is loaded as a fresh module and every
+        live object's class is rebound to it; roster-derived attributes are
+        re-applied so new instance fields exist.  A failure leaves the old code
+        running but stops new claims (RELOAD_FAILED) until the owner restarts
+        or a later RELOAD succeeds."""
+        before = dict(self._code_hashes)
+        targets = self.reload_targets()
+        after = {name: sha256_file(path) for name, path in targets}
+        changed = sorted(n for n in after if before.get(n) != after[n])
+        rec = {"ts": utc_ms(), "reason": reason, "pid": os.getpid(), "n": self._reload_count + 1,
+               "before": before, "after": after, "changed": changed, "ok": False}
+        old_mod = type(self).__module__
+        try:
+            for name, path in targets:
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
+                try:                              # never trust a stale .pyc (same mtime second + size)
+                    os.unlink(importlib.util.cache_from_source(str(path)))
+                except (OSError, ValueError):
+                    pass
+            importlib.invalidate_caches()
+            for name, path in targets[:-1]:
+                importlib.reload(sys.modules[name])
+            own_path = targets[-1][1]
+            new_name = "lanedriver_r%d" % (self._reload_count + 1)
+            spec = importlib.util.spec_from_file_location(new_name, str(own_path))
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[new_name] = mod
+            spec.loader.exec_module(mod)
+            reloaded = {name for name, _ in targets[:-1]}
+            self._rebind(self, mod, old_mod, reloaded, seen=set())
+            self._reload_count += 1
+            self._code_hashes = after
+            self._reload_failed = None
+            self._apply_roster(self.roster)
+            rec.update({"ok": True, "module": new_name})
+            self.log("RELOAD ok #%d %s -> %s changed=%s (%s)"
+                     % (self._reload_count, self._short(before), self._short(after), changed, reason))
+            self.alert("RELOAD", "code reloaded in place (#%d): %s; version %s -> %s"
+                       % (self._reload_count, ", ".join(changed) or "no file changed",
+                          self._short(before), self._short(after)))
+        except Exception as exc:  # noqa: BLE001 -- keep the old code, stop claiming
+            rec.update({"ok": False, "error": "%s: %s" % (type(exc).__name__, exc),
+                        "traceback": traceback.format_exc()[-2000:]})
+            self._reload_failed = rec["error"]
+            self.log("RELOAD FAILED: %s" % rec["error"])
+            self.alert("RELOAD_FAILED", "code reload failed, old code keeps running but NO NEW CLAIMS "
+                       "until a RELOAD succeeds or the owner restarts: %s" % rec["error"][:300])
+        _append_jsonl(self.run_root / "reloads.jsonl", rec, self._lock)
+        self.comms("lanedriver", "audit", "reload %s: %s" % ("ok" if rec["ok"] else "FAILED",
+                                                            rec.get("error") or ", ".join(changed) or "no change"),
+                   kind="lifecycle")
+        try:
+            self.write_activation_record()
+        except Exception as exc:  # noqa: BLE001
+            self.log("RELOAD activation record: %s" % exc)
+        return rec
+
+    @staticmethod
+    def _short(hashes):
+        h = hashlib.sha256()
+        for name, digest in sorted(hashes.items()):
+            h.update(("%s=%s\n" % (name, digest)).encode())
+        return h.hexdigest()[:12]
+
+    @classmethod
+    def _rebind(cls, obj, mod, old_mod, reloaded, seen, depth=0):
+        """point obj (and the objects it holds, three levels deep) at the
+        reloaded classes: lanedriver classes come from `mod`, helper classes
+        from their reloaded module"""
+        if id(obj) in seen or depth > 3:
+            return
+        seen.add(id(obj))
+        t = type(obj)
+        if t.__module__ == old_mod or t.__module__.startswith("lanedriver"):
+            new_cls = getattr(mod, t.__name__, None)
+            if isinstance(new_cls, type):
+                try:
+                    obj.__class__ = new_cls
+                except TypeError:
+                    pass
+        elif t.__module__ in reloaded:
+            new_cls = getattr(sys.modules[t.__module__], t.__name__, None)
+            if isinstance(new_cls, type):
+                try:
+                    obj.__class__ = new_cls
+                except TypeError:
+                    pass
+        d = getattr(obj, "__dict__", None)
+        if not isinstance(d, dict):
+            return
+        for v in list(d.values()):
+            cls._rebind_value(v, mod, old_mod, reloaded, seen, depth + 1)
+
+    @classmethod
+    def _rebind_value(cls, v, mod, old_mod, reloaded, seen, depth):
+        if isinstance(v, dict):
+            for x in list(v.values()):
+                cls._rebind_value(x, mod, old_mod, reloaded, seen, depth)
+        elif isinstance(v, (list, tuple, set)):
+            for x in list(v):
+                cls._rebind_value(x, mod, old_mod, reloaded, seen, depth)
+        elif hasattr(v, "__dict__") and not isinstance(v, type) and not callable(v):
+            cls._rebind(v, mod, old_mod, reloaded, seen, depth)
 
     # -- dispatch -------------------------------------------------------------------------
 
@@ -3055,6 +3254,9 @@ def build_parser():
     se.add_argument("--day", help="IST day YYYY-MM-DD; default today")
     se.add_argument("--force", action="store_true", help="rewrite an existing manifest")
     sub.add_parser("render", help="F14: write LEDGER.md now (the loop also does it on a timer)")
+    rl = sub.add_parser("reload", help="D12: write RUN_ROOT/RELOAD; the running driver quiesces, "
+                                       "reloads its code in place at active == 0, resumes")
+    rl.add_argument("--reason", default="")
     rp = sub.add_parser("retry-packet", help="re-instantiate a packet whose task closed without a real "
                                              "verdict (e.g. RUNNER_CRASH -> INVALID_EVIDENCE) as <id>-R<n>")
     rp.add_argument("packet")
@@ -3093,8 +3295,21 @@ def cmd_retry_packet(drv, args):
     return 0
 
 
+def cmd_reload(drv, args):
+    f = drv.run_root / RELOAD_FILE
+    f.write_text(json.dumps({"reason": args.reason, "requested_at": utc_ms(), "by": "cli"}) + "\n",
+                 encoding="utf-8")
+    hb = read_heartbeat(drv.run_root)
+    print(json.dumps({"status": "REQUESTED", "marker": str(f),
+                      "driver": {"pid": (hb or {}).get("pid"), "active": (hb or {}).get("active"),
+                                 "code_version": (hb or {}).get("code_version")},
+                      "note": "applied when active == 0; watch driver.log for 'RELOAD ok' / RELOAD_FAILED "
+                              "and driver.heartbeat code_version"}, indent=2))
+    return 0
+
+
 SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
-               "retry-packet")
+               "retry-packet", "reload")
 
 
 def main(argv=None):
@@ -3141,6 +3356,8 @@ def main(argv=None):
         return cmd_seal(drv, args)
     if args.cmd == "retry-packet":
         return cmd_retry_packet(drv, args)
+    if args.cmd == "reload":
+        return cmd_reload(drv, args)
     if args.cmd == "render":
         out = drv.render()
         print(json.dumps({"status": "OK" if out else "FAILED", "ledger": str(out or "")}))
