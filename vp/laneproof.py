@@ -31,9 +31,14 @@ from vpdriver import circle_failed_nodes  # noqa: E402
 
 RERUN_KINDS = {"platform": "platform/", "deploy": "deploy/", "agent": "agent/"}
 DEFAULT_CIRCLE = {"enabled": False, "mode": "overflow", "kinds": ["full"], "param": "run_full_suite",
-                  "branch_prefix": "vp/proof/", "account": None, "poll_interval_s": 60,
+                  "branch_prefix": "vp/proof/", "account": "3", "poll_interval_s": 60,
                   "deadline_min": 90, "delete_branch_after": True, "flake_rerun_max": 10,
-                  "max_pipelines_per_day": None, "max_in_flight": 2}
+                  "max_pipelines_per_day": None, "max_in_flight": 2,
+                  # item 9: the owner granted standing CircleCI use, so the flip-off
+                  # watcher (RUN_ROOT/CIRCLECI-OFF routes to the box and cancels the
+                  # pipelines in flight) is optional and off by default
+                  "flip_off_watcher": False}
+OFF_FILE = "CIRCLECI-OFF"
 
 
 def utc_ms():
@@ -64,16 +69,28 @@ class Proof(object):
 
     def circle_cfg(self):
         cc = dict(DEFAULT_CIRCLE)
-        cc.update(self.cfg.get("circleci") or {})
+        raw = dict(self.cfg.get("circleci") or {})
+        # roster-v13 spells the in-flight bound `max_pipelines_in_flight`
+        if "max_pipelines_in_flight" in raw and "max_in_flight" not in raw:
+            raw["max_in_flight"] = raw.pop("max_pipelines_in_flight")
+        cc.update(raw)
         return cc
+
+    def circle_off(self):
+        """flip-off watcher: only when enabled, and only by the OFF file"""
+        if not self.circle_cfg().get("flip_off_watcher"):
+            return False
+        return (self.run_root / OFF_FILE).exists()
 
     def route(self, kind):
         """-> ("box"|"circleci", why)"""
         cc = self.circle_cfg()
         if not cc.get("enabled") or kind not in (cc.get("kinds") or []):
             return "box", "circleci disabled or kind %s not listed" % kind
+        if self.circle_off():
+            return "box", "circleci flipped off (%s)" % OFF_FILE
         cap = cc.get("max_pipelines_per_day")
-        if cap is not None and self.pipelines_today() >= int(cap):
+        if cap is not None and int(cap) > 0 and self.pipelines_today() >= int(cap):
             self.alert("PIPELINE_CAP", "%d CircleCI pipelines today >= cap %d; proofs fall back "
                        "to the box" % (self.pipelines_today(), int(cap)))
             return "box", "daily cap"
@@ -182,7 +199,8 @@ class Proof(object):
                 self.log("PROOF %s %s circleci pipeline %s (account %s)" % (task, pid, pipeline_id, account))
                 res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
                                        deadline_s=int(cc.get("deadline_min", 90)) * 60,
-                                       runner=runner, account=account, abort=abort or (lambda: False))
+                                       runner=runner, account=account,
+                                       abort=lambda: bool((abort and abort()) or self.circle_off()))
             except self.circle.Cancelled:
                 done = self.circle.cancel_pipeline(pipeline_id, runner, account)
                 rec = {"status": "CANCELLED", "route": "circleci", "proof_id": pid, "sha": cand,

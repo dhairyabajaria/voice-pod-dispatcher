@@ -223,3 +223,54 @@ def test_circleci_failure_is_unknown_never_a_crash(tmp_path):
     p = make_proof(tmp_path, Broken({}), FakeExec({}))
     rec = p.run("L35", "proof-4", wt, base, cand, "platform", [])
     assert rec["status"] == "UNKNOWN" and "credits exhausted" in rec["reason"]
+
+
+# -- item 9: vpcircle configuration -------------------------------------------------
+
+def test_item9_defaults_account_3_overflow_no_daily_cap_two_in_flight_delete_branch(tmp_path):
+    p = make_proof(tmp_path, FakeCircle({}), FakeExec({}))
+    p.cfg = {}
+    cc = p.circle_cfg()
+    assert (cc["account"], cc["mode"], cc["max_pipelines_per_day"], cc["max_in_flight"],
+            cc["delete_branch_after"], cc["flip_off_watcher"]) == ("3", "overflow", None, 2, True, False)
+    # roster-v13 spellings: max_pipelines_in_flight alias, 0 daily cap = no cap
+    p.cfg = {"circleci": {"enabled": True, "kinds": ["full"], "max_pipelines_in_flight": 1,
+                          "max_pipelines_per_day": 0}}
+    assert p.circle_cfg()["max_in_flight"] == 1
+    p.box_active = 1
+    assert p.route("full")[0] == "circleci"
+    p.circle_active = 1
+    assert p.route("full") == ("box", "circleci in flight 1/1")
+
+
+def test_item9_flip_off_watcher_is_off_by_default_and_routes_to_box_when_armed(tmp_path):
+    p = make_proof(tmp_path, FakeCircle({}), FakeExec({}),
+                   cfg={"circleci": {"enabled": True, "mode": "all", "kinds": ["full"]}})
+    (tmp_path / "run").mkdir(exist_ok=True)
+    (tmp_path / "run" / "CIRCLECI-OFF").write_text("owner said stop\n")
+    assert p.route("full")[0] == "circleci", "watcher off: the OFF file is ignored"
+    p.cfg["circleci"]["flip_off_watcher"] = True
+    assert p.route("full") == ("box", "circleci flipped off (CIRCLECI-OFF)")
+
+
+def test_item9_flip_off_mid_poll_cancels_the_pipeline(tmp_path):
+    wt, base, cand = repo(tmp_path)
+
+    class Flip(FakeCircle):
+        def poll(self, pipeline_id, interval, deadline_s, runner, account, abort):
+            (tmp_path / "run" / "CIRCLECI-OFF").write_text("stop\n")
+            if abort():
+                raise vpcircle.Cancelled("flipped off")
+            return self.res
+
+        def cancel_pipeline(self, pid, runner, account):
+            self.calls.append(("cancel", pid))
+            return ["w1"]
+
+    circle = Flip(pipeline([]))
+    p = make_proof(tmp_path, circle, FakeExec({}),
+                   cfg={"circleci": {"enabled": True, "mode": "all", "kinds": ["platform"],
+                                     "flip_off_watcher": True}})
+    rec = p.run("L35", "proof-9", wt, base, cand, "platform", [])
+    assert rec["status"] == "CANCELLED" and rec["cancelled_workflows"] == ["w1"]
+    assert ("cancel", "pipe-206") in circle.calls
