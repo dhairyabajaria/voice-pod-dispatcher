@@ -1202,7 +1202,7 @@ class LaneDriver(object):
                                  BUILDER_PROMPT, out_path, vpschema.validate_result, sid, rnd)
             if outcome.status != STATUS_DONE:
                 return outcome, None
-            self._autofix(wt, task)
+            self._autofix(wt, task, tdir)
             gserver = self._pick_server(gcfg) if grunner == "opencode" else None
             if grunner == "opencode" and gserver is None:
                 gserver = server
@@ -1298,9 +1298,82 @@ class LaneDriver(object):
                  "evidence": str(l.get("evidence") or "")[:300]}
                 for l in doc.get("lines") or [] if isinstance(l, dict) and l.get("verdict") != "PASS"]
 
-    def _autofix(self, wt, task):
-        """Deterministic-fixer hook (item 6 fills it in)."""
-        return None
+    PY_EXT = (".py",)
+    PORTAL_EXT = (".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".scss", ".md")
+
+    def _tool(self, name, wt):
+        """Prefer the worktree's own venv/node_modules binary, then the roster bins, then PATH."""
+        for cand in (wt / "platform" / ".venv" / "bin" / name, wt / "agent" / ".venv" / "bin" / name,
+                     wt / "portal" / "node_modules" / ".bin" / name, self.trunk / "platform" / ".venv" / "bin" / name,
+                     self.trunk / "portal" / "node_modules" / ".bin" / name):
+            if cand.exists():
+                return str(cand)
+        return self.bins.get(name) or shutil.which(name)
+
+    def _autofix(self, wt, task, tdir=None, base=None):
+        """Deterministic fixers after a builder turn (plan §2.1 point 6): ruff
+        --fix + ruff format on touched .py, prettier on touched portal files,
+        tsc --noEmit on the portal when touched (report only).  Whatever they
+        changed is committed as `autofix:` so the grader and every reviewer
+        see a tree no human formatting nit can fail."""
+        base = base or self._base_of(wt)
+        rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "%s..HEAD" % base]) if base else (1, "", "")
+        changed = [l.strip() for l in out.splitlines() if l.strip()] if rc == 0 else []
+        py = [f for f in changed if f.endswith(self.PY_EXT) and (wt / f).exists()]
+        portal = [f for f in changed if f.startswith("portal/") and f.endswith(self.PORTAL_EXT)
+                  and (wt / f).exists() and "node_modules" not in f]
+        steps = []
+
+        def run(name, argv, cwd):
+            rc, o, e = self.exec.run(argv, cwd=str(cwd), timeout_s=600)
+            steps.append({"tool": name, "argv": argv, "rc": rc, "stdout": (o or "")[-1500:],
+                          "stderr": (e or "")[-1500:]})
+            return rc
+
+        ruff = self._tool("ruff", wt) if py else None
+        if py and ruff:
+            run("ruff-fix", [ruff, "check", "--fix", "--exit-zero"] + py, wt)
+            run("ruff-format", [ruff, "format"] + py, wt)
+        elif py:
+            steps.append({"tool": "ruff", "skipped": "ruff not found"})
+        prettier = self._tool("prettier", wt) if portal else None
+        if portal and prettier:
+            run("prettier", [prettier, "--write"] + portal, wt)
+        elif portal:
+            steps.append({"tool": "prettier", "skipped": "prettier not found"})
+        tsc_rc = None
+        if portal and (wt / "portal" / "tsconfig.json").exists():
+            tsc = self._tool("tsc", wt)
+            npx = self.bins.get("npx") or shutil.which("npx")
+            if tsc:
+                tsc_rc = run("tsc", [tsc, "--noEmit", "-p", "portal"], wt)
+            elif npx:
+                tsc_rc = run("tsc", [npx, "tsc", "--noEmit", "-p", "portal"], wt)
+            else:
+                steps.append({"tool": "tsc", "skipped": "tsc/npx not found"})
+        rc, status, _ = self.git(["-C", str(wt), "status", "--porcelain", "--untracked-files=no"])
+        committed = None
+        if rc == 0 and status.strip():
+            files = sorted(set(l[3:].strip() for l in status.splitlines() if l.strip()))
+            self.git(["-C", str(wt), "add", "--"] + files, log=True)
+            rc2, o2, e2 = self.git(["-C", str(wt), "-c", "user.email=lanedriver@vp", "-c", "user.name=lanedriver",
+                                    "commit", "-q", "-m", "autofix: ruff/prettier (%s)" % task], log=True)
+            committed = self.head_sha(wt) if rc2 == 0 else None
+            if rc2 != 0:
+                steps.append({"tool": "git-commit", "rc": rc2, "stderr": (e2 or o2)[-500:]})
+            else:
+                self.log("AUTOFIX %s committed %s (%d files)" % (task, committed[:12], len(files)))
+        rec = {"ts": utc_ms(), "task": task, "base": base, "changed": changed, "py": py, "portal": portal,
+               "steps": steps, "tsc_rc": tsc_rc, "committed": committed}
+        if tdir is not None:
+            try:
+                (Path(tdir) / "autofix.json").write_text(json.dumps(rec, indent=2, sort_keys=True),
+                                                        encoding="utf-8")
+            except OSError:
+                pass
+        if tsc_rc:
+            self.log("AUTOFIX %s tsc --noEmit rc=%s (reported to the grader via autofix.json)" % (task, tsc_rc))
+        return rec
 
     def _review_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid, base):
         state = self.control.state_view()

@@ -866,6 +866,77 @@ def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypat
     assert "PROOF_UNKNOWN" in (env.run_root / "OWNER-ALERTS.md").read_text()
 
 
+# -- item 6: deterministic fixers after every builder turn ----------------------------------------
+
+def fake_tool(path, body):
+    import stat
+    path.write_text(body)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return str(path)
+
+
+def test_autofix_runs_ruff_and_prettier_and_commits_as_autofix(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    # fake ruff: `check --fix` appends a marker; `format` rewrites quotes
+    ruff = fake_tool(tmp_path / "ruff", "#!/bin/sh\n"
+                     'if [ "$1" = check ]; then for f in "$@"; do case "$f" in *.py) echo "# ruff-fixed" >> "$f";; esac; done; fi\n'
+                     'if [ "$1" = format ]; then for f in "$@"; do case "$f" in *.py) sed -i "" "s/x = 2/x = 2  # formatted/" "$f";; esac; done; fi\n')
+    prettier = fake_tool(tmp_path / "prettier", "#!/bin/sh\nshift\nfor f in \"$@\"; do echo \"// pretty\" >> \"$f\"; done\n")
+    tsc = fake_tool(tmp_path / "tsc", "#!/bin/sh\necho 'portal/x.ts(1,1): error TS1' ; exit 2\n")
+    (env.trunk / "portal").mkdir()
+    (env.trunk / "portal" / "tsconfig.json").write_text("{}")
+    (env.trunk / "portal" / "x.ts").write_text("let a=1\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "portal")
+
+    def builder(spec, ab):
+        wt = Path(spec.cwd)
+        (wt / "portal" / "x.ts").write_text("let a=2\n")
+        return result_ok(spec, ab)
+
+    def routed(spec, ab):
+        return findings("PASS")(spec, ab) if spec.role == "grader" else builder(spec, ab)
+
+    drv = env.driver({"opencode": FakeRunner(default=routed), "codex": FakeRunner(), "claude": FakeRunner()},
+                     bins={"ruff": ruff, "prettier": prettier, "tsc": tsc})
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED"
+    wt = env.tmp / "wt" / "L02"
+    log = git(wt, "log", "--format=%s", "-3")
+    assert log.splitlines()[0] == "autofix: ruff/prettier (L02)"
+    assert log.splitlines()[1].startswith("work L02")
+    assert "# ruff-fixed" in (wt / "platform" / "a.py").read_text()
+    assert "# formatted" in (wt / "platform" / "a.py").read_text()
+    assert "// pretty" in (wt / "portal" / "x.ts").read_text()
+    assert rows["L02"]["output_sha"] == git(wt, "rev-parse", "HEAD"), "the autofix commit is the output"
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    rec = json.loads((tdir / "autofix.json").read_text())
+    assert rec["py"] == ["platform/a.py"] and rec["portal"] == ["portal/x.ts"]
+    assert [s["tool"] for s in rec["steps"]] == ["ruff-fix", "ruff-format", "prettier", "tsc"]
+    assert rec["tsc_rc"] == 2 and rec["committed"] == rows["L02"]["output_sha"]
+    assert "tsc --noEmit rc=2" in (env.run_root / "driver.log").read_text()
+    gitlog = (env.run_root / "git.jsonl").read_text()
+    assert "autofix: ruff/prettier" in gitlog
+    # design-kind tasks (no builder turn) never run the fixers
+    assert not list((env.run_root / "turns" / "L01").glob("*/autofix.json"))
+
+
+def test_autofix_without_tools_or_changes_commits_nothing(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()},
+                     bins={"ruff": str(tmp_path / "no-such-ruff")})
+    drv._tool = lambda name, wt: None
+    settle(drv, 2)
+    wt = env.tmp / "wt" / "L02"
+    assert git(wt, "log", "--format=%s", "-1").startswith("work L02"), "no autofix commit"
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    rec = json.loads((tdir / "autofix.json").read_text())
+    assert rec["committed"] is None and rec["steps"][0].get("skipped") == "ruff not found"
+
+
 def test_render_packet_and_benchmark_from_contract(tmp_path):
     con = catalog()["contracts"][2]
     pk = lanedriver.LaneDriver.render_packet(con, "a" * 40)

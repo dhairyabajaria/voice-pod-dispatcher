@@ -1517,7 +1517,9 @@ def test_overflow_sends_the_proof_off_box_only_while_the_box_is_busy():
         drv = make_driver(env, [builder_ok], [junior_pass_fence], [senior_approve],
                           [final_approve], driver_cls=vpdriver.Driver, circle_runner=runner)
         drv._box_active = 1                      # a box proof is running elsewhere
-        assert pump_fast(drv, 80, lambda: env.item("M-OV")["status"] == "APPROVED"), env.item("M-OV")
+        # 160 ticks: the full cycle behind ~40 vpctl subprocesses lost the 80-tick
+        # budget under full-suite load (2 of 4 runs, 2026-09-17)
+        assert pump_fast(drv, 160, lambda: env.item("M-OV")["status"] == "APPROVED"), env.item("M-OV")
         assert any("pipeline/run" in " ".join(c) for c in fake.calls)
         assert drv._pipelines_today() == 1
         assert drv._box_active == 1              # the off-box leg never touched the box counter
