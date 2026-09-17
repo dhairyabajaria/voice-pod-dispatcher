@@ -5,6 +5,7 @@ No network, no model, no opencode/codex/claude binaries."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -944,3 +945,62 @@ def test_render_packet_and_benchmark_from_contract(tmp_path):
     bm = lanedriver.LaneDriver.render_benchmark(con)
     assert bm.splitlines()[0].startswith("- B1 [evidence] L02 verified — check:")
     assert len(bm.splitlines()) == 2
+
+
+# -- item 7: logging tree (turns/*/raw.jsonl, comms.jsonl, seal) ---------------------
+
+def raw_result(spec, abort_flag=None):
+    """probe result whose runner also leaves a raw stream log behind"""
+    out = result_ok(spec, abort_flag)
+    log = Path(spec.out_path).parent / "1-r0-probe-opencode.jsonl"
+    log.write_text('{"type":"step_start"}\n{"type":"text","text":"hello"}\n')
+    out.log_path = str(log)
+    return out
+
+
+def test_item7_raw_jsonl_carries_the_runner_stream_and_seal_hashes_the_tree(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=raw_result), "codex": FakeRunner()})
+    settle(drv, 2)
+    tdir = next((env.run_root / "turns" / "L00").iterdir())
+    assert (tdir / "prompt.md").exists() and (tdir / "record.json").exists()
+    raw = (tdir / "raw.jsonl").read_text().splitlines()
+    hdr = json.loads(raw[0])
+    assert hdr["vp"] == "turn" and hdr["runner"] == "opencode" and hdr["role"] == "probe"
+    assert raw[1:3] == ['{"type":"step_start"}', '{"type":"text","text":"hello"}'], "verbatim stream"
+    assert (env.run_root / "control.jsonl").exists() and (env.run_root / "git.jsonl").exists()
+    # seal: one manifest per IST day, written on the first tick; hashes every audit file
+    day = drv.ist_now().strftime("%Y-%m-%d")
+    man = json.loads((env.run_root / ("MANIFEST-%s.json" % day)).read_text())
+    assert "driver.heartbeat" not in man["entries"] and "roster.json" in man["entries"]
+    assert man["entries"]["roster.json"]["sha256"] == \
+        hashlib.sha256((env.run_root / "roster.json").read_bytes()).hexdigest()
+    assert drv.seal() is None, "idempotent per day"
+    out = drv.seal(force=True)
+    man2 = json.loads(out.read_text())
+    assert "turns/L00/%s/raw.jsonl" % tdir.name in man2["entries"]
+    seals = [json.loads(l) for l in (env.run_root / "seals.jsonl").read_text().splitlines()]
+    assert [s["day"] for s in seals] == [day, day]
+    # day rollover under a live driver closes yesterday and opens today
+    drv._sealed_day = "2000-01-01"
+    drv.tick()
+    assert (env.run_root / "MANIFEST-2000-01-01.json").exists() and drv._sealed_day == day
+
+
+def test_item7_comms_hook_appends_from_cli_and_alerts_mirror_into_it(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "comms", "--from", "fixer",
+                          "--to", "orchestrator", "--text", "item 7 done", "--task", "L00"])
+    assert rc == 0
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    drv.alert("IDLE", "nothing to do", task=None)
+    rows = [json.loads(l) for l in (env.run_root / "comms.jsonl").read_text().splitlines()]
+    assert rows[0]["from"] == "fixer" and rows[0]["to"] == "orchestrator" and rows[0]["task"] == "L00"
+    assert rows[0]["kind"] == "message" and rows[0]["text"] == "item 7 done" and rows[0]["ts"].endswith("Z")
+    assert rows[1] == {"ts": rows[1]["ts"], "from": "lanedriver", "to": "owner", "kind": "alert:IDLE",
+                       "text": "nothing to do"}
+    rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "seal"])
+    assert rc == 0
+    assert list(env.run_root.glob("MANIFEST-*.json"))

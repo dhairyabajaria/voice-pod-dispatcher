@@ -324,6 +324,7 @@ class LaneDriver(object):
         self.alerts_md = self.run_root / "OWNER-ALERTS.md"
         self.alerts_jsonl = self.run_root / "alerts.jsonl"
         self.git_jsonl = self.run_root / "git.jsonl"
+        self._sealed_day = None
 
         self._apply_roster(self.roster)
         self.git_bin = self.bins.get("git", "git")
@@ -410,6 +411,7 @@ class LaneDriver(object):
             pass
         _append_jsonl(self.alerts_jsonl, {"ts": ts, "kind": kind, "task": task, "text": text},
                       self._lock)
+        self.comms("lanedriver", "owner", text, kind="alert:%s" % kind, task=task)
         if kind in ("STUCK", "QUOTA_WEEKLY", "QUOTA_ROLLING", "AUTH", "CONTROL_DOWN"):
             self._notify(kind, text)
 
@@ -823,6 +825,83 @@ class LaneDriver(object):
             pass
         return payload
 
+    # -- comms + seal (plan §2.1 point 5) ---------------------------------------------------
+
+    def comms(self, sender, to, text, kind="message", task=None, ref=None):
+        """Append one line to comms.jsonl.  This is the hook the Claude sessions
+        (Chief / Architect / Fixer) call so every cross-session message about the
+        run lives in the audit tree next to control.jsonl; the driver itself logs
+        its own outbound alerts here too."""
+        row = {"ts": utc_ms(), "from": sender, "to": to, "kind": kind, "text": text}
+        if task:
+            row["task"] = task
+        if ref:
+            row["ref"] = ref
+        _append_jsonl(self.run_root / "comms.jsonl", row)
+        return row
+
+    SEAL_SKIP = ("driver.heartbeat", "driver.heartbeat.tmp", "STOP", "DRAIN")
+
+    def seal(self, day=None, force=False):
+        """Daily seal: MANIFEST-<day>.json listing sha256 + size of every file
+        under RUN_ROOT (except the live heartbeat and control flags, and earlier
+        manifests) so the tree can be verified after the fact.  Idempotent per
+        IST day unless `force`."""
+        day = day or self.ist_now().strftime("%Y-%m-%d")
+        out = self.run_root / ("MANIFEST-%s.json" % day)
+        if out.exists() and not force:
+            return None
+        files, total = {}, 0
+        for p in sorted(self.run_root.rglob("*")):
+            if not p.is_file() or p.is_symlink():
+                continue
+            rel = p.relative_to(self.run_root).as_posix()
+            if rel in self.SEAL_SKIP or (rel.startswith("MANIFEST-") and rel.endswith(".json")):
+                continue
+            if rel.startswith("worktrees/") or rel.startswith("trunk/"):
+                continue
+            try:
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                size = p.stat().st_size
+            except OSError:
+                continue
+            files[rel] = {"sha256": h.hexdigest(), "bytes": size}
+            total += size
+        body = json.dumps({"day": day, "ts": utc_ms(), "run_root": str(self.run_root),
+                           "sequence": self.control.sequence(), "files": len(files),
+                           "bytes": total, "entries": files}, indent=2, sort_keys=True)
+        manifest_sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        try:
+            tmp = out.with_suffix(".json.tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(str(tmp), str(out))
+        except OSError:
+            return None
+        _append_jsonl(self.run_root / "seals.jsonl",
+                      {"ts": utc_ms(), "day": day, "manifest": out.name, "sha256": manifest_sha,
+                       "files": len(files), "bytes": total})
+        self.log("SEAL %s files=%d sha256=%s" % (out.name, len(files), manifest_sha[:12]))
+        return out
+
+    def _seal_step(self):
+        """seal the previous IST day once its clock has rolled over, and the current
+        day at most once per driver start (so a restart leaves a fresh manifest)"""
+        today = self.ist_now().strftime("%Y-%m-%d")
+        if self._sealed_day == today:
+            return
+        try:
+            if self._sealed_day is not None:
+                # day rolled over under a live driver: the closing seal for the
+                # day just ended replaces the provisional one written at start
+                self.seal(self._sealed_day, force=True)
+            self.seal(today)
+        except Exception as exc:  # noqa: BLE001 -- seal must never take the tick down
+            self.log("seal failed: %s" % exc)
+        self._sealed_day = today
+
     def _stop_step(self):
         elapsed = time.monotonic() - (self._stop_started or time.monotonic())
         with self._lock:
@@ -846,6 +925,7 @@ class LaneDriver(object):
         except OSError:
             pass
         self.write_heartbeat({"finished": reason})
+        self.comms("lanedriver", "audit", "finish %s tick=%d" % (reason, self.tick_count), kind="lifecycle")
 
     # -- the tick ---------------------------------------------------------------------------
 
@@ -867,6 +947,7 @@ class LaneDriver(object):
                 self._reconciled = True
                 self.log("RECONCILE %s" % json.dumps(res)[:300])
         self.write_heartbeat()
+        self._seal_step()
         if self._stopping:
             self._stop_step()
             return 0
@@ -1551,10 +1632,20 @@ class LaneDriver(object):
                                                                      default=str), encoding="utf-8")
             (tdir / "record.json").write_text(json.dumps(payload, indent=2, sort_keys=True,
                                                          default=str), encoding="utf-8")
-            if outcome.log_path and Path(outcome.log_path).exists():
-                raw = tdir / "raw.jsonl"
-                with open(raw, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"tag": tag, "log": str(outcome.log_path)}) + "\n")
+            # raw.jsonl: the runner's full raw stream, verbatim, one JSON line
+            # per event, framed by a header line naming the turn it came from
+            raw = tdir / "raw.jsonl"
+            with open(raw, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"vp": "turn", "tag": tag, "runner": runner, "role": role,
+                                     "n": n, "round": rnd, "log": str(outcome.log_path or ""),
+                                     "ts": utc_ms()}) + "\n")
+                if outcome.log_path and Path(outcome.log_path).exists():
+                    text = Path(outcome.log_path).read_text(encoding="utf-8", errors="replace")
+                    if text.lstrip().startswith("{") and "\n" in text.strip() and runner == "claude":
+                        fh.write(json.dumps({"vp": "claude-result", "raw": text}) + "\n")
+                    else:
+                        for line in text.splitlines():
+                            fh.write(line.rstrip("\n") + "\n")
         except OSError:
             pass
 
@@ -1991,12 +2082,40 @@ def build_parser():
     c.add_argument("--tree-sha")
     c.add_argument("--evidence", action="append", default=[])
     c.add_argument("--reason")
+    cm = sub.add_parser("comms", help="append one cross-session message to RUN_ROOT/comms.jsonl")
+    cm.add_argument("--from", dest="sender", required=True, help="e.g. chief, architect, fixer")
+    cm.add_argument("--to", required=True)
+    cm.add_argument("--text", required=True)
+    cm.add_argument("--kind", default="message")
+    cm.add_argument("--task")
+    cm.add_argument("--ref", help="session id / message id the line answers")
+    se = sub.add_parser("seal", help="write MANIFEST-<day>.json (sha256 of every audit file)")
+    se.add_argument("--day", help="IST day YYYY-MM-DD; default today")
+    se.add_argument("--force", action="store_true", help="rewrite an existing manifest")
     return ap
+
+
+def cmd_comms(drv, args):
+    row = drv.comms(args.sender, args.to, args.text, kind=args.kind, task=args.task, ref=args.ref)
+    print(json.dumps(row))
+    return 0
+
+
+def cmd_seal(drv, args):
+    out = drv.seal(args.day, force=args.force)
+    if out is None:
+        print(json.dumps({"status": "EXISTS", "day": args.day or drv.ist_now().strftime("%Y-%m-%d")}))
+        return 0
+    print(json.dumps({"status": "OK", "manifest": str(out)}))
+    return 0
+
+
+SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal")
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and not any(a in argv for a in ("run", "drain", "undrain", "restart", "item")):
+    if argv and not any(a in argv for a in SUBCOMMANDS):
         argv = argv[:2] + ["run"] + argv[2:] if argv[0] == "--roster" else argv
     args = build_parser().parse_args(argv)
     if args.cmd == "run":
@@ -2009,6 +2128,8 @@ def main(argv=None):
         if args.fake_runners:
             drv.log("FAKE RUNNERS in force: no model call will be made")
         drv.log("lanedriver start pid=%d roster=%s" % (os.getpid(), drv.roster_path))
+        drv.comms("lanedriver", "audit", "start pid=%d fake_runners=%s" % (os.getpid(), args.fake_runners),
+                  kind="lifecycle")
         if args.once:
             drv.run_once()
         else:
@@ -2023,6 +2144,10 @@ def main(argv=None):
         return cmd_restart(drv, args)
     if args.cmd == "item":
         return cmd_item(drv, args)
+    if args.cmd == "comms":
+        return cmd_comms(drv, args)
+    if args.cmd == "seal":
+        return cmd_seal(drv, args)
     return 1
 
 
