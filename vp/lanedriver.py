@@ -331,6 +331,55 @@ def normalize_roster(data):
     return r
 
 
+def snapshot_roster(run_root, content):
+    """07 §1: roster.json is the one rewritable file; every edit is also kept
+    as roster.<n>.json (append-only history).  Returns the snapshot path, or
+    None when the latest snapshot already holds this content."""
+    run_root = Path(run_root)
+    snaps = sorted(run_root.glob("roster.*.json"),
+                   key=lambda p: int(p.name.split(".")[1]) if p.name.split(".")[1].isdigit() else -1)
+    snaps = [p for p in snaps if p.name.split(".")[1].isdigit()]
+    if snaps and snaps[-1].read_bytes() == content:
+        return None
+    n = (int(snaps[-1].name.split(".")[1]) + 1) if snaps else 1
+    out = run_root / ("roster.%d.json" % n)
+    out.write_bytes(content)
+    return out
+
+
+def cmd_init_run(args):
+    """§4(a) / 06 §0: copy v13-pack/roster-v13.json to RUN_ROOT/roster.json at
+    start (RUN_ROOT from the roster's run.run_root unless --run-root), lint it,
+    snapshot it as roster.<n>.json, and refuse a roster with lint errors."""
+    import vplint
+    src = Path(args.source).resolve()
+    data = json.loads(src.read_text(encoding="utf-8"))
+    run_root = Path(os.path.expanduser(args.run_root or data.get("run", {}).get("run_root") or "")).resolve() \
+        if (args.run_root or data.get("run", {}).get("run_root")) else None
+    if run_root is None:
+        print(json.dumps({"status": "REFUSED", "reason": "no run.run_root in %s and no --run-root" % src}))
+        return 2
+    msgs = vplint.lint_roster(str(src))
+    errors = [m for m in msgs if m.startswith("ERROR")]
+    if errors and not args.force:
+        print(json.dumps({"status": "REFUSED", "reason": "vplint roster errors", "lint": msgs}, indent=2))
+        return 2
+    run_root.mkdir(parents=True, exist_ok=True)
+    dest = run_root / "roster.json"
+    content = src.read_bytes()
+    changed = not dest.exists() or dest.read_bytes() != content
+    if changed:
+        dest.write_bytes(content)
+    snap = snapshot_roster(run_root, content)
+    for sub in ("turns", "probes", "proofs", "claude-settings"):
+        (run_root / sub).mkdir(exist_ok=True)
+    rec = {"ts": utc_ms(), "op": "init-run", "source": str(src), "source_sha256": sha256_file(src),
+           "roster": str(dest), "changed": changed, "snapshot": str(snap) if snap else None, "lint": msgs}
+    _append_jsonl(run_root / "git.jsonl", rec)
+    print(json.dumps(dict(rec, status="OK"), indent=2))
+    return 0
+
+
 class LaneDriver(object):
 
     def __init__(self, roster_path, exec_=None, runners=None, control=None,
@@ -557,7 +606,8 @@ class LaneDriver(object):
         self._roster_mtime = m
         with self._lock:
             self._apply_roster(data)
-        self.log("roster reloaded (mtime changed)")
+        snap = snapshot_roster(self.run_root, self.roster_path.read_bytes())
+        self.log("roster reloaded (mtime changed) -> %s" % (snap.name if snap else "no snapshot"))
 
     # -- parking / concurrency -----------------------------------------------------------
 
@@ -737,15 +787,35 @@ class LaneDriver(object):
                 if rc != 0:
                     raise ControlError("worktree add failed for %s: %s"
                                        % (task, (err or out).strip()[:300]))
-        for rel in ("agent/.venv", "portal/node_modules", "platform/.venv"):
+        self.link_deps(wt, task)
+        return wt
+
+    WORKTREE_LINKS = ("platform/.venv", "agent/.venv", "portal/node_modules")
+
+    def link_deps(self, wt, task=None):
+        """§4(a): every worktree gets the trunk's platform/.venv, agent/.venv and
+        portal/node_modules as symlinks (L04-FLOOR, docs/TEST_GATES.md).  A
+        missing target is alerted once per run, never silently skipped."""
+        made, missing = [], []
+        for rel in self.WORKTREE_LINKS:
             link, target = wt / rel, self.trunk / rel
+            if not target.exists():
+                missing.append(rel)
+                continue
             try:
                 link.parent.mkdir(parents=True, exist_ok=True)
-                if not link.exists() and not link.is_symlink() and target.exists():
+                if not link.exists() and not link.is_symlink():
                     os.symlink(str(target), str(link))
-            except OSError:
-                pass
-        return wt
+                    made.append(rel)
+            except OSError as exc:
+                missing.append("%s (%s)" % (rel, exc))
+        _append_jsonl(self.git_jsonl, {"ts": utc_ms(), "op": "link_deps", "task": task, "worktree": str(wt),
+                                       "linked": made, "missing": missing}, self._lock)
+        if missing:
+            self.alert_once("deps-missing", "WORKTREE_DEPS_MISSING",
+                            "trunk lacks %s; worktrees run without them (box proofs will fail for that "
+                            "surface)" % ", ".join(missing), task)
+        return made, missing
 
     def _pack_paths(self, task):
         if not self.pack_dir:
@@ -2351,7 +2421,7 @@ def cmd_item(drv, args):
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--roster", required=True)
+    ap.add_argument("--roster", help="RUN_ROOT/roster.json (every command but init-run)")
     sub = ap.add_subparsers(dest="cmd")
     run = sub.add_parser("run", help="tick loop (default when no command is given)")
     g = run.add_mutually_exclusive_group(required=True)
@@ -2404,6 +2474,10 @@ def build_parser():
     se.add_argument("--day", help="IST day YYYY-MM-DD; default today")
     se.add_argument("--force", action="store_true", help="rewrite an existing manifest")
     sub.add_parser("render", help="F14: write LEDGER.md now (the loop also does it on a timer)")
+    ir = sub.add_parser("init-run", help="copy v13-pack/roster-v13.json -> RUN_ROOT/roster.json (lint, snapshot)")
+    ir.add_argument("--source", required=True, help="the pack roster, e.g. v13-pack/roster-v13.json")
+    ir.add_argument("--run-root", help="override the roster's run.run_root")
+    ir.add_argument("--force", action="store_true", help="copy despite vplint errors")
     return ap
 
 
@@ -2422,7 +2496,7 @@ def cmd_seal(drv, args):
     return 0
 
 
-SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render")
+SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run")
 
 
 def main(argv=None):
@@ -2430,6 +2504,10 @@ def main(argv=None):
     if argv and not any(a in argv for a in SUBCOMMANDS):
         argv = argv[:2] + ["run"] + argv[2:] if argv[0] == "--roster" else argv
     args = build_parser().parse_args(argv)
+    if args.cmd == "init-run":
+        return cmd_init_run(args)
+    if not args.roster:
+        build_parser().error("--roster is required")
     if args.cmd == "run":
         runners = None
         if args.fake_runners:

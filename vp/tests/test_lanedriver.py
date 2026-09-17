@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1164,3 +1165,58 @@ def test_item11_gate_hold_parks_the_attempt_and_retries_only_complete(tmp_path, 
     assert env.rows()["L01"]["state"] != "WAITING_DEPENDENCY", "the release unlocked the dependants"
     assert not hold.exists() and hold.with_name("gate-hold.released.json").exists()
     assert len([c for c in probe.calls if c.item == "L00"]) == 1
+
+
+# -- pack §4(a): roster copy at start, worktree dependency links ----------------------
+
+def test_pack4a_init_run_copies_lints_and_snapshots_the_roster(tmp_path):
+    import vplint
+    src = tmp_path / "roster-v13.json"
+    r = json.loads((CONTROL_DIR / "v13-pack" / "roster-v13.json").read_text())
+    r["run"]["run_root"] = str(tmp_path / "RUN")
+    src.write_text(json.dumps(r, indent=2))
+    assert vplint.lint_roster(str(src)) == []
+    assert lanedriver.main(["init-run", "--source", str(src)]) == 0
+    run_root = tmp_path / "RUN"
+    assert (run_root / "roster.json").read_bytes() == src.read_bytes()
+    assert (run_root / "roster.1.json").exists() and (run_root / "turns").is_dir()
+    rec = json.loads((run_root / "git.jsonl").read_text().splitlines()[0])
+    assert rec["op"] == "init-run" and rec["changed"] is True and rec["snapshot"].endswith("roster.1.json")
+    # same content again: no new snapshot; an edit: roster.2.json
+    assert lanedriver.main(["init-run", "--source", str(src)]) == 0
+    assert not (run_root / "roster.2.json").exists()
+    r["concurrency"]["claude_max"] = 1
+    src.write_text(json.dumps(r, indent=2))
+    assert lanedriver.main(["init-run", "--source", str(src)]) == 2, "lint error (claude_max) refuses"
+    assert (run_root / "roster.json").read_bytes() != src.read_bytes()
+    r["concurrency"]["claude_max"] = 2
+    r["night"]["render_every_min"] = 5
+    src.write_text(json.dumps(r, indent=2))
+    assert lanedriver.main(["init-run", "--source", str(src)]) == 0
+    assert (run_root / "roster.2.json").read_bytes() == src.read_bytes()
+
+
+def test_pack4a_worktrees_link_both_venvs_and_node_modules_and_alert_on_a_missing_one(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    (env.trunk / "platform" / ".venv" / "bin").mkdir(parents=True)
+    (env.trunk / "portal" / "node_modules" / ".bin").mkdir(parents=True)
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    settle(drv, 2)
+    wt = env.tmp / "wt" / "L00"
+    assert (wt / "platform" / ".venv").is_symlink() and (wt / "portal" / "node_modules").is_symlink()
+    assert os.readlink(str(wt / "platform" / ".venv")) == str(env.trunk / "platform" / ".venv")
+    assert not (wt / "agent" / ".venv").exists()
+    links = [json.loads(l) for l in (env.run_root / "git.jsonl").read_text().splitlines()
+             if '"link_deps"' in l]
+    assert links[0]["linked"] == ["platform/.venv", "portal/node_modules"] and links[0]["missing"] == ["agent/.venv"]
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert alerts.count("WORKTREE_DEPS_MISSING") == 1, "once per run, not per worktree"
+    # a roster edit under a live driver is snapshotted as roster.<n>.json
+    roster = json.loads((env.run_root / "roster.json").read_text())
+    roster["alerts"]["idle_every_min"] = 31
+    time.sleep(0.02)
+    (env.run_root / "roster.json").write_text(json.dumps(roster, indent=2))
+    os.utime(str(env.run_root / "roster.json"), None)
+    drv.tick()
+    assert (env.run_root / "roster.1.json").exists()
