@@ -28,6 +28,12 @@ import re
 
 __all__ = [
     "validate_result",
+    "normalize_result",
+    "int_like",
+    "check_name",
+    "check_executed",
+    "check_reason",
+    "diff_stat_files",
     "validate_findings",
     "validate_result_obj",
     "validate_findings_obj",
@@ -48,8 +54,12 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 # Written into <worktree>/.vp/ when vp/schemas/*.json is not on disk.
 RESULT_SCHEMA_DOC = {
-    "$comment": "Voice Pod v9 Builder result. All keys required. "
-                "Validated by vpschema.validate_result.",
+    "$comment": "Voice Pod v9 Builder result, validated by vpschema.validate_result. "
+                "item/attempt/commit/base/blocked are BINDING (exact meaning; attempt "
+                "may be a digit-string). diff_stat/checks/disputes/notes are your own "
+                "honest report: keep the shapes below, never fabricate a number or an "
+                "exit code; a check you could not run keeps exit null and says why in "
+                "log.",
     "type": "object",
     "required": ["item", "attempt", "commit", "base", "diff_stat", "checks",
                  "disputes", "blocked", "notes"],
@@ -69,15 +79,21 @@ RESULT_SCHEMA_DOC = {
                           "deletions": {"type": "integer"}}},
         "checks": {"type": "array", "items": {
             "type": "object",
-            "required": ["name", "command", "exit", "log"],
+            "required": ["command", "exit", "log"],
             "properties": {
-                "exit": {"type": ["integer", "null"],
-                         "$comment": "null = NOT EXECUTED here (e.g. the sandbox denies "
-                                     "the command); then `log` must say why. Never "
-                                     "fabricate an exit code."}}}},
+                "name": {"type": "string", "$comment": "short label; defaults to the command"},
+                "command": {"type": "string"},
+                "exit": {"type": ["integer", "null", "string"],
+                         "$comment": "the integer exit code, or null when NOT EXECUTED here "
+                                     "(e.g. the sandbox denies the command); a word such as "
+                                     "\"blocked\"/\"not run\" is read as null. Either way "
+                                     "`log` must say why. Never fabricate an exit code."},
+                "log": {"type": "string"}}}},
         "disputes": {"type": "array", "items": {
-            "type": "object", "required": ["line", "reason"]}},
-        "blocked": {"type": ["null", "string"]},
+            "type": "object", "required": ["line", "reason"],
+            "properties": {"line": {"type": ["string", "integer"]}, "reason": {"type": "string"}}}},
+        "blocked": {"type": ["null", "string"],
+                    "$comment": "null (or false / \"\") = not blocked; otherwise the reason"},
         "notes": {"type": "string"},
     },
 }
@@ -140,27 +156,251 @@ def _want_int(val, where, errors, minimum=None):
     return True
 
 
-def _want_exit(val, chk, where, errors):
-    """checks[].exit: an integer exit code; null means the command was NOT
-    EXECUTED in this sandbox (the builder profile denies pytest/psql/...) and
-    is accepted when `log` explains -- an honest "not run" must not fail the
-    turn, the proof harness is the real gate.  A digit-string ("0") is
-    coerced like `attempt`; anything else is malformed."""
+# --------------------------------------------------------------------------
+# RESULT.json rule (D10)
+#
+# RESULT.json has two classes of field:
+#   BINDING       item, attempt, commit, base, blocked -- the driver acts on
+#                 them (HEAD check, attempt identity, blocked routing).  Their
+#                 *meaning* is strict, their *representation* is lenient: an
+#                 attempt may be an int or a digit-string, a sha any 7-40 hex,
+#                 blocked null/false/"" (not blocked) or any non-empty scalar
+#                 (its text is the reason).
+#   INFORMATIONAL diff_stat, checks, disputes, notes -- the builder's own
+#                 report.  The proof harness and the grader are the gates, so a
+#                 builder that reports honestly but spells a leaf differently
+#                 must not lose the turn.  Rule: the CONTAINER shape must be
+#                 recognisable (object / array of objects; a lone object where
+#                 an array is expected is wrapped), a missing container
+#                 defaults to empty, and every LEAF accepts any JSON scalar --
+#                 numbers coerce from number-like values (int, integral float,
+#                 digit-string, or a list whose length is the count) and
+#                 otherwise stay as written.  The one hard rule inside checks:
+#                 a check that was NOT EXECUTED (exit is null / a word / bool)
+#                 must carry a non-empty log or reason saying why, and every
+#                 check must be identifiable (command or name).
+# normalize_result() returns the canonical form + warnings; validate_result()
+# returns errors only for binding and structural failures.
+# --------------------------------------------------------------------------
+
+BINDING_KEYS = ("item", "attempt", "commit", "base", "blocked")
+INFO_DEFAULTS = {"diff_stat": {}, "checks": [], "disputes": [], "notes": ""}
+NOT_EXECUTED_REASON_KEYS = ("log", "reason", "note", "notes", "why")
+CHECK_SYNONYMS = {"command": ("cmd", "argv", "run"),
+                  "exit": ("exit_code", "exitcode", "rc", "returncode", "return_code", "status", "code"),
+                  "log": ("output", "stdout", "result", "detail"),
+                  "name": ("label", "id", "check")}
+
+
+def int_like(val):
+    """-> int, or None when `val` is not a number-like representation.
+    Number-like: int (not bool), integral float, digit-string (+/-, spaces),
+    or a list/tuple (its length -- 'files': [paths] is a count by another name)."""
     if isinstance(val, bool):
-        _err(errors, where, "expected integer, got bool")
-        return False
+        return None
     if isinstance(val, int):
+        return val
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    if isinstance(val, str):
+        t = val.strip().replace(",", "")
+        if t.lstrip("+-").isdigit():
+            return int(t)
+        return None
+    if isinstance(val, (list, tuple)):
+        return len(val)
+    return None
+
+
+def _text(val):
+    """any scalar as text; None/False/"" -> "" """
+    if val is None or val is False:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (int, float, bool)):
+        return str(val)
+    try:
+        return json.dumps(val, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def check_executed(chk):
+    """True iff checks[].exit is an exit code (int-like); null, a word,
+    a bool or a missing key all mean NOT EXECUTED."""
+    val = chk.get("exit") if isinstance(chk, dict) else None
+    return int_like(val) is not None and not isinstance(val, (list, tuple))
+
+
+def check_name(chk):
+    """checks[].name, or the command when the builder left the label out"""
+    if isinstance(chk, dict):
+        for k in ("name", "command"):
+            v = chk.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+    return "?"
+
+
+def check_reason(chk):
+    """why a check was not executed: the first non-empty of log/reason/note/why"""
+    if isinstance(chk, dict):
+        for k in NOT_EXECUTED_REASON_KEYS:
+            t = _text(chk.get(k)).strip()
+            if t:
+                return t
+    return ""
+
+
+def _want_blocked(val, where, errors):
+    """null/false/"" -> not blocked; any other scalar -> a reason"""
+    if val is None or val is False or (isinstance(val, str) and not val.strip()):
         return True
-    if isinstance(val, str) and val.strip().lstrip("-").isdigit():
+    if isinstance(val, (str, int, float, bool)):
         return True
-    if val is None:
-        log = chk.get("log") if isinstance(chk, dict) else None
-        if isinstance(log, str) and log.strip():
-            return True
-        _err(errors, where, "null (not executed) requires a non-empty log saying why")
-        return False
-    _err(errors, where, "expected integer or null, got %s" % type(val).__name__)
+    _err(errors, where, "expected null or a reason string, got %s" % type(val).__name__)
     return False
+
+
+def _as_list(val, where, warnings):
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, dict):
+        warnings.append("%s: object where an array was expected; wrapped" % where)
+        return [val]
+    warnings.append("%s: %s where an array was expected; dropped" % (where, type(val).__name__))
+    return []
+
+
+def _normalize_diff_stat(ds, warnings, errors):
+    if ds is None:
+        warnings.append("diff_stat: missing; defaulted to zeros")
+        ds = {}
+    if not isinstance(ds, dict):
+        _err(errors, "diff_stat", "expected object, got %s" % type(ds).__name__)
+        return {"files": 0, "insertions": 0, "deletions": 0}
+    out = {}
+    for key in ("files", "insertions", "deletions"):
+        val = ds.get(key)
+        n = int_like(val)
+        if key not in ds:
+            warnings.append("diff_stat.%s: missing; 0" % key)
+            n = 0
+        elif n is None:
+            warnings.append("diff_stat.%s: not number-like (%r); 0" % (key, val))
+            n = 0
+        elif n < 0:
+            warnings.append("diff_stat.%s: negative (%d); 0" % (key, n))
+            n = 0
+        out[key] = n
+    if isinstance(ds.get("files"), (list, tuple)):
+        out["paths"] = [str(x) for x in ds["files"]]
+    return out
+
+
+def _normalize_check(chk, w, warnings, errors):
+    if not isinstance(chk, dict):
+        if isinstance(chk, str) and chk.strip():
+            warnings.append("%s: bare string; read as a not-executed command" % w)
+            chk = {"command": chk, "exit": None, "log": "(no log)"}
+        else:
+            _err(errors, w, "expected object, got %s" % type(chk).__name__)
+            return None
+    for key, alts in CHECK_SYNONYMS.items():
+        if key not in chk:
+            for alt in alts:
+                if alt in chk:
+                    chk = dict(chk, **{key: chk[alt]})
+                    warnings.append("%s.%s: read from `%s`" % (w, key, alt))
+                    break
+    name = check_name(chk)
+    if name == "?":
+        _err(errors, w, "unidentifiable check: needs a command or a name")
+        return None
+    executed = check_executed(chk)
+    reason = check_reason(chk)
+    if not executed and not reason:
+        _err(errors, "%s.exit" % w, "%r means NOT EXECUTED; a non-empty log/reason must say why"
+             % (chk.get("exit"),))
+        return None
+    out = dict(chk)
+    out["name"] = name
+    out["command"] = _text(chk.get("command")) or name
+    out["exit"] = int_like(chk.get("exit")) if executed else None
+    out["executed"] = executed
+    out["log"] = _text(chk.get("log"))
+    if not executed:
+        out["reason"] = reason
+    for k in ("name", "command", "log"):
+        if k in chk and not isinstance(chk[k], str):
+            warnings.append("%s.%s: %s coerced to text" % (w, k, type(chk[k]).__name__))
+    return out
+
+
+def _normalize_dispute(dis, w, warnings, errors):
+    if isinstance(dis, str):
+        warnings.append("%s: bare string; read as the reason" % w)
+        return {"line": "?", "reason": dis}
+    if not isinstance(dis, dict):
+        _err(errors, w, "expected object, got %s" % type(dis).__name__)
+        return None
+    out = dict(dis)
+    out["line"] = _text(dis.get("line")) or "?"
+    out["reason"] = _text(dis.get("reason") or dis.get("note") or dis.get("why"))
+    if not out["reason"].strip():
+        warnings.append("%s: no reason given" % w)
+    return out
+
+
+def normalize_result(obj):
+    """-> (canonical, errors, warnings).  `canonical` is None when obj is not an
+    object.  Errors are binding/structural failures only (see the D10 rule);
+    warnings record every lenient reading so the record can carry them."""
+    errors, warnings = [], []
+    if not isinstance(obj, dict):
+        return None, ["<root>: expected object, got %s" % type(obj).__name__], warnings
+    out = dict(obj)
+    # binding
+    ok, v = _req(obj, "item", "", errors)
+    if ok:
+        _want_str(v, "item", errors)
+    ok, v = _req(obj, "attempt", "", errors)
+    if ok and _want_attempt(v, "attempt", errors):
+        out["attempt"] = int(v)
+    ok, v = _req(obj, "commit", "", errors)
+    if ok:
+        _want_sha(v, "commit", errors)
+    ok, v = _req(obj, "base", "", errors)
+    if ok:
+        _want_sha(v, "base", errors)
+    if "blocked" not in obj:
+        warnings.append("blocked: missing; null")
+        out["blocked"] = None
+    elif _want_blocked(obj["blocked"], "blocked", errors):
+        t = _text(obj["blocked"]).strip()
+        out["blocked"] = t or None
+    # informational
+    for key, default in INFO_DEFAULTS.items():
+        if key not in obj:
+            warnings.append("%s: missing; %r" % (key, default))
+    out["diff_stat"] = _normalize_diff_stat(obj.get("diff_stat"), warnings, errors)
+    checks = []
+    for i, chk in enumerate(_as_list(obj.get("checks"), "checks", warnings)):
+        c = _normalize_check(chk, "checks[%d]" % i, warnings, errors)
+        if c is not None:
+            checks.append(c)
+    out["checks"] = checks
+    disputes = []
+    for i, dis in enumerate(_as_list(obj.get("disputes"), "disputes", warnings)):
+        d = _normalize_dispute(dis, "disputes[%d]" % i, warnings, errors)
+        if d is not None:
+            disputes.append(d)
+    out["disputes"] = disputes
+    out["notes"] = _text(obj.get("notes"))
+    return out, errors, warnings
 
 
 def _want_sha(val, where, errors):
@@ -209,95 +449,15 @@ def _load(path):
 # --------------------------------------------------------------------------
 
 def validate_result_obj(obj):
-    errors = []
-    if not isinstance(obj, dict):
-        return False, ["<root>: expected object, got %s" % type(obj).__name__]
-
-    ok, v = _req(obj, "item", "", errors)
-    if ok:
-        _want_str(v, "item", errors)
-    ok, v = _req(obj, "attempt", "", errors)
-    if ok:
-        _want_attempt(v, "attempt", errors)
-    ok, v = _req(obj, "commit", "", errors)
-    if ok:
-        _want_sha(v, "commit", errors)
-    ok, v = _req(obj, "base", "", errors)
-    if ok:
-        _want_sha(v, "base", errors)
-
-    ok, ds = _req(obj, "diff_stat", "", errors)
-    if ok:
-        if not isinstance(ds, dict):
-            _err(errors, "diff_stat", "expected object, got %s" % type(ds).__name__)
-        else:
-            for key in ("files", "insertions", "deletions"):
-                present, val = _req(ds, key, "diff_stat", errors)
-                if not present:
-                    continue
-                if key == "files" and isinstance(val, list) and all(isinstance(x, str) for x in val):
-                    continue          # the changed paths: a count by another name (diff_stat_files())
-                if isinstance(val, str) and val.strip().isdigit():
-                    continue          # "3": coerced like `attempt`
-                _want_int(val, "diff_stat.%s" % key, errors, minimum=0)
-
-    ok, checks = _req(obj, "checks", "", errors)
-    if ok:
-        if not isinstance(checks, list):
-            _err(errors, "checks", "expected array, got %s" % type(checks).__name__)
-        else:
-            for i, chk in enumerate(checks):
-                w = "checks[%d]" % i
-                if not isinstance(chk, dict):
-                    _err(errors, w, "expected object, got %s" % type(chk).__name__)
-                    continue
-                for key in ("name", "command", "log"):
-                    present, val = _req(chk, key, w, errors)
-                    if present:
-                        _want_str(val, "%s.%s" % (w, key), errors,
-                                  allow_empty=(key == "log"))
-                present, val = _req(chk, "exit", w, errors)
-                if present:
-                    _want_exit(val, chk, "%s.exit" % w, errors)
-
-    ok, disputes = _req(obj, "disputes", "", errors)
-    if ok:
-        if not isinstance(disputes, list):
-            _err(errors, "disputes",
-                 "expected array, got %s" % type(disputes).__name__)
-        else:
-            for i, dis in enumerate(disputes):
-                w = "disputes[%d]" % i
-                if not isinstance(dis, dict):
-                    _err(errors, w, "expected object, got %s" % type(dis).__name__)
-                    continue
-                present, val = _req(dis, "line", w, errors)
-                if present and (isinstance(val, bool)
-                                or not isinstance(val, (str, int))):
-                    _err(errors, "%s.line" % w, "expected string or integer")
-                present, val = _req(dis, "reason", w, errors)
-                if present:
-                    _want_str(val, "%s.reason" % w, errors)
-
-    ok, blocked = _req(obj, "blocked", "", errors)
-    if ok and blocked is not None:
-        _want_str(blocked, "blocked", errors)
-
-    ok, notes = _req(obj, "notes", "", errors)
-    if ok and notes is not None:
-        _want_str(notes, "notes", errors, allow_empty=True)
-
+    """(ok, errors) under the D10 rule; see normalize_result for the reading."""
+    _, errors, _ = normalize_result(obj)
     return (not errors), errors
 
 
 def diff_stat_files(obj):
     """diff_stat.files as an int whatever valid form the builder used"""
-    val = ((obj or {}).get("diff_stat") or {}).get("files")
-    if isinstance(val, list):
-        return len(val)
-    if isinstance(val, str) and val.strip().isdigit():
-        return int(val)
-    return val
+    n = int_like(((obj or {}).get("diff_stat") or {}).get("files"))
+    return 0 if n is None else n
 
 
 def validate_result(path):

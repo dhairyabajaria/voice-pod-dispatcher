@@ -888,11 +888,13 @@ def test_no_commit_strikes_accumulate_to_blocked():
 
 
 def builder_missing_check_name(spec):
-    """Commits, but writes a RESULT.json whose checks[0] lacks `name`
-    (A3-3p's shape, D105)."""
+    """Commits, but writes a RESULT.json whose checks[0] has neither `name`
+    nor `command` (unidentifiable under D10; a missing name alone is now
+    read from the command, A3-3p's shape D105 no longer costs the turn)."""
     builder_ok(spec)
     rec = json.loads(Path(spec.out_path).read_text())
     del rec["checks"][0]["name"]
+    rec["checks"][0].pop("command", None)
     Path(spec.out_path).write_text(json.dumps(rec))
     ok, errs = vpschema.validate_result_obj(rec)
     assert not ok and any("name" in e for e in errs), errs

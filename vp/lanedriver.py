@@ -2025,15 +2025,20 @@ class LaneDriver(object):
         denies pytest/psql/...); the turn stands, the proof is the gate, but
         the owner should know the packet mandates a command the sandbox denies."""
         try:
-            checks = json.loads(Path(out_path).read_text(encoding="utf-8")).get("checks") or []
-        except (OSError, ValueError, AttributeError):
+            raw = json.loads(Path(out_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             return []
-        unrun = [c for c in checks if isinstance(c, dict) and c.get("exit") is None]
+        canon, errs, warnings = vpschema.normalize_result(raw)
+        if warnings:
+            self.log("RESULT %s read leniently (D10): %s" % (task, "; ".join(warnings)[:600]))
+        if not canon:
+            return []
+        unrun = [c for c in canon["checks"] if not c["executed"]]
         if unrun:
             self.alert_once("check-not-run:%s" % task, "CHECK_NOT_RUN",
                             "%s: %d check(s) not executed in the sandbox: %s -- proof is the gate; "
                             "if the packet mandates them, the vp-builder profile denies them"
-                            % (task, len(unrun), "; ".join("%s (%s)" % (c.get("name"), (c.get("command") or "")[:80])
+                            % (task, len(unrun), "; ".join("%s (%s)" % (c["name"], c["command"][:80])
                                                             for c in unrun)[:400]), task)
         return unrun
 
