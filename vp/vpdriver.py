@@ -67,6 +67,9 @@ JUNIOR_PROMPT = (
     "file:line evidence and stop. all_pass is true ONLY when every line is PASS; "
     "an UNKNOWN verdict is not PASS. Use UNKNOWN only for a line you genuinely "
     "cannot verify with the tools you have, and say why in its note. "
+    "If .vp/PROOF.json exists it is the driver's own test run of this exact HEAD "
+    "(status, route, failed_nodes, and the pytest log at .vp/proofs/<proof_id>.log): "
+    "use it as the evidence for every [test] and proof line instead of running tests. "
     "If the write is refused, print the complete "
     "FINDINGS JSON in a single ```json fence as your final message and stop."
 )

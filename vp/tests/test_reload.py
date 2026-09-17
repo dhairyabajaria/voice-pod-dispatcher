@@ -24,7 +24,7 @@ sys.path.insert(0, str(VP))
 sys.path.insert(0, str(HERE))
 
 import lanedriver  # noqa: E402
-from test_lanedriver import Env, FakeRunner, result_ok, settle, slow_result  # noqa: E402
+from test_lanedriver import Env, FakeRunner, result_ok, settle, slow_result, wait_state  # noqa: E402
 
 
 def _extra_module(tmp_path, body):
@@ -57,8 +57,7 @@ def test_reload_waits_for_active_zero_then_rebinds_and_resumes(tmp_path):
     old_cls = type(drv)
     th = threading.Thread(target=drv.loop, daemon=True)
     th.start()
-    time.sleep(0.5)                                   # L00 is live
-    assert env.rows()["L00"]["state"] == "RUNNING"
+    wait_state(env, "L00", "RUNNING")                 # L00 is live (the fake turn holds 1.5 s)
     extra.write_text("def answer():\n    return 2\n")
     (env.run_root / "RELOAD").write_text(json.dumps({"reason": "test change"}))
     time.sleep(0.5)

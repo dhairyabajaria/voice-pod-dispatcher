@@ -279,3 +279,136 @@ def test_review_packet_waits_for_a_candidate_then_carries_the_union_dispatch_rec
     import pytest
     with pytest.raises(ValueError):
         drv3.request_packet_retry("NOPE", "x")
+
+
+# -- D16: a verified retry / fix retires the rows it supersedes ---------------------------------
+
+def test_superseded_by_pure():
+    from lanedriver import LaneDriver
+    t = {"X": {"state": "REPAIR_REQUIRED"}, "X-R1": {"state": "INVALID_EVIDENCE"}, "X-R2": {"state": "VERIFIED"},
+         "X-R3": {"state": "READY"}, "X-FIX-1": {"state": "REPAIR_REQUIRED"}, "X-FIX-2": {"state": "VERIFIED"},
+         "XY": {"state": "REPAIR_REQUIRED"}, "X-HOSTED": {"state": "READY"}, "Y-R1": {"state": "RUNNING"},
+         "Y": {"state": "CLAIMED"}}
+    assert LaneDriver.superseded_by("X-R2", t) == ["X", "X-R1"], "root and lower retries only"
+    assert LaneDriver.superseded_by("X-FIX-2", t) == ["X", "X-FIX-1", "X-R1", "X-R3"], "a fix supersedes every retry"
+    assert LaneDriver.superseded_by("Y-R1", t) == [], "a CLAIMED root is left alone (F8)"
+    assert LaneDriver.superseded_by("X", t) == [] and LaneDriver.superseded_by("XY", t) == []
+
+
+def test_verified_retry_retires_the_superseded_base_row(tmp_path):
+    pd = tmp_path / "pack"
+    packet(pd, "P-GAP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="gap for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    seen = []
+
+    def grader(spec, ab):
+        seen.append(spec.item)
+        # the first task's grades FAIL (both rounds); its retry passes
+        return findings("FAIL" if spec.item == "P-GAP" else "PASS")(spec, ab)
+    runner = by_role({"builder": result_ok, "grader": grader, "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-GAP"]["state"] == "REPAIR_REQUIRED", rows["P-GAP"]
+    drv.request_packet_retry("P-GAP", "driver bug, not a verdict")
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-GAP-R1"]["state"] == "VERIFIED", rows["P-GAP-R1"]
+    assert rows["P-GAP"]["state"] == "CANCELLED" and rows["P-GAP"]["blocker"]["class"] == "RETIRED"
+    assert rows["P-GAP"]["blocker"]["reason"] == "SUPERSEDED_BY:P-GAP-R1"
+    assert rows["P-GAP"]["blocker"]["closers"] == ["P-GAP-R1"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "SUPERSEDED by P-GAP-R1: P-GAP retired" in log
+    closures = [json.loads(l) for l in (env.run_root / "packets" / "closures.jsonl").read_text().splitlines()]
+    assert any(c.get("op") == "supersede" and c["retired"] == ["P-GAP"] for c in closures)
+
+
+def test_supersede_sweep_retires_rows_verified_before_the_rule_existed(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    params = env.tmp / "p.json"
+    params.write_text(json.dumps({"parent_contract_id": "L00", "unproved_criterion": "x", "candidate_sha": env.base,
+                                  "test_location": "platform/a.py", "owned_paths": ["platform/a.py"]}))
+    for t in ("G", "G-R1", "G-R2"):
+        env.control_call("instantiate", "--template", "TEST_GAP", "--task", t, "--parent-contract", "L00",
+                         "--chief", "B", "--parameters-json", str(params))
+    env.control_call("block", "--task", "G", "--blocker-class", "EXTERNAL", "--reason", "old", "--unblock-action", "n/a",
+                     "--evidence", str(params))
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    drv._supersede = lambda task, tasks=None: []    # pretend the completion hook did not exist yet
+    settle(drv, 2)                                  # L00 verified -> G* READY; G-R1, G-R2 run and verify
+    settle(drv, 3)
+    rows = env.rows()
+    assert rows["G-R2"]["state"] == "VERIFIED" and rows["G-R1"]["state"] == "VERIFIED"
+    assert rows["G"]["state"] == "BLOCKED", "nothing retired it at completion time"
+    del drv._supersede                              # the real rule is back
+    drv._pack_last_mono = None
+    drv.tick()                                      # the sweep runs on the pack cadence
+    rows = env.rows()
+    assert rows["G"]["state"] == "CANCELLED" and rows["G"]["blocker"]["reason"] == "SUPERSEDED_BY:G-R1"
+    assert rows["G-R1"]["state"] == "VERIFIED", "an accepted lower retry is never retired"
+    # idempotent: a second sweep retires nothing more
+    assert drv._supersede_sweep({"tasks": rows}) == []
+
+
+# -- D17: a v13 review packet reviews the SUBJECT, then the driver writes the verdict and grades ---
+
+def test_review_packet_reviews_the_subject_then_writes_the_verdict_and_grades(tmp_path, monkeypatch):
+    from test_lanedriver import FakeCodex, register_candidate
+    import lanedriver
+    pd = tmp_path / "pack"
+    packet(pd, "SEC-REV", "NEW:JUNIOR_REVIEW", kind="review", template="JUNIOR_REVIEW", role="junior",
+           body="security review of the delta of L00")
+    pm = pd / "SEC-REV" / "PACKET.md"
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    # a second trunk commit: the subject is base..candidate = first..second commit
+    (env.trunk / "platform" / "a.py").write_text("x = 2\n")
+    git = __import__("test_lanedriver").git
+    git(env.trunk, "commit", "-qam", "delta")
+    pm.write_text(pm.read_text().replace("owner_gate: none\n", "owner_gate: none\nreview_base: %s\n"
+                                                                "coverage_targets: [L00, L01]\n" % env.base))
+    pm.write_text(pm.read_text().replace("  - control/evidence/SEC-REV/v13/REGRADE.md",
+                                         "  - control/evidence/SEC-REV/v13/verdict-packet.json"))
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    monkeypatch.setattr(lanedriver.LaneDriver, "_review_gate_check", lambda self, *a: (True, "PASS: fake gate"))
+    codex = FakeCodex()
+    seen = {}
+
+    def grader(spec, ab):
+        wt = Path(spec.cwd)
+        seen["benchmark"] = (wt / ".vp" / "BENCHMARK.md").read_text()
+        seen["verdict_in_tree"] = (wt / "control" / "evidence" / "SEC-REV" / "v13" / "verdict-packet.json").exists()
+        seen["result"] = json.loads((wt / ".vp" / "RESULT.json").read_text())
+        return findings("PASS")(spec, ab)
+    oc = by_role({"builder": result_ok, "grader": grader, "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": codex})
+    settle(drv, 2)
+    register_candidate(env)
+    settle(drv, 3)
+    rows = env.rows()
+    row = rows["SEC-REV"]
+    wt = env.tmp / "wt" / "SEC-REV"
+    req = json.loads((wt / ".vp" / "REVIEW_REQUEST.json").read_text())
+    assert req["base"] == env.base and req["candidate"] != env.base, "review_base..candidate, not an empty diff"
+    assert req["coverage_targets"] == ["L00", "L01"] and req["packet"] == "SEC-REV"
+    rev = codex.calls[-1]
+    assert rev.role == "reviewer"
+    review = json.loads((wt / ".vp" / "REVIEW.json").read_text())
+    ids = [v["id"] for v in review["verdicts"]]
+    assert ids and all(i in req["benchmark_ids"] for i in ids)
+    assert "# Review subject" not in seen["benchmark"], "the packet's own benchmark is back for the grader"
+    assert seen["verdict_in_tree"], "verdict-packet.json committed at the packet's owned path before the grade"
+    assert seen["result"]["checks"][0]["name"] == "review_gate.validate" and seen["result"]["checks"][0]["exit"] == 0
+    assert git(wt, "log", "--oneline", "-1").endswith("SEC-REV: v13 junior verdict packet")
+    vp = json.loads((wt / "control" / "evidence" / "SEC-REV" / "v13" / "verdict-packet.json").read_text())
+    assert set(vp["coverage"]) >= {"L00", "L01"}
+    # the scheduler's own gate still runs on complete: no native rollout -> refused -> INVALID_EVIDENCE
+    assert row["state"] == "INVALID_EVIDENCE" and "verdict refused" in row["blocker"]
+    assert "VERDICT_REFUSED" in (env.run_root / "OWNER-ALERTS.md").read_text()

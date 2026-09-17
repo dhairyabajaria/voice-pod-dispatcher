@@ -190,7 +190,7 @@ class Proof(object):
         rec = {"status": status, "route": "box", "proof_id": pid, "sha": cand, "kind": kind,
                "paths": paths, "failed_nodes": counts.get("failed_nodes") or [],
                "errors": counts.get("errors") or {}, "rc": rc, "stderr": (err or "")[-500:],
-               "counts": counts, "ts": utc_ms()}
+               "counts": counts, "log": res.get("log"), "ts": utc_ms()}
         self._write(pid, rec)
         self.log("PROOF %s %s -> %s (box, %d reds)" % (task, pid, status, len(rec["failed_nodes"])))
         return rec

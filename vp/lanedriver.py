@@ -867,21 +867,86 @@ class LaneDriver(object):
         wt = self.worktree_path(task)
         if wt.exists() and not (wt / ".git").exists():
             raise ControlError("worktree path %s exists but is not a worktree" % wt)
+        if wt.exists():
+            why = self._worktree_stale(wt, base)
+            if why:
+                self._retire_stale_worktree(wt, task, why)
         if not wt.exists():
             rc, _o, _e = self.git(["-C", str(self.trunk), "cat-file", "-e", base + "^{commit}"])
             if rc != 0:
                 raise ControlError("%s base %s is not a commit in trunk" % (task, base[:12]))
             wt.parent.mkdir(parents=True, exist_ok=True)
+            self.git(["-C", str(self.trunk), "worktree", "prune"])
+            branch = "vp/%s" % task
+            self._retire_stale_branch(branch, base, task)
             rc, out, err = self.git(["-C", str(self.trunk), "worktree", "add", str(wt),
-                                     "-b", "vp/%s" % task, base], log=True)
+                                     "-b", branch, base], log=True)
             if rc != 0 and not wt.exists():
-                rc, out, err = self.git(["-C", str(self.trunk), "worktree", "add", str(wt),
-                                         "vp/%s" % task], log=True)
+                # the branch exists and descends from base: an earlier candidate
+                # of this task is resumed on it
+                rc, out, err = self.git(["-C", str(self.trunk), "worktree", "add", str(wt), branch], log=True)
                 if rc != 0:
                     raise ControlError("worktree add failed for %s: %s"
                                        % (task, (err or out).strip()[:300]))
         self.link_deps(wt, task)
         return wt
+
+    def _worktree_stale(self, wt, base):
+        """D15: a worktree is the task's only when it belongs to THIS trunk and
+        its base is an ancestor of HEAD.  TRUNK-04 was built on a leftover
+        worktree of the pre-v13 repo (branch tip 1f9e1236, 195-file diff
+        against the v13 base): ensure_worktree reused any existing path."""
+        rc, common, _ = self.git(["-C", str(wt), "rev-parse", "--git-common-dir"])
+        if rc != 0:
+            return "not a git worktree"
+        try:
+            mine = (Path(common.strip()) if Path(common.strip()).is_absolute()
+                    else (wt / common.strip())).resolve()
+            trunk_git = (self.trunk / ".git").resolve()
+            rc2, tcommon, _ = self.git(["-C", str(self.trunk), "rev-parse", "--git-common-dir"])
+            if rc2 == 0:
+                tc = Path(tcommon.strip())
+                trunk_git = (tc if tc.is_absolute() else (self.trunk / tc)).resolve()
+        except OSError:
+            return "git dir unresolvable"
+        if mine != trunk_git:
+            return "belongs to %s, not the trunk" % mine
+        if base:
+            rc, _o, _e = self.git(["-C", str(wt), "merge-base", "--is-ancestor", base, "HEAD"])
+            if rc != 0:
+                return "base %s is not an ancestor of its HEAD" % base[:12]
+        return None
+
+    def _retire_stale_worktree(self, wt, task, why):
+        stamp = utc_ms().replace(":", "").replace("-", "")[:15]
+        dst = wt.with_name("%s.stale-%s" % (wt.name, stamp))
+        try:
+            os.rename(str(wt), str(dst))
+        except OSError as exc:
+            raise ControlError("stale worktree %s could not be moved aside (%s): %s" % (wt, why, exc))
+        self.git(["-C", str(self.trunk), "worktree", "prune"])
+        _append_jsonl(self.git_jsonl, {"ts": utc_ms(), "op": "stale_worktree", "task": task, "from": str(wt),
+                                       "to": str(dst), "why": why}, self._lock)
+        self.alert("WORKTREE_STALE", "%s: worktree %s (%s) moved to %s; a fresh one is created on the "
+                   "task's base" % (task, wt, why, dst.name), task)
+        self.log("WORKTREE %s stale (%s) -> %s" % (task, why, dst.name))
+
+    def _retire_stale_branch(self, branch, base, task):
+        """a same-named vp/<task> branch whose tip does not descend from base
+        (a pre-v13 candidate) is renamed vp-stale/<task>-<ts>, never deleted."""
+        rc, _o, _e = self.git(["-C", str(self.trunk), "rev-parse", "--verify", "-q", "refs/heads/%s" % branch])
+        if rc != 0:
+            return False
+        rc, _o, _e = self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", base, branch])
+        if rc == 0:
+            return False
+        stamp = utc_ms().replace(":", "").replace("-", "")[:15]
+        old = "vp-stale/%s-%s" % (task, stamp)
+        rc, out, err = self.git(["-C", str(self.trunk), "branch", "-m", branch, old], log=True)
+        if rc != 0:
+            raise ControlError("stale branch %s could not be renamed: %s" % (branch, (err or out)[:200]))
+        self.log("WORKTREE %s stale branch %s -> %s (tip does not descend from %s)" % (task, branch, old, base[:12]))
+        return True
 
     WORKTREE_LINKS = ("platform/.venv", "agent/.venv", "portal/node_modules")
 
@@ -935,18 +1000,89 @@ class LaneDriver(object):
                         % (p["id"], p["owner_gate"], p["owner_gate"]), task)
         return False
 
+    # -- D16: a verified retry/fix retires the rows it supersedes ----------------------------
+    SUPERSEDE_RE = re.compile(r"^(?P<root>.+?)-(?:R(?P<r>\d+)|FIX-(?P<f>\d+))$")
+    RETIRABLE = ("PLANNED", "WAITING_DEPENDENCY", "READY", "REPAIR_REQUIRED", "BLOCKED", "INVALID_EVIDENCE")
+
+    @classmethod
+    def superseded_by(cls, task, tasks):
+        """rows that a VERIFIED `task` = <ID>-R<n> / <ID>-FIX-<n> supersedes:
+        <ID> itself, every <ID>-R<m> with m < n (for -FIX-<n>: every -R<m> and
+        every -FIX-<m> with m < n) that exists and sits in a retirable state.
+        RUNNING/CLAIMED rows are left alone (F8), accepted ones are not rows to
+        retire."""
+        m = cls.SUPERSEDE_RE.match(task)
+        if not m:
+            return []
+        root = m.group("root")
+        n = int(m.group("r") or m.group("f"))
+        is_fix = m.group("f") is not None
+        out = []
+        for t, row in tasks.items():
+            if t == task or not t.startswith(root):
+                continue
+            if t == root:
+                pass
+            else:
+                mm = cls.SUPERSEDE_RE.match(t)
+                if not mm or mm.group("root") != root:
+                    continue
+                k = int(mm.group("r") or mm.group("f"))
+                if mm.group("f") is not None:
+                    if not is_fix or k >= n:
+                        continue
+                elif not is_fix and k >= n:
+                    continue
+            if (row or {}).get("state") in cls.RETIRABLE:
+                out.append(t)
+        return sorted(out)
+
+    def _supersede(self, task, tasks=None):
+        """retire what `task` supersedes via the scheduler's `retire` (closer =
+        task, reason SUPERSEDED_BY:<task>).  Returns the retired ids."""
+        tasks = tasks if tasks is not None else ((self.control.state_view() or {}).get("tasks") or {})
+        done = []
+        for target in self.superseded_by(task, tasks):
+            try:
+                self.control.call("retire", ["--task", target, "--closer", task, "--reason",
+                                             "SUPERSEDED_BY:%s" % task])
+                done.append(target)
+            except ControlError as exc:
+                self.alert_once("supersede:%s:%s" % (task, target), "SUPERSEDE_REFUSED",
+                                "%s: retire of superseded %s refused: %s" % (task, target, str(exc)[:200]), task)
+        if done:
+            self.log("SUPERSEDED by %s: %s retired" % (task, ",".join(done)))
+            _append_jsonl(self.run_root / "packets" / "closures.jsonl",
+                          {"ts": utc_ms(), "op": "supersede", "task": task, "retired": done}, self._lock)
+        return done
+
+    def _supersede_sweep(self, state):
+        """idempotent: every accepted <ID>-R<n>/<ID>-FIX-<n> row retires the
+        rows it supersedes (covers verdicts reached before D16 existed, e.g.
+        WA-04-DP12R-DP17R-DP18R whose -R2 was VERIFIED)."""
+        tasks = (state or {}).get("tasks") or {}
+        retired = []
+        for t, row in sorted(tasks.items()):
+            if (row or {}).get("state") in vppack.ACCEPTED and self.SUPERSEDE_RE.match(t) \
+                    and self.superseded_by(t, tasks):
+                retired += self._supersede(t, tasks)
+        return retired
+
     def _pack_step(self):
-        if not self.pack:
-            return
         every = float(self.alerts_cfg.get("pack_every_s", 300))
         last = self._pack_last_mono
         if last is not None and time.monotonic() - last < every:
             return
         self._pack_last_mono = time.monotonic()
+        if self.pack:
+            try:
+                self._pack_reconcile()
+            except Exception as exc:  # noqa: BLE001 -- never take the tick down
+                self.log("PACK reconcile failed: %s: %s" % (type(exc).__name__, exc))
         try:
-            self._pack_reconcile()
-        except Exception as exc:  # noqa: BLE001 -- never take the tick down
-            self.log("PACK reconcile failed: %s: %s" % (type(exc).__name__, exc))
+            self._supersede_sweep(self.control.state_view())
+        except Exception as exc:  # noqa: BLE001
+            self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
 
     def _pack_record(self, packet, rec):
         d = self.run_root / "packets"
@@ -2268,6 +2404,7 @@ class LaneDriver(object):
                     self._pack_record_review(task, verdict, kind)
                 if self.packet_for(task):
                     self._pack_closure(task, harvest, wt or (self.worktrees_root / task))
+                self._supersede(task)
             except Exception as exc:  # noqa: BLE001 -- closure never undoes a completion
                 self.alert("CLOSURE_FAILED", "%s: %s: %s" % (task, type(exc).__name__, str(exc)[:200]), task)
         return True
@@ -2308,27 +2445,46 @@ class LaneDriver(object):
                          "evidence": [out_path, tdir / "record.json"]}
 
     def _build_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid):
+        """D14 order per round: build -> autofix -> PROOF -> grade.  The proof
+        runs on the exact head the grader sees and its record + log are copied
+        into <wt>/.vp/proofs/ (the grader's sandbox cannot read RUN_ROOT);
+        red proof nodes are appended to FINDINGS.json as FAIL lines so the next
+        builder round repairs them like any other FAIL.  Before D14 the grade
+        came first: [test] rows were UNKNOWN (no proof yet), the proof ran only
+        on an otherwise-clean grade, and a red proof went straight to
+        REPAIR_REQUIRED without a repair round (5 rows graded with no proof at
+        all, L17-REPLY-WIRING-R2 needed a hand-written FIX packet)."""
         gcfg = self.roles.get("grader") or {}
         grunner = gcfg.get("runner", "opencode")
         max_rounds = int(self.conc.get("max_rounds", 3))
         out_path = wt / ".vp" / "RESULT.json"
         fpath = wt / ".vp" / "FINDINGS.json"
-        outcome, fails = None, []
+        outcome, fails, blocking, owed, prec = None, [], [], [], None
         kind = contract.get("kind") or row.get("kind")
         needs_proof = kind in (self.proof_cfg.get("require_for_kinds") or ["integration"])
         pending = self._proof_pending(tdir)
-        if needs_proof and pending and self.head_sha(wt) == pending.get("sha"):
-            # an earlier attempt built and graded this exact head; only the proof is owed
-            self.log("PROOF %s resumes on %s (build+grade skipped)" % (task, pending["sha"][:12]))
-            return self._proof_step(task, attempt, row, contract, wt, tdir, pending["sha"],
-                                    pending.get("base") or self._base_of(wt))
+        resume_proof = bool(needs_proof and pending and self.head_sha(wt) == pending.get("sha"))
         for rnd in range(1, max_rounds + 1):
-            outcome = self._turn(task, attempt, row, server, runner, rcfg, wt, tdir, "builder",
-                                 BUILDER_PROMPT, out_path, vpschema.validate_result, sid, rnd)
-            if outcome.status != STATUS_DONE:
-                return outcome, None
-            self._note_unrun_checks(task, out_path)
-            self._autofix(wt, task, tdir)
+            if resume_proof:
+                # an earlier attempt built this exact head and its proof died on
+                # infra: the build is not repeated, the proof (then grade) is
+                resume_proof = False
+                self.log("PROOF %s resumes on %s (build skipped)" % (task, pending["sha"][:12]))
+                outcome = vprunners.TurnOutcome(STATUS_DONE, "proof resumed", runner="proof")
+            else:
+                outcome = self._turn(task, attempt, row, server, runner, rcfg, wt, tdir, "builder",
+                                     BUILDER_PROMPT, out_path, vpschema.validate_result, sid, rnd)
+                if outcome.status != STATUS_DONE:
+                    return outcome, None
+                self._note_unrun_checks(task, out_path)
+                self._autofix(wt, task, tdir)
+            head = self.head_sha(wt)
+            prec = None
+            if needs_proof:
+                pout, prec = self._proof_step(task, attempt, row, contract, wt, tdir, head,
+                                              self._base_of(wt), build_outcome=outcome)
+                if prec is None:
+                    return pout, None            # FAIL_INFRA/UNKNOWN: retry the proof alone later
             gserver = self._pick_server(gcfg) if grunner == "opencode" else None
             if grunner == "opencode" and gserver is None:
                 gserver = server
@@ -2341,6 +2497,7 @@ class LaneDriver(object):
                               expect_fence=True)
             if gout.status != STATUS_DONE:
                 return gout, None
+            self._merge_proof_findings(fpath, prec)
             _doc, fails, unknown = findings_verdicts(fpath)
             hosted = self.hosted_rows(wt)
             owed = [u for u in unknown if u in hosted]
@@ -2349,51 +2506,75 @@ class LaneDriver(object):
                 self.alert_once("hosted-owed:%s" % task, "HOSTED_OWED",
                                 "%s: %s graded UNKNOWN on the box as 04-REVIEW-POLICY §2 allows; the "
                                 "<ID>-HOSTED twin owes the CircleCI/VPS evidence" % (task, ",".join(owed)), task)
-            if not fails and not blocking:
-                return self._accept_build(task, attempt, row, contract, wt, tdir, outcome, out_path, fpath,
-                                          needs_proof, owed)
-            if not fails and needs_proof and self.regrade_once and not self._proof_pending(tdir):
-                # only [box] rows the grader could not evaluate without the proof
-                # log remain: run the proof now and re-grade this exact commit once
-                # (review.regrade_same_commit_on_unknown_once)
-                self.log("ROUND %s %d/%d unknown=%s -> proof, then one regrade" % (task, rnd, max_rounds, blocking))
-                head = self.head_sha(wt)
-                pout, harvest = self._proof_step(task, attempt, row, contract, wt, tdir, head,
-                                                 self._base_of(wt), build_outcome=outcome)
-                if harvest is None or harvest.get("outcome") != "VERIFIED":
-                    return pout, harvest          # proof red or infra: as before
+            if not fails and blocking and self.regrade_once:
+                # the proof is on disk and only [box] UNKNOWNs remain: one regrade
+                # of this exact commit (review.regrade_same_commit_on_unknown_once)
+                self.log("ROUND %s %d/%d unknown=%s -> one regrade" % (task, rnd, max_rounds, blocking))
                 gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
                                   JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, rnd + 100,
                                   expect_fence=True)
                 if gout.status != STATUS_DONE:
                     return gout, None
+                self._merge_proof_findings(fpath, prec)
                 _doc, fails, unknown = findings_verdicts(fpath)
                 owed = [u for u in unknown if u in hosted]
                 blocking = [u for u in unknown if u not in hosted]
-                if not fails and not blocking:
-                    harvest["hosted_owed"] = owed
-                    return outcome, harvest
-                self.log("REGRADE %s after proof: fails=%s unknown=%s" % (task, fails, blocking))
+            if not fails and not blocking:
+                return self._accept_build(task, attempt, row, contract, wt, tdir, outcome, out_path, fpath,
+                                          prec, owed)
             self.log("ROUND %s %d/%d fails=%s unknown=%s%s" % (task, rnd, max_rounds, fails, blocking,
                                                              " hosted_owed=%s" % owed if owed else ""))
         head = self.head_sha(wt)
         reason = "%d rounds; FAIL %s" % (max_rounds, ",".join(fails)[:300])
         if not fails and blocking:
             reason = "%d rounds; UNGRADEABLE %s" % (max_rounds, ",".join(blocking)[:300])
+        if prec is not None and prec.get("status") == "FAIL_PRODUCT":
+            reason = "%d rounds; proof %s FAIL_PRODUCT: %s" % (max_rounds, prec.get("proof_id"),
+                                                                ", ".join(prec.get("failed_nodes") or [])[:300])
         return outcome, {"outcome": "REPAIR_REQUIRED", "output_sha": head, "tree_sha": self.tree_sha(wt),
-                         "evidence": [out_path, fpath, tdir / "record.json"],
+                         "evidence": [out_path, fpath, tdir / "record.json"] + self._proof_evidence(prec),
                          "reason": reason, "fails": self._fail_lines(fpath), "hosted_owed": owed}
 
-    def _accept_build(self, task, attempt, row, contract, wt, tdir, outcome, out_path, fpath, needs_proof, owed):
+    def _proof_evidence(self, prec):
+        if not prec:
+            return []
+        return [self.run_root / "proofs" / ("%s.json" % prec.get("proof_id"))]
+
+    @staticmethod
+    def _merge_proof_findings(fpath, prec):
+        """append the proof's red nodes to FINDINGS.json as FAIL lines (id = the
+        node id, evidence = the log copied under .vp/proofs/) and recompute
+        all_pass; the builder's next round sees them as FAIL lines to repair."""
+        if not prec or prec.get("status") != "FAIL_PRODUCT":
+            return False
+        try:
+            doc = json.loads(Path(fpath).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        lines = doc.get("lines") if isinstance(doc, dict) else None
+        if not isinstance(lines, list):
+            return False
+        have = {str(l.get("id")) for l in lines if isinstance(l, dict)}
+        errs = prec.get("errors") or {}
+        log = prec.get("wt_log") or prec.get("log") or ""
+        added = 0
+        for node in prec.get("failed_nodes") or []:
+            if node in have:
+                continue
+            lines.append({"id": node, "kind": "test", "verdict": "FAIL", "evidence": str(log)[:300],
+                          "note": ("proof %s red: %s" % (prec.get("proof_id"), errs.get(node) or
+                                                          "red on %s" % prec.get("route")))[:300]})
+            added += 1
+        if added:
+            doc["all_pass"] = False
+            Path(fpath).write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+        return bool(added)
+
+    def _accept_build(self, task, attempt, row, contract, wt, tdir, outcome, out_path, fpath, prec, owed):
         head = self.head_sha(wt)
-        if needs_proof:
-            pout, harvest = self._proof_step(task, attempt, row, contract, wt, tdir, head,
-                                             self._base_of(wt), build_outcome=outcome)
-            if harvest is not None:
-                harvest["hosted_owed"] = owed
-            return pout, harvest
+        ev = [out_path, fpath, tdir / "record.json"] + self._proof_evidence(prec)
         return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
-                         "evidence": [out_path, fpath, tdir / "record.json"], "hosted_owed": owed}
+                         "evidence": ev, "hosted_owed": owed}
 
     @staticmethod
     def hosted_rows(wt):
@@ -2422,6 +2603,12 @@ class LaneDriver(object):
             return None
 
     def _proof_step(self, task, attempt, row, contract, wt, tdir, cand, base, build_outcome=None):
+        """run the proof on `cand`; returns (outcome, record) for PASS /
+        FAIL_PRODUCT (the caller grades next, the record decides) and
+        (PROOF_<status> outcome, None) for FAIL_INFRA/UNKNOWN/CANCELLED, which
+        keeps proof-pending.json so the retry resumes at the proof.  The record
+        and the pytest log are copied to <wt>/.vp/proofs/<pid>.{json,log} and
+        the record to .vp/PROOF.json: that is what the grader may read."""
         hdr = {}
         try:
             hdr, _ = vplint.parse_front_matter((wt / ".vp" / "PACKET.md").read_text(encoding="utf-8"))
@@ -2434,39 +2621,49 @@ class LaneDriver(object):
         (tdir / "proof-pending.json").write_text(json.dumps(pending, indent=2), encoding="utf-8")
         pid = "proof-%s-%s" % (task, attempt[-15:])
         rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set())
-        ppath = self.run_root / "proofs" / ("%s.json" % pid)
         status = rec.get("status")
-        try:                                      # the regrade reads it from .vp/
-            (wt / ".vp" / "PROOF.json").write_text(json.dumps(rec, indent=2, sort_keys=True, default=str),
-                                                   encoding="utf-8")
-        except OSError:
-            pass
+        self._copy_proof_into_worktree(wt, pid, rec)
         outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")
-        evidence = [wt / ".vp" / "RESULT.json", wt / ".vp" / "FINDINGS.json", tdir / "record.json", ppath]
-        if status == "PASS":
+        if status in ("PASS", "FAIL_PRODUCT"):
             try:
                 (tdir / "proof-pending.json").unlink()
             except OSError:
                 pass
-            return outcome, {"outcome": "VERIFIED", "output_sha": cand, "tree_sha": self.tree_sha(wt),
-                             "evidence": evidence}
-        if status == "FAIL_PRODUCT":
-            try:
-                (tdir / "proof-pending.json").unlink()
-            except OSError:
-                pass
-            nodes = rec.get("failed_nodes") or []
-            errs = rec.get("errors") or {}
-            return outcome, {"outcome": "REPAIR_REQUIRED", "output_sha": cand, "tree_sha": self.tree_sha(wt),
-                             "evidence": evidence,
-                             "reason": "proof %s FAIL_PRODUCT: %s" % (pid, ", ".join(nodes)[:300]),
-                             "fails": [{"id": n, "note": (errs.get(n) or "red on %s" % rec.get("route"))[:300],
-                                        "evidence": n} for n in nodes]}
+            return outcome, rec
         # FAIL_INFRA / UNKNOWN / CANCELLED: not the candidate's fault -- retry the
         # proof alone after the backoff (proof-pending.json keeps the head)
         return vprunners.TurnOutcome("PROOF_" + str(status), "proof %s %s: %s"
                                      % (pid, status, str(rec.get("reason") or "")[:200]),
                                      runner="proof"), None
+
+    PROOF_LOG_CAP = 2 * 1024 * 1024
+
+    def _copy_proof_into_worktree(self, wt, pid, rec):
+        """<wt>/.vp/proofs/<pid>.json + .log (tail-capped) and .vp/PROOF.json.
+        The grader runs in a sandbox rooted at the worktree: RUN_ROOT/proofs is
+        "permission denied" to it, so the evidence must live under .vp/."""
+        pdir = Path(wt) / ".vp" / "proofs"
+        try:
+            pdir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        src = rec.get("log") or (rec.get("counts") or {}).get("log")
+        if src and Path(str(src)).exists():
+            try:
+                data = Path(str(src)).read_bytes()
+                if len(data) > self.PROOF_LOG_CAP:
+                    data = b"[... head truncated by lanedriver ...]\n" + data[-self.PROOF_LOG_CAP:]
+                (pdir / ("%s.log" % pid)).write_bytes(data)
+                rec["wt_log"] = ".vp/proofs/%s.log" % pid
+            except OSError:
+                pass
+        rec["wt_record"] = ".vp/proofs/%s.json" % pid
+        text = json.dumps(rec, indent=2, sort_keys=True, default=str)
+        for dst in (pdir / ("%s.json" % pid), Path(wt) / ".vp" / "PROOF.json"):
+            try:
+                dst.write_text(text, encoding="utf-8")
+            except OSError:
+                pass
 
     @staticmethod
     def _fail_lines(fpath):
@@ -2593,14 +2790,27 @@ class LaneDriver(object):
     def _review_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid, base):
         state = self.control.state_view()
         cand = (state.get("candidate") or {}).get("sha") or base
+        p = self.packet_for(task)
+        rp = self._review_packet_plan(task, row, contract, wt, base, cand, state) if p and p.get("v13_kind") == "review" else None
+        if rp:
+            base = rp["base"]
+            # D17: the reviewer judges the SUBJECT (the target contracts' own
+            # criteria over review_base..candidate), never the packet's benchmark
+            # about the verdict file the driver has yet to write
+            (wt / ".vp" / "BENCHMARK.md").write_text(rp["review_benchmark"], encoding="utf-8")
         req = {"item": task, "subject": "item", "base": base, "candidate": cand,
                "reviewer": rcfg.get("model") or "reviewer",
                "benchmark_ids": self._benchmark_ids(wt), "unverified_ids": []}
+        if rp:
+            req.update({"subject": rp["subject"], "coverage_targets": rp["targets"],
+                        "criteria": rp["criteria"], "packet": p["id"]})
         (wt / ".vp" / "REVIEW_REQUEST.json").write_text(json.dumps(req, indent=2, sort_keys=True),
                                                         encoding="utf-8")
         out_path = wt / ".vp" / "REVIEW.json"
         outcome = self._turn(task, attempt, row, server, runner, rcfg, wt, tdir, "reviewer",
                              REVIEW_PROMPT, out_path, vpschema.validate_review, sid, 1)
+        if rp:
+            (wt / ".vp" / "BENCHMARK.md").write_text(rp["packet_benchmark"], encoding="utf-8")
         if outcome.status != STATUS_DONE:
             return outcome, None
         try:
@@ -2609,7 +2819,11 @@ class LaneDriver(object):
             doc = {}
         verdict = doc.get("verdict")
         if verdict == "APPROVE":
-            packet = self._verdict_packet(task, row, contract, state, outcome, out_path, tdir, doc)
+            packet = self._verdict_packet(task, row, contract, state, outcome, out_path, tdir, doc,
+                                          targets=(rp or {}).get("targets"), criteria=(rp or {}).get("criteria"))
+            if rp:
+                return self._review_packet_finish(task, attempt, row, contract, server, wt, tdir, outcome,
+                                                  packet, rp, cand)
             return outcome, {"outcome": "VERIFIED", "output_sha": cand, "tree_sha": self.tree_sha(wt),
                              "evidence": [out_path, tdir / "record.json"], "verdict": packet}
         fails = [{"id": str(f.get("id")), "note": str(f.get("title") or "")[:300],
@@ -2618,9 +2832,163 @@ class LaneDriver(object):
                          "reason": "review %s: %s" % (verdict, str(doc.get("summary") or "")[:300]),
                          "fails": fails}
 
-    def _verdict_packet(self, task, row, contract, state, outcome, out_path, tdir, doc):
+    # -- D17: v13 review packets ------------------------------------------------------------
+
+    def _review_packet_plan(self, task, row, contract, wt, base, cand, state):
+        """what a `v13_kind: review` packet asks the driver to review.  Header
+        keys (optional): `review_base` (the subject's base sha; default the
+        row base -- for SEC-REVIEW-S3 the s3 delta d18363e5..5deac821, not an
+        empty base==candidate diff) and `coverage_targets` (contracts whose
+        criteria the verdict packet must cover; default the parent contract).
+        The reviewer's benchmark is those criteria, one row each."""
+        hdr = {}
+        try:
+            hdr, _ = vplint.parse_front_matter((wt / ".vp" / "PACKET.md").read_text(encoding="utf-8"))
+            hdr = hdr or {}
+        except (OSError, ValueError):
+            pass
+        rbase = str(hdr.get("review_base") or "").strip() or base
+        if rbase != base:
+            rc, _o, _e = self.git(["-C", str(wt), "cat-file", "-e", rbase + "^{commit}"])
+            if rc != 0:
+                self.alert_once("review-base:%s" % task, "REVIEW_BASE_UNKNOWN",
+                                "%s: review_base %s is not a commit; reviewing from the row base %s"
+                                % (task, rbase[:12], base[:12]), task)
+                rbase = base
+        target = (row.get("parameters") or {}).get("parent_contract_id") or task
+        targets = [str(t) for t in (hdr.get("coverage_targets") or [])] or [target]
+        if target not in targets:
+            targets.insert(0, target)
+        criteria = {}
+        for t in targets:
+            tcon = self.control.contract(t, ((state.get("tasks") or {}).get(t) or {}))
+            criteria[t] = list(dict.fromkeys((tcon.get("verification") or []) + (tcon.get("acceptance") or [])))
+        lines, n = [], 0
+        for t in targets:
+            for c in criteria[t]:
+                n += 1
+                lines.append("- B%d [invariant] [box] %s: %s — check: `git diff %s..%s` and the files it touches\n"
+                             % (n, t, c.replace("\n", " "), rbase[:12], cand[:12]))
+        if not lines:
+            lines.append("- B1 [invariant] [box] %s: the candidate is sound over %s..%s — check: the diff\n"
+                         % (target, rbase[:12], cand[:12]))
+        try:
+            packet_benchmark = (wt / ".vp" / "BENCHMARK.md").read_text(encoding="utf-8")
+        except OSError:
+            packet_benchmark = ""
+        head = "# Review subject: %s..%s (%s)\n" % (rbase[:12], cand[:12], ", ".join(targets))
+        return {"base": rbase, "targets": targets, "criteria": criteria, "subject": "union" if "union" in
+                str((row.get("parameters") or {}).get("diff_or_scope") or "") else "item",
+                "review_benchmark": head + "".join(lines), "packet_benchmark": packet_benchmark}
+
+    def _verdict_owned_path(self, task, p, row):
+        """the packet's verdict-packet.json under owned_files, with <union>
+        resolved the way the dispatch record resolves it."""
+        owned = []
+        try:
+            disp = json.loads((self.worktrees_root / task / ".vp" / "DISPATCH.json").read_text(encoding="utf-8"))
+            owned = list(disp.get("owned_files") or [])
+        except (OSError, ValueError):
+            owned = list((row.get("parameters") or {}).get("owned_paths") or p.get("owned_files") or [])
+        for f in owned:
+            if f.endswith("verdict-packet.json") and "<" not in f:
+                return f
+        return "control/evidence/%s/v13/verdict-packet.json" % p["id"]
+
+    def _review_packet_finish(self, task, attempt, row, contract, server, wt, tdir, outcome, packet, rp, cand):
+        """after APPROVE: validate the verdict packet with review_gate (the
+        packet's Step: a refusal is recorded, never relabelled), copy it to the
+        packet's owned path and commit, then grade the packet's OWN benchmark
+        with the grader as for any build; VERIFIED carries the verdict."""
+        p = self.packet_for(task)
+        state = self.control.state_view()
+        gate_ok, gate_msg = self._review_gate_check(packet, state, row, task, contract)
+        rel = self._verdict_owned_path(task, p, row)
+        dst = wt / rel
+        if not gate_ok:
+            # the packet's own Step: a refusal is recorded in RESULT.json
+            # `blocked`, nothing is committed, the verdict is never relabelled.
+            # INVALID_EVIDENCE (not REPAIR_REQUIRED): the gate refused the
+            # session linkage/rollout, not the review's substance, and only an
+            # INVALID_EVIDENCE/CANCELLED review admits a retry under the same
+            # review key
+            head = self.head_sha(wt)
+            self._write_review_result(wt, task, attempt, head, self._base_of(wt), packet, False, gate_msg, rp)
+            self.log("REVIEW %s APPROVE but review_gate refused: %s" % (task, gate_msg[:200]))
+            return outcome, {"outcome": "INVALID_EVIDENCE", "output_sha": head, "tree_sha": self.tree_sha(wt),
+                             "evidence": [wt / ".vp" / "REVIEW.json", wt / ".vp" / "RESULT.json",
+                                          tdir / "record.json", packet],
+                             "reason": "review_gate refused the verdict packet: %s" % gate_msg[:300],
+                             "fails": [{"id": "review_gate", "note": gate_msg[:300], "evidence": rel}]}
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(packet), str(dst))
+            gate = {"validated": gate_ok, "message": gate_msg, "packet": str(packet), "ts": utc_ms()}
+            (dst.parent / "review-gate.json").write_text(json.dumps(gate, indent=2, sort_keys=True), encoding="utf-8")
+            self.git(["-C", str(wt), "add", "--", rel, str(dst.parent / "review-gate.json")], log=True)
+            self.git(["-C", str(wt), "-c", "user.email=lanedriver@vp", "-c", "user.name=lanedriver",
+                      "commit", "-q", "-m", "%s: v13 %s verdict packet" % (p["id"], contract.get("kind"))], log=True)
+        except OSError as exc:
+            self.log("REVIEW %s verdict copy failed: %s" % (task, exc))
+        head = self.head_sha(wt)
+        self._write_review_result(wt, task, attempt, head, self._base_of(wt), packet, gate_ok, gate_msg, rp)
+        gcfg = self.roles.get("grader") or {}
+        grunner = gcfg.get("runner", "opencode")
+        gserver = self._pick_server(gcfg) if grunner == "opencode" else None
+        if grunner == "opencode" and gserver is None:
+            gserver = server
+        fpath = wt / ".vp" / "FINDINGS.json"
+        gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
+                          JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, 1, expect_fence=True)
+        if gout.status != STATUS_DONE:
+            return gout, None
+        _doc, fails, unknown = findings_verdicts(fpath)
+        hosted = self.hosted_rows(wt)
+        blocking = [u for u in unknown if u not in hosted]
+        ev = [wt / ".vp" / "REVIEW.json", wt / ".vp" / "RESULT.json", fpath, tdir / "record.json", packet]
+        if fails or blocking:
+            return outcome, {"outcome": "REPAIR_REQUIRED", "output_sha": head, "tree_sha": self.tree_sha(wt),
+                             "evidence": ev, "reason": "verdict written; packet benchmark FAIL %s UNKNOWN %s"
+                             % (",".join(fails)[:200], ",".join(blocking)[:100]), "fails": self._fail_lines(fpath)}
+        return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
+                         "evidence": ev, "verdict": packet, "hosted_owed": [u for u in unknown if u in hosted]}
+
+    def _review_gate_check(self, packet, state, row, task, contract):
+        """review_gate.validate from the scheduler's directory, in-process
+        (read-only): (ok, message).  Missing module -> (False, why)."""
+        ctl = self.roster.get("control") or {}
+        cwd = ctl.get("cwd") or (str(Path(ctl["script"]).parent) if ctl.get("script") else None)
+        if not cwd or not (Path(cwd) / "review_gate.py").exists():
+            return False, "review_gate.py not found beside the scheduler"
+        role = {"final_review": "final_review"}.get(contract.get("kind"), contract.get("kind"))
+        target = (row.get("parameters") or {}).get("parent_contract_id") or task
+        try:
+            spec = importlib.util.spec_from_file_location("vp_review_gate", str(Path(cwd) / "review_gate.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            rec = mod.validate(str(packet), state, self.control.catalog(), target, role)
+            return True, "PASS: %s" % json.dumps(rec, default=str)[:200]
+        except Exception as exc:  # noqa: BLE001 -- the gate's refusal is the message
+            return False, "%s: %s" % (type(exc).__name__, str(exc)[:300])
+
+    def _write_review_result(self, wt, task, attempt, head, base, packet, gate_ok, gate_msg, rp):
+        doc = {"item": task, "attempt": attempt, "commit": head, "base": base,
+               "diff_stat": {"files": 2, "insertions": 0, "deletions": 0},
+               "checks": [{"name": "review_gate.validate", "command": "review_gate.validate(<packet>)",
+                           "exit": 0 if gate_ok else 1, "log": gate_msg[:400]}],
+               "disputes": [], "blocked": None if gate_ok else gate_msg[:300],
+               "notes": "D17 review packet: verdict %s; subject %s..; targets %s"
+                        % (Path(packet).name, rp["base"][:12], ",".join(rp["targets"]))}
+        try:
+            (wt / ".vp" / "RESULT.json").write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _verdict_packet(self, task, row, contract, state, outcome, out_path, tdir, doc, targets=None, criteria=None):
         """review_gate packet from the review record; the scheduler validates it
-        (runtime log under ~/.codex/sessions, reviewer == the task's child_id)."""
+        (runtime log under ~/.codex/sessions, reviewer == the task's child_id).
+        `targets`/`criteria` (D17) widen the coverage map to every contract the
+        packet names (SEC-REVIEW-S3 + L29 + L30)."""
         role = contract.get("kind")
         role = {"final_review": "final_review"}.get(role, role)
         cand = state.get("candidate") or {}
@@ -2628,6 +2996,9 @@ class LaneDriver(object):
         tcon = self.control.contract(target)
         trow = (state.get("tasks") or {}).get(target) or {}
         crit = list(dict.fromkeys((tcon.get("verification") or []) + (tcon.get("acceptance") or [])))
+        coverage = {target: {c: "PASS" for c in crit}}
+        for t in (targets or []):
+            coverage.setdefault(t, {c: "PASS" for c in (criteria or {}).get(t) or []})
         runtime = self._codex_rollout(outcome.session_id)
         authors = [a for a in (trow.get("child_id"), "lanedriver:%d" % os.getpid())
                    if a and a != outcome.session_id]
@@ -2639,7 +3010,7 @@ class LaneDriver(object):
                   "runtime_log": {"path": str(runtime) if runtime else "",
                                   "sha256": sha256_file(runtime) if runtime else ""},
                   "artifacts": [{"path": str(out_path), "sha256": sha256_file(out_path)}],
-                  "coverage": {target: {c: "PASS" for c in crit}},
+                  "coverage": coverage,
                   "model_seen": outcome.model_seen, "summary": doc.get("summary")}
         p = tdir / "verdict-packet.json"
         p.write_text(json.dumps(packet, indent=2, sort_keys=True), encoding="utf-8")

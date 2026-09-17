@@ -237,6 +237,18 @@ def settle(drv, ticks=1):
         drv.join(timeout=60)
 
 
+def wait_state(env, task, state, timeout=20.0):
+    """poll until `task` is in `state` (a loaded box takes >0.5 s from claim to
+    RUNNING: every control call is a python subprocess); returns the row."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row = env.rows().get(task) or {}
+        if row.get("state") == state:
+            return row
+        time.sleep(0.1)
+    raise AssertionError("%s never reached %s (last %s)" % (task, state, row.get("state")))
+
+
 # -- tests --------------------------------------------------------------------------
 
 def test_l00_verified_unlocks_l01_l04_and_all_complete(tmp_path):
@@ -607,8 +619,7 @@ def test_f9_restart_is_drain_then_active_zero_then_stop(tmp_path):
     drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, interval=0.2)
     th = threading.Thread(target=drv.loop, daemon=True)
     th.start()
-    time.sleep(0.5)                               # L00 claimed and running
-    assert env.rows()["L00"]["state"] == "RUNNING"
+    wait_state(env, "L00", "RUNNING")             # L00 claimed and running (the fake turn holds 1.5 s)
     ctl = env.driver({}, interval=0.2)            # the control-surface instance (no runners)
     rc = lanedriver.cmd_restart(ctl, Args(timeout=1, poll=0.1, interval=0.2, force=False,
                                           no_start=True, fake_runners=False))
@@ -633,7 +644,7 @@ def test_f9_restart_aborts_when_turns_do_not_finish(tmp_path):
                       "claude": FakeRunner()}, interval=0.2)
     th = threading.Thread(target=drv.loop, daemon=True)
     th.start()
-    time.sleep(0.5)
+    wait_state(env, "L00", "RUNNING")
     ctl = env.driver({}, interval=0.2)
     rc = lanedriver.cmd_restart(ctl, Args(timeout=0.01, poll=0.1, interval=0.2, force=False,
                                           no_start=True, fake_runners=False))
@@ -833,17 +844,30 @@ def routed_pass(spec, ab):
 
 
 def test_proof_pass_verifies_and_fail_product_is_repair_required(tmp_path):
+    """D14: the proof runs before the grade in every round; its red nodes land
+    in FINDINGS.json as FAIL lines for the next builder round; still red after
+    max_rounds -> REPAIR_REQUIRED with the node ids as fails."""
     env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
     env.activate()
-    proof = FakeProof([{"status": "FAIL_PRODUCT", "failed_nodes": ["platform/tests/test_a.py::test_x"],
-                        "errors": {"platform/tests/test_a.py::test_x": "AssertionError: 1 != 2"}}])
-    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(),
-                      "claude": FakeRunner()}, proof=proof)
+    red = {"status": "FAIL_PRODUCT", "failed_nodes": ["platform/tests/test_a.py::test_x"],
+           "errors": {"platform/tests/test_a.py::test_x": "AssertionError: 1 != 2"}}
+    proof = FakeProof([red, red])                 # Env max_rounds == 2
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
     settle(drv, 2)
     rows = env.rows()
     assert rows["L02"]["state"] == "REPAIR_REQUIRED" and "FAIL_PRODUCT" in rows["L02"]["blocker"]
     assert rows["L01"]["state"] == "VERIFIED", "design kind needs no proof"
-    assert len(proof.calls) == 1 and proof.calls[0][0] == "L02" and proof.calls[0][3] == "platform"
+    assert len(proof.calls) == 2 and proof.calls[0][0] == "L02" and proof.calls[0][3] == "platform"
+    l02 = [s for s in oc.calls if s.item == "L02"]
+    assert len([s for s in l02 if s.role == "builder"]) == 2, "a red proof is a FAIL line the builder repairs"
+    assert len([s for s in l02 if s.role == "grader"]) == 2, "graded once per round, after the proof"
+    wt = env.tmp / "wt" / "L02"
+    findings = json.loads((wt / ".vp" / "FINDINGS.json").read_text())
+    proof_lines = [l for l in findings["lines"] if l["id"] == "platform/tests/test_a.py::test_x"]
+    assert proof_lines and proof_lines[0]["verdict"] == "FAIL" and "1 != 2" in proof_lines[0]["note"]
+    assert (wt / ".vp" / "PROOF.json").exists()
+    assert list((wt / ".vp" / "proofs").glob("proof-L02-*.json")), "record copied under .vp/proofs/"
     harvest = json.loads(next((env.run_root / "turns" / "L02").glob("*/harvest.json")).read_text())
     assert harvest["fails"][0]["id"] == "platform/tests/test_a.py::test_x"
     assert "1 != 2" in harvest["fails"][0]["note"]
@@ -851,6 +875,23 @@ def test_proof_pass_verifies_and_fail_product_is_repair_required(tmp_path):
     drv.tick()
     rep = [t for t in env.rows() if t.startswith("R-L02")]
     assert rep and env.rows()[rep[0]]["parameters"]["defect_id"] == "platform-tests-test_a.py::test_x"
+
+
+def test_proof_red_once_is_repaired_in_the_next_round(tmp_path):
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
+    env.activate()
+    proof = FakeProof([{"status": "FAIL_PRODUCT", "failed_nodes": ["platform/tests/test_a.py::test_x"],
+                        "errors": {"platform/tests/test_a.py::test_x": "boom"}}, {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    assert len(proof.calls) == 2, "round 1 red, round 2 green"
+    l02 = [s for s in oc.calls if s.item == "L02"]
+    assert len([s for s in l02 if s.role == "builder"]) == 2 and len([s for s in l02 if s.role == "grader"]) == 2
+    log = (env.run_root / "driver.log").read_text()
+    assert "fails=['platform/tests/test_a.py::test_x']" in log
 
 
 def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypatch):
@@ -863,17 +904,18 @@ def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypat
     settle(drv, 2)
     rows = env.rows()
     assert rows["L02"]["state"] == "RUNNING", "infra-unknown proof leaves the attempt for retry"
-    builds = len([s for s in oc.calls if s.item == "L02"])
-    assert builds == 2, "one builder + one grader turn so far"
+    turns = [s for s in oc.calls if s.item == "L02"]
+    assert [s.role for s in turns] == ["builder"], "D14: the proof runs before the grade; no grade yet"
     tdir = next((env.run_root / "turns" / "L02").iterdir())
-    assert json.loads((tdir / "proof-pending.json").read_text())["sha"] == rows["L02"]["output_sha"] or True
-    settle(drv)                                   # adopt: proof only, no rebuild
+    assert (tdir / "proof-pending.json").exists()
+    settle(drv)                                   # adopt: proof then grade, no rebuild
     rows = env.rows()
     assert rows["L02"]["state"] == "VERIFIED"
-    assert len([s for s in oc.calls if s.item == "L02"]) == builds, "build+grade were not repeated"
+    assert [s.role for s in oc.calls if s.item == "L02"] == ["builder", "grader"], "build not repeated"
     assert len(proof.calls) == 2 and proof.calls[0][2] == proof.calls[1][2]
     assert not (tdir / "proof-pending.json").exists()
     assert "PROOF_UNKNOWN" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "build skipped" in (env.run_root / "driver.log").read_text()
 
 
 # -- D11: [hosted] rows never block; [box] UNKNOWNs -> proof, then one regrade --------------------
@@ -923,26 +965,34 @@ def test_d11_hosted_unknown_never_blocks_and_is_recorded_as_owed(tmp_path, monke
     assert len([s for s in runner.calls if s.item == "L02" and s.role == "builder"]) == 1
 
 
-def test_d11_box_unknown_runs_the_proof_then_regrades_the_same_commit_once(tmp_path, monkeypatch):
+def test_d11_box_unknown_regrades_the_same_commit_once_with_the_proof_on_disk(tmp_path, monkeypatch):
     _with_hosted_row(monkeypatch)
     env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
     env.activate()
     proof = FakeProof([{"status": "PASS"}])
-    runner = by_role({"builder": result_ok, "grader": grader_unknown_on({"B1", "B9"}, until_proof=True),
-                      "probe": result_ok})
+    seen = []
+
+    def grader(spec, ab):
+        # D14: the proof precedes the first grade, so PROOF.json is already
+        # there; the first grade still says UNKNOWN on B1 (a flaky grader), the
+        # regrade of the same commit passes it
+        seen.append((Path(spec.cwd) / ".vp" / "PROOF.json").exists())
+        ids = {"B1", "B9"} if len(seen) == 1 else {"B9"}
+        return grader_unknown_on(ids)(spec, ab)
+    runner = by_role({"builder": result_ok, "grader": grader, "probe": result_ok})
     drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
     settle(drv, 2)
     rows = env.rows()
     assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
-    assert len(proof.calls) == 1, "proof ran once, on the graded head"
+    assert len(proof.calls) == 1, "proof ran once, before the grade"
+    assert seen == [True, True], "both grader turns saw .vp/PROOF.json"
     calls = [s for s in runner.calls if s.item == "L02"]
     assert len([s for s in calls if s.role == "builder"]) == 1, "no rebuild: same commit regraded"
-    assert len([s for s in calls if s.role == "grader"]) == 2, "grade, proof, regrade"
-    assert (env.tmp / "wt" / "L02" / ".vp" / "PROOF.json").exists()
+    assert len([s for s in calls if s.role == "grader"]) == 2, "grade, regrade"
     harvest = json.loads(next((env.run_root / "turns" / "L02").glob("*/harvest.json")).read_text())
     assert harvest["hosted_owed"] == ["B9"]
     log = (env.run_root / "driver.log").read_text()
-    assert "-> proof, then one regrade" in log
+    assert "-> one regrade" in log
 
 
 def test_d11_box_unknown_without_a_proof_is_ungradeable_after_the_rounds(tmp_path):
@@ -953,6 +1003,71 @@ def test_d11_box_unknown_without_a_proof_is_ungradeable_after_the_rounds(tmp_pat
     settle(drv, 2)
     rows = env.rows()
     assert rows["L02"]["state"] == "REPAIR_REQUIRED" and "UNGRADEABLE B1" in rows["L02"]["blocker"]
+
+
+# -- D15: stale worktrees / branches never carry a candidate ------------------------------------
+
+def test_stale_foreign_worktree_is_moved_aside_and_rebuilt_on_the_base(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    other = env.tmp / "other-repo"                # the pre-v13 repo TRUNK-04 came from
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    git(other, "config", "user.email", "t@t")
+    git(other, "config", "user.name", "t")
+    (other / "old.txt").write_text("old\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-q", "-m", "old world")
+    wt = env.tmp / "wt" / "L02"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    git(other, "worktree", "add", "-q", str(wt), "-b", "vp/L02")
+    (wt / ".vp").mkdir()
+    (wt / ".vp" / "BASE").write_text(env.base)
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    common = git(wt, "rev-parse", "--git-common-dir")
+    assert Path(common).resolve() == (env.trunk / ".git").resolve(), "fresh worktree belongs to the trunk"
+    assert git(wt, "merge-base", "--is-ancestor", env.base, "HEAD") == ""
+    stale = [p for p in wt.parent.iterdir() if p.name.startswith("L02.stale-")]
+    assert len(stale) == 1 and (stale[0] / "old.txt").exists(), "the old worktree is kept aside, not deleted"
+    assert "WORKTREE_STALE" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    log = (env.run_root / "driver.log").read_text()
+    assert "WORKTREE L02 stale (belongs to" in log
+
+
+def test_stale_same_named_branch_is_renamed_not_reused(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    # a vp/L02 branch whose tip does not descend from the base: an orphan root
+    git(env.trunk, "checkout", "-q", "--orphan", "vp/L02")
+    (env.trunk / "stale.txt").write_text("stale\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "pre-v13 candidate")
+    git(env.trunk, "checkout", "-q", "successor/s3")
+    (env.trunk / "stale.txt").unlink(missing_ok=True)
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    wt = env.tmp / "wt" / "L02"
+    assert git(wt, "merge-base", "--is-ancestor", env.base, "HEAD") == ""
+    assert not (wt / "stale.txt").exists()
+    branches = git(env.trunk, "branch", "--list", "vp-stale/L02-*")
+    assert "vp-stale/L02-" in branches, "the old branch is renamed, never deleted"
+    assert "stale branch vp/L02 -> vp-stale/L02-" in (env.run_root / "driver.log").read_text()
+
+
+def test_worktree_on_its_own_base_is_reused(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 2)
+    wt = env.tmp / "wt" / "L02"
+    assert env.rows()["L02"]["state"] == "VERIFIED"
+    assert drv._worktree_stale(wt, env.base) is None
+    assert not [p for p in wt.parent.iterdir() if ".stale-" in p.name]
 
 
 # -- item 6: deterministic fixers after every builder turn ----------------------------------------
