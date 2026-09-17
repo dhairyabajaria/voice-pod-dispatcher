@@ -50,3 +50,23 @@ def test_check_exit_digit_string_coerces_but_words_and_bools_do_not():
 def test_schema_doc_tells_the_model_null_is_allowed():
     ex = vpschema.RESULT_SCHEMA_DOC["properties"]["checks"]["items"]["properties"]["exit"]
     assert ex["type"] == ["integer", "null"] and "NOT EXECUTED" in ex["$comment"]
+
+
+def test_diff_stat_files_accepts_a_count_a_path_list_or_a_digit_string():
+    r = _result()
+    assert vpschema.validate_result_obj(r)[0] and vpschema.diff_stat_files(r) == 1
+    r["diff_stat"]["files"] = ["TECHNICAL.md", "README.md"]
+    ok, errs = vpschema.validate_result_obj(r)
+    assert ok, errs
+    assert vpschema.diff_stat_files(r) == 2
+    r["diff_stat"]["files"] = "3"
+    assert vpschema.validate_result_obj(r)[0] and vpschema.diff_stat_files(r) == 3
+    r["diff_stat"]["files"] = [1, 2]
+    ok, errs = vpschema.validate_result_obj(r)
+    assert not ok and any("diff_stat.files" in e for e in errs), errs
+    r["diff_stat"]["files"] = -1
+    assert not vpschema.validate_result_obj(r)[0]
+    r["diff_stat"]["files"] = 1
+    r["diff_stat"]["insertions"] = ["a.py"]
+    ok, errs = vpschema.validate_result_obj(r)
+    assert not ok and any("diff_stat.insertions" in e for e in errs), errs

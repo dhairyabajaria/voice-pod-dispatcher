@@ -59,7 +59,14 @@ RESULT_SCHEMA_DOC = {
         "commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
         "base": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
         "diff_stat": {"type": "object",
-                      "required": ["files", "insertions", "deletions"]},
+                      "required": ["files", "insertions", "deletions"],
+                      "$comment": "the three numbers of `git diff --shortstat <base>..<commit>`",
+                      "properties": {
+                          "files": {"type": "integer",
+                                    "$comment": "COUNT of changed files (an array of their "
+                                                "paths is tolerated and counted)"},
+                          "insertions": {"type": "integer"},
+                          "deletions": {"type": "integer"}}},
         "checks": {"type": "array", "items": {
             "type": "object",
             "required": ["name", "command", "exit", "log"],
@@ -226,8 +233,13 @@ def validate_result_obj(obj):
         else:
             for key in ("files", "insertions", "deletions"):
                 present, val = _req(ds, key, "diff_stat", errors)
-                if present:
-                    _want_int(val, "diff_stat.%s" % key, errors, minimum=0)
+                if not present:
+                    continue
+                if key == "files" and isinstance(val, list) and all(isinstance(x, str) for x in val):
+                    continue          # the changed paths: a count by another name (diff_stat_files())
+                if isinstance(val, str) and val.strip().isdigit():
+                    continue          # "3": coerced like `attempt`
+                _want_int(val, "diff_stat.%s" % key, errors, minimum=0)
 
     ok, checks = _req(obj, "checks", "", errors)
     if ok:
@@ -276,6 +288,16 @@ def validate_result_obj(obj):
         _want_str(notes, "notes", errors, allow_empty=True)
 
     return (not errors), errors
+
+
+def diff_stat_files(obj):
+    """diff_stat.files as an int whatever valid form the builder used"""
+    val = ((obj or {}).get("diff_stat") or {}).get("files")
+    if isinstance(val, list):
+        return len(val)
+    if isinstance(val, str) and val.strip().isdigit():
+        return int(val)
+    return val
 
 
 def validate_result(path):
