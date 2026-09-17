@@ -2020,12 +2020,30 @@ class LaneDriver(object):
 
     # -- pipelines ----------------------------------------------------------------------
 
+    def _note_unrun_checks(self, task, out_path):
+        """checks[].exit == null is an honest NOT EXECUTED (the builder profile
+        denies pytest/psql/...); the turn stands, the proof is the gate, but
+        the owner should know the packet mandates a command the sandbox denies."""
+        try:
+            checks = json.loads(Path(out_path).read_text(encoding="utf-8")).get("checks") or []
+        except (OSError, ValueError, AttributeError):
+            return []
+        unrun = [c for c in checks if isinstance(c, dict) and c.get("exit") is None]
+        if unrun:
+            self.alert_once("check-not-run:%s" % task, "CHECK_NOT_RUN",
+                            "%s: %d check(s) not executed in the sandbox: %s -- proof is the gate; "
+                            "if the packet mandates them, the vp-builder profile denies them"
+                            % (task, len(unrun), "; ".join("%s (%s)" % (c.get("name"), (c.get("command") or "")[:80])
+                                                            for c in unrun)[:400]), task)
+        return unrun
+
     def _single_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid, role):
         out_path = wt / ".vp" / "RESULT.json"
         outcome = self._turn(task, attempt, row, server, runner, rcfg, wt, tdir, role, PROBE_PROMPT,
                              out_path, vpschema.validate_result, sid, 1)
         if outcome.status != STATUS_DONE:
             return outcome, None
+        self._note_unrun_checks(task, out_path)
         head = self.head_sha(wt)
         return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                          "evidence": [out_path, tdir / "record.json"]}
@@ -2050,6 +2068,7 @@ class LaneDriver(object):
                                  BUILDER_PROMPT, out_path, vpschema.validate_result, sid, rnd)
             if outcome.status != STATUS_DONE:
                 return outcome, None
+            self._note_unrun_checks(task, out_path)
             self._autofix(wt, task, tdir)
             gserver = self._pick_server(gcfg) if grunner == "opencode" else None
             if grunner == "opencode" and gserver is None:

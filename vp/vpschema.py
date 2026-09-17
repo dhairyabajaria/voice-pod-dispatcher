@@ -62,7 +62,12 @@ RESULT_SCHEMA_DOC = {
                       "required": ["files", "insertions", "deletions"]},
         "checks": {"type": "array", "items": {
             "type": "object",
-            "required": ["name", "command", "exit", "log"]}},
+            "required": ["name", "command", "exit", "log"],
+            "properties": {
+                "exit": {"type": ["integer", "null"],
+                         "$comment": "null = NOT EXECUTED here (e.g. the sandbox denies "
+                                     "the command); then `log` must say why. Never "
+                                     "fabricate an exit code."}}}},
         "disputes": {"type": "array", "items": {
             "type": "object", "required": ["line", "reason"]}},
         "blocked": {"type": ["null", "string"]},
@@ -126,6 +131,29 @@ def _want_int(val, where, errors, minimum=None):
         _err(errors, where, "must be >= %d (got %d)" % (minimum, val))
         return False
     return True
+
+
+def _want_exit(val, chk, where, errors):
+    """checks[].exit: an integer exit code; null means the command was NOT
+    EXECUTED in this sandbox (the builder profile denies pytest/psql/...) and
+    is accepted when `log` explains -- an honest "not run" must not fail the
+    turn, the proof harness is the real gate.  A digit-string ("0") is
+    coerced like `attempt`; anything else is malformed."""
+    if isinstance(val, bool):
+        _err(errors, where, "expected integer, got bool")
+        return False
+    if isinstance(val, int):
+        return True
+    if isinstance(val, str) and val.strip().lstrip("-").isdigit():
+        return True
+    if val is None:
+        log = chk.get("log") if isinstance(chk, dict) else None
+        if isinstance(log, str) and log.strip():
+            return True
+        _err(errors, where, "null (not executed) requires a non-empty log saying why")
+        return False
+    _err(errors, where, "expected integer or null, got %s" % type(val).__name__)
+    return False
 
 
 def _want_sha(val, where, errors):
@@ -218,7 +246,7 @@ def validate_result_obj(obj):
                                   allow_empty=(key == "log"))
                 present, val = _req(chk, "exit", w, errors)
                 if present:
-                    _want_int(val, "%s.exit" % w, errors)
+                    _want_exit(val, chk, "%s.exit" % w, errors)
 
     ok, disputes = _req(obj, "disputes", "", errors)
     if ok:
