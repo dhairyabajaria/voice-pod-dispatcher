@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -326,7 +327,7 @@ class LaneDriver(object):
         self._apply_roster(self.roster)
         self.git_bin = self.bins.get("git", "git")
         transport = run.get("opencode_transport", "http")
-        self.runners = runners or {
+        self.runners = runners if runners is not None else {
             name: vprunners.runner_for(name, self.exec, self.bins, opencode_transport=transport)
             for name in ("opencode", "codex", "claude", "agy")
         }
@@ -728,8 +729,54 @@ class LaneDriver(object):
     def stop_requested(self):
         return self.stop_file.exists()
 
+    def drain_state(self):
+        """RUN_ROOT/DRAIN is a state row with an expiry (F1): {since, deadline_min,
+        reason, expires}.  An empty/legacy file drains without a deadline."""
+        try:
+            text = self.drain_file.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            data = json.loads(text) if text.strip() else {}
+        except ValueError:
+            data = {}
+        return data if isinstance(data, dict) else {}
+
     def drain_requested(self):
-        return self.drain_file.exists()
+        return self.drain_state() is not None
+
+    def write_drain(self, reason, deadline_min=None):
+        now = self.clock()
+        row = {"since": utc_ms(), "since_epoch": now, "reason": reason,
+               "deadline_min": deadline_min,
+               "expires_epoch": (now + float(deadline_min) * 60) if deadline_min else None,
+               "pid": os.getpid()}
+        self.drain_file.write_text(json.dumps(row, indent=2, sort_keys=True), encoding="utf-8")
+        self.log("DRAIN written: %s deadline=%s" % (reason, deadline_min))
+        return row
+
+    def clear_drain(self, why):
+        try:
+            self.drain_file.unlink()
+        except OSError:
+            return False
+        self.log("DRAIN cleared: %s" % why)
+        return True
+
+    def _drain_deadline_step(self):
+        """F1: a drain whose paired restart never came is released by the
+        driver itself when its deadline passes -- dispatch resumes, one alert."""
+        row = self.drain_state()
+        if row is None:
+            return False
+        exp = row.get("expires_epoch")
+        if not exp or self.clock() < float(exp) or self._stopping:
+            return False
+        self.clear_drain("deadline %s min passed without a restart" % row.get("deadline_min"))
+        self.alert("DRAIN_EXPIRED", "drain since %s (%s) hit its %s-minute deadline with no "
+                   "restart; dispatch restored by the driver"
+                   % (row.get("since"), row.get("reason"), row.get("deadline_min")))
+        return True
 
     def write_heartbeat(self, extra=None):
         with self._lock:
@@ -808,6 +855,7 @@ class LaneDriver(object):
             return 0
         may_start = self._guards()
         self._maybe_unpark()
+        self._drain_deadline_step()
         state = self.control.state_view()
         phase = state.get("phase")
         if phase != self._phase_logged:
@@ -826,6 +874,8 @@ class LaneDriver(object):
             self._idle_since = None
             self._last_idle_alert_mono = None
         self.spawned_total += spawned
+        if spawned:
+            self.write_heartbeat()
         return spawned
 
     # -- dispatch -------------------------------------------------------------------------
@@ -1582,31 +1632,231 @@ class DryRunRunner(object):
         return {"path": str(dest_path), "bytes": 2}
 
 
-def main(argv=None):
+# --------------------------------------------------------------------------
+# control surface: drain / undrain / restart / item (F1, F8, F9)
+# --------------------------------------------------------------------------
+
+HEARTBEAT_FRESH_S = 60.0
+
+
+def read_heartbeat(run_root):
+    try:
+        hb = json.loads((Path(run_root) / "driver.heartbeat").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ts = hb.get("ts")
+    try:
+        age = time.time() - datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        age = None
+    hb["age_s"] = age
+    hb["fresh"] = age is not None and age < HEARTBEAT_FRESH_S and not hb.get("finished")
+    return hb
+
+
+def live_tasks(run_root):
+    hb = read_heartbeat(run_root)
+    if not hb or not hb["fresh"]:
+        return {}
+    return dict(hb.get("live") or {})
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def cmd_drain(drv, args):
+    row = drv.write_drain(args.reason, args.deadline)
+    drv.alert("DRAIN", "drain requested: %s (deadline %s min)" % (args.reason, args.deadline))
+    print(json.dumps({"status": "DRAINING", "drain": row}, indent=2))
+    return 0
+
+
+def cmd_undrain(drv, args):
+    ok = drv.clear_drain(args.reason or "undrain")
+    print(json.dumps({"status": "ACTIVE" if ok else "NOT_DRAINING"}, indent=2))
+    return 0
+
+
+def wait_until(pred, timeout_s, poll_s=1.0):
+    end = time.monotonic() + float(timeout_s)
+    while True:
+        if pred():
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(poll_s)
+
+
+def cmd_restart(drv, args, python=None, here=None):
+    """F9: drain -> wait heartbeat active=0 -> STOP -> wait finished -> start.
+    Never kills a process: a driver that ignores STOP is reported, not shot."""
+    run_root = drv.run_root
+    hb = read_heartbeat(run_root)
+    report = {"steps": []}
+    drv.write_drain("restart", args.timeout)
+    report["steps"].append("DRAIN written (deadline %s min)" % args.timeout)
+    if hb and hb["fresh"] and _pid_alive(hb.get("pid")):
+        quiet = wait_until(lambda: (read_heartbeat(run_root) or {}).get("active", 1) == 0,
+                           args.timeout * 60, args.poll)
+        report["steps"].append("active=0 %s" % ("reached" if quiet else "NOT reached in time"))
+        if not quiet and not args.force:
+            drv.clear_drain("restart aborted: turns still live")
+            drv.alert("RESTART_ABORTED", "active turns did not finish within %s min; drain "
+                      "released, driver left running" % args.timeout)
+            report["status"] = "ABORTED"
+            print(json.dumps(report, indent=2))
+            return 2
+        drv.stop_file.write_text("restart %s\n" % utc_ms(), encoding="utf-8")
+        report["steps"].append("STOP written")
+        pid = hb.get("pid")
+        gone = wait_until(lambda: not _pid_alive(pid) or bool((read_heartbeat(run_root) or {}).get("finished")),
+                          max(60, drv.stop_grace_s + 60), args.poll)
+        report["steps"].append("old driver pid %s %s" % (pid, "exited" if gone else "STILL RUNNING"))
+        if not gone:
+            drv.alert("RESTART_STUCK", "driver pid %s ignored STOP for %ds; not killed -- owner action"
+                      % (pid, drv.stop_grace_s + 60))
+            report["status"] = "STUCK"
+            print(json.dumps(report, indent=2))
+            return 3
+    else:
+        report["steps"].append("no live driver (heartbeat stale or pid gone)")
+    try:
+        drv.stop_file.unlink()
+    except OSError:
+        pass
+    drv.clear_drain("restart complete")
+    report["steps"].append("STOP + DRAIN cleared")
+    if args.no_start:
+        report["status"] = "STOPPED"
+        print(json.dumps(report, indent=2))
+        return 0
+    python = python or sys.executable
+    here = here or Path(__file__).resolve()
+    argv = [python, str(here), "--roster", str(drv.roster_path), "run", "--loop",
+            "--interval", str(args.interval)]
+    if args.fake_runners:
+        argv.append("--fake-runners")
+    out = open(run_root / "driver.out", "a", encoding="utf-8")
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                            start_new_session=True, cwd=str(here.parent))
+    report["steps"].append("started pid %d: %s" % (proc.pid, " ".join(argv)))
+    report["status"] = "RESTARTED"
+    report["pid"] = proc.pid
+    drv.alert("RESTART", "driver restarted: pid %d" % proc.pid)
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def cmd_item(drv, args):
+    """F8: hand status edits refuse while the driver has a live turn on the task."""
+    live = live_tasks(drv.run_root)
+    if args.task in live:
+        print(json.dumps({"status": "REFUSED", "task": args.task,
+                          "reason": "attempt %s is RUNNING under the live driver; stop or drain first"
+                          % live[args.task]}, indent=2))
+        return 4
+    try:
+        if args.item_cmd == "block":
+            _rc, data = drv.control.call("block", ["--task", args.task, "--blocker-class", args.blocker_class,
+                                                   "--reason", args.reason, "--unblock-action", args.unblock_action,
+                                                   "--evidence", args.evidence])
+        elif args.item_cmd == "unblock":
+            _rc, data = drv.control.call("unblock", ["--task", args.task, "--evidence", args.evidence])
+        else:
+            _rc, data = drv.control.complete(args.task, args.attempt_id, args.outcome,
+                                             args.evidence or [], args.output_sha, args.tree_sha,
+                                             args.reason, None, args.unlock_dependents)
+    except ControlError as exc:
+        print(json.dumps({"status": "REFUSED_BY_SCHEDULER", "task": args.task, "error": str(exc)}, indent=2))
+        return 5
+    drv.log("ITEM %s %s by hand" % (args.item_cmd, args.task))
+    print(json.dumps({"status": "OK", "task": args.task, "result": data}, indent=2, default=str))
+    return 0
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--roster", required=True)
-    g = ap.add_mutually_exclusive_group(required=True)
+    sub = ap.add_subparsers(dest="cmd")
+    run = sub.add_parser("run", help="tick loop (default when no command is given)")
+    g = run.add_mutually_exclusive_group(required=True)
     g.add_argument("--once", action="store_true")
     g.add_argument("--loop", action="store_true")
-    ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
-    ap.add_argument("--max-ticks", type=int, default=None)
-    ap.add_argument("--fake-runners", action="store_true",
-                    help="dry run: every runner is DryRunRunner (no model, no network)")
-    args = ap.parse_args(argv)
-    runners = None
-    if args.fake_runners:
-        dry = DryRunRunner()
-        runners = {"opencode": dry, "codex": dry, "claude": dry, "agy": dry}
-    drv = LaneDriver(args.roster, interval=args.interval, runners=runners,
-                     bins={"osascript": shutil.which("osascript")} if shutil.which("osascript") else None)
-    if args.fake_runners:
-        drv.log("FAKE RUNNERS in force: no model call will be made")
-    drv.log("lanedriver start pid=%d roster=%s" % (os.getpid(), drv.roster_path))
-    if args.once:
-        drv.run_once()
-    else:
-        drv.loop(max_ticks=args.max_ticks)
-    return 0
+    run.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+    run.add_argument("--max-ticks", type=int, default=None)
+    run.add_argument("--fake-runners", action="store_true",
+                     help="dry run: every runner is DryRunRunner (no model, no network)")
+    d = sub.add_parser("drain", help="F1: no new claims; released by the driver after --deadline")
+    d.add_argument("--reason", required=True)
+    d.add_argument("--deadline", type=float, default=30.0, help="minutes; 0 = no deadline")
+    u = sub.add_parser("undrain")
+    u.add_argument("--reason")
+    r = sub.add_parser("restart", help="F9: drain -> active=0 -> STOP -> start")
+    r.add_argument("--timeout", type=float, default=30.0, help="minutes to wait for active=0")
+    r.add_argument("--poll", type=float, default=2.0)
+    r.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+    r.add_argument("--force", action="store_true", help="STOP even if turns are still live")
+    r.add_argument("--no-start", action="store_true")
+    r.add_argument("--fake-runners", action="store_true")
+    it = sub.add_parser("item", help="F8: hand edits, refused while the task has a live turn")
+    isub = it.add_subparsers(dest="item_cmd", required=True)
+    b = isub.add_parser("block")
+    b.add_argument("task")
+    b.add_argument("--blocker-class", required=True)
+    b.add_argument("--reason", required=True)
+    b.add_argument("--unblock-action", required=True)
+    b.add_argument("--evidence", required=True)
+    ub = isub.add_parser("unblock")
+    ub.add_argument("task")
+    ub.add_argument("--evidence", required=True)
+    c = isub.add_parser("complete")
+    c.add_argument("task")
+    c.add_argument("--attempt-id", required=True)
+    c.add_argument("--outcome", required=True)
+    c.add_argument("--unlock-dependents", action="store_true")
+    c.add_argument("--output-sha")
+    c.add_argument("--tree-sha")
+    c.add_argument("--evidence", action="append", default=[])
+    c.add_argument("--reason")
+    return ap
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and not any(a in argv for a in ("run", "drain", "undrain", "restart", "item")):
+        argv = argv[:2] + ["run"] + argv[2:] if argv[0] == "--roster" else argv
+    args = build_parser().parse_args(argv)
+    if args.cmd == "run":
+        runners = None
+        if args.fake_runners:
+            dry = DryRunRunner()
+            runners = {"opencode": dry, "codex": dry, "claude": dry, "agy": dry}
+        drv = LaneDriver(args.roster, interval=args.interval, runners=runners,
+                         bins={"osascript": shutil.which("osascript")} if shutil.which("osascript") else None)
+        if args.fake_runners:
+            drv.log("FAKE RUNNERS in force: no model call will be made")
+        drv.log("lanedriver start pid=%d roster=%s" % (os.getpid(), drv.roster_path))
+        if args.once:
+            drv.run_once()
+        else:
+            drv.loop(max_ticks=args.max_ticks)
+        return 0
+    drv = LaneDriver(args.roster, runners={})
+    if args.cmd == "drain":
+        return cmd_drain(drv, args)
+    if args.cmd == "undrain":
+        return cmd_undrain(drv, args)
+    if args.cmd == "restart":
+        return cmd_restart(drv, args)
+    if args.cmd == "item":
+        return cmd_item(drv, args)
+    return 1
 
 
 if __name__ == "__main__":

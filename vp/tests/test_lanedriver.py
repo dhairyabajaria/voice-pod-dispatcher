@@ -537,6 +537,153 @@ def test_codex_review_preopens_the_thread_and_starts_with_its_id(tmp_path):
     assert "VERDICT_REFUSED" in (env.run_root / "OWNER-ALERTS.md").read_text()
 
 
+# -- item 3: F1 drain deadline, F9 drain-first restart, F8 item verbs ---------------------------
+
+class Args(object):
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_f1_drain_deadline_restores_dispatch_and_alerts(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    now = [1000.0]
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(),
+                      "claude": FakeRunner()}, clock=lambda: now[0])
+    settle(drv)                                   # L00 done, L01-L04 READY
+    drv.write_drain("owner pause", deadline_min=10)
+    assert drv.drain_state()["deadline_min"] == 10
+    n = drv.tick()
+    assert n == 0 and all(env.rows()[t]["state"] == "READY" for t in ("L01", "L02", "L03", "L04"))
+    hb = json.loads((env.run_root / "driver.heartbeat").read_text())
+    assert hb["draining"] is True
+    now[0] += 9 * 60
+    assert drv.tick() == 0, "still draining before the deadline"
+    now[0] += 2 * 60                              # 11 min: deadline passed, no restart came
+    n = drv.tick()
+    drv.join(timeout=60)
+    assert n == 4, "the driver released the drain itself and dispatched"
+    assert not (env.run_root / "DRAIN").exists()
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "**DRAIN_EXPIRED**" in alerts and "10-minute deadline" in alerts
+    assert all(env.rows()[t]["state"] == "VERIFIED" for t in ("L01", "L02", "L03", "L04"))
+
+
+def test_f1_drain_without_deadline_holds_until_undrain(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    now = [1000.0]
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(),
+                      "claude": FakeRunner()}, clock=lambda: now[0])
+    settle(drv)
+    drv.write_drain("hold", deadline_min=None)
+    now[0] += 24 * 3600
+    assert drv.tick() == 0
+    assert lanedriver.cmd_undrain(drv, Args(reason="resume")) == 0
+    assert drv.tick() == 4
+
+
+def slow_result(delay):
+    def fn(spec, ab):
+        time.sleep(delay)
+        return result_ok(spec, ab)
+    return fn
+
+
+def test_f9_restart_is_drain_then_active_zero_then_stop(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    oc = FakeRunner(default=slow_result(1.5))
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, interval=0.2)
+    th = threading.Thread(target=drv.loop, daemon=True)
+    th.start()
+    time.sleep(0.5)                               # L00 claimed and running
+    assert env.rows()["L00"]["state"] == "RUNNING"
+    ctl = env.driver({}, interval=0.2)            # the control-surface instance (no runners)
+    rc = lanedriver.cmd_restart(ctl, Args(timeout=1, poll=0.1, interval=0.2, force=False,
+                                          no_start=True, fake_runners=False))
+    assert rc == 0
+    th.join(timeout=10)
+    assert not th.is_alive(), "old driver exited on STOP"
+    rows = env.rows()
+    assert rows["L00"]["state"] == "VERIFIED", "the live turn was harvested, not killed"
+    assert all(rows[t]["state"] == "READY" for t in ("L01", "L02", "L03", "L04")), \
+        "nothing new was claimed after the drain"
+    assert not (env.run_root / "STOP").exists() and not (env.run_root / "DRAIN").exists()
+    log = (env.run_root / "driver.log").read_text()
+    assert log.index("DRAIN written") < log.index("STOP file seen") < log.index("FINISH STOP")
+    alerts_md = env.run_root / "OWNER-ALERTS.md"
+    assert not alerts_md.exists() or "**RESTART**" not in alerts_md.read_text()  # --no-start
+
+
+def test_f9_restart_aborts_when_turns_do_not_finish(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=wait_abort), "codex": FakeRunner(),
+                      "claude": FakeRunner()}, interval=0.2)
+    th = threading.Thread(target=drv.loop, daemon=True)
+    th.start()
+    time.sleep(0.5)
+    ctl = env.driver({}, interval=0.2)
+    rc = lanedriver.cmd_restart(ctl, Args(timeout=0.01, poll=0.1, interval=0.2, force=False,
+                                          no_start=True, fake_runners=False))
+    assert rc == 2
+    assert not (env.run_root / "STOP").exists(), "no STOP: the running turn was not aborted"
+    assert not (env.run_root / "DRAIN").exists(), "drain released again"
+    assert "**RESTART_ABORTED**" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    (env.run_root / "STOP").write_text("")
+    drv._abort.set()
+    th.join(timeout=10)
+
+
+def test_f8_item_verbs_refuse_while_the_attempt_is_live(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    oc = FakeRunner(script=[wait_abort], default=result_ok)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    drv.tick()                                    # L00 live, heartbeat fresh
+    ctl = env.driver({})
+    ev = env.tmp / "ev.json"
+    ev.write_text("{}")
+    rc = lanedriver.cmd_item(ctl, Args(item_cmd="block", task="L00", blocker_class="EXTERNAL",
+                                       reason="hand edit", unblock_action="none", evidence=str(ev)))
+    assert rc == 4, "refused: the driver holds a live turn on L00"
+    assert env.rows()["L00"]["state"] == "RUNNING"
+    assert not any(l["verb"] == "block" for l in env.control_lines())
+    rc = lanedriver.cmd_item(ctl, Args(item_cmd="complete", task="L00", attempt_id=drv._live["L00"],
+                                       outcome="BLOCKED", unlock_dependents=False, output_sha=None,
+                                       tree_sha=None, evidence=[], reason="hand"))
+    assert rc == 4
+    drv._abort.set()
+    drv.join(timeout=30)
+    # driver gone (stale heartbeat): the verb passes through to the scheduler, which
+    # itself refuses to block a RUNNING attempt (F8 is unconditional there too)
+    hb = json.loads((env.run_root / "driver.heartbeat").read_text())
+    hb["ts"] = "2000-01-01T00:00:00.000Z"
+    (env.run_root / "driver.heartbeat").write_text(json.dumps(hb))
+    rc = lanedriver.cmd_item(ctl, Args(item_cmd="block", task="L00", blocker_class="EXTERNAL",
+                                       reason="hand edit", unblock_action="none", evidence=str(ev)))
+    assert rc == 5
+    assert any(l["verb"] == "block" and l["rc"] != 0 for l in env.control_lines())
+    # a non-live task can be hand-completed once its attempt is orphaned by a dead driver
+    rc = lanedriver.cmd_item(ctl, Args(item_cmd="complete", task="L00", attempt_id=env.rows()["L00"]["attempt_id"],
+                                       outcome="INVALID_EVIDENCE", unlock_dependents=False, output_sha=None,
+                                       tree_sha=None, evidence=[], reason="dead driver"))
+    assert rc == 0 and env.rows()["L00"]["state"] == "INVALID_EVIDENCE"
+
+
+def test_cli_drain_and_undrain_write_the_state_row(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "drain",
+                          "--reason", "owner pause", "--deadline", "15"])
+    assert rc == 0
+    row = json.loads((env.run_root / "DRAIN").read_text())
+    assert row["deadline_min"] == 15 and row["reason"] == "owner pause" and row["expires_epoch"]
+    assert lanedriver.main(["--roster", str(env.run_root / "roster.json"), "undrain"]) == 0
+    assert not (env.run_root / "DRAIN").exists()
+
+
 def test_render_packet_and_benchmark_from_contract(tmp_path):
     con = catalog()["contracts"][2]
     pk = lanedriver.LaneDriver.render_packet(con, "a" * 40)
