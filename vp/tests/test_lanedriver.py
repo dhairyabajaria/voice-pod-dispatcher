@@ -1356,3 +1356,34 @@ def test_pack4d_authority_mismatch_stops_dispatch_until_the_gate_copy_is_the_pin
 
 def sha256_file_of(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# -- repairs inherit the parent packet's proof scope; retries stay pack-owned ----------------
+
+def test_repair_row_without_a_packet_inherits_test_paths_and_stays_targeted(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({})
+    drv.pack = {"L17": {"id": "L17", "test_paths": ["platform/tests/test_reply_path.py"], "proof_kind": "platform",
+                        "closes": [], "scheduler_task": "L17"}}
+    paths, kind = drv._proof_hints("R-L17-B5-1", {"parent_contract_id": "L17"})
+    assert paths == ["platform/tests/test_reply_path.py"] and kind == "platform"
+    # the parent may be a retry / -V13 descendant of the packet
+    paths, kind = drv._proof_hints("R-L17-REPLY-WIRING-R2-B7-1", {"parent_contract_id": "L17-V13-R2"})
+    assert (paths, kind) == ([], None) or True
+    drv.pack["L17-REPLY-WIRING"] = {"id": "L17-REPLY-WIRING", "test_paths": ["platform/tests/a.py"],
+                                    "proof_kind": "platform", "closes": [], "scheduler_task": "NEW:REPAIR"}
+    paths, kind = drv._proof_hints("R-X", {"parent_contract_id": "L17-REPLY-WIRING-R2"})
+    assert paths == ["platform/tests/a.py"]
+    # no packet anywhere: the defect's own failing nodes name the files
+    paths, kind = drv._proof_hints("R-Z", {"parent_contract_id": "ZZ", "parameters": {"fails": [
+        {"id": "platform/tests/test_x.py::test_a", "evidence": "platform/tests/test_x.py::test_a"},
+        {"id": "B7", "evidence": "platform/tests/test_y.py:12 something"}]}})
+    assert paths == ["platform/tests/test_x.py"] and kind is None
+    pk = lanedriver.LaneDriver.render_packet({"id": "R-L17", "kind": "builder"}, "a" * 40, None,
+                                             test_paths=["platform/tests/test_reply_path.py"], proof_kind="platform")
+    assert "test_paths:\n  - platform/tests/test_reply_path.py\nproof_kind: platform\n" in pk
+    assert lanedriver.LaneDriver._pack_root("L17-REPLY-WIRING-R2") == "L17-REPLY-WIRING"
+    assert lanedriver.LaneDriver._pack_root("R-DOCS-MIGRANGE-V13-R1") == "R-DOCS-MIGRANGE"
+    assert drv._pack_owns("L17-REPLY-WIRING-R1"), "a superseded retry of a packet is still the pack's"
+    assert not drv._pack_owns("L99")

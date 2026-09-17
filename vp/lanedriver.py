@@ -1275,13 +1275,53 @@ class LaneDriver(object):
         return (p if p.exists() and p.stat().st_size else None,
                 b if b.exists() and b.stat().st_size else None)
 
+    def _proof_hints(self, task, row):
+        """(test_paths, proof_kind) for a row without a packet of its own (a
+        driver-instantiated REPAIR): the parent packet's, else the test files
+        the defect names, else nothing.  Without this a repair proofs with an
+        empty path list, which run_box turns into the FULL suite."""
+        row = row or {}
+        pid = self.pack_by_task.get(task) or self.pack_by_task.get(row.get("parent_contract_id") or "")
+        p = self.pack.get(pid) if pid else None
+        if p is None:
+            parent = row.get("parent_contract_id") or ""
+            for cand in (parent, self._pack_root(parent)):
+                if cand in self.pack:
+                    p = self.pack[cand]
+                    break
+        if p is not None and (p.get("test_paths") or p.get("proof_kind")):
+            return list(p.get("test_paths") or []), p.get("proof_kind")
+        files = []
+        for f in (row.get("parameters") or {}).get("fails") or []:
+            for text in (str(f.get("id") or ""), str(f.get("evidence") or "")):
+                node = text.split("::")[0].strip()
+                if node.endswith(".py") and "/tests/" in node and node not in files:
+                    files.append(node)
+        return files, None
+
     @staticmethod
-    def render_packet(contract, base, row=None):
+    def _pack_root(task):
+        """L17-REPLY-WIRING-R2 / R-X-V13-R1 / L02-V13 -> the packet id they descend from"""
+        t = str(task or "")
+        while True:
+            m = re.match(r"^(.*)-R\d+$", t)
+            if m:
+                t = m.group(1)
+                continue
+            if t.endswith("-V13"):
+                t = t[:-4]
+                continue
+            return t
+
+    @staticmethod
+    def render_packet(contract, base, row=None, test_paths=None, proof_kind=None):
         owned = contract.get("owned_paths") or []
         lines = ["---", "item: %s" % contract["id"], "title: %s" % contract.get("title", contract["id"]),
                  "kind: %s" % contract.get("kind"), "base_sha: %s" % base,
                  "depends_on: [%s]" % ", ".join(contract.get("depends_on") or []),
                  "owned_files:"] + ["  - %s" % p for p in owned] + \
+                (["test_paths:"] + ["  - %s" % p for p in test_paths] if test_paths else []) + \
+                (["proof_kind: %s" % proof_kind] if proof_kind else []) + \
                 ["max_rounds: %d" % int((row or {}).get("max_rounds") or 3), "---",
                  "## Goal", contract.get("title", ""), "", "## Steps"]
         for i, s in enumerate(contract.get("build_steps") or contract.get("steps") or [], 1):
@@ -1310,8 +1350,10 @@ class LaneDriver(object):
         vp = wt / ".vp"
         vp.mkdir(parents=True, exist_ok=True)
         pp, bp = self._pack_paths(task)
+        paths, pkind = (None, None) if pp else self._proof_hints(task, row)
         (vp / "PACKET.md").write_text(pp.read_text(encoding="utf-8") if pp
-                                      else self.render_packet(contract, base, row), encoding="utf-8")
+                                      else self.render_packet(contract, base, row, test_paths=paths,
+                                                              proof_kind=pkind), encoding="utf-8")
         (vp / "BENCHMARK.md").write_text(bp.read_text(encoding="utf-8") if bp
                                          else self.render_benchmark(contract), encoding="utf-8")
         for name, doc in (("RESULT_SCHEMA.json", vpschema.RESULT_SCHEMA_DOC),
@@ -2798,6 +2840,8 @@ class LaneDriver(object):
         REPAIR_REQUIRED review rows the pack retires; a review is never repaired)"""
         if task in self.pack_by_task or task in self.pack:
             return True
+        if self._pack_root(task) in self.pack:
+            return True                       # a retry / -V13 descendant of a packet (bound or superseded)
         return any(task in p["closes"] or p["scheduler_task"] == task for p in self.pack.values())
 
     def _instantiate_repair(self, parent, tasks):

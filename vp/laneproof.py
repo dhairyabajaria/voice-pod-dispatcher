@@ -82,11 +82,14 @@ class Proof(object):
             return False
         return (self.run_root / OFF_FILE).exists()
 
-    def route(self, kind):
-        """-> ("box"|"circleci", why)"""
+    def route(self, kind, suite=None):
+        """-> ("box"|"circleci", why).  `circleci.kinds` may name the suite
+        ("full" / "targeted", 06-ROUTING §5: every full suite off-box) or a
+        proof_kind ("platform", ...); either match makes CircleCI eligible."""
         cc = self.circle_cfg()
-        if not cc.get("enabled") or kind not in (cc.get("kinds") or []):
-            return "box", "circleci disabled or kind %s not listed" % kind
+        listed = set(cc.get("kinds") or [])
+        if not cc.get("enabled") or not ({kind, suite} & listed):
+            return "box", "circleci disabled or kind %s/%s not listed" % (kind, suite)
         if self.circle_off():
             return "box", "circleci flipped off (%s)" % OFF_FILE
         cap = cc.get("max_pipelines_per_day")
@@ -100,6 +103,8 @@ class Proof(object):
             mode = str(cc.get("mode", "overflow"))
             if mode in ("all", "swap"):
                 return "circleci", "mode all"
+            if suite == "full" and "full" in listed:
+                return "circleci", "full suite is never run on the box (06-ROUTING §5)"
             slots = int(self.cfg.get("box_slots", 1))
             if self.box_active < slots:
                 return "box", "overflow: box free (%d/%d)" % (self.box_active, slots)
@@ -140,8 +145,9 @@ class Proof(object):
             self._write(pid, rec)
             self.log("PROOF %s %s -> PASS (%s-only, no run)" % (task, pid, kind))
             return rec
-        route, why = self.route(kind)
-        self.log("PROOF %s %s route=%s (%s)" % (task, pid, route, why))
+        suite = "targeted" if paths else "full"
+        route, why = self.route(kind, suite)
+        self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
         if route == "circleci":
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort)
         return self.run_box(task, pid, wt, cand, kind, paths)

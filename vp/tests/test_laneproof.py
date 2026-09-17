@@ -297,3 +297,14 @@ def test_box_proof_skips_the_store_row_unless_the_roster_asks(tmp_path):
     p2 = make_proof(tmp_path, FakeCircle(pipeline([])), ex, cfg=dict(cfg, store_record=True))
     p2.run("L02", "proof-L02-2", tmp_path, "b" * 40, "c" * 40, "platform", ["platform/tests/test_a.py"])
     assert "--no-record" not in ex.calls[-1]
+
+
+def test_full_suite_routes_to_circleci_when_kinds_names_full(tmp_path):
+    """06-ROUTING §5: circleci.kinds ["full"] means every FULL suite goes
+    off-box; a targeted proof of the same proof_kind stays on the box."""
+    ex = FakeExec({})
+    cfg = {"circleci": {"enabled": True, "mode": "overflow", "kinds": ["full"], "account": "3"}}
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), ex, cfg=cfg)
+    assert p.route("platform", "full")[0] == "circleci"
+    assert p.route("platform", "targeted")[0] == "box"
+    assert p.route("platform")[0] == "box", "no suite given: the proof_kind alone is not listed"
