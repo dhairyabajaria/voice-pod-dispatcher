@@ -621,6 +621,10 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     assert members.exists(), (env.run_root / "driver.log").read_text()
     doc = json.loads(members.read_text())
     assert doc["union"] == "union-1" and doc["base_sha"] == sha and doc["for"] == ["REVIEW-FIXSET"]
+    assert doc["branch"] == "vp/v13-union-1" and git(env.trunk, "rev-parse", "vp/v13-union-1") == doc["union_sha"]
+    # D29: a stale directory at the union path (v12 left union-1..80 of another repo there) is not fatal
+    (env.tmp / "wt" / "union-1").mkdir(parents=True)
+    (env.tmp / "wt" / "union-1" / "stale").write_text("v12")
     assert {m["task"]: m["output_sha"] for m in doc["members"]} == {
         "P-FIX-A": rows["P-FIX-A"]["output_sha"], "P-FIX-B": rows["P-FIX-B"]["output_sha"]}
     assert all(m["merge"] == "clean" for m in doc["members"])
@@ -670,12 +674,16 @@ def test_union_review_is_held_until_a_union_contains_all_its_depends_on_rows(tmp
     (env.run_root / "unions" / "1" / "members.json").write_text(json.dumps(
         {"union": "union-1", "n": 1, "base_sha": sha, "union_sha": sha,
          "members": [{"task": "P-FIX-A", "output_sha": rows["P-FIX-A"]["output_sha"]}]}))
+    drv.clear_failures("REVIEW-FIXSET")           # re-evaluate now instead of after the 600 s hold
     settle(drv, 3)
     assert env.rows()["REVIEW-FIXSET"]["state"] == "READY", "held: never claimed"
     assert codex.calls == []
     alerts = (env.run_root / "alerts.jsonl").read_text()
     assert "REVIEW_UNION_INCOMPLETE" in alerts and "['P-FIX-B']" in alerts
-    assert "HOLD REVIEW-FIXSET 600s REVIEW_UNION_INCOMPLETE" in (env.run_root / "driver.log").read_text()
+    log = (env.run_root / "driver.log").read_text()
+    assert "HOLD REVIEW-FIXSET 600s REVIEW_UNION_INCOMPLETE" in log
+    # D29: the hold sticks across ticks (the scheduler's `ready` touches updated_at every call)
+    assert log.count("HOLD REVIEW-FIXSET 600s") == 2, log.count("HOLD REVIEW-FIXSET 600s")   # once per re-evaluation, not per tick
     # a stale member sha is as good as a missing one
     (env.run_root / "unions" / "2").mkdir(parents=True)
     (env.run_root / "unions" / "2" / "members.json").write_text(json.dumps(
@@ -685,13 +693,14 @@ def test_union_review_is_held_until_a_union_contains_all_its_depends_on_rows(tmp
     p = drv.packet_for("REVIEW-FIXSET")
     union, missing = drv._union_for("REVIEW-FIXSET", p, env.rows())
     assert union is None and missing == ["P-FIX-B"]
-    # a complete union dispatches it (hold dropped on the next ready pass)
+    # a complete union dispatches it (a hand-made union: the hold is dropped by hand too;
+    # the integrator's own union clears it itself, see the integrator test)
     doc = json.loads((env.run_root / "unions" / "2" / "members.json").read_text())
     doc["members"][1]["output_sha"] = rows["P-FIX-B"]["output_sha"]
     (env.run_root / "unions" / "2" / "members.json").write_text(json.dumps(doc))
     union, missing = drv._union_for("REVIEW-FIXSET", p, env.rows())
     assert union["union"] == "union-2" and missing == []
-    drv._fail.pop("REVIEW-FIXSET", None)
+    drv.clear_failures("REVIEW-FIXSET")
     settle(drv, 3)
     assert env.rows()["REVIEW-FIXSET"]["state"] != "READY"
     assert codex.calls and json.loads((env.tmp / "wt" / "REVIEW-FIXSET" / ".vp" / "DISPATCH.json").read_text())["union"] == "union-2"
@@ -711,8 +720,8 @@ def test_union_conflict_is_recorded_and_the_review_stays_held(tmp_path):
     assert con["status"] == "CONFLICT" and con["conflict"]["task"] == "P-FIX-B" and [m["task"] for m in con["members"]] == ["P-FIX-A"]
     assert "UNION_CONFLICT" in (env.run_root / "alerts.jsonl").read_text()
     assert env.rows()["REVIEW-FIXSET"]["state"] == "READY" and codex.calls == []
-    assert git(env.trunk, "branch", "--list", "vp/union-1") == ""
-    assert not (env.tmp / "wt" / "union-1").exists()
+    assert git(env.trunk, "branch", "--list", "vp/v13-union-1") == ""
+    assert not (env.tmp / "wt" / "v13-unions" / "union-1").exists()
     settle(drv, 2)
     assert not (env.run_root / "unions" / "2").exists(), "the failed member set is tried once"
 
@@ -797,9 +806,8 @@ def test_divergent_dependency_outputs_hold_the_build_until_the_integrator_cuts_t
     alerts = (env.run_root / "alerts.jsonl").read_text()
     assert "STACKED_BASE_MISSING" in alerts and "divergent dependency outputs ['P-FIX-A', 'P-FIX-B']" in alerts
     assert "HOLD P-ON-BOTH 600s STACKED_BASE_MISSING" in (env.run_root / "driver.log").read_text()
-    # the integrator cuts union-1 of the two; the build stands on its tip
+    # the integrator cuts union-1 of the two and lifts the hold itself; the build stands on its tip
     del drv._union_step
-    drv._fail.pop("P-ON-BOTH", None)
     settle(drv, 6)
     rows = env.rows()
     doc = json.loads((env.run_root / "unions" / "1" / "members.json").read_text())

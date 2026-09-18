@@ -1154,7 +1154,7 @@ class LaneDriver(object):
             text = ("%s: no union tip yet (candidate %s == base, no covered rows, no unions/*/members.json); "
                     "held, not dispatched, until a union exists" % (task, (cand or "none")[:12]))
         self.alert_once("review-subject:%s:%s" % (task, ",".join(missing or [])), why, text, task)
-        self.note_hold(task, "ready:%s" % row.get("updated_at"), "%s %s" % (why, task), self.REVIEW_SUBJECT_HOLD_S)
+        self.note_hold(task, self._ready_key(row), "%s %s" % (why, task), self.REVIEW_SUBJECT_HOLD_S)
         return True
 
     # -- D28 §10: a dependent build stands on its dependency's verified output ---------------
@@ -1253,10 +1253,16 @@ class LaneDriver(object):
         udir = self.run_root / "unions"
         udir.mkdir(parents=True, exist_ok=True)
         n = max([int(d.name) for d in udir.iterdir() if d.name.isdigit()] or [0]) + 1
-        uid, branch = "union-%d" % n, "vp/union-%d" % n
-        wt = self.worktrees_root / uid
+        uid, branch = "union-%d" % n, "vp/v13-union-%d" % n
+        # D29: under <worktrees>/v13-unions/ and on vp/v13-union-<n> -- the v12
+        # driver left union-1..80 worktrees of the OLD repo directly under
+        # <worktrees>/ and `worktree add` refused the path (L35/L36, 11:47Z)
+        wt = self.worktrees_root / "v13-unions" / uid
         if wt.exists():
-            self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
+            rc, _o, _e = self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
+            if wt.exists():
+                shutil.rmtree(str(wt), ignore_errors=True)
+        wt.parent.mkdir(parents=True, exist_ok=True)
         self.git(["-C", str(self.trunk), "worktree", "prune"])
         self.git(["-C", str(self.trunk), "branch", "-D", branch])
         rc, out, err = self.git(["-C", str(self.trunk), "worktree", "add", str(wt), "-b", branch, base], log=True)
@@ -1309,8 +1315,9 @@ class LaneDriver(object):
         self.log("UNION %s %s base=%s for %s members=%s" % (uid, union_sha[:12], base[:12], for_task,
                                                            ",".join(m["task"] for m in merged)))
         with self._lock:
-            for k in [k for k in self._alerted if k.startswith("review-subject:%s" % for_task)]:
+            for k in [k for k in self._alerted if k.startswith(("review-subject:%s" % for_task, "stack:%s" % for_task))]:
                 self._alerted.discard(k)
+        self.clear_failures(for_task)             # the hold was for this union: dispatch on the next pass
         return rec
 
     # -- D16: a verified retry/fix retires the rows it supersedes ----------------------------
@@ -2573,6 +2580,14 @@ class LaneDriver(object):
                         return c.get("task_id")
         return None
 
+    @staticmethod
+    def _ready_key(row):
+        """D29: the backoff key of a READY row.  `updated_at` is touched by the
+        scheduler's own `ready` verb every tick, so a key built on it never
+        matched twice and every ready-side hold/backoff re-fired each tick
+        (SEC-REVIEW-S3-FIXSET logged HOLD 600s every 5 s)."""
+        return "ready:%s:%s:%s" % (row.get("state"), row.get("attempt_id"), row.get("claim_id"))
+
     def _base_for(self, row, state):
         if row.get("review_key") or (row.get("kind") in REVIEW_KINDS):
             return (state.get("candidate") or {}).get("sha")
@@ -2589,7 +2604,7 @@ class LaneDriver(object):
         if not plan["base"]:
             self.alert_once("stack:%s:%s" % (task, ",".join(plan["on"])), "STACKED_BASE_MISSING",
                             "%s: %s; held until the integrator cuts one" % (task, plan["why"]), task)
-            self.note_hold(task, "ready:%s" % row.get("updated_at"), "STACKED_BASE_MISSING %s" % task,
+            self.note_hold(task, self._ready_key(row), "STACKED_BASE_MISSING %s" % task,
                            self.STACK_HOLD_S)
             return None, plan
         return plan["base"], plan
@@ -2612,7 +2627,7 @@ class LaneDriver(object):
             with self._lock:
                 if task in self._live:
                     continue
-            if self._backed_off(task, "ready:%s" % row.get("updated_at")):
+            if self._backed_off(task, self._ready_key(row)):
                 continue
             contract = self.control.contract(task, row)
             kind = contract.get("kind") or row.get("kind")
@@ -2662,8 +2677,15 @@ class LaneDriver(object):
                     self._start(task, attempt, contract, "lanedriver:%d:%s" % (os.getpid(), attempt))
             except ControlError as exc:
                 self._release(server, runner)
-                self.note_failure(task, "ready:%s" % row.get("updated_at"), str(exc))
+                if "path conflict" in str(exc):
+                    # a sibling claimed inside this pass (the state view is from
+                    # before the loop): wait a tick, no strike (D29 -- with a
+                    # stable ready key a strike would hold the row 60 s+)
+                    self.log("WAIT %s: %s" % (task, str(exc)[:200]))
+                    continue
+                self.note_failure(task, self._ready_key(row), str(exc))
                 continue
+            state.setdefault("claims", {})["pending:%s" % attempt] = {"state": "ACTIVE", "task_id": task, "paths": paths}
             # codex kinds: the thread pre-opens the codex session and calls
             # `start` with the real thread id (review_gate linkage)
             self._spawn(task, attempt, row, contract, server, runner, base,
