@@ -105,7 +105,10 @@ class Env(object):
             "run": {"cn": str(self.tmp), "trunk": str(self.trunk),
                     "worktrees": str(self.tmp / "wt"), "stop_grace_s": 1},
             "control": {"python": PY, "script": str(SCRIPT), "state": str(self.state),
-                        "catalog": str(self.catalog), "cwd": str(CONTROL_DIR)},
+                        "catalog": str(self.catalog), "cwd": str(CONTROL_DIR),
+                        # VP_TEST_AUTHORITY: a pin file for the scheduler on disk, so the
+                        # suite can run on a scheduler edit before the Architect re-pins
+                        **({"authority": os.environ["VP_TEST_AUTHORITY"]} if os.environ.get("VP_TEST_AUTHORITY") else {})},
             "night": {"pause_on_disk_gb": 0},
             "concurrency": {"max_rounds": 2, "codex_max": 2, "claude_max": 1,
                             "max_minutes_per_turn": {"default": 1}},
@@ -1528,6 +1531,8 @@ def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
                      "run_state": str(env.state), "catalog": str(env.catalog),
                      "packets_dir": str(env.tmp / "nopack")})
     r["control"] = {"python": PY}
+    if os.environ.get("VP_TEST_AUTHORITY"):
+        r["control"]["authority"] = os.environ["VP_TEST_AUTHORITY"]
     (env.run_root / "roster.json").write_text(json.dumps(r, indent=2))
     drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
     assert drv.roles["verification"]["runner"] == "opencode" and drv.roles["final_review"]["runner"] == "codex"

@@ -258,11 +258,14 @@ class Control(object):
         _rc, data = self.call("reconcile")
         return data if isinstance(data, dict) else {}
 
-    def claim(self, task, chief, attempt_id, base_sha, paths):
+    def claim(self, task, chief, attempt_id, base_sha, paths, stacked=None):
         args = ["--task", task, "--chief", chief, "--attempt-id", attempt_id,
                 "--base-sha", base_sha]
         for p in paths:
             args += ["--path", p]
+        if stacked:
+            # D28: the ledger records what the build actually stood on
+            args += ["--stacked-base", stacked["base"], "--stacked-on", ",".join(stacked["on"])]
         return self.call("claim", args)
 
     def start(self, task, attempt_id, child_id, model, effort, agent_type=None):
@@ -1154,6 +1157,50 @@ class LaneDriver(object):
         self.note_hold(task, "ready:%s" % row.get("updated_at"), "%s %s" % (why, task), self.REVIEW_SUBJECT_HOLD_S)
         return True
 
+    # -- D28 §10: a dependent build stands on its dependency's verified output ---------------
+    def _stack_plan(self, task, tasks):
+        """what a build packet's worktree must be cut from (BULK-RULING §10):
+        the depends_on rows' VERIFIED output shas that trunk does not yet
+        contain.  Returns None (no packet / nothing to stack: trunk base) or
+        {"members": [...], "on": [tasks], "base": sha|None, "why": str}: one
+        member, or several where one descends from the rest -> base = that
+        tip; several divergent -> base = the union tip whose members ⊇ them,
+        else base None (the caller HOLDs; the integrator cuts the union)."""
+        p = self.packet_for(task)
+        if not p or p.get("v13_kind") == "review" or not p.get("depends_on"):
+            return None
+        wanted = self._union_members_wanted(p)
+        if wanted is None:
+            return None
+        trunk = self.trunk_sha()
+        members = []
+        for dep, t in wanted.items():
+            r = tasks.get(t) or {}
+            sha = r.get("output_sha")
+            if r.get("state") not in self.UNION_MEMBER_STATES or not sha:
+                continue                          # gated/legacy dep satisfied without an output: nothing to stack
+            rc, _o, _e = self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", sha, trunk])
+            if rc == 0:
+                continue                          # already in trunk: the trunk base carries it
+            members.append({"task": t, "packet": dep, "output_sha": sha,
+                            "depth": len(self.pack.get(dep, {}).get("depends_on") or [])})
+        if not members:
+            return None
+        on = sorted(m["task"] for m in members)
+        for m in members:
+            if all(x is m or self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor",
+                                       x["output_sha"], m["output_sha"]])[0] == 0 for x in members):
+                return {"members": members, "on": on, "base": m["output_sha"],
+                        "why": "output of %s (descends from %s)" % (m["task"], [x["task"] for x in members if x is not m])}
+        need = {m["task"]: m["output_sha"] for m in members}
+        for doc in reversed(self._union_docs(self.run_root)):
+            have = {m.get("task"): m.get("output_sha") for m in (doc.get("members") or []) if isinstance(m, dict)}
+            if doc.get("union_sha") and all(have.get(t) == sha for t, sha in need.items()):
+                return {"members": members, "on": on, "base": doc["union_sha"],
+                        "why": "%s tip (members %s)" % (doc["union"], sorted(have))}
+        return {"members": members, "on": on, "base": None,
+                "why": "divergent dependency outputs %s and no union contains them" % on}
+
     # -- D27 §9(5b): the union integrator ----------------------------------------------------
     UNION_MEMBER_STATES = ("VERIFIED", "INTEGRATED", "ACCEPTED")
 
@@ -1165,27 +1212,31 @@ class LaneDriver(object):
         merged, not the unchanged candidate (BULK-RULING-2026-09-18 §9 ruling 2)."""
         tasks = state.get("tasks") or {}
         cand = (state.get("candidate") or {}).get("sha")
-        if not cand:
-            return
         for task, pid in sorted(self.pack_by_task.items()):
-            p = self._union_review_packet(task)
-            if not p or not p.get("depends_on"):
-                continue
             row = tasks.get(task) or {}
             if row.get("state") not in ("PLANNED", "WAITING_DEPENDENCY", "READY"):
                 continue
-            union, missing = self._union_for(task, p, tasks)
-            if union or missing is None:
-                continue
-            wanted = self._union_members_wanted(p) or {}
-            members = []
-            for dep, t in wanted.items():
-                r = tasks.get(t) or {}
-                if r.get("state") not in self.UNION_MEMBER_STATES or not r.get("output_sha"):
-                    members = None
-                    break
-                members.append({"task": t, "packet": dep, "output_sha": r["output_sha"],
-                                "depth": len(self.pack.get(dep, {}).get("depends_on") or [])})
+            p = self._union_review_packet(task)
+            base = cand if p else self.trunk_sha()   # a review's union descends from the registered candidate
+            if p and p.get("depends_on"):
+                if not cand:
+                    continue
+                union, missing = self._union_for(task, p, tasks)
+                if union or missing is None:
+                    continue
+                wanted = self._union_members_wanted(p) or {}
+                members = []
+                for dep, t in wanted.items():
+                    r = tasks.get(t) or {}
+                    if r.get("state") not in self.UNION_MEMBER_STATES or not r.get("output_sha"):
+                        members = None
+                        break
+                    members.append({"task": t, "packet": dep, "output_sha": r["output_sha"],
+                                    "depth": len(self.pack.get(dep, {}).get("depends_on") or [])})
+            else:
+                # D28: a build whose dependency outputs diverge needs a union to stand on
+                plan = self._stack_plan(task, tasks)
+                members = plan["members"] if plan and plan["base"] is None and len(plan["members"]) > 1 else None
             if not members:
                 continue
             key = "union:%s:%s" % (task, ",".join(sorted(m["output_sha"] for m in members)))
@@ -1193,7 +1244,7 @@ class LaneDriver(object):
                 continue                          # this exact member set already failed to merge
             self._pack_logged.add(key)
             try:
-                self._build_union(task, cand, members)
+                self._build_union(task, base, members)
             except Exception as exc:  # noqa: BLE001 -- never take the tick down
                 self.log("UNION build for %s failed: %s: %s" % (task, type(exc).__name__, exc))
                 self.alert("UNION_FAILED", "%s: %s" % (task, str(exc)[:300]), task)
@@ -1718,6 +1769,7 @@ class LaneDriver(object):
         udoc = union or {}
         union = udoc.get("union") or ("union-%s" % attempt)
         rec = {"task": task, "attempt": attempt, "union": union, "base_sha": base, "kind": contract.get("kind"),
+               "stacked_base": row.get("stacked_base"), "stacked_on": row.get("stacked_on"),
                "union_sha": udoc.get("union_sha"), "union_base_sha": udoc.get("base_sha"),
                "union_members": [m.get("task") for m in (udoc.get("members") or [])] or None,
                "candidate_sha": ((row.get("parameters") or {}).get("candidate_sha")),
@@ -2526,6 +2578,22 @@ class LaneDriver(object):
             return (state.get("candidate") or {}).get("sha")
         return self.trunk_sha()
 
+    STACK_HOLD_S = 600
+
+    def _stacked_base(self, task, row, state):
+        """D28: (base, stacked) for a build row -- the trunk base and None, or
+        the dependency's verified output and the plan; (None, plan) means HOLD"""
+        plan = self._stack_plan(task, state.get("tasks") or {})
+        if not plan:
+            return self._base_for(row, state), None
+        if not plan["base"]:
+            self.alert_once("stack:%s:%s" % (task, ",".join(plan["on"])), "STACKED_BASE_MISSING",
+                            "%s: %s; held until the integrator cuts one" % (task, plan["why"]), task)
+            self.note_hold(task, "ready:%s" % row.get("updated_at"), "STACKED_BASE_MISSING %s" % task,
+                           self.STACK_HOLD_S)
+            return None, plan
+        return plan["base"], plan
+
     def _dispatch_ready(self, state):
         try:
             rows = self.control.ready().get("ready") or []
@@ -2566,7 +2634,13 @@ class LaneDriver(object):
             if other:
                 self.log("WAIT %s: paths conflict with active claim of %s" % (task, other))
                 continue
-            base = self._base_for(row, state)
+            stacked = None
+            if kind in BUILD_KINDS:
+                base, stacked = self._stacked_base(task, row, state)
+                if not base:
+                    continue
+            else:
+                base = self._base_for(row, state)
             if not base:
                 self.alert_once("base:%s" % task, "NO_BASE",
                                 "%s needs a registered candidate before it can be claimed" % task)
@@ -2575,8 +2649,15 @@ class LaneDriver(object):
                 continue
             attempt = "%s-a%s" % (task, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3])
             try:
-                self.control.claim(task, row["chief"], attempt, base, paths)
-                self.log("CLAIM %s %s base %s paths %s" % (task, attempt, base[:12], paths))
+                self.control.claim(task, row["chief"], attempt, base, paths, stacked=stacked)
+                self.log("CLAIM %s %s base %s paths %s%s" % (task, attempt, base[:12], paths,
+                         (" STACKED on %s (%s)" % (",".join(stacked["on"]), stacked["why"])) if stacked else ""))
+                if stacked:
+                    row = dict(row, stacked_base=base, stacked_on=stacked["on"])
+                    _append_jsonl(self.run_root / "packets" / "bindings.jsonl",
+                                  {"ts": utc_ms(), "packet": self.pack_by_task.get(task), "task": task, "op": "stacked",
+                                   "attempt": attempt, "stacked_base": base, "stacked_on": stacked["on"],
+                                   "members": stacked["members"]}, self._lock)
                 if runner != "codex":
                     self._start(task, attempt, contract, "lanedriver:%d:%s" % (os.getpid(), attempt))
             except ControlError as exc:
@@ -2723,6 +2804,7 @@ class LaneDriver(object):
             try:
                 (tdir / "dispatch.json").write_text(json.dumps(
                     {"task": task, "attempt": attempt, "base_sha": base, "activation_id": self.activation_id,
+                     "stacked_base": row.get("stacked_base"), "stacked_on": row.get("stacked_on"),
                      "kind": kind, "runner": runner, "code_version": self.code_version(),
                      "sequence": self.control.sequence(), "ts": utc_ms()}, indent=2, sort_keys=True),
                     encoding="utf-8")

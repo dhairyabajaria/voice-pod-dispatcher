@@ -715,3 +715,95 @@ def test_union_conflict_is_recorded_and_the_review_stays_held(tmp_path):
     assert not (env.tmp / "wt" / "union-1").exists()
     settle(drv, 2)
     assert not (env.run_root / "unions" / "2").exists(), "the failed member set is tried once"
+
+
+# -- D28 §10: a dependent build stands on its dependency's verified output ----------------------
+
+def test_dependent_build_is_cut_from_its_dependency_output_and_the_row_records_the_stacked_base(tmp_path):
+    """L30-MATRIX-139 built on trunk without L30-REGISTRY-DISCOVERY-R1's exclusion
+    literal: the base of a build whose depends_on packet is VERIFIED is that
+    packet's output_sha, recorded on the row (stacked_base/stacked_on), in
+    dispatch.json and in bindings.jsonl."""
+    pd = tmp_path / "pack"
+    packet(pd, "P-DEP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="first fix for L00")
+    packet(pd, "P-STACKED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", deps=["P-DEP"],
+           body="builds on P-DEP for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    seen = {}
+
+    def builder(spec, ab):
+        wt = Path(spec.cwd)
+        seen[spec.item] = {"head": git(wt, "rev-parse", "HEAD"), "base": (wt / ".vp" / "BASE").read_text().strip(),
+                           "has_dep_file": (wt / "platform" / "p_dep.py").exists()}
+        return _fix_builder(spec, ab)
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-DEP"]["state"] == "VERIFIED" and rows["P-STACKED"]["state"] == "VERIFIED", rows
+    dep_out = rows["P-DEP"]["output_sha"]
+    assert seen["P-DEP"]["base"] == env.base and seen["P-DEP"]["head"] == env.base
+    assert seen["P-STACKED"]["base"] == dep_out and seen["P-STACKED"]["head"] == dep_out
+    assert seen["P-STACKED"]["has_dep_file"], "the dependency's output is in the tree the builder starts from"
+    row = rows["P-STACKED"]
+    assert row["base_sha"] == dep_out and row["stacked_base"] == dep_out and row["stacked_on"] == ["P-DEP"]
+    assert rows["P-DEP"]["stacked_base"] is None and rows["P-DEP"]["stacked_on"] == []
+    assert git(env.trunk, "merge-base", "--is-ancestor", dep_out, row["output_sha"]) == ""
+    disp = json.loads(next((env.run_root / "turns" / "P-STACKED").glob("*/dispatch.json")).read_text())
+    assert disp["base_sha"] == dep_out and disp["stacked_base"] == dep_out and disp["stacked_on"] == ["P-DEP"]
+    vdisp = json.loads((env.tmp / "wt" / "P-STACKED" / ".vp" / "DISPATCH.json").read_text())
+    assert vdisp["stacked_base"] == dep_out
+    log = (env.run_root / "driver.log").read_text()
+    assert "STACKED on P-DEP (output of P-DEP (descends from []))" in log
+    ops = [json.loads(l) for l in (env.run_root / "packets" / "bindings.jsonl").read_text().splitlines()]
+    st = [o for o in ops if o.get("op") == "stacked"]
+    assert st and st[0]["task"] == "P-STACKED" and st[0]["stacked_base"] == dep_out and st[0]["stacked_on"] == ["P-DEP"]
+    ev = [json.loads(l) for l in (env.run_root / "control.jsonl").read_text().splitlines()
+          if json.loads(l).get("verb") == "claim" and "P-STACKED" in json.loads(l)["argv"]]
+    assert ev and "--stacked-base" in ev[0]["argv"]
+
+
+def test_divergent_dependency_outputs_hold_the_build_until_the_integrator_cuts_their_union(tmp_path):
+    """two VERIFIED deps neither of which descends from the other: no guessed
+    merge -- STACKED_BASE_MISSING hold, then the integrator's union is the base"""
+    pd = tmp_path / "pack"
+    packet(pd, "P-FIX-A", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix A for L00")
+    packet(pd, "P-FIX-B", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix B for L00")
+    packet(pd, "P-ON-BOTH", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder",
+           deps=["P-FIX-A", "P-FIX-B"], body="builds on both fixes for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    seen = {}
+
+    def builder(spec, ab):
+        wt = Path(spec.cwd)
+        seen[spec.item] = {"head": git(wt, "rev-parse", "HEAD"),
+                           "files": sorted(p.name for p in (wt / "platform").glob("p_*.py"))}
+        return _fix_builder(spec, ab)
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    drv._union_step = lambda state: None          # first: no integrator -> the build holds
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
+    assert rows["P-ON-BOTH"]["state"] == "READY" and "P-ON-BOTH" not in seen
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "STACKED_BASE_MISSING" in alerts and "divergent dependency outputs ['P-FIX-A', 'P-FIX-B']" in alerts
+    assert "HOLD P-ON-BOTH 600s STACKED_BASE_MISSING" in (env.run_root / "driver.log").read_text()
+    # the integrator cuts union-1 of the two; the build stands on its tip
+    del drv._union_step
+    drv._fail.pop("P-ON-BOTH", None)
+    settle(drv, 6)
+    rows = env.rows()
+    doc = json.loads((env.run_root / "unions" / "1" / "members.json").read_text())
+    assert sorted(m["task"] for m in doc["members"]) == ["P-FIX-A", "P-FIX-B"] and doc["for"] == ["P-ON-BOTH"]
+    assert rows["P-ON-BOTH"]["state"] == "VERIFIED", rows["P-ON-BOTH"]
+    assert seen["P-ON-BOTH"]["head"] == doc["union_sha"] and seen["P-ON-BOTH"]["files"] == ["p_fix_a.py", "p_fix_b.py"]
+    assert rows["P-ON-BOTH"]["stacked_base"] == doc["union_sha"] and rows["P-ON-BOTH"]["stacked_on"] == ["P-FIX-A", "P-FIX-B"]
