@@ -301,11 +301,26 @@ def closure_plan(packet, pack, tasks, bindings=None):
     return plan
 
 
+HOSTED_TWIN_SUFFIX = "-HOSTED"
+
+
+def is_hosted_twin(packet):
+    """the <ID>-HOSTED twin that owes the hosted evidence (00-SCOPE §5,
+    PACKET-FORMAT §2); the base packet goes VERIFIED_LOCAL on its [box] rows"""
+    return str(packet.get("id") or "").endswith(HOSTED_TWIN_SUFFIX)
+
+
 def owner_gate_open(packet, roster):
+    """D34 (BULK-RULING §14): an owner gate holds only the <ID>-HOSTED twin;
+    the base packet dispatches on depends_on alone (L31/L34 were held whole
+    behind DELIVERY-2/4 and never ran their box rows).  A roster with no
+    `owner_gates` map is all-closed for twins, never silently open."""
     gate = packet.get("owner_gate") or "none"
-    if gate == "none":
+    if gate == "none" or not is_hosted_twin(packet):
         return True
-    gates = (roster.get("owner_gates") or {})
+    gates = roster.get("owner_gates")
+    if not isinstance(gates, dict):
+        return False
     return bool(gates.get(gate))
 
 

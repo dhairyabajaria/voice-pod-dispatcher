@@ -70,8 +70,8 @@ def tiny_pack(tmp_path):
     packet(pd, "P-REGRADE-L00", "L00", closes=["JX"])                                 # dynamic once L00 finishes
     packet(pd, "P-REGRADE-2", "NEW:EVIDENCE_RECOVERY", template="EVIDENCE_RECOVERY", role="probe",
            closes=["JX"], deps=["P-REGRADE-L00"], body="second closer of JX for L00")
-    packet(pd, "P-GATED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder",
-           gate="DELIVERY-1", body="gated behind L00")
+    packet(pd, "P-GATED-HOSTED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder",
+           gate="DELIVERY-1", body="gated behind L00 (D34: only a -HOSTED twin is gated)")
     packet(pd, "L04", "L04", kind="chain", role="probe", deps=["P-REGRADE-L00"])       # rewired direct task
     return pd
 
@@ -104,7 +104,7 @@ def test_parent_dependencies_parameters_and_closure_plan(tmp_path):
     t = tasks_fixture()
     assert vppack.parent_for(pack["P-REGRADE-L00"], t, pack) == ("L00", "scheduler_task")
     assert vppack.parent_for(pack["P-REGRADE-2"], t, pack) == ("L00", "depends_on:P-REGRADE-L00")
-    assert vppack.parent_for(pack["P-GATED"], t, pack) == ("L00", "body-cite")
+    assert vppack.parent_for(pack["P-GATED-HOSTED"], t, pack) == ("L00", "body-cite")
     assert vppack.dependency_tasks(pack["P-REGRADE-2"], pack, t) is None, "dependency not instantiated yet"
     # D23: only an OWNER-GATED dependency packet whose own row is accepted is
     # satisfied by that row (L34-ACK-DEDUP behind L34's DELIVERY-4 regrade)
@@ -115,8 +115,8 @@ def test_parent_dependencies_parameters_and_closure_plan(tmp_path):
     params = vppack.parameters_for(pack["P-REGRADE-2"], "EVIDENCE_RECOVERY", "L00")
     assert params["parent_contract_id"] == "L00" and params["candidate_sha"] == "a" * 40
     assert params["evidence_paths"] == ["control/evidence/P-REGRADE-2/v13/REGRADE.md"] and params["closes"] == ["JX"]
-    assert vppack.parameters_for(pack["P-GATED"], "JUNIOR_REVIEW", "L00", candidate={}) is None
-    rv = vppack.parameters_for(pack["P-GATED"], "JUNIOR_REVIEW", "L00", candidate={"sha": "s", "tree": "t"},
+    assert vppack.parameters_for(pack["P-GATED-HOSTED"], "JUNIOR_REVIEW", "L00", candidate={}) is None
+    rv = vppack.parameters_for(pack["P-GATED-HOSTED"], "JUNIOR_REVIEW", "L00", candidate={"sha": "s", "tree": "t"},
                                covered=["L06"])
     assert (rv["candidate_sha"], rv["tree_sha"], rv["covered_rows"], rv["criteria"]) == ("s", "t", ["L06"], "catalog")
     # §6b: three closers of JX; the plan retires only when the OTHER two are accepted
@@ -133,8 +133,12 @@ def test_parent_dependencies_parameters_and_closure_plan(tmp_path):
     own = dict(pack["L02"], closes=["L02"], scheduler_task="L02")
     assert vppack.closure_plan(own, {"L02": own}, {"L02": {"state": "REPAIR_REQUIRED"}})["promote"] == ["L02"]
     assert vppack.closure_plan(own, {"L02": own}, {"L02": {"state": "BLOCKED"}})["retire"] == ["L02"]
-    assert vppack.owner_gate_open(pack["P-GATED"], {}) is False
-    assert vppack.owner_gate_open(pack["P-GATED"], {"owner_gates": {"DELIVERY-1": True}}) is True
+    # D34: the gate holds only the <ID>-HOSTED twin; the base packet never consults it
+    assert vppack.owner_gate_open(dict(pack["P-GATED-HOSTED"], id="P-GATED"), {}) is True
+    twin = pack["P-GATED-HOSTED"]
+    assert vppack.owner_gate_open(twin, {}) is False, "no owner_gates map = all closed for twins"
+    assert vppack.owner_gate_open(twin, {"owner_gates": {"DELIVERY-1": False}}) is False
+    assert vppack.owner_gate_open(twin, {"owner_gates": {"DELIVERY-1": True}}) is True
     assert vppack.substitute_union(dict(pack["L02"], owned_files=["x/<union>/y"]), "union-7") == ["x/union-7/y"]
 
 
@@ -167,7 +171,7 @@ def test_driver_binds_the_pack_retires_the_joint_closer_and_gates_and_rewires(tm
     env.control_call("activate")
     runner = by_role({"probe": result_ok, "builder": result_ok, "grader": findings("PASS")})
     drv = env.driver({"opencode": runner, "codex": FakeRunner()})
-    assert set(drv.pack) == {"L02", "P-REGRADE-L00", "P-REGRADE-2", "P-GATED", "L04"} and drv.pack_lint == []
+    assert set(drv.pack) == {"L02", "P-REGRADE-L00", "P-REGRADE-2", "P-GATED-HOSTED", "L04"} and drv.pack_lint == []
     drv.tick()                                       # tick 1: the pack is bound before any dispatch
     rows = env.rows()
     assert drv.pack_by_task["L02"] == "L02" and drv.pack_by_task["L04"] == "L04"
@@ -190,7 +194,7 @@ def test_driver_binds_the_pack_retires_the_joint_closer_and_gates_and_rewires(tm
     assert disp["packet"] == "L02" and disp["union"].startswith("union-L02-a") and disp["closes"] == ["JX"]
     assert (env.tmp / "wt" / "L02" / ".vp" / "PACKET.md").read_text().startswith("---\nitem: L02\n")
     # the owner gate holds P-GATED until the roster says DELIVERY-1 is delivered
-    assert "P-GATED" not in rows and "OWNER_GATE" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "P-GATED-HOSTED" not in rows and "OWNER_GATE" in (env.run_root / "OWNER-ALERTS.md").read_text()
     settle(drv, 8)
     rows = env.rows()
     assert {rows[t]["state"] for t in ("L02", "P-REGRADE-L00", "P-REGRADE-2")} == {"VERIFIED"}
@@ -214,8 +218,8 @@ def test_driver_binds_the_pack_retires_the_joint_closer_and_gates_and_rewires(tm
     drv._roster_mtime = 0
     settle(drv, 4)
     rows = env.rows()
-    assert rows["P-GATED"]["template_id"] == "TEST_GAP" and rows["P-GATED"]["parent_contract_id"] == "L00"
-    assert (env.run_root / "packets" / "P-GATED.params.json").exists()
+    assert rows["P-GATED-HOSTED"]["template_id"] == "TEST_GAP" and rows["P-GATED-HOSTED"]["parent_contract_id"] == "L00"
+    assert (env.run_root / "packets" / "P-GATED-HOSTED.params.json").exists()
 
 
 def test_review_packet_waits_for_a_candidate_then_carries_the_union_dispatch_record(tmp_path):
