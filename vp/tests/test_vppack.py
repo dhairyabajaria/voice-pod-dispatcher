@@ -958,3 +958,37 @@ def test_closure_sweep_retires_a_target_whose_closer_verified_before_the_hook_co
     drv._pack_last_mono = None
     drv.tick()
     assert log.count("closure-sweep") == (env.run_root / "driver.log").read_text().count("closure-sweep")
+
+
+# -- D36 §16: builders/graders of a stacked row are told what `base` means -------------------
+
+def test_stacked_row_prompts_carry_the_base_rule_and_unstacked_rows_do_not(tmp_path):
+    pd = tmp_path / "pack"
+    packet(pd, "P-DEP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="first fix for L00")
+    packet(pd, "P-STACKED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", deps=["P-DEP"],
+           body="builds on P-DEP for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    prompts = {}
+
+    def builder(spec, ab):
+        prompts.setdefault(spec.item, {})["builder"] = spec.prompt
+        return _fix_builder(spec, ab)
+
+    def grader(spec, ab):
+        prompts.setdefault(spec.item, {})["grader"] = spec.prompt
+        return findings("PASS")(spec, ab)
+    oc = by_role({"builder": builder, "grader": grader, "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-STACKED"]["state"] == "VERIFIED" and rows["P-STACKED"]["stacked_on"] == ["P-DEP"]
+    dep_out = rows["P-DEP"]["output_sha"]
+    for role in ("builder", "grader"):
+        assert "BASE RULE" not in prompts["P-DEP"][role], "an unstacked row gets no note"
+        note = prompts["P-STACKED"][role]
+        assert "BASE RULE" in note and dep_out[:12] in note and ("a" * 12) in note   # packet base_sha named
+        assert "reports UNKNOWN, never FAIL" in note

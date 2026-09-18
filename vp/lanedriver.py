@@ -3920,8 +3920,34 @@ class LaneDriver(object):
                 self.log("export failed %s: %s" % (task, exc))
         return outcome
 
+    STACKED_BASE_NOTE = (
+        " BASE RULE (PACKET-FORMAT §3b, 04-REVIEW-POLICY): this worktree was cut from the STACKED base "
+        "%s (a dependency's verified output), not the packet header's base_sha %s. In every benchmark "
+        "row and Step, `base`, `base_sha` and `git diff base..HEAD` mean the build base recorded in "
+        ".vp/BASE; the dependency's files sit between the packet base and .vp/BASE and are not this "
+        "packet's diff. A grader that can only diff against the packet base reports UNKNOWN, never FAIL."
+    )
+
+    def _base_note(self, role, wt):
+        """D36 (BULK-RULING §16): builders and graders of a stacked row are told
+        what `base` means; 35 packets say 'git diff base..HEAD lists exactly
+        the owned files', which is structurally wrong on a stacked base."""
+        if role not in ("builder", "grader"):
+            return ""
+        try:
+            base = (wt / ".vp" / "BASE").read_text(encoding="utf-8").strip()
+            hdr, _ = vplint.parse_front_matter((wt / ".vp" / "PACKET.md").read_text(encoding="utf-8"))
+            pbase = str((hdr or {}).get("base_sha") or "").strip()
+        except (OSError, ValueError):
+            return ""
+        trunk = self.trunk_sha() or ""
+        if not base or base == trunk or (pbase and base == pbase):
+            return ""                             # cut from trunk / the packet base: nothing to explain
+        return self.STACKED_BASE_NOTE % (base[:12], (pbase or trunk)[:12])
+
     def _spec(self, role, task, wt, prompt, rcfg, runner, server, sid, out_path, validator,
               timeout_s, tdir, tag, expect_fence, rnd):
+        prompt = prompt + self._base_note(role, wt)
         base = dict(variant=rcfg.get("variant"), agent=rcfg.get("agent"), session_id=sid,
                     out_path=str(out_path), timeout_s=timeout_s, log_dir=str(tdir), tag=tag,
                     validator=validator, title="%s %s r%d" % (task, role, rnd),
