@@ -2710,7 +2710,15 @@ class LaneDriver(object):
                 doc = json.loads(src.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 doc = {}
-            if str(doc.get("commit") or "").startswith(sha[:12]) or sha.startswith(str(doc.get("commit") or "x")):
+            named = str(doc.get("commit") or "")
+            pre = str(doc.get("pre_autofix_commit") or "")
+            if named.startswith(sha[:12]) or (pre and (pre.startswith(sha[:12]) or sha.startswith(pre))):
+                if not named.startswith(sha[:12]):
+                    # the driver had rebound the builder's RESULT.json to the
+                    # autofix head; the regrade is of the builder's own commit
+                    doc["commit"] = sha
+                    doc["notes"] = ("%s\n[regrade: commit rebound from autofix head %s back to the builder's %s]"
+                                    % (doc.get("notes") or "", named[:12], sha[:12])).strip()
                 (wt / ".vp").mkdir(parents=True, exist_ok=True)
                 (wt / ".vp" / "RESULT.json").write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
                 self.log("REGRADE %s carried %s/.vp/RESULT.json (commit %s)" % (task, prev, sha[:12]))
@@ -3013,8 +3021,11 @@ class LaneDriver(object):
     # numstat/diff-scope benchmark row (H22-QUOTA-R1: 1-line fix + 375/232
     # autofix).  Import order, unused imports, trailing whitespace: nothing else.
     AUTOFIX_RULES = ("I001", "F401", "W291", "W293")
+    # a digest / byte-for-byte pin on a file is a diff-scope pin too (L32's
+    # B1 pins the companion test's sha256: any autofix touch fails it)
     DIFF_SCOPE_RE = re.compile(r"numstat|--shortstat|--stat\b|insertions?\b|deletions?\b|diff[- ]scope|"
-                               r"lines? (?:changed|added|removed|touched)|exactly \d+ lines?|line count", re.I)
+                               r"lines? (?:changed|added|removed|touched)|exactly \d+ lines?|line count|"
+                               r"sha256|sha-256|byte-for-byte|git hash-object|blob [0-9a-f]{7,}", re.I)
 
     def _tool(self, name, wt):
         """Prefer the worktree's own venv/node_modules binary, then the roster bins, then PATH."""

@@ -370,6 +370,19 @@ def test_retry_packet_regrade_grades_the_same_commit_without_a_builder_round(tmp
     wt = env.tmp / "wt" / "P-GAP-R1"
     assert git(wt, "rev-parse", "HEAD") == built
     assert json.loads((wt / ".vp" / "RESULT.json").read_text())["commit"] == built
+    # a RESULT.json the driver had rebound to an autofix head is carried when
+    # its pre_autofix_commit is the regrade sha, and rebound back
+    prev_res = env.tmp / "wt" / "P-GAP" / ".vp" / "RESULT.json"
+    doc = json.loads(prev_res.read_text())
+    doc.update({"commit": "f" * 40, "pre_autofix_commit": built})
+    prev_res.write_text(json.dumps(doc))
+    wt2 = env.tmp / "wt" / "P-GAP-R9"
+    git(env.trunk, "worktree", "add", "-q", "--detach", str(wt2), built)
+    (wt2 / ".vp").mkdir()
+    (wt2 / ".vp" / "BASE").write_text(env.base)
+    assert drv._regrade_reset("P-GAP-R9", wt2, {"sha": built, "retry_of": "P-GAP"}) is None
+    carried = json.loads((wt2 / ".vp" / "RESULT.json").read_text())
+    assert carried["commit"] == built and "rebound from autofix head ffffffffffff" in carried["notes"]
     log = (env.run_root / "driver.log").read_text()
     assert "REGRADE P-GAP-R1 on %s (build + autofix skipped; retry_of P-GAP)" % built[:12] in log
     assert "REGRADE P-GAP-R1 carried P-GAP/.vp/RESULT.json" in log
