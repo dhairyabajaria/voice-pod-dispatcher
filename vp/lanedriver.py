@@ -1236,7 +1236,11 @@ class LaneDriver(object):
                     members.append({"task": t, "packet": dep, "output_sha": r["output_sha"],
                                     "depth": len(self.pack.get(dep, {}).get("depends_on") or [])})
             else:
-                # D28: a build whose dependency outputs diverge needs a union to stand on
+                # D28: a build whose dependency outputs diverge needs a union to stand on --
+                # cut only once the row is READY (D35: L35 got union-4/5/6 five minutes
+                # apart while still WAITING_DEPENDENCY, one per newly verified member)
+                if row.get("state") != "READY":
+                    continue
                 plan = self._stack_plan(task, tasks)
                 members = plan["members"] if plan and plan["base"] is None and len(plan["members"]) > 1 else None
             if not members:
