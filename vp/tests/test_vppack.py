@@ -649,7 +649,18 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     assert codex.calls and Path(codex.calls[0].cwd) == wt
     # the verdict packet names the registered candidate (review_gate) AND the union it reviewed
     vp = json.loads(next((env.run_root / "turns" / "REVIEW-FIXSET").rglob("verdict-packet.json")).read_text())
-    assert vp["candidate_sha"] == sha and vp["union"] == "union-1" and vp["union_sha"] == tip
+    # D30: keyed by the union tip, the registered candidate kept alongside
+    assert vp["candidate_sha"] == tip and vp["tree_sha"] == git(env.trunk, "rev-parse", tip + "^{tree}")
+    assert vp["registered_candidate_sha"] == sha and vp["union"] == "union-1" and vp["union_sha"] == tip
+    # ... and the real review_gate accepts exactly that key for a non-final role
+    import importlib.util
+    from test_lanedriver import CONTROL_DIR
+    spec = importlib.util.spec_from_file_location("review_gate_live", CONTROL_DIR / "review_gate.py")
+    gate = importlib.util.module_from_spec(spec); spec.loader.exec_module(gate)
+    cand = json.loads(env.state.read_text())["candidate"]
+    assert gate._union_subject(vp, cand, "junior") is True
+    with pytest.raises(ValueError):
+        gate._union_subject(vp, cand, "final_review") or (_ for _ in ()).throw(ValueError("final never"))
     log = (env.run_root / "driver.log").read_text()
     assert "UNION union-1 %s base=%s for REVIEW-FIXSET members=P-FIX-A,P-FIX-B" % (tip[:12], sha[:12]) in log
     assert "UNION union-1: REVIEW-FIXSET worktree at %s (2 members)" % tip[:12] in log

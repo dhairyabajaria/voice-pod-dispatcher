@@ -3715,9 +3715,14 @@ class LaneDriver(object):
                   "coverage": coverage,
                   "model_seen": outcome.model_seen, "summary": doc.get("summary")}
         if union:
-            # D27: what was actually reviewed (candidate_sha above stays the
-            # registered candidate the gate checks; the union descends from it)
-            packet.update({"union": union.get("union"), "union_sha": union.get("union_sha"),
+            # D30 (BULK-RULING §12 item 3): a union tip is not a registered
+            # candidate, so the verdict is keyed by the tip itself (review_gate
+            # accepts it for non-final roles when it descends from the candidate)
+            tip = union.get("union_sha")
+            rc, tree, _e = self.git(["-C", str(self.trunk), "rev-parse", tip + "^{tree}"])
+            packet.update({"candidate_sha": tip, "tree_sha": tree.strip() if rc == 0 else None,
+                           "registered_candidate_sha": cand.get("sha"),
+                           "union": union.get("union"), "union_sha": tip,
                            "union_base_sha": union.get("base_sha"),
                            "union_members": [m.get("task") for m in union.get("members") or []]})
         p = tdir / "verdict-packet.json"
