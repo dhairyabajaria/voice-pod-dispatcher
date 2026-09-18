@@ -117,6 +117,9 @@ def load_pack(pack_dir):
         for dep in p["depends_on"]:
             if dep not in pack:
                 lint.append("ERROR pack: %s depends_on %s is not a packet" % (pid, dep))
+    for pid in sorted(pack):
+        for twin in hosted_twins(pack[pid], Path(pack[pid]["dir"]) / "BENCHMARK.md", lint):
+            pack.setdefault(twin["id"], twin)
     return pack, lint
 
 
@@ -302,26 +305,186 @@ def closure_plan(packet, pack, tasks, bindings=None):
 
 
 HOSTED_TWIN_SUFFIX = "-HOSTED"
+HOSTED_ROW_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\].*$", re.M)
+ROW_GATE_RE = re.compile(r"\(gate: (DELIVERY-[1-5][AB]?|O[1-9]|CIRCLECI)\)")   # check-v13.py GATES_RE
+GATE_ROSTER_KEY = {"CIRCLECI": "DELIVERY-1"}    # 00-SCOPE §5: CIRCLECI rows run once DELIVERY-1 is usable
+GATE_TEMPLATE = {"CIRCLECI": "TEST_GAP"}        # §19(2): product proof via CircleCI; DELIVERY-*/O* -> EXTERNAL_PREP
+TWIN_KIND = "hosted"
 
 
 def is_hosted_twin(packet):
-    """the <ID>-HOSTED twin that owes the hosted evidence (00-SCOPE §5,
-    PACKET-FORMAT §2); the base packet goes VERIFIED_LOCAL on its [box] rows"""
-    return str(packet.get("id") or "").endswith(HOSTED_TWIN_SUFFIX)
+    """the <ID>-HOSTED[-<GATE>] twin that owes the hosted evidence (00-SCOPE §5,
+    PACKET-FORMAT §2/§6); the base packet goes VERIFIED_LOCAL on its [box] rows"""
+    return bool(packet.get("twin_of")) or HOSTED_TWIN_SUFFIX in str(packet.get("id") or "")
 
 
-def owner_gate_open(packet, roster):
-    """D34 (BULK-RULING §14): an owner gate holds only the <ID>-HOSTED twin;
-    the base packet dispatches on depends_on alone (L31/L34 were held whole
-    behind DELIVERY-2/4 and never ran their box rows).  A roster with no
-    `owner_gates` map is all-closed for twins, never silently open."""
-    gate = packet.get("owner_gate") or "none"
-    if gate == "none" or not is_hosted_twin(packet):
-        return True
+def hosted_row_gates(text):
+    """{row_id: (gate|None, verbatim line)} for every [hosted] row of a BENCHMARK.md"""
+    out = {}
+    for m in HOSTED_ROW_RE.finditer(text):
+        g = ROW_GATE_RE.search(m.group(0))
+        out[m.group(1)] = (g.group(1) if g else None, m.group(0).strip())
+    return out
+
+
+def twin_id(parent_id, gate, gates):
+    """<ID>-HOSTED when every hosted row shares one gate, else <ID>-HOSTED-<GATE> (§19(1))"""
+    return "%s%s" % (parent_id, HOSTED_TWIN_SUFFIX) if len(set(gates)) == 1 \
+        else "%s%s-%s" % (parent_id, HOSTED_TWIN_SUFFIX, gate)
+
+
+def hosted_twins(packet, benchmark_path, lint=None):
+    """D37 (PACKET-FORMAT §6, BULK-RULING §19): one synthetic twin packet per
+    (packet, gate) over the parent's [hosted] rows.  The twin is held by ITS
+    gate only (the header's owner_gate is informational), depends on the
+    parent, closes nothing, and is built on the parent's VERIFIED output
+    (the driver fills base_sha at instantiation; D28 stacks the worktree).
+    A hosted row without a (gate: X) tag is a lint error and joins no twin."""
+    if is_hosted_twin(packet) or packet.get("v13_kind") == "review":
+        return []
+    try:
+        text = Path(benchmark_path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rows = hosted_row_gates(text)
+    if not rows:
+        return []
+    by_gate = {}
+    for rid, (gate, line) in rows.items():
+        if gate is None:
+            if lint is not None:
+                lint.append("ERROR benchmark: %s %s is [hosted] but names no (gate: X); no twin carries it"
+                            % (packet["id"], rid))
+            continue
+        by_gate.setdefault(gate, []).append((rid, line))
+    twins = []
+    for gate in sorted(by_gate):
+        rids = [r for r, _ in by_gate[gate]]
+        lines = [l for _, l in by_gate[gate]]
+        template = GATE_TEMPLATE.get(gate, "EXTERNAL_PREP")
+        tid = twin_id(packet["id"], gate, list(by_gate))
+        twins.append({
+            "id": tid, "dir": packet["dir"], "title": "%s hosted rows %s behind %s: %s"
+            % (packet["id"], ",".join(rids), gate, " | ".join(lines)),
+            "v13_kind": TWIN_KIND, "scheduler_task": "NEW:%s" % template, "template": template,
+            "runner_role": packet["runner_role"], "closes": [], "depends_on": [packet["id"]],
+            "hosted_owed": False, "critical": packet.get("critical", False), "owner_gate": gate,
+            "base_sha": "", "owned_files": list(packet["owned_files"]),
+            # CIRCLECI twins run the FULL suite off-box: no targeted paths -> suite "full" -> one
+            # pipeline per proof (06-ROUTING §5); max_rounds 1 keeps it one pipeline per twin (§19)
+            "test_paths": [] if gate == "CIRCLECI" else list(packet["test_paths"]),
+            "proof_kind": packet["proof_kind"], "max_rounds": 1 if gate == "CIRCLECI" else packet["max_rounds"],
+            "parent_contract": packet.get("parent_contract"), "group": packet.get("group"), "body": packet["body"],
+            "review_base": "", "coverage_targets": [],
+            "twin_of": packet["id"], "twin_gate": gate, "hosted_rows": rids, "hosted_lines": lines,
+        })
+    return twins
+
+
+def gate_open(gate, roster):
+    """an owner gate is open only when roster.owner_gates names it true; no map
+    = all closed (D34).  CIRCLECI rows open with DELIVERY-1 (00-SCOPE §5)."""
     gates = roster.get("owner_gates")
     if not isinstance(gates, dict):
         return False
-    return bool(gates.get(gate))
+    return bool(gates.get(GATE_ROSTER_KEY.get(gate, gate)))
+
+
+def twin_gate(packet):
+    return packet.get("twin_gate") or packet.get("owner_gate") or "none"
+
+
+def owner_gate_open(packet, roster):
+    """D34 (BULK-RULING §14) + D37 (§19(1)): an owner gate holds only a hosted
+    twin, and a twin is held by its OWN gate (its rows' `(gate: X)` tag), never
+    by the packet header's owner_gate; the base packet dispatches on
+    depends_on alone.  A roster with no `owner_gates` map is all-closed for
+    twins, never silently open."""
+    if not is_hosted_twin(packet):
+        return True
+    gate = twin_gate(packet)
+    if gate == "none":
+        return True
+    return gate_open(gate, roster)
+
+
+def twin_benchmark(packet):
+    """the twin's .vp/BENCHMARK.md: exactly its hosted rows, verbatim (§6: its
+    benchmark IS the [hosted] rows of the parent)"""
+    return ("# %s -- hosted rows of %s behind %s (PACKET-FORMAT-v13 §6)\n\n%s\n"
+            % (packet["id"], packet["twin_of"], packet["twin_gate"], "\n".join(packet["hosted_lines"])))
+
+
+TWIN_PREAMBLE = """<!-- HOSTED TWIN {id} (PACKET-FORMAT-v13 §6, BULK-RULING §19) -->
+> **This is the hosted twin of `{parent}` for gate `{gate}`.** The parent's `[box]` rows are already VERIFIED
+> at `{base}`; this worktree is cut from exactly that commit (`.vp/BASE`), never trunk. Prove ONLY the rows in
+> `.vp/BENCHMARK.md` ({rows}); every other row of the parent benchmark is out of scope here. Do not re-do the
+> parent's product work: the owned files below are the parent's, listed so the proof scope is unchanged.
+{how}
+> Rows: {lines}
+
+"""
+TWIN_HOW = {
+    "CIRCLECI": "> Proof: the driver runs the FULL CircleCI pipeline on this exact sha as the proof (06-ROUTING §5,"
+                " one pipeline per twin); grade each row from the proof record and the pipeline artefacts.",
+    "DELIVERY-2A": "> Host: the Oracle VPS is reachable over SSH/sudo/Docker per `voice-pod/deployment/VPS_HANDOVER.md`"
+                   " §1-2 (DELIVERY-2A). Rehearsal secret policy (§18 ruling, standing default): agent-generated"
+                   " values per VPS_HANDOVER.md §5, placeholder strings for the 3 owner API keys, hostname-coupled"
+                   " vars = voicepod-vps.internal, ACME off, deploy.env never committed, everything discarded before"
+                   " the real DELIVERY-2B deploy.",
+}
+
+
+TWIN_HEADER_OVERRIDES = ("item", "title", "depends_on", "test_paths", "closes", "hosted_owed", "owner_gate",
+                         "max_rounds", "base_sha", "twin_of", "twin_gate", "hosted_rows")
+
+
+def _yaml_list(key, values):
+    return ["%s: []" % key] if not values else ["%s:" % key] + ["  - %s" % v for v in values]
+
+
+def twin_front_matter(packet, base):
+    """the twin's front matter: the parent's, with the twin's own item/title/
+    depends_on/test_paths/base_sha/owner_gate/max_rounds (the driver's proof
+    step and base rule read THIS header: no test_paths -> the full suite ->
+    CircleCI, 06-ROUTING §5)"""
+    body = packet["body"]
+    lines = body.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None, body
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return None, body
+    drop = set(TWIN_HEADER_OVERRIDES)
+    if not packet["test_paths"]:
+        drop |= {"proof_paths", "proof_workers"}   # a full-suite twin keeps no box narrowing (F-B)
+    kept, skip = [], False
+    for ln in lines[1:end]:
+        key = ln.split(":", 1)[0].strip() if ln and not ln.startswith((" ", "\t", "-")) else None
+        if key is not None:
+            skip = key in drop
+        if not skip:
+            kept.append(ln)
+    kept += ["item: %s" % packet["id"], "title: %s" % json.dumps(packet["title"][:200]),
+             "base_sha: %s" % base, "owner_gate: %s" % packet["twin_gate"], "hosted_owed: false",
+             "max_rounds: %d" % packet["max_rounds"], "twin_of: %s" % packet["twin_of"],
+             "twin_gate: %s" % packet["twin_gate"]]
+    kept += _yaml_list("depends_on", packet["depends_on"]) + _yaml_list("test_paths", packet["test_paths"])
+    kept += _yaml_list("closes", []) + _yaml_list("hosted_rows", packet["hosted_rows"])
+    return "---\n" + "\n".join(kept) + "\n---\n", "\n".join(lines[end + 1:])
+
+
+def twin_packet_text(packet, base):
+    """the twin's .vp/PACKET.md: the twin's front matter, the §6 preamble, then
+    the parent's packet body"""
+    how = TWIN_HOW.get(packet["twin_gate"], "> Gate `%s` is open per roster owner_gates; the row text names the"
+                       " external system to prove against." % packet["twin_gate"])
+    pre = TWIN_PREAMBLE.format(id=packet["id"], parent=packet["twin_of"], gate=packet["twin_gate"], base=base,
+                               rows=",".join(packet["hosted_rows"]), how=how,
+                               lines=" | ".join(packet["hosted_lines"]))
+    fm, body = twin_front_matter(packet, base)
+    return (fm or "") + pre + body
 
 
 def dispatch_record(packet, task, mode, template, parent, base, extra=None):

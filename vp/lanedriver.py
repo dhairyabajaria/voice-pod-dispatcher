@@ -1068,10 +1068,106 @@ class LaneDriver(object):
         p = self.packet_for(task)
         if not p or vppack.owner_gate_open(p, self.roster):
             return True
-        self.alert_once("owner-gate:%s" % p["owner_gate"], "OWNER_GATE",
+        gate = vppack.twin_gate(p)
+        self.alert_once("owner-gate:%s" % gate, "OWNER_GATE",
                         "%s waits for %s (roster owner_gates.%s is not true); nothing dispatched behind it"
-                        % (p["id"], p["owner_gate"], p["owner_gate"]), task)
+                        % (p["id"], gate, gate), task)
         return False
+
+    # -- D37 (PACKET-FORMAT §6, BULK-RULING §19): hosted twins -------------------------------
+    TWIN_DEPENDENTS = ["L36", "L42"]          # roster packet.twin_dependents; L35 never waits on a twin
+
+    def _twin_parent_output(self, p, tasks):
+        """(parent_task, output_sha) once the parent's bound row is accepted with
+        an output; (parent_task|None, None) while the twin must wait"""
+        ptask = next((t for t, pid in self.pack_by_task.items() if pid == p["twin_of"]), None)
+        if not ptask:
+            return None, None
+        r = tasks.get(ptask) or {}
+        if r.get("state") not in self.UNION_MEMBER_STATES or not r.get("output_sha"):
+            return ptask, None
+        return ptask, r["output_sha"]
+
+    def _twin_dependents_expand(self, twin_task, tasks):
+        """§19(4): L36/L42 (roster packet.twin_dependents) wait on every twin too"""
+        for tid in (self.roster.get("packet") or {}).get("twin_dependents", self.TWIN_DEPENDENTS):
+            row = tasks.get(tid)
+            if not row or row.get("state") not in ("PLANNED", "WAITING_DEPENDENCY", "READY"):
+                continue
+            deps = list(row.get("depends_on") or [])
+            if twin_task in deps:
+                continue
+            deps.append(twin_task)
+            try:
+                self.control.call("rewire", ["--task", tid, "--depends-on"] + deps +
+                                  ["--reason", "D37: %s waits on hosted twin %s (§19(4))" % (tid, twin_task)])
+            except ControlError as exc:
+                self.alert_once("rewire-twin:%s:%s" % (tid, twin_task), "REWIRE_REFUSED",
+                                "%s += %s: %s" % (tid, twin_task, str(exc)[:240]), tid)
+                continue
+            row["depends_on"] = deps
+            self.log("PACK rewired %s.depends_on += %s (hosted twin)" % (tid, twin_task))
+            _append_jsonl(self.run_root / "packets" / "bindings.jsonl",
+                          {"ts": utc_ms(), "packet": tid, "op": "rewire", "depends_on": deps,
+                           "twin": twin_task}, self._lock)
+
+    def _twin_slot_full(self, task):
+        """§19 throughput: a CIRCLECI twin is one pipeline; never more of them
+        live than roster proof.circleci.max_in_flight (default 2), so the
+        burst of 57 twins queues on the driver instead of overflowing the
+        proof router onto the box (laneproof.route: in-flight cap -> box)"""
+        p = self.packet_for(task)
+        if not p or not vppack.is_hosted_twin(p) or p.get("twin_gate") != "CIRCLECI":
+            return False
+        cap = int(self.proof.circle_cfg().get("max_in_flight", 2) or 2)   # roster max_pipelines_in_flight
+        with self._lock:
+            live = [t for t in self._live if (self.packet_for(t) or {}).get("twin_gate") == "CIRCLECI"]
+        if len(live) < cap:
+            return False
+        if ("twin-slot", task) not in self._pack_logged:
+            self._pack_logged.add(("twin-slot", task))
+            self.log("WAIT %s: %d CIRCLECI twin(s) live >= cap %d" % (task, len(live), cap))
+        return True
+
+    def _twin_record(self, task, outcome, fpath, attempt):
+        """§19(5): per-row verdicts on the parent's hosted record
+        (RUN_ROOT/hosted/<parent_task>.json), and box_only clears only once
+        every twin of the parent is VERIFIED.  A sidecar, never an edit of the
+        parent's sealed evidence files."""
+        p = self.packet_for(task)
+        if not p or not vppack.is_hosted_twin(p):
+            return
+        ptask = next((t for t, pid in self.pack_by_task.items() if pid == p.get("twin_of")), None) or p.get("twin_of")
+        verdicts = {}
+        try:
+            doc = json.loads(Path(fpath).read_text(encoding="utf-8")) if fpath and Path(fpath).exists() else {}
+            for line in (doc.get("lines") or []):
+                if isinstance(line, dict) and str(line.get("id")) in (p.get("hosted_rows") or []):
+                    verdicts[str(line["id"])] = str(line.get("verdict") or "UNKNOWN")
+        except (OSError, ValueError):
+            pass
+        for rid in p.get("hosted_rows") or []:
+            verdicts.setdefault(rid, "UNKNOWN" if outcome != "VERIFIED" else "PASS")
+        hdir = self.run_root / "hosted"
+        hdir.mkdir(parents=True, exist_ok=True)
+        f = hdir / ("%s.json" % ptask)
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        except (OSError, ValueError):
+            rec = {}
+        rec.setdefault("task", ptask)
+        rec["packet"] = p.get("twin_of")
+        twins = rec.setdefault("twins", {})
+        twins[task] = {"gate": p.get("twin_gate"), "outcome": outcome, "attempt": attempt, "ts": utc_ms()}
+        rows = rec.setdefault("hosted_rows", {})
+        for rid, v in verdicts.items():
+            rows[rid] = {"verdict": v, "twin": task, "attempt": attempt, "ts": utc_ms()}
+        all_twins = [q["id"] for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")]
+        rec["box_only"] = not all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
+        rec["twins_expected"] = sorted(all_twins)
+        rec["ts"] = utc_ms()
+        f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.log("HOSTED %s <- %s %s rows=%s box_only=%s" % (ptask, task, outcome, verdicts, rec["box_only"]))
 
     REVIEW_SUBJECT_HOLD_S = 600
 
@@ -1485,8 +1581,21 @@ class LaneDriver(object):
                                                                 {"state": tasks[task].get("state")}))
                 continue
             # dynamic and not yet instantiated
+            if vppack.is_hosted_twin(p) and p.get("twin_of"):
+                # D37: a twin is built on the parent's VERIFIED output (§19(3)); it is
+                # instantiated only once that output exists (PACKET-FORMAT §6)
+                ptask, out = self._twin_parent_output(p, tasks)
+                if not out:
+                    if ("twin", pid) not in self._pack_logged:
+                        self._pack_logged.add(("twin", pid))
+                        self.log("PACK %s waits: parent %s (%s) has no VERIFIED output yet" % (pid, p["twin_of"], ptask))
+                    continue
+                p["base_sha"] = out
+                self._pack_logged.discard(("twin", pid))
             if self._pack_instantiate(p, task, mode[2], tasks, candidate, bindings):
                 bound_now += 1
+                if vppack.is_hosted_twin(p) and p.get("twin_of"):
+                    self._twin_dependents_expand(task, tasks)
         for tid in (self.roster.get("packet") or {}).get("rewire", ["L42"]):
             self._pack_rewire(tid, tasks, bindings)
         if bound_now:
@@ -1663,7 +1772,11 @@ class LaneDriver(object):
         if not p or not row or row.get("state") not in ("PLANNED", "WAITING_DEPENDENCY", "READY"):
             return
         deps = vppack.dependency_tasks(p, self.pack, tasks, bindings)
-        if deps is None or list(row.get("depends_on") or []) == deps:
+        if deps is None:
+            return
+        deps = deps + [t for t in (row.get("depends_on") or [])          # D37: twins added by
+                       if t not in deps and vppack.is_hosted_twin(self.pack.get(self.pack_by_task.get(t, ""), {}))]
+        if list(row.get("depends_on") or []) == deps:
             return
         try:
             self.control.call("rewire", ["--task", tid, "--depends-on"] + deps +
@@ -1945,12 +2058,19 @@ class LaneDriver(object):
         vp = wt / ".vp"
         vp.mkdir(parents=True, exist_ok=True)
         pp, bp = self._pack_paths(task)
-        paths, pkind = (None, None) if pp else self._proof_hints(task, row)
-        (vp / "PACKET.md").write_text(pp.read_text(encoding="utf-8") if pp
-                                      else self.render_packet(contract, base, row, test_paths=paths,
-                                                              proof_kind=pkind), encoding="utf-8")
-        (vp / "BENCHMARK.md").write_text(bp.read_text(encoding="utf-8") if bp
-                                         else self.render_benchmark(contract), encoding="utf-8")
+        twin = self.packet_for(task)
+        twin = twin if twin and vppack.is_hosted_twin(twin) and twin.get("twin_of") else None
+        paths, pkind = (None, None) if (pp or twin) else self._proof_hints(task, row)
+        if twin:
+            # D37: the twin's packet is the parent's under the §6 preamble; its benchmark IS the hosted rows
+            (vp / "PACKET.md").write_text(vppack.twin_packet_text(twin, base), encoding="utf-8")
+            (vp / "BENCHMARK.md").write_text(vppack.twin_benchmark(twin), encoding="utf-8")
+        else:
+            (vp / "PACKET.md").write_text(pp.read_text(encoding="utf-8") if pp
+                                          else self.render_packet(contract, base, row, test_paths=paths,
+                                                                  proof_kind=pkind), encoding="utf-8")
+            (vp / "BENCHMARK.md").write_text(bp.read_text(encoding="utf-8") if bp
+                                             else self.render_benchmark(contract), encoding="utf-8")
         for name, doc in (("RESULT_SCHEMA.json", vpschema.RESULT_SCHEMA_DOC),
                           ("FINDINGS_SCHEMA.json", vpschema.FINDINGS_SCHEMA_DOC),
                           ("REVIEW_SCHEMA.json", vpschema.REVIEW_SCHEMA_DOC)):
@@ -2688,6 +2808,15 @@ class LaneDriver(object):
         """D28: (base, stacked) for a build row -- the trunk base and None, or
         the dependency's verified output and the plan; (None, plan) means HOLD"""
         tasks = state.get("tasks") or {}
+        p = self.packet_for(task)
+        if p and vppack.is_hosted_twin(p) and p.get("twin_of"):
+            ptask, out = self._twin_parent_output(p, tasks)
+            if not out:
+                self.note_hold(task, self._ready_key(row), "TWIN_PARENT_OUTPUT %s" % task, self.STACK_HOLD_S)
+                return None, None
+            # §19(3): the hosted proof runs on exactly the tree the box verified
+            return out, {"members": [{"task": ptask, "packet": p["twin_of"], "output_sha": out, "depth": 0}],
+                         "on": [ptask], "base": out, "why": "hosted twin of %s: its VERIFIED output" % ptask}
         plan = self._stack_plan(task, tasks)
         missing = self._unstacked_deps(row, tasks, plan)
         if missing:
@@ -2734,6 +2863,8 @@ class LaneDriver(object):
                                 "no roster role for kind %r (task %s); not dispatched" % (kind, task))
                 continue
             if not self._owner_gate_open(task):
+                continue
+            if self._twin_slot_full(task):
                 continue
             if self._review_subject_empty(task, row, state):
                 continue
@@ -3062,6 +3193,10 @@ class LaneDriver(object):
             # D32: a retry going red is a ruling owed to a human, not a row to leave in the counts
             self.alert("FAIL_AFTER_RETRY", "%s (%s) -> %s: %s" % (task, attempt, outcome, (reason or "")[:300]), task)
         self.completed.append((task, attempt, outcome))
+        try:
+            self._twin_record(task, outcome, (wt / ".vp" / "FINDINGS.json") if wt else None, attempt)
+        except Exception as exc:  # noqa: BLE001 -- a sidecar never undoes a completion
+            self.alert("HOSTED_RECORD_FAILED", "%s: %s: %s" % (task, type(exc).__name__, str(exc)[:200]), task)
         if outcome == "VERIFIED":
             try:
                 if verdict and kind in REVIEW_KINDS:
@@ -3229,7 +3364,7 @@ class LaneDriver(object):
                 return gout, None
             self._merge_proof_findings(fpath, prec)
             _doc, fails, unknown = findings_verdicts(fpath)
-            hosted = self.hosted_rows(wt)
+            hosted = self._exempt_rows(task, wt)
             owed = [u for u in unknown if u in hosted]
             blocking = [u for u in unknown if u not in hosted]
             if owed:
@@ -3305,6 +3440,15 @@ class LaneDriver(object):
         ev = [out_path, fpath, tdir / "record.json"] + self._proof_evidence(prec)
         return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                          "evidence": ev, "hosted_owed": owed}
+
+    def _exempt_rows(self, task, wt):
+        """rows that may stay UNKNOWN without blocking: every [hosted] row of a
+        base packet (its twin owns them); NONE on a twin -- there the hosted
+        rows are the subject (D37)"""
+        p = self.packet_for(task)
+        if p and vppack.is_hosted_twin(p) and p.get("twin_of"):
+            return set()
+        return self.hosted_rows(wt)
 
     @staticmethod
     def hosted_rows(wt):
@@ -3749,7 +3893,7 @@ class LaneDriver(object):
         if gout.status != STATUS_DONE:
             return gout, None
         _doc, fails, unknown = findings_verdicts(fpath)
-        hosted = self.hosted_rows(wt)
+        hosted = self._exempt_rows(task, wt)
         blocking = [u for u in unknown if u not in hosted]
         ev = [wt / ".vp" / "REVIEW.json", wt / ".vp" / "RESULT.json", fpath, tdir / "record.json", packet]
         if fails or blocking:

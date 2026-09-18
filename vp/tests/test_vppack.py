@@ -15,6 +15,7 @@ VP = HERE.parent
 sys.path.insert(0, str(VP))
 sys.path.insert(0, str(HERE))
 
+import vplint  # noqa: E402
 import vppack  # noqa: E402
 from test_lanedriver import Env, FakeRunner, by_role, findings, git, result_ok, settle  # noqa: E402
 
@@ -992,3 +993,129 @@ def test_stacked_row_prompts_carry_the_base_rule_and_unstacked_rows_do_not(tmp_p
         note = prompts["P-STACKED"][role]
         assert "BASE RULE" in note and dep_out[:12] in note and ("a" * 12) in note   # packet base_sha named
         assert "reports UNKNOWN, never FAIL" in note
+
+
+BM_HOSTED = ("- B1 [evidence] [box] {id} regraded — check: control/evidence/{id}/v13/REGRADE.md\n"
+             "- B2 [invariant] [hosted] full CircleCI matrix green on the sha (gate: CIRCLECI)\n"
+             "- B3 [invariant] [hosted] restore leg runs on the VPS (gate: DELIVERY-2A)\n"
+             "- B4 [negative] [hosted] deploy places no provider call (gate: DELIVERY-2A)\n")
+
+
+def test_hosted_twins_one_per_gate_held_by_their_own_gate(tmp_path):
+    """D37 (PACKET-FORMAT §6, §19): a packet with [hosted] rows yields one
+    synthetic twin per gate; template by gate; a twin is held by ITS gate,
+    never the header's; its benchmark is exactly its rows."""
+    pd = tmp_path / "pack"
+    packet(pd, "P-PAR", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="DELIVERY-2B",
+           body="parent for L00")
+    (pd / "P-PAR" / "BENCHMARK.md").write_text(BM_HOSTED.format(id="P-PAR"))
+    packet(pd, "P-BOX", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="box only for L00")
+    pack, lint = vppack.load_pack(pd)
+    assert lint == [] and set(pack) == {"P-PAR", "P-BOX", "P-PAR-HOSTED-CIRCLECI", "P-PAR-HOSTED-DELIVERY-2A"}
+    cc, va = pack["P-PAR-HOSTED-CIRCLECI"], pack["P-PAR-HOSTED-DELIVERY-2A"]
+    assert cc["template"] == "TEST_GAP" and cc["hosted_rows"] == ["B2"] and cc["test_paths"] == [] and cc["max_rounds"] == 1
+    assert va["template"] == "EXTERNAL_PREP" and va["hosted_rows"] == ["B3", "B4"] and va["test_paths"] == ["platform/a.py"]
+    assert cc["depends_on"] == va["depends_on"] == ["P-PAR"] and cc["closes"] == [] and not cc["hosted_owed"]
+    assert vppack.bind(cc, {}) == ("dynamic", "P-PAR-HOSTED-CIRCLECI", "TEST_GAP")
+    assert vppack.topo_order(pack).index("P-PAR") < vppack.topo_order(pack).index("P-PAR-HOSTED-DELIVERY-2A")
+    # the header says DELIVERY-2B (closed); the twins go by their rows' gates
+    roster = {"owner_gates": {"DELIVERY-1": True, "DELIVERY-2A": True, "DELIVERY-2B": False}}
+    assert vppack.owner_gate_open(pack["P-PAR"], roster) and vppack.owner_gate_open(cc, roster)
+    assert vppack.owner_gate_open(va, roster)
+    assert not vppack.owner_gate_open(va, {"owner_gates": {"DELIVERY-2B": True}})
+    assert not vppack.owner_gate_open(cc, {"owner_gates": {"CIRCLECI": True}}), "CIRCLECI rows open with DELIVERY-1"
+    assert not vppack.owner_gate_open(cc, {}), "no map = closed"
+    bm = vppack.twin_benchmark(va)
+    assert "B3 " in bm and "B4 " in bm and "B1 " not in bm and "B2 " not in bm
+    txt = vppack.twin_packet_text(va, "c" * 40)
+    hdr, rest = vplint.parse_front_matter(txt)
+    assert hdr["item"] == "P-PAR-HOSTED-DELIVERY-2A" and hdr["base_sha"] == "c" * 40 and hdr["owner_gate"] == "DELIVERY-2A"
+    assert hdr["depends_on"] == ["P-PAR"] and hdr["test_paths"] == ["platform/a.py"] and hdr["twin_of"] == "P-PAR"
+    assert hdr["v13_kind"] == "repair" and hdr["proof_kind"] == "platform", "the rest of the parent header is kept"
+    assert "<!-- HOSTED TWIN P-PAR-HOSTED-DELIVERY-2A" in txt and "voicepod-vps.internal" in txt
+    assert "## Goal" in txt and "item: P-PAR\n" not in txt, "the parent's BODY follows the preamble"
+    cc_hdr, _ = vplint.parse_front_matter(vppack.twin_packet_text(cc, "c" * 40))
+    assert cc_hdr["test_paths"] == [] and cc_hdr["max_rounds"] == 1, "no targeted paths: the proof is the full suite"
+    # a single-gate packet's twin keeps the bare -HOSTED name (§19(1))
+    packet(pd, "P-ONE", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="one gate for L00")
+    (pd / "P-ONE" / "BENCHMARK.md").write_text(
+        "- B1 [evidence] [box] x — check: y\n- B2 [invariant] [hosted] y (gate: CIRCLECI)\n")
+    pack, lint = vppack.load_pack(pd)
+    assert "P-ONE-HOSTED" in pack and lint == []
+    # a hosted row without a gate joins no twin and is a lint error
+    (pd / "P-ONE" / "BENCHMARK.md").write_text("- B2 [invariant] [hosted] y\n")
+    pack, lint = vppack.load_pack(pd)
+    assert "P-ONE-HOSTED" not in pack and any("P-ONE B2 is [hosted] but names no (gate" in l for l in lint)
+
+
+def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_verdicts(tmp_path):
+    """D37 driver half: the twin is instantiated once the parent has a VERIFIED
+    output, cut from exactly that sha (§19(3)), its worktree carries the twin
+    packet/benchmark, L42-class dependents wait on it (§19(4)), and its
+    verdicts land on the parent's hosted record with box_only (§19(5))."""
+    pd = tmp_path / "pack"
+    packet(pd, "P-PAR", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="DELIVERY-2B",
+           body="parent for L00")
+    (pd / "P-PAR" / "BENCHMARK.md").write_text(BM_HOSTED.format(id="P-PAR"))
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "packet": {"twin_dependents": ["L04"]},
+                                      "owner_gates": {"DELIVERY-1": True},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    seen = {}
+
+    def builder(spec, ab):
+        wt = Path(spec.cwd)
+        seen[spec.item] = {"base": (wt / ".vp" / "BASE").read_text().strip(),
+                           "packet": (wt / ".vp" / "PACKET.md").read_text(),
+                           "bench": (wt / ".vp" / "BENCHMARK.md").read_text()}
+        return _fix_builder(spec, ab)
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    drv.tick()
+    rows = env.rows()
+    assert "P-PAR" in rows and "P-PAR-HOSTED-CIRCLECI" not in rows, "no twin before the parent's output exists"
+    assert "P-PAR-HOSTED-CIRCLECI waits: parent P-PAR" in (env.run_root / "driver.log").read_text()
+    settle(drv, 8)
+    rows = env.rows()
+    assert rows["P-PAR"]["state"] == "VERIFIED"
+    par_out = rows["P-PAR"]["output_sha"]
+    cc = rows["P-PAR-HOSTED-CIRCLECI"]
+    assert cc["state"] == "VERIFIED" and cc["template_id"] == "TEST_GAP" and cc["depends_on"] == ["P-PAR"]
+    assert cc["stacked_base"] == par_out and cc["stacked_on"] == ["P-PAR"] and cc["base_sha"] == par_out
+    assert seen["P-PAR-HOSTED-CIRCLECI"]["base"] == par_out
+    assert "<!-- HOSTED TWIN P-PAR-HOSTED-CIRCLECI" in seen["P-PAR-HOSTED-CIRCLECI"]["packet"]
+    assert seen["P-PAR-HOSTED-CIRCLECI"]["packet"].startswith("---\n")
+    assert [l.split()[1] for l in seen["P-PAR-HOSTED-CIRCLECI"]["bench"].splitlines() if l.startswith("- B")] == ["B2"]
+    params = json.loads((env.run_root / "packets" / "P-PAR-HOSTED-CIRCLECI.params.json").read_text())
+    assert params["candidate_sha"] == par_out and "(gate: CIRCLECI)" in params["unproved_criterion"]
+    # the DELIVERY-2A twin waits for its own gate, not the header's DELIVERY-2B
+    assert "P-PAR-HOSTED-DELIVERY-2A" not in rows
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "P-PAR-HOSTED-DELIVERY-2A waits for DELIVERY-2A" in alerts
+    # L04 (roster packet.twin_dependents) now waits on the twin as well
+    assert "P-PAR-HOSTED-CIRCLECI" in rows["L04"]["depends_on"]
+    # §19(5): per-row verdicts on the parent's hosted record; box_only until every twin is VERIFIED
+    rec = json.loads((env.run_root / "hosted" / "P-PAR.json").read_text())
+    assert rec["hosted_rows"]["B2"]["verdict"] == "PASS" and rec["hosted_rows"]["B2"]["twin"] == "P-PAR-HOSTED-CIRCLECI"
+    assert rec["box_only"] is True and rec["twins_expected"] == ["P-PAR-HOSTED-CIRCLECI", "P-PAR-HOSTED-DELIVERY-2A"]
+    # open DELIVERY-2A: the second twin instantiates, runs on the same parent output, clears box_only
+    roster = json.loads((env.run_root / "roster.json").read_text())
+    roster["owner_gates"] = {"DELIVERY-1": True, "DELIVERY-2A": True}
+    (env.run_root / "roster.json").write_text(json.dumps(roster, indent=2))
+    drv._roster_mtime = 0
+    settle(drv, 8)
+    rows = env.rows()
+    va = rows["P-PAR-HOSTED-DELIVERY-2A"]
+    assert va["state"] == "VERIFIED" and va["template_id"] == "EXTERNAL_PREP" and va["stacked_base"] == par_out
+    assert seen["P-PAR-HOSTED-DELIVERY-2A"]["base"] == par_out
+    # L04 ran once its first twin dependency verified; a dependent that already
+    # finished is not rewired (only PLANNED/WAITING/READY rows are)
+    assert rows["L04"]["state"] == "VERIFIED" and "P-PAR-HOSTED-CIRCLECI" in rows["L04"]["depends_on"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "PACK rewired L04.depends_on += P-PAR-HOSTED-CIRCLECI (hosted twin)" in log
+    rec = json.loads((env.run_root / "hosted" / "P-PAR.json").read_text())
+    assert {k: v["verdict"] for k, v in rec["hosted_rows"].items()} == {"B2": "PASS", "B3": "PASS", "B4": "PASS"}
+    assert rec["box_only"] is False

@@ -107,6 +107,10 @@ def catalog():
              "required_parameters": ["parent_contract_id", "unproved_criterion", "candidate_sha",
                                      "test_location", "owned_paths"],
              "steps": ["test"], "acceptance": ["gap closed"]},
+            {"id": "EXTERNAL_PREP", "kind": "builder",
+             "required_parameters": ["parent_contract_id", "missing_capability", "existing_authority_refs",
+                                     "required_fields"],
+             "steps": ["prepare"], "acceptance": ["external prepared"]},
         ],
         "contracts": [
             c("L00", "probe", "A", [], ["control/baseline"], ROLE_DS),
