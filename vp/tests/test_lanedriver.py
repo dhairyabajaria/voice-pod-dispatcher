@@ -1127,13 +1127,18 @@ def fake_tool(path, body):
     return str(path)
 
 
-def test_autofix_runs_ruff_and_prettier_and_commits_as_autofix(tmp_path):
+def test_autofix_runs_only_safe_ruff_fixes_never_format_or_prettier(tmp_path):
+    """D20: `ruff check --fix --select I001,F401,W291,W293` on the changed .py
+    files; `ruff format` and prettier are never invoked (s3's gate is `ruff
+    check` only); tsc stays report-only."""
     env = Env(tmp_path)
     env.activate()
-    # fake ruff: `check --fix` appends a marker; `format` rewrites quotes
+    calls = tmp_path / "ruff-calls.log"
     ruff = fake_tool(tmp_path / "ruff", "#!/bin/sh\n"
+                     'echo "$@" >> "%s"\n'
                      'if [ "$1" = check ]; then for f in "$@"; do case "$f" in *.py) echo "# ruff-fixed" >> "$f";; esac; done; fi\n'
-                     'if [ "$1" = format ]; then for f in "$@"; do case "$f" in *.py) sed -i "" "s/x = 2/x = 2  # formatted/" "$f";; esac; done; fi\n')
+                     'if [ "$1" = format ]; then for f in "$@"; do case "$f" in *.py) sed -i "" "s/x = 2/x = 2  # formatted/" "$f";; esac; done; fi\n'
+                     % calls)
     prettier = fake_tool(tmp_path / "prettier", "#!/bin/sh\nshift\nfor f in \"$@\"; do echo \"// pretty\" >> \"$f\"; done\n")
     tsc = fake_tool(tmp_path / "tsc", "#!/bin/sh\necho 'portal/x.ts(1,1): error TS1' ; exit 2\n")
     (env.trunk / "portal").mkdir()
@@ -1157,28 +1162,69 @@ def test_autofix_runs_ruff_and_prettier_and_commits_as_autofix(tmp_path):
     assert rows["L02"]["state"] == "VERIFIED"
     wt = env.tmp / "wt" / "L02"
     log = git(wt, "log", "--format=%s", "-3")
-    assert log.splitlines()[0] == "autofix: ruff/prettier (L02)"
+    assert log.splitlines()[0] == "autofix: ruff I001/F401/W291/W293 (L02)"
     assert log.splitlines()[1].startswith("work L02")
     assert "# ruff-fixed" in (wt / "platform" / "a.py").read_text()
-    assert "# formatted" in (wt / "platform" / "a.py").read_text()
-    assert "// pretty" in (wt / "portal" / "x.ts").read_text()
+    assert "# formatted" not in (wt / "platform" / "a.py").read_text(), "ruff format is never run"
+    assert "// pretty" not in (wt / "portal" / "x.ts").read_text(), "prettier is never run"
+    invocations = calls.read_text().splitlines()
+    assert len(invocations) == 1 and invocations[0].startswith("check --fix --exit-zero --select I001,F401,W291,W293 platform/a.py")
     assert rows["L02"]["output_sha"] == git(wt, "rev-parse", "HEAD"), "the autofix commit is the output"
     tdir = next((env.run_root / "turns" / "L02").iterdir())
     rec = json.loads((tdir / "autofix.json").read_text())
-    assert rec["py"] == ["platform/a.py"] and rec["portal"] == ["portal/x.ts"]
-    assert [s["tool"] for s in rec["steps"]] == ["ruff-fix", "ruff-format", "prettier", "tsc"]
+    assert rec["py"] == ["platform/a.py"] and rec["portal"] == ["portal/x.ts"] and rec["pinned"] is None
+    assert [s["tool"] for s in rec["steps"]] == ["ruff-fix", "tsc"]
     assert rec["tsc_rc"] == 2 and rec["committed"] == rows["L02"]["output_sha"]
     assert "tsc --noEmit rc=2" in (env.run_root / "driver.log").read_text()
     # the RESULT.json the builder wrote named the pre-autofix sha; the graded
     # record is rebound to HEAD (54 packets' rows require commit == HEAD)
     res = json.loads((wt / ".vp" / "RESULT.json").read_text())
     assert res["commit"] == git(wt, "rev-parse", "HEAD") and res["pre_autofix_commit"] == git(wt, "rev-parse", "HEAD~1")
-    assert res["diff_stat"]["files"] == 2 and res["diff_stat"]["insertions"] >= 3
     assert "RESULT.json commit rebound" in (env.run_root / "driver.log").read_text()
-    gitlog = (env.run_root / "git.jsonl").read_text()
-    assert "autofix: ruff/prettier" in gitlog
     # design-kind tasks (no builder turn) never run the fixers
     assert not list((env.run_root / "turns" / "L01").glob("*/autofix.json"))
+
+
+def test_autofix_is_skipped_when_the_benchmark_pins_the_diff_scope(tmp_path, monkeypatch):
+    orig = lanedriver.LaneDriver.render_benchmark
+
+    def render(contract):
+        return orig(contract) + "- B9 [forbidden] [box] exactly one line added — check: `git diff --numstat base..HEAD` prints 1 0\n"
+    monkeypatch.setattr(lanedriver.LaneDriver, "render_benchmark", staticmethod(render))
+    env = Env(tmp_path)
+    env.activate()
+    ruff = fake_tool(tmp_path / "ruff", "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in *.py) echo \"# ruff-fixed\" >> \"$f\";; esac; done\n")
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()},
+                     bins={"ruff": ruff})
+    settle(drv, 2)
+    wt = env.tmp / "wt" / "L02"
+    assert git(wt, "log", "--format=%s", "-1").startswith("work L02"), "no autofix commit"
+    assert "# ruff-fixed" not in (wt / "platform" / "a.py").read_text()
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    rec = json.loads((tdir / "autofix.json").read_text())
+    assert rec["committed"] is None and rec["pinned"].startswith("benchmark pins the diff scope")
+    assert rec["steps"][0] == {"tool": "ruff-fix", "skipped": rec["pinned"]}
+    assert "AUTOFIX L02 skipped: benchmark pins the diff scope" in (env.run_root / "driver.log").read_text()
+
+
+def test_autofix_is_skipped_when_the_packet_header_says_none(tmp_path, monkeypatch):
+    orig = lanedriver.LaneDriver.render_packet
+
+    def render(contract, base, row=None, test_paths=None, proof_kind=None):
+        return orig(contract, base, row, test_paths, proof_kind).replace("max_rounds:", "autofix: none\nmax_rounds:", 1)
+    monkeypatch.setattr(lanedriver.LaneDriver, "render_packet", staticmethod(render))
+    env = Env(tmp_path)
+    env.activate()
+    ruff = fake_tool(tmp_path / "ruff", "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in *.py) echo \"# ruff-fixed\" >> \"$f\";; esac; done\n")
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()},
+                     bins={"ruff": ruff})
+    settle(drv, 2)
+    wt = env.tmp / "wt" / "L02"
+    assert git(wt, "log", "--format=%s", "-1").startswith("work L02"), "no autofix commit"
+    assert "# ruff-fixed" not in (wt / "platform" / "a.py").read_text()
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    rec = json.loads((tdir / "autofix.json").read_text())
+    assert rec["committed"] is None and rec["pinned"] == "packet header autofix: none"
 
 
 def test_autofix_without_tools_or_changes_commits_nothing(tmp_path):

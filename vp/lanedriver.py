@@ -2752,6 +2752,14 @@ class LaneDriver(object):
 
     PY_EXT = (".py",)
     PORTAL_EXT = (".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".scss", ".md")
+    # D20: only fixes the s3 style gate itself would demand (02-CODE-STYLE §4/§7:
+    # CI runs `ruff check`, never `ruff format`, and has no prettier) -- a
+    # whole-file reformat is noise against that gate and it broke every
+    # numstat/diff-scope benchmark row (H22-QUOTA-R1: 1-line fix + 375/232
+    # autofix).  Import order, unused imports, trailing whitespace: nothing else.
+    AUTOFIX_RULES = ("I001", "F401", "W291", "W293")
+    DIFF_SCOPE_RE = re.compile(r"numstat|--shortstat|--stat\b|insertions?\b|deletions?\b|diff[- ]scope|"
+                               r"lines? (?:changed|added|removed|touched)|exactly \d+ lines?|line count", re.I)
 
     def _tool(self, name, wt):
         """Prefer the worktree's own venv/node_modules binary, then the roster bins, then PATH."""
@@ -2762,12 +2770,31 @@ class LaneDriver(object):
                 return str(cand)
         return self.bins.get(name) or shutil.which(name)
 
+    def _autofix_pinned(self, wt):
+        """True when the packet pins a diff scope (numstat / line counts /
+        --stat) in its benchmark or says `autofix: none` in its header: then
+        even a one-line lint fix would fail a row, so nothing is touched."""
+        vp = Path(wt) / ".vp"
+        try:
+            hdr, _ = vplint.parse_front_matter((vp / "PACKET.md").read_text(encoding="utf-8"))
+            if str((hdr or {}).get("autofix") or "").strip().lower() in ("none", "off", "false", "no"):
+                return "packet header autofix: none"
+        except (OSError, ValueError):
+            pass
+        try:
+            text = (vp / "BENCHMARK.md").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        m = self.DIFF_SCOPE_RE.search(text)
+        return ("benchmark pins the diff scope (%s)" % m.group(0)) if m else None
+
     def _autofix(self, wt, task, tdir=None, base=None):
-        """Deterministic fixers after a builder turn (plan §2.1 point 6): ruff
-        --fix + ruff format on touched .py, prettier on touched portal files,
-        tsc --noEmit on the portal when touched (report only).  Whatever they
-        changed is committed as `autofix:` so the grader and every reviewer
-        see a tree no human formatting nit can fail."""
+        """Deterministic fixer after a builder turn (plan §2.1 point 6, D20):
+        `ruff check --fix` restricted to AUTOFIX_RULES on the .py files the
+        builder changed -- never `ruff format`, never prettier; tsc --noEmit on
+        a touched portal stays report-only.  Skipped entirely when the packet
+        pins its diff scope.  Whatever changed is committed as `autofix:` so
+        the grader and every reviewer see the same tree."""
         base = base or self._base_of(wt)
         rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "%s..HEAD" % base]) if base else (1, "", "")
         changed = [l.strip() for l in out.splitlines() if l.strip()] if rc == 0 else []
@@ -2775,6 +2802,7 @@ class LaneDriver(object):
         portal = [f for f in changed if f.startswith("portal/") and f.endswith(self.PORTAL_EXT)
                   and (wt / f).exists() and "node_modules" not in f]
         steps = []
+        pinned = self._autofix_pinned(wt)
 
         def run(name, argv, cwd):
             rc, o, e = self.exec.run(argv, cwd=str(cwd), timeout_s=600)
@@ -2783,16 +2811,12 @@ class LaneDriver(object):
             return rc
 
         ruff = self._tool("ruff", wt) if py else None
-        if py and ruff:
-            run("ruff-fix", [ruff, "check", "--fix", "--exit-zero"] + py, wt)
-            run("ruff-format", [ruff, "format"] + py, wt)
+        if pinned:
+            steps.append({"tool": "ruff-fix", "skipped": pinned})
+        elif py and ruff:
+            run("ruff-fix", [ruff, "check", "--fix", "--exit-zero", "--select", ",".join(self.AUTOFIX_RULES)] + py, wt)
         elif py:
             steps.append({"tool": "ruff", "skipped": "ruff not found"})
-        prettier = self._tool("prettier", wt) if portal else None
-        if portal and prettier:
-            run("prettier", [prettier, "--write"] + portal, wt)
-        elif portal:
-            steps.append({"tool": "prettier", "skipped": "prettier not found"})
         tsc_rc = None
         if portal and (wt / "portal" / "tsconfig.json").exists():
             tsc = self._tool("tsc", wt)
@@ -2805,19 +2829,23 @@ class LaneDriver(object):
                 steps.append({"tool": "tsc", "skipped": "tsc/npx not found"})
         rc, status, _ = self.git(["-C", str(wt), "status", "--porcelain", "--untracked-files=no"])
         committed = None
-        if rc == 0 and status.strip():
+        if rc == 0 and status.strip() and not pinned:
             files = sorted(set(l[3:].strip() for l in status.splitlines() if l.strip()))
             self.git(["-C", str(wt), "add", "--"] + files, log=True)
             rc2, o2, e2 = self.git(["-C", str(wt), "-c", "user.email=lanedriver@vp", "-c", "user.name=lanedriver",
-                                    "commit", "-q", "-m", "autofix: ruff/prettier (%s)" % task], log=True)
+                                    "commit", "-q", "-m", "autofix: ruff %s (%s)" % ("/".join(self.AUTOFIX_RULES), task)],
+                                   log=True)
             committed = self.head_sha(wt) if rc2 == 0 else None
             if rc2 != 0:
                 steps.append({"tool": "git-commit", "rc": rc2, "stderr": (e2 or o2)[-500:]})
             else:
                 self.log("AUTOFIX %s committed %s (%d files)" % (task, committed[:12], len(files)))
                 self._rebind_result(wt, committed, task)
+        elif pinned:
+            self.log("AUTOFIX %s skipped: %s" % (task, pinned))
         rec = {"ts": utc_ms(), "task": task, "base": base, "changed": changed, "py": py, "portal": portal,
-               "steps": steps, "tsc_rc": tsc_rc, "committed": committed}
+               "steps": steps, "tsc_rc": tsc_rc, "committed": committed, "pinned": pinned,
+               "rules": list(self.AUTOFIX_RULES)}
         if tdir is not None:
             try:
                 (Path(tdir) / "autofix.json").write_text(json.dumps(rec, indent=2, sort_keys=True),
