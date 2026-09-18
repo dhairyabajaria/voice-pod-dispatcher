@@ -103,6 +103,9 @@ def load_pack(pack_dir):
             "test_paths": _as_list(fm.get("test_paths")), "proof_kind": str(fm.get("proof_kind") or "platform"),
             "max_rounds": int(fm.get("max_rounds") or 4), "parent_contract": fm.get("parent_contract"),
             "group": fm.get("group"), "body": text,
+            # D17/D21 review subject keys (the driver's _review_packet_plan)
+            "review_base": str(fm.get("review_base") or "").strip(),
+            "coverage_targets": [str(t).strip() for t in _as_list(fm.get("coverage_targets"))],
         }
         if st.startswith("NEW:"):
             tpl = st[4:]

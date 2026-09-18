@@ -6,6 +6,7 @@ tests plus one driver cycle over a tiny pack with fake runners."""
 from __future__ import annotations
 
 import json
+import pytest
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ sys.path.insert(0, str(VP))
 sys.path.insert(0, str(HERE))
 
 import vppack  # noqa: E402
-from test_lanedriver import Env, FakeRunner, by_role, findings, result_ok, settle  # noqa: E402
+from test_lanedriver import Env, FakeRunner, by_role, findings, git, result_ok, settle  # noqa: E402
 
 FM = """---
 item: {id}
@@ -327,6 +328,55 @@ def test_verified_retry_retires_the_superseded_base_row(tmp_path):
     assert any(c.get("op") == "supersede" and c["retired"] == ["P-GAP"] for c in closures)
 
 
+def test_retry_packet_regrade_grades_the_same_commit_without_a_builder_round(tmp_path):
+    """D21: after a benchmark amendment, `retry-packet --regrade <sha>` makes
+    <id>-R<n> reset its worktree to that exact commit, carry the previous
+    RESULT.json, and go straight to proof + grade: no builder turn, no autofix."""
+    pd = tmp_path / "pack"
+    packet(pd, "P-GAP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="gap for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    builds = []
+
+    def builder(spec, ab):
+        builds.append(spec.item)
+        return result_ok(spec, ab)
+
+    def grader(spec, ab):
+        return findings("FAIL" if spec.item == "P-GAP" else "PASS")(spec, ab)
+    runner = by_role({"builder": builder, "grader": grader, "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-GAP"]["state"] == "REPAIR_REQUIRED"
+    built = git(env.tmp / "wt" / "P-GAP", "rev-parse", "HEAD")
+    n_builds = len(builds)
+    # an unknown sha is refused up front
+    with pytest.raises(ValueError):
+        drv.request_packet_retry("P-GAP", "x", regrade_sha="0" * 40)
+    rec = drv.request_packet_retry("P-GAP", "B3 amended: regrade the same commit", regrade_sha=built[:12])
+    assert rec["regrade_sha"] == built
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-GAP-R1"]["state"] == "VERIFIED", rows["P-GAP-R1"]
+    assert rows["P-GAP-R1"]["output_sha"] == built, "the regraded commit is the output"
+    assert len(builds) == n_builds, "no builder turn"
+    wt = env.tmp / "wt" / "P-GAP-R1"
+    assert git(wt, "rev-parse", "HEAD") == built
+    assert json.loads((wt / ".vp" / "RESULT.json").read_text())["commit"] == built
+    log = (env.run_root / "driver.log").read_text()
+    assert "REGRADE P-GAP-R1 on %s (build + autofix skipped; retry_of P-GAP)" % built[:12] in log
+    assert "REGRADE P-GAP-R1 carried P-GAP/.vp/RESULT.json" in log
+    assert not list((env.run_root / "turns" / "P-GAP-R1").glob("*/1-r1-builder-*"))
+    assert not list((env.run_root / "turns" / "P-GAP-R1").glob("*/autofix.json"))
+    prec = json.loads((env.run_root / "packets" / "P-GAP.json").read_text())
+    assert prec["task"] == "P-GAP-R1" and prec["regrade_sha"] == built
+    assert rows["P-GAP"]["state"] == "CANCELLED" and rows["P-GAP"]["blocker"]["reason"] == "SUPERSEDED_BY:P-GAP-R1"
+
+
 def test_supersede_sweep_retires_rows_verified_before_the_rule_existed(tmp_path):
     env = Env(tmp_path)
     env.activate()
@@ -356,6 +406,42 @@ def test_supersede_sweep_retires_rows_verified_before_the_rule_existed(tmp_path)
 
 
 # -- D17: a v13 review packet reviews the SUBJECT, then the driver writes the verdict and grades ---
+
+def test_union_review_with_an_empty_subject_is_held_not_dispatched(tmp_path):
+    """D21: coverage_targets [<union>] + no review_base + no covered rows + no
+    unions/*/members.json -> the review is held (REVIEW_SUBJECT_EMPTY), no
+    reviewer turn is spent; it dispatches once a union exists."""
+    from test_lanedriver import FakeCodex, register_candidate
+    pd = tmp_path / "pack"
+    packet(pd, "REVIEW-UNION", "NEW:JUNIOR_REVIEW", kind="review", template="JUNIOR_REVIEW", role="junior",
+           body="one Luna review per union of L00")
+    pm = pd / "REVIEW-UNION" / "PACKET.md"
+    pm.write_text(pm.read_text().replace("  - control/evidence/REVIEW-UNION/v13/REGRADE.md",
+                                         "  - control/evidence/REVIEW-UNION/<union>/verdict-packet.json")
+                  .replace("---\n", "---\ncoverage_targets: [<union>]\n", 1))
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    codex = FakeCodex()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": codex})
+    register_candidate(env)
+    settle(drv, 3)
+    row = env.rows()["REVIEW-UNION"]
+    assert row["state"] == "READY", "held: never claimed"
+    assert not (env.run_root / "turns" / "REVIEW-UNION").exists(), "no reviewer turn spent"
+    log = (env.run_root / "driver.log").read_text()
+    assert "REVIEW_SUBJECT_EMPTY" in (env.run_root / "alerts.jsonl").read_text()
+    assert "HOLD REVIEW-UNION 600s REVIEW_SUBJECT_EMPTY" in log
+    # a union appears: the hold is dropped on the next ready pass
+    (env.run_root / "unions" / "1").mkdir(parents=True)
+    (env.run_root / "unions" / "1" / "members.json").write_text(json.dumps({"items": [{"task": "L00"}]}))
+    drv._fail.pop("REVIEW-UNION", None)
+    settle(drv, 3)
+    assert env.rows()["REVIEW-UNION"]["state"] != "READY"
+    assert (env.run_root / "turns" / "REVIEW-UNION").exists()
+
 
 def test_review_packet_reviews_the_subject_then_writes_the_verdict_and_grades(tmp_path, monkeypatch):
     from test_lanedriver import FakeCodex, register_candidate

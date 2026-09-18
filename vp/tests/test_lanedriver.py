@@ -330,6 +330,8 @@ def test_grader_fail_twice_is_repair_required_then_repair_is_instantiated_and_pr
     assert rows["L02"]["state"] == "INTEGRATED" and rows["L02"]["unlocks_dependents"] is True
     promote = next(l for l in env.control_lines() if l["verb"] == "promote")
     assert "--supporting-task" in promote["argv"] and "R-L02-B1-1" in promote["argv"]
+    # D20 (ii): every promote names the trunk so the scheduler can refuse an autofix output commit
+    assert promote["argv"][promote["argv"].index("--repo") + 1] == str(env.trunk)
     # no second repair for the same parent while one is live/finished-clean
     drv.tick()
     assert [t for t in env.rows() if t.startswith("R-L02")] == ["R-L02-B1-1"]
@@ -1225,6 +1227,32 @@ def test_autofix_is_skipped_when_the_packet_header_says_none(tmp_path, monkeypat
     tdir = next((env.run_root / "turns" / "L02").iterdir())
     rec = json.loads((tdir / "autofix.json").read_text())
     assert rec["committed"] is None and rec["pinned"] == "packet header autofix: none"
+
+
+def test_contamination_sweep_flags_reformat_autofix_outputs_only(tmp_path):
+    """D20 (i): VERIFIED/INTEGRATED rows whose output_sha subject is a pre-D20
+    `autofix: ruff/prettier` commit are flagged with the clean commit under
+    them; D20's own safe-rules commit and ordinary commits are not."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+    def commit(msg):
+        (env.trunk / "platform" / "a.py").write_text("# %s\n" % msg)
+        git(env.trunk, "add", "-A")
+        git(env.trunk, "commit", "-q", "-m", msg)
+        return git(env.trunk, "rev-parse", "HEAD")
+    clean = commit("L02: real work")
+    reformat = commit("autofix: ruff/prettier (L02)")
+    safe = commit("autofix: ruff I001/F401/W291/W293 (L03)")
+    state = {"tasks": {"L02": {"state": "VERIFIED", "output_sha": reformat},
+                       "L03": {"state": "INTEGRATED", "output_sha": safe},
+                       "L04": {"state": "VERIFIED", "output_sha": clean},
+                       "L05": {"state": "REPAIR_REQUIRED", "output_sha": reformat},
+                       "L06": {"state": "VERIFIED", "output_sha": "f" * 40}}}
+    flagged = lanedriver.autofix_contamination(drv, state)
+    assert [(f["task"], f["flag"]) for f in flagged] == [("L02", "CONTAMINATED"), ("L06", "output_sha is not a commit in the trunk")]
+    assert flagged[0]["clean_commit"] == clean and flagged[0]["contaminating_commit"] == reformat
+    assert flagged[0]["numstat"].startswith("1\t1\tplatform/a.py")
 
 
 def test_autofix_without_tools_or_changes_commits_nothing(tmp_path):

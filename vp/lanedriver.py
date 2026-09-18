@@ -276,7 +276,7 @@ class Control(object):
             args += ["--depends-on", d]
         return self.call("instantiate", args)
 
-    def promote(self, task, output_sha, tree_sha, evidence, supporting=(), verdict=None):
+    def promote(self, task, output_sha, tree_sha, evidence, supporting=(), verdict=None, repo=None):
         args = ["--task", task, "--output-sha", output_sha, "--tree-sha", tree_sha]
         for s in supporting:
             args += ["--supporting-task", s]
@@ -284,6 +284,10 @@ class Control(object):
             args += ["--evidence", str(e)]
         if verdict:
             args += ["--verdict", str(verdict)]
+        if repo:
+            # D20 belt and braces: the scheduler reads the output commit's
+            # subject there and refuses an autofix (reformat) output
+            args += ["--repo", str(repo)]
         return self.call("promote", args)
 
     def drain(self, reason):
@@ -1033,6 +1037,31 @@ class LaneDriver(object):
                         % (p["id"], p["owner_gate"], p["owner_gate"]), task)
         return False
 
+    REVIEW_SUBJECT_HOLD_S = 600
+
+    def _review_subject_empty(self, task, row, state):
+        """D21: a `<union>` review whose subject would be an empty diff (no
+        review_base, candidate == the row's base, no union members) is held,
+        not dispatched: REVIEW-JUNIOR-UNION-R2 burned a reviewer turn to
+        report F-EMPTY-DIFF because no union tip existed yet."""
+        p = self.packet_for(task)
+        if not p or p.get("v13_kind") != "review" or "<union>" not in (p.get("coverage_targets") or []):
+            return False
+        if p.get("review_base"):
+            return False
+        params = row.get("parameters") or {}
+        if params.get("covered_rows"):
+            return False
+        if any((self.run_root / "unions").glob("*/members.json")):
+            return False
+        cand = (state.get("candidate") or {}).get("sha")
+        self.alert_once("review-subject:%s" % task, "REVIEW_SUBJECT_EMPTY",
+                        "%s: no union tip yet (candidate %s == base, no covered rows, no unions/*/members.json); "
+                        "held, not dispatched, until a union exists" % (task, (cand or "none")[:12]), task)
+        self.note_hold(task, "ready:%s" % row.get("updated_at"), "REVIEW_SUBJECT_EMPTY %s" % task,
+                       self.REVIEW_SUBJECT_HOLD_S)
+        return True
+
     # -- D16: a verified retry/fix retires the rows it supersedes ----------------------------
     SUPERSEDE_RE = re.compile(r"^(?P<root>.+?)-(?:R(?P<r>\d+)|FIX-(?P<f>\d+))$")
     RETIRABLE = ("PLANNED", "WAITING_DEPENDENCY", "READY", "REPAIR_REQUIRED", "BLOCKED", "INVALID_EVIDENCE")
@@ -1249,7 +1278,7 @@ class LaneDriver(object):
         except (OSError, ValueError):
             return {}
 
-    def request_packet_retry(self, pid, reason):
+    def request_packet_retry(self, pid, reason, regrade_sha=None):
         """CLI `retry-packet`: ask the loop to re-instantiate a packet whose
         bound dynamic task ended without a real verdict (e.g. RUNNER_CRASH ->
         INVALID_EVIDENCE).  Refused for unknown packets and for tasks that are
@@ -1270,6 +1299,14 @@ class LaneDriver(object):
         pdir.mkdir(parents=True, exist_ok=True)
         rec = {"packet": pid, "previous_task": cur, "previous_state": row.get("state"),
                "reason": reason, "requested_at": utc_ms()}
+        if regrade_sha:
+            # D21: grade the previous task's exact commit again (a benchmark
+            # amendment, never a builder round): the new task's round 1 resets
+            # its worktree to that sha and skips build + autofix
+            rc, full, _e = self.git(["-C", str(self.trunk), "rev-parse", "--verify", regrade_sha + "^{commit}"])
+            if rc != 0:
+                raise ValueError("regrade sha %s is not a commit in the trunk" % regrade_sha)
+            rec["regrade_sha"] = full.strip()
         (pdir / (self.RETRY_MARKER % pid)).write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
         _append_jsonl(pdir / "bindings.jsonl", dict(rec, op="retry-requested"), self._lock)
         self.comms("lanedriver", "audit", "retry requested for %s (was %s %s): %s"
@@ -1304,8 +1341,10 @@ class LaneDriver(object):
         if prev in self.pack_by_task:
             del self.pack_by_task[prev]
         bindings.pop(pid, None)
-        ok = self._pack_instantiate(p, task, template, tasks, candidate, bindings,
-                                    {"retry_of": prev, "retry_reason": req.get("reason")})
+        extra = {"retry_of": prev, "retry_reason": req.get("reason")}
+        if req.get("regrade_sha"):
+            extra["regrade_sha"] = req["regrade_sha"]
+        ok = self._pack_instantiate(p, task, template, tasks, candidate, bindings, extra)
         if not ok:
             if prev:
                 self.pack_by_task[prev] = pid     # keep the old binding until it works
@@ -1369,7 +1408,8 @@ class LaneDriver(object):
                 done["refused"][target] = str(exc)[:240]
         for target in plan["promote"]:
             try:
-                self.control.promote(target, harvest.get("output_sha"), harvest.get("tree_sha"), ev, supporting=[task])
+                self.control.promote(target, harvest.get("output_sha"), harvest.get("tree_sha"), ev,
+                                     supporting=[task], repo=self.trunk)
                 done["promoted"].append(target)
             except ControlError as exc:
                 done["refused"][target] = str(exc)[:240]
@@ -2163,6 +2203,8 @@ class LaneDriver(object):
                 continue
             if not self._owner_gate_open(task):
                 continue
+            if self._review_subject_empty(task, row, state):
+                continue
             runner = rcfg.get("runner", "opencode")
             server = self._pick_server(rcfg) if runner == "opencode" else None
             if runner == "opencode" and server is None:
@@ -2485,6 +2527,51 @@ class LaneDriver(object):
         return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                          "evidence": [out_path, tdir / "record.json"]}
 
+    def _regrade_for(self, task):
+        """D21: {"sha", "retry_of"} when the task was instantiated by
+        `retry-packet --regrade <sha>` (packets/<pid>.json), else None."""
+        pid = self.pack_by_task.get(task)
+        if not pid:
+            return None
+        try:
+            rec = json.loads((self.run_root / "packets" / ("%s.json" % pid)).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if rec.get("task") != task or not rec.get("regrade_sha"):
+            return None
+        return {"sha": rec["regrade_sha"], "retry_of": rec.get("retry_of")}
+
+    def _regrade_reset(self, task, wt, regrade):
+        """reset the fresh worktree to the regrade sha (must descend from the
+        row base) and carry the previous task's .vp/RESULT.json over when it
+        names that commit; -> None or the refusal."""
+        sha, base = regrade["sha"], self._base_of(wt)
+        rc, _o, _e = self.git(["-C", str(wt), "cat-file", "-e", sha + "^{commit}"])
+        if rc != 0:
+            return "regrade sha %s is not a commit" % sha[:12]
+        if base:
+            rc, _o, _e = self.git(["-C", str(wt), "merge-base", "--is-ancestor", base, sha])
+            if rc != 0:
+                return "regrade sha %s does not descend from the base %s" % (sha[:12], base[:12])
+        rc, _o, err = self.git(["-C", str(wt), "reset", "-q", "--hard", sha], log=True)
+        if rc != 0:
+            return "reset to %s failed: %s" % (sha[:12], (err or "")[:200])
+        prev = regrade.get("retry_of")
+        src = self.worktree_path(prev) / ".vp" / "RESULT.json" if prev else None
+        if src and src.exists():
+            try:
+                doc = json.loads(src.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                doc = {}
+            if str(doc.get("commit") or "").startswith(sha[:12]) or sha.startswith(str(doc.get("commit") or "x")):
+                (wt / ".vp").mkdir(parents=True, exist_ok=True)
+                (wt / ".vp" / "RESULT.json").write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+                self.log("REGRADE %s carried %s/.vp/RESULT.json (commit %s)" % (task, prev, sha[:12]))
+            else:
+                self.alert("REGRADE_NO_RESULT", "%s: %s/.vp/RESULT.json names %s, not %s; graded without it"
+                           % (task, prev, str(doc.get("commit"))[:12], sha[:12]), task)
+        return None
+
     def _build_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid):
         """D14 order per round: build -> autofix -> PROOF -> grade.  The proof
         runs on the exact head the grader sees and its record + log are copied
@@ -2505,8 +2592,21 @@ class LaneDriver(object):
         needs_proof = kind in (self.proof_cfg.get("require_for_kinds") or ["integration"])
         pending = self._proof_pending(tdir)
         resume_proof = bool(needs_proof and pending and self.head_sha(wt) == pending.get("sha"))
+        regrade = self._regrade_for(task)
         for rnd in range(1, max_rounds + 1):
-            if resume_proof:
+            if rnd == 1 and regrade:
+                # D21: the packet's benchmark was amended; the previous task's
+                # exact commit is proved and graded again, no builder round
+                why = self._regrade_reset(task, wt, regrade)
+                if why:
+                    self.alert("REGRADE_REFUSED", "%s: %s" % (task, why), task)
+                    return (vprunners.TurnOutcome(STATUS_DONE, why, runner="regrade"),
+                            {"outcome": "INVALID_EVIDENCE", "reason": "REGRADE_REFUSED: %s" % why,
+                             "evidence": [tdir / "record.json"]})
+                self.log("REGRADE %s on %s (build + autofix skipped; retry_of %s)"
+                         % (task, regrade["sha"][:12], regrade.get("retry_of")))
+                outcome = vprunners.TurnOutcome(STATUS_DONE, "regrade of %s" % regrade["sha"][:12], runner="regrade")
+            elif resume_proof:
                 # an earlier attempt built this exact head and its proof died on
                 # infra: the build is not repeated, the proof (then grade) is
                 resume_proof = False
@@ -3381,7 +3481,7 @@ class LaneDriver(object):
             return False
         try:
             self.control.promote(parent, rrow["output_sha"], rrow.get("tree_sha") or rrow["output_sha"],
-                                 ev, supporting=[repair])
+                                 ev, supporting=[repair], repo=self.trunk)
         except ControlError as exc:
             self.alert_once("promote:%s:%s" % (parent, repair), "PROMOTE_REFUSED",
                             "%s via %s: %s" % (parent, repair, str(exc)[:200]), parent)
@@ -3774,6 +3874,10 @@ def build_parser():
                                              "verdict (e.g. RUNNER_CRASH -> INVALID_EVIDENCE) as <id>-R<n>")
     rp.add_argument("packet")
     rp.add_argument("--reason", required=True)
+    rp.add_argument("--regrade", metavar="SHA", help="D21: prove + grade this exact commit of the previous "
+                                                   "task again (benchmark amended); no builder round")
+    sub.add_parser("contamination", help="D20 (i): list VERIFIED/INTEGRATED rows whose output_sha is a "
+                                         "pre-D20 autofix (reformat) commit; writes packets/contamination-<ts>.json")
     ir = sub.add_parser("init-run", help="copy v13-pack/roster-v13.json -> RUN_ROOT/roster.json (lint, snapshot)")
     ir.add_argument("--source", required=True, help="the pack roster, e.g. v13-pack/roster-v13.json")
     ir.add_argument("--run-root", help="override the roster's run.run_root")
@@ -3798,13 +3902,51 @@ def cmd_seal(drv, args):
 
 def cmd_retry_packet(drv, args):
     try:
-        rec = drv.request_packet_retry(args.packet, args.reason)
+        rec = drv.request_packet_retry(args.packet, args.reason, regrade_sha=getattr(args, "regrade", None))
     except ValueError as exc:
         print(json.dumps({"status": "REFUSED", "error": str(exc)}))
         return 2
     print(json.dumps({"status": "REQUESTED", "retry": rec,
                       "note": "the loop instantiates <packet>-R<n> on its next pack reconcile "
                               "(alerts.pack_every_s, default 300 s)"}, indent=2))
+    return 0
+
+
+AUTOFIX_SAFE_SUBJECT_RE = re.compile(r"^autofix: ruff I001/F401/W291/W293 \(")
+
+
+def autofix_contamination(drv, state=None):
+    """D20 (i): every VERIFIED/INTEGRATED row whose output_sha commit subject is
+    an `autofix:` commit other than D20's own safe-rules lint commit -- the
+    rows a pre-D20 ruff-format/prettier reformat landed on.  Read-only."""
+    state = state or drv.control.state_view()
+    out = []
+    for task, row in sorted((state.get("tasks") or {}).items()):
+        sha = row.get("output_sha")
+        if row.get("state") not in ("VERIFIED", "INTEGRATED") or not sha:
+            continue
+        rc, subj, _e = drv.git(["-C", str(drv.trunk), "log", "-1", "--format=%s", sha])
+        subj = (subj or "").strip()
+        rec = {"task": task, "state": row["state"], "output_sha": sha, "subject": subj if rc == 0 else None}
+        if rc != 0:
+            rec["flag"] = "output_sha is not a commit in the trunk"
+        elif subj.startswith("autofix:") and not AUTOFIX_SAFE_SUBJECT_RE.match(subj):
+            rc2, ns, _ = drv.git(["-C", str(drv.trunk), "diff", "--numstat", sha + "~1", sha])
+            rec.update({"flag": "CONTAMINATED", "contaminating_commit": sha,
+                        "clean_commit": drv.git(["-C", str(drv.trunk), "rev-parse", sha + "~1"])[1].strip(),
+                        "numstat": (ns or "").strip()})
+        else:
+            continue
+        out.append(rec)
+    return out
+
+
+def cmd_contamination(drv, args):
+    rows = autofix_contamination(drv)
+    out = drv.run_root / "packets" / ("contamination-%s.json" % utc_ms().replace(":", "").replace("-", "")[:15])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"ts": utc_ms(), "trunk": str(drv.trunk), "flagged": rows}, indent=2), encoding="utf-8")
+    print(json.dumps({"status": "OK", "flagged": rows, "report": str(out)}, indent=2))
     return 0
 
 
@@ -3822,7 +3964,7 @@ def cmd_reload(drv, args):
 
 
 SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
-               "retry-packet", "reload")
+               "retry-packet", "reload", "contamination")
 
 
 def main(argv=None):
@@ -3871,6 +4013,8 @@ def main(argv=None):
         return cmd_retry_packet(drv, args)
     if args.cmd == "reload":
         return cmd_reload(drv, args)
+    if args.cmd == "contamination":
+        return cmd_contamination(drv, args)
     if args.cmd == "render":
         out = drv.render()
         print(json.dumps({"status": "OK" if out else "FAILED", "ledger": str(out or "")}))
