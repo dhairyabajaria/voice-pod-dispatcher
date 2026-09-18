@@ -1112,7 +1112,7 @@ def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_ver
                            "packet": (wt / ".vp" / "PACKET.md").read_text(),
                            "bench": (wt / ".vp" / "BENCHMARK.md").read_text()}
         return _fix_builder(spec, ab)
-    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": builder})
     drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
     drv.tick()
     rows = env.rows()
@@ -1149,7 +1149,9 @@ def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_ver
     settle(drv, 8)
     rows = env.rows()
     va = rows["P-PAR-HOSTED-DELIVERY-2A"]
+    # D41: EXTERNAL_PREP is a non-build kind (probe here, infra live) and still stands on the parent output
     assert va["state"] == "VERIFIED" and va["template_id"] == "EXTERNAL_PREP" and va["stacked_base"] == par_out
+    assert va["kind"] == "probe" and va["stacked_on"] == ["P-PAR"]
     assert seen["P-PAR-HOSTED-DELIVERY-2A"]["base"] == par_out
     # L04 ran once its first twin dependency verified; a dependent that already
     # finished is not rewired (only PLANNED/WAITING/READY rows are)

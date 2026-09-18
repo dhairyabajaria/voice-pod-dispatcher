@@ -2977,7 +2977,12 @@ class LaneDriver(object):
                 self.log("WAIT %s: paths conflict with active claim of %s" % (task, other))
                 continue
             stacked = None
-            if kind in BUILD_KINDS:
+            twin = self.packet_for(task)
+            twin = twin if twin and vppack.is_hosted_twin(twin) and twin.get("twin_of") else None
+            if kind in BUILD_KINDS or twin:
+                # D37/§19(3): a hosted twin stands on its parent's VERIFIED output whatever
+                # its template's kind (L34-OBSERVER-WIRING-HOSTED, an EXTERNAL_PREP row of
+                # kind infra, was claimed on trunk 21:55Z)
                 base, stacked = self._stacked_base(task, row, state)
                 if not base:
                     continue

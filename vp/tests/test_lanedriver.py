@@ -107,7 +107,7 @@ def catalog():
              "required_parameters": ["parent_contract_id", "unproved_criterion", "candidate_sha",
                                      "test_location", "owned_paths"],
              "steps": ["test"], "acceptance": ["gap closed"]},
-            {"id": "EXTERNAL_PREP", "kind": "builder",
+            {"id": "EXTERNAL_PREP", "kind": "probe",       # a non-build kind: twins must still stack (D41)
              "required_parameters": ["parent_contract_id", "missing_capability", "existing_authority_refs",
                                      "required_fields"],
              "steps": ["prepare"], "acceptance": ["external prepared"]},
