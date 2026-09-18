@@ -469,9 +469,11 @@ def test_draining_phase_refuses_new_claims_but_harvests_running(tmp_path):
     assert hb["active"] == 0
 
 
-def test_control_jsonl_records_every_call_with_sequence(tmp_path):
+def test_control_jsonl_records_every_call_with_sequence(tmp_path, monkeypatch):
     env = Env(tmp_path)
     env.activate()
+    monkeypatch.setattr(lanedriver.Control, "BLOB_AT", 400)       # the tiny catalog's replies are ~1 KB
+    monkeypatch.setattr(lanedriver.Control, "BLOB_HEAD", 100)
     drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(),
                       "claude": FakeRunner()})
     settle(drv)
@@ -483,6 +485,15 @@ def test_control_jsonl_records_every_call_with_sequence(tmp_path):
         assert set(l) >= {"ts", "verb", "argv", "rc", "stdout", "stderr", "seq_before", "seq_after", "ms"}
         assert l["argv"][1].endswith("orchestration_control.py")
     assert lines[2]["seq_after"] == lines[2]["seq_before"] + 1
+    # AUDIT-5: stdout over BLOB_AT lives whole in control-blobs/, hashed; the line keeps a head + pointer
+    big = [l for l in lines if l.get("stdout_blob")]
+    assert big, "the ready/reconcile dumps exceed %d chars" % lanedriver.Control.BLOB_AT
+    for l in big:
+        blob = (env.run_root / l["stdout_blob"]).read_text()
+        assert len(l["stdout"]) == lanedriver.Control.BLOB_HEAD and blob.startswith(l["stdout"])
+        assert hashlib.sha256(blob.encode()).hexdigest() == l["stdout_sha256"] and l["stdout_bytes"] == len(blob.encode())
+        assert json.loads(blob), "the blob is the verbatim JSON reply"
+    assert all(len(l["stdout"]) <= lanedriver.Control.BLOB_AT for l in lines)
 
 
 class FakeCodex(FakeRunner):

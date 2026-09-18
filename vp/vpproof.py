@@ -422,6 +422,22 @@ def _classify(rc, log_text, timed_out):
     return "UNKNOWN", counts
 
 
+def _missing_paths_are_product(status, counts, paths, wt, kind):
+    """a targeted path the candidate does not have is the CANDIDATE's failure
+    (the packet names a test file the builder never landed: L32-BINDINGS-TG
+    came back rc=5 "no tests ran"), never infra -- infra retries would strike
+    three times and file it as INVALID_EVIDENCE.  Named in failed_nodes so
+    the grader/builder see the missing path as a FAIL line."""
+    if kind != "targeted" or status == "PASS":
+        return status, counts
+    missing = [pp for pp in paths if not (Path(wt) / pp.split("::")[0]).exists()]
+    if not missing:
+        return status, counts
+    return "FAIL_PRODUCT", dict(counts, failed_nodes=sorted(set(list(counts.get("failed_nodes") or []) + missing)),
+                                missing_paths=missing,
+                                reason="test path(s) missing at the candidate: %s" % ", ".join(missing))
+
+
 def _rec(args, st, *a, **k):
     if getattr(args, 'no_record', False):
         return None
@@ -587,6 +603,7 @@ def run_proof(args):
                      % (utc_ms(), rc, timed_out, json.dumps(escalation), json.dumps(reaped)))
         text = log_path.read_text(encoding="utf-8", errors="replace")
         status, counts = (_classify_vitest if args.proof_kind == "portal" else _classify)(rc, text, timed_out)
+        status, counts = _missing_paths_are_product(status, counts, paths, wt, args.kind)
         counts["started"] = started
         counts["ended"] = utc_ms()
         counts["paths"] = paths

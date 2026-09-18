@@ -58,6 +58,26 @@ def test_zero_collected_is_infra_whatever_the_rc():
         assert counts["reason"] in ("no tests collected", "no tests ran"), counts
 
 
+def test_missing_targeted_path_is_the_candidates_failure_not_infra(tmp_path):
+    """L32-BINDINGS-TG: the packet's test_paths file did not exist at the
+    candidate -> pytest rc=5 "no tests ran" -> FAIL_INFRA -> three infra
+    strikes -> INVALID_EVIDENCE.  A missing targeted path is FAIL_PRODUCT
+    naming the path; a present path keeps the classifier's verdict."""
+    wt = tmp_path / "wt"
+    (wt / "platform" / "tests").mkdir(parents=True)
+    (wt / "platform" / "tests" / "test_here.py").write_text("def test_x(): pass\n")
+    status, counts = vpproof._classify(5, "no tests ran in 0.18s\n", False)
+    assert status == "FAIL_INFRA"
+    st, c = vpproof._missing_paths_are_product(status, counts, ["platform/tests/test_gone.py",
+                                                                 "platform/tests/test_here.py::test_x"], wt, "targeted")
+    assert st == "FAIL_PRODUCT" and c["missing_paths"] == ["platform/tests/test_gone.py"]
+    assert c["failed_nodes"] == ["platform/tests/test_gone.py"] and "missing at the candidate" in c["reason"]
+    # present paths: unchanged; full suite: unchanged; PASS: unchanged
+    assert vpproof._missing_paths_are_product(status, counts, ["platform/tests/test_here.py"], wt, "targeted")[0] == "FAIL_INFRA"
+    assert vpproof._missing_paths_are_product(status, counts, ["platform/tests/test_gone.py"], wt, "full")[0] == "FAIL_INFRA"
+    assert vpproof._missing_paths_are_product("PASS", {}, ["platform/tests/test_gone.py"], wt, "targeted")[0] == "PASS"
+
+
 def test_ipcs_rows_parse_the_right_columns():
     segs = vpproof._ipcs_segments(IPCS)
     assert [(s["id"], s["nattch"], s["cpid"]) for s in segs] == \

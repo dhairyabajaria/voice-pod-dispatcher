@@ -146,6 +146,9 @@ class Control(object):
     appends a control.jsonl line: argv, rc, stdout, stderr, sequence before
     and after (read from the state file; -1 when unreadable)."""
 
+    BLOB_AT = 2048          # stdout longer than this goes to control-blobs/
+    BLOB_HEAD = 512         # ... and the line keeps this much of it
+
     def __init__(self, exec_, python, script, state_path, catalog_path, log_path,
                  cwd=None, timeout_s=120):
         self.exec = exec_
@@ -179,6 +182,20 @@ class Control(object):
                "stdout": (out or "")[:20000], "stderr": (err or "")[-4000:],
                "seq_before": seq_before, "seq_after": seq_after,
                "ms": int((time.monotonic() - t0) * 1000)}
+        if len(out or "") > self.BLOB_AT:
+            # AUDIT-5: big stdout (ready/frontier state dumps: 225 MB over
+            # 10k lines) lives in control-blobs/<seq>-<verb>-<ts>.txt, whole
+            # and hashed; the line keeps a head and the pointer
+            bdir = self.log_path.parent / "control-blobs"
+            name = "%s-%s-%s.txt" % (seq_after if seq_after >= 0 else "x", verb,
+                                     rec["ts"].replace(":", "").replace("-", "").replace(".", ""))
+            try:
+                bdir.mkdir(parents=True, exist_ok=True)
+                (bdir / name).write_text(out, encoding="utf-8")
+                rec.update({"stdout": out[:self.BLOB_HEAD], "stdout_blob": "control-blobs/%s" % name,
+                            "stdout_bytes": len(out.encode("utf-8")), "stdout_sha256": sha256_text(out)})
+            except OSError:
+                pass                                  # the inline copy stands
         _append_jsonl(self.log_path, rec, self._lock)
         self.calls.append((verb, rc))
         data = None
