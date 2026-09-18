@@ -81,6 +81,8 @@ REVIEW_PROMPT = (
 )
 
 BUILD_KINDS = ("builder", "control", "security_build", "integration")
+RED_OUTCOMES = ("REPAIR_REQUIRED", "INVALID_EVIDENCE", "BLOCKED")
+OWED_RULINGS_AFTER_S = 1800
 REVIEW_KINDS = ("junior", "security", "final_review", "adjudicator")
 FINISHED_STATES = ("VERIFIED", "INTEGRATED", "REPAIR_REQUIRED", "BLOCKED",
                    "INVALID_EVIDENCE", "CANCELLED")
@@ -1429,6 +1431,10 @@ class LaneDriver(object):
                 self._union_step(self.control.state_view() or {})
             except Exception as exc:  # noqa: BLE001
                 self.log("UNION step failed: %s: %s" % (type(exc).__name__, exc))
+            try:
+                self._closure_sweep(self.control.state_view() or {})
+            except Exception as exc:  # noqa: BLE001
+                self.log("CLOSURE sweep failed: %s: %s" % (type(exc).__name__, exc))
 
     def _pack_record(self, packet, rec):
         d = self.run_root / "packets"
@@ -1676,7 +1682,42 @@ class LaneDriver(object):
         return sorted(t for t, r in tasks.items() if r.get("state") == "INTEGRATED"
                       and (r.get("kind") or "") not in REVIEW_KINDS and t not in ("L35", "L42", "L44"))
 
-    def _pack_closure(self, task, harvest, wt):
+    def _closure_sweep(self, state):
+        """D33 (BULK-RULING §13 item 5): closure is a state, not an event.  On
+        every pack reconcile, every packet whose bound task is accepted
+        (VERIFIED/INTEGRATED) re-evaluates its closure_plan from the rows: a
+        target left open because its closer verified before the closer's
+        `closes` existed, before the driver ran, or while a retire was refused,
+        is retired/promoted now.  Idempotent: targets already CANCELLED or
+        accepted are skipped."""
+        tasks = state.get("tasks") or {}
+        bindings = {pid: t for t, pid in self.pack_by_task.items()}
+        done = []
+        for task, pid in sorted(self.pack_by_task.items()):
+            p = self.pack.get(pid)
+            row = tasks.get(task) or {}
+            if not p or not p["closes"] or row.get("state") not in vppack.ACCEPTED:
+                continue
+            plan = vppack.closure_plan(p, self.pack, tasks, bindings)
+            tried = self._pack_logged
+            retire = [t for t in plan["retire"] if (tasks.get(t) or {}).get("state") in self.RETIRABLE
+                      and ("closure", pid, t) not in tried]
+            promote = [t for t in plan["promote"] if (tasks.get(t) or {}).get("state") in ("REPAIR_REQUIRED", "VERIFIED")
+                       and ("closure", pid, t) not in tried]
+            if not retire and not promote:
+                continue
+            ev = [e.get("path") if isinstance(e, dict) else e for e in (row.get("evidence") or [])]
+            harvest = {"output_sha": row.get("output_sha"), "tree_sha": row.get("tree_sha"), "evidence": ev,
+                       "closure_sweep": True, "targets": {"retire": retire, "promote": promote}}
+            self.log("PACK closure-sweep %s (%s %s): retire %s promote %s" % (pid, task, row.get("state"), retire, promote))
+            res = self._pack_closure(task, harvest, self.worktrees_root / task, only=set(retire + promote))
+            for t in (res or {}).get("refused") or {}:
+                tried.add(("closure", pid, t))     # a refusal is reported once, not every reconcile
+            if res:
+                done.append((pid, res))
+        return done
+
+    def _pack_closure(self, task, harvest, wt, only=None):
         """§6b after VERIFIED: retire the closes targets whose last closer this
         is; promote the packet's own scheduler_task; leave the rest as
         closes_pending in RESULT.json + harvest."""
@@ -1686,7 +1727,10 @@ class LaneDriver(object):
         tasks = (self.control.state_view() or {}).get("tasks") or {}
         plan = vppack.closure_plan(p, self.pack, tasks, {pid: t for t, pid in self.pack_by_task.items()})
         done = {"retired": [], "promoted": [], "pending": plan["pending"], "missing": plan["missing"], "refused": {}}
-        ev = [e for e in (harvest.get("evidence") or []) if Path(e).exists()][:1]
+        if only is not None:
+            plan = dict(plan, retire=[t for t in plan["retire"] if t in only], promote=[t for t in plan["promote"] if t in only])
+            done.update({"pending": {}, "missing": [], "sweep": True})
+        ev = [e for e in (harvest.get("evidence") or []) if e and Path(e).exists()][:1]
         for target in plan["retire"]:
             try:
                 self.control.call("retire", ["--task", target, "--closer", task, "--reason",
@@ -2612,10 +2656,42 @@ class LaneDriver(object):
 
     STACK_HOLD_S = 600
 
+    def _unstacked_deps(self, row, tasks, plan):
+        """D32 (Advisor gap 2): scheduler-level depends_on rows that are
+        VERIFIED with an output trunk does not contain and that the stack plan
+        does not carry -- dispatching on trunk in that state is a guaranteed
+        red (WA-01-DP09-R2, L32-BINDINGS-TG built without their fix)."""
+        trunk = self.trunk_sha()
+        carried = {m["task"] for m in (plan or {}).get("members") or []}
+        base = (plan or {}).get("base")
+        out = []
+        for dep in (row.get("depends_on") or []):
+            r = tasks.get(dep) or {}
+            sha = r.get("output_sha")
+            if dep not in self.pack_by_task or not r.get("dynamic"):
+                continue                          # catalog rows integrate through unions/L35, not by stacking;
+                                                  # only a packet-instantiated fix/regrade row is a stacking dependency
+            if r.get("state") not in self.UNION_MEMBER_STATES or not sha or dep in carried:
+                continue
+            if self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", sha, trunk])[0] == 0:
+                continue
+            if base and self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", sha, base])[0] == 0:
+                continue
+            out.append(dep)
+        return out
+
     def _stacked_base(self, task, row, state):
         """D28: (base, stacked) for a build row -- the trunk base and None, or
         the dependency's verified output and the plan; (None, plan) means HOLD"""
-        plan = self._stack_plan(task, state.get("tasks") or {})
+        tasks = state.get("tasks") or {}
+        plan = self._stack_plan(task, tasks)
+        missing = self._unstacked_deps(row, tasks, plan)
+        if missing:
+            self.alert_once("stack-required:%s:%s" % (task, ",".join(missing)), "STACK_REQUIRED",
+                            "%s: depends_on %s VERIFIED with output not in trunk and not in the stacked base; "
+                            "held (a build on trunk in that state is a guaranteed red)" % (task, missing), task)
+            self.note_hold(task, self._ready_key(row), "STACK_REQUIRED %s" % task, self.STACK_HOLD_S)
+            return None, plan
         if not plan:
             return self._base_for(row, state), None
         if not plan["base"]:
@@ -2978,6 +3054,9 @@ class LaneDriver(object):
                 return False
         newly = (data or {}).get("newly_ready") or []
         self.log("COMPLETE %s %s -> %s unlock=%s newly_ready=%s" % (task, attempt, outcome, unlock, newly))
+        if outcome in RED_OUTCOMES and self.SUPERSEDE_RE.match(task or ""):
+            # D32: a retry going red is a ruling owed to a human, not a row to leave in the counts
+            self.alert("FAIL_AFTER_RETRY", "%s (%s) -> %s: %s" % (task, attempt, outcome, (reason or "")[:300]), task)
         self.completed.append((task, attempt, outcome))
         if outcome == "VERIFIED":
             try:
@@ -3921,6 +4000,28 @@ class LaneDriver(object):
             self.alert("IDLE", "nothing dispatchable since %s; counts=%s; actions=%s; warnings=%s"
                        % (self._idle_since, json.dumps(counts),
                           json.dumps(fr.get("actions") or [])[:600], fr.get("warnings")))
+        self._owed_rulings_check(counts, tasks=state.get("tasks") or {})
+
+    def _owed_rulings_check(self, counts, tasks):
+        """D32: IDLE for longer than alerts.owed_rulings_after_s (1800) while
+        REPAIR_REQUIRED + INVALID_EVIDENCE rows exist always means a human owes
+        a ruling; it ran silently for 1h50m on 2026-09-18.  One alert per idle
+        stretch, naming the rows."""
+        owed = int(counts.get("REPAIR_REQUIRED") or 0) + int(counts.get("INVALID_EVIDENCE") or 0)
+        if not self._idle_since or owed <= 0:
+            return
+        after = float(self.alerts_cfg.get("owed_rulings_after_s", OWED_RULINGS_AFTER_S))
+        try:
+            since = datetime.strptime(self._idle_since[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return
+        idle_s = (datetime.now(timezone.utc) - since).total_seconds()
+        if idle_s < after:
+            return
+        rows = sorted(t for t, r in tasks.items() if r.get("state") in ("REPAIR_REQUIRED", "INVALID_EVIDENCE"))
+        self.alert_once("owed-rulings:%s" % self._idle_since, "OWED_RULINGS",
+                        "idle %d min with %d row(s) awaiting a ruling (REPAIR_REQUIRED/INVALID_EVIDENCE): %s"
+                        % (idle_s // 60, owed, ", ".join(rows)[:500]))
 
     def _frontier_actions(self, state, fr):
         acted = 0

@@ -832,3 +832,125 @@ def test_divergent_dependency_outputs_hold_the_build_until_the_integrator_cuts_t
     assert rows["P-ON-BOTH"]["state"] == "VERIFIED", rows["P-ON-BOTH"]
     assert seen["P-ON-BOTH"]["head"] == doc["union_sha"] and seen["P-ON-BOTH"]["files"] == ["p_fix_a.py", "p_fix_b.py"]
     assert rows["P-ON-BOTH"]["stacked_base"] == doc["union_sha"] and rows["P-ON-BOTH"]["stacked_on"] == ["P-FIX-A", "P-FIX-B"]
+
+
+# -- D32: stacked-or-wait check, FAIL_AFTER_RETRY, OWED_RULINGS -------------------------------
+
+def test_build_whose_scheduler_dependency_is_a_verified_fix_not_in_its_base_is_held(tmp_path, monkeypatch):
+    """Advisor gap 2: a row whose scheduler depends_on names a pack-bound fix
+    that is VERIFIED and not in trunk must stand on it or wait -- never build
+    on trunk (WA-01-DP09-R2, L32-BINDINGS-TG went red exactly that way)."""
+    import lanedriver
+    pd = tmp_path / "pack"
+    packet(pd, "P-DEP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="first fix for L00")
+    packet(pd, "P-STACKED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", deps=["P-DEP"],
+           body="builds on P-DEP for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    oc = by_role({"builder": _fix_builder, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    # the stack plan is silenced (as if the packet-level stacking did not carry the dep)
+    monkeypatch.setattr(lanedriver.LaneDriver, "_stack_plan", lambda self, task, tasks: None)
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-DEP"]["state"] == "VERIFIED"
+    assert rows["P-STACKED"]["state"] == "READY", rows["P-STACKED"]["state"]
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "STACK_REQUIRED" in alerts and "['P-DEP']" in alerts
+    assert "HOLD P-STACKED 600s STACK_REQUIRED" in (env.run_root / "driver.log").read_text()
+    # with the real stack plan the same row builds on the dependency
+    monkeypatch.undo()
+    drv.clear_failures("P-STACKED")
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-STACKED"]["state"] == "VERIFIED" and rows["P-STACKED"]["stacked_on"] == ["P-DEP"]
+
+
+def test_a_retry_going_red_alerts_fail_after_retry(tmp_path):
+    pd = tmp_path / "pack"
+    packet(pd, "P-GAP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="gap for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    runner = by_role({"builder": result_ok, "grader": findings("FAIL"), "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 4)
+    assert env.rows()["P-GAP"]["state"] == "REPAIR_REQUIRED"
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "FAIL_AFTER_RETRY" not in alerts, "the first round is not a retry"
+    drv.request_packet_retry("P-GAP", "again")
+    settle(drv, 4)
+    assert env.rows()["P-GAP-R1"]["state"] == "REPAIR_REQUIRED"
+    line = next(json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()
+                if json.loads(l).get("kind") == "FAIL_AFTER_RETRY")
+    assert line["task"] == "P-GAP-R1" and "REPAIR_REQUIRED" in line["text"]
+
+
+def test_idle_with_rows_awaiting_a_ruling_alerts_once_per_idle_stretch(tmp_path):
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "owed_rulings_after_s": 0}})
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    drv._idle_since = "2026-09-18T00:00:00.000Z"
+    drv._owed_rulings_check({"REPAIR_REQUIRED": 1, "INVALID_EVIDENCE": 2}, {"A": {"state": "REPAIR_REQUIRED"},
+                                                                          "B": {"state": "INVALID_EVIDENCE"},
+                                                                          "C": {"state": "VERIFIED"}})
+    drv._owed_rulings_check({"REPAIR_REQUIRED": 1, "INVALID_EVIDENCE": 2}, {"A": {"state": "REPAIR_REQUIRED"}})
+    lines = [json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()
+             if json.loads(l).get("kind") == "OWED_RULINGS"]
+    assert len(lines) == 1 and "3 row(s)" in lines[0]["text"] and "A, B" in lines[0]["text"]
+    # nothing owed, or not idle long enough: silent
+    drv._owed_rulings_check({"VERIFIED": 5}, {})
+    drv2 = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})
+    drv2.alerts_cfg["owed_rulings_after_s"] = 1800
+    drv2._idle_since = drv2._idle_since or __import__("lanedriver").utc_ms()
+    drv2._owed_rulings_check({"REPAIR_REQUIRED": 1}, {"A": {"state": "REPAIR_REQUIRED"}})
+    assert sum(1 for l in (env.run_root / "alerts.jsonl").read_text().splitlines()
+               if json.loads(l).get("kind") == "OWED_RULINGS") == 1
+
+
+# -- D33 §13: closure is a state -- the sweep retires targets the harvest-time hook missed ------
+
+def test_closure_sweep_retires_a_target_whose_closer_verified_before_the_hook_could_act(tmp_path):
+    """L31-V13/L34-V13 -> JR-REVIEW-18/18B/20: a closer's `closes` is honoured
+    from the rows on every reconcile, not only at the closer's harvest."""
+    pd = tmp_path / "pack"
+    packet(pd, "P-REGRADE-L00", "L00", closes=["JX"])
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    params = env.tmp / "p.json"
+    params.write_text(json.dumps({"parent_contract_id": "L00", "unproved_criterion": "x", "candidate_sha": env.base,
+                                  "test_location": "platform/a.py", "owned_paths": ["platform/a.py"]}))
+    env.control_call("instantiate", "--template", "TEST_GAP", "--task", "JX", "--parent-contract", "L00",
+                     "--chief", "B", "--parameters-json", str(params))
+    env.control_call("block", "--task", "JX", "--blocker-class", "EXTERNAL", "--reason", "old", "--unblock-action", "n/a",
+                     "--evidence", str(params))
+    oc = by_role({"builder": result_ok, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    drv._pack_closure = lambda task, harvest, wt, only=None: None     # the harvest-time hook is asleep
+    drv._closure_sweep = lambda state: None                           # and so is the sweep
+    settle(drv, 6)
+    rows = env.rows()
+    # the packet bound DIRECT to L00 (unfinished at bind time): L00's own verification is the closer's
+    assert rows["L00"]["state"] == "VERIFIED" and rows["JX"]["state"] == "BLOCKED", "nothing retired JX at harvest"
+    del drv._pack_closure                                             # the real hook and sweep are back
+    del drv._closure_sweep
+    drv._pack_last_mono = None
+    drv.tick()
+    rows = env.rows()
+    assert rows["JX"]["state"] == "CANCELLED" and rows["JX"]["blocker"]["reason"] == "closed by packet P-REGRADE-L00"
+    log = (env.run_root / "driver.log").read_text()
+    assert "PACK closure-sweep P-REGRADE-L00 (L00 VERIFIED): retire ['JX'] promote []" in log
+    closures = [json.loads(l) for l in (env.run_root / "packets" / "closures.jsonl").read_text().splitlines()]
+    assert any(c.get("sweep") and c["retired"] == ["JX"] for c in closures)
+    # idempotent: a second sweep does nothing
+    drv._pack_last_mono = None
+    drv.tick()
+    assert log.count("closure-sweep") == (env.run_root / "driver.log").read_text().count("closure-sweep")
