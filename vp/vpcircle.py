@@ -149,17 +149,63 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
-def push_branch(worktree, branch, runner=None):
-    """git push origin <branch>:<branch> from `worktree`. Never the model:
-    called only by the driver/integrator process."""
+def _is_local_url(url):
+    u = (url or "").strip()
+    return u.startswith(("/", "file://", "./", "../")) or (u.endswith(".git") and "://" not in u and ":" not in u)
+
+
+def github_remote(worktree, runner=None, override=None, hops=4):
+    """D38: the remote CircleCI's GitHub App watches.  Every v13 worktree is
+    a clone of voice-pod/chief9-recovery whose `origin` is the LOCAL repo
+    voice-pod/.git, so `push origin` never reached GitHub and every trigger
+    400'd ("Failed to fetch config reference").  Follow local origins
+    (repo -> its origin -> ...) until a non-local URL; `override` (roster
+    circleci.push_remote) wins."""
+    if override:
+        return override
     runner = runner or Runner()
+    cwd = worktree
+    for _ in range(hops):
+        res = runner.git(["remote", "get-url", "origin"], cwd=cwd)
+        url = (res.stdout or "").strip() if res.returncode == 0 else ""
+        if not url:
+            raise RuntimeError(f"github_remote: no origin url at {cwd}")
+        if not _is_local_url(url):
+            return url
+        cwd = url[len("file://"):] if url.startswith("file://") else url
+        if cwd.endswith("/.git"):
+            cwd = cwd[:-5]
+    raise RuntimeError(f"github_remote: origin chain from {worktree} never leaves this machine")
+
+
+def branch_on_remote(worktree, remote, branch, runner=None):
+    runner = runner or Runner()
+    res = runner.git(["ls-remote", "--heads", remote, branch], cwd=worktree)
+    return res.returncode == 0 and bool((res.stdout or "").strip())
+
+
+def push_branch(worktree, branch, runner=None, remote=None):
+    """git push <github remote> <branch>:<branch> from `worktree`, then prove
+    the branch is there (ls-remote) -- the trigger must never be asked for a
+    branch GitHub has not got.  Never the model: called only by the
+    driver/integrator process."""
+    runner = runner or Runner()
+    remote = remote or github_remote(worktree, runner)
     refspec = f"{branch}:{branch}"
-    result = runner.git(["push", "origin", refspec], cwd=worktree)
+    result = runner.git(["push", remote, refspec], cwd=worktree)
     if result.returncode != 0:
         raise RuntimeError(
-            f"push_branch: git push {refspec} failed: {(result.stderr or '').strip()}"
+            f"push_branch: git push {remote} {refspec} failed: {(result.stderr or '').strip()}"
         )
+    if not branch_on_remote(worktree, remote, branch, runner):
+        raise RuntimeError(f"push_branch: {branch} is not on {remote} after the push")
     return result
+
+
+def delete_branch(worktree, branch, runner=None, remote=None):
+    runner = runner or Runner()
+    remote = remote or github_remote(worktree, runner)
+    return runner.git(["push", remote, "--delete", branch], cwd=worktree)
 
 
 def _trigger_once(runner, account, branch, parameters):

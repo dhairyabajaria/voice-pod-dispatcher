@@ -213,7 +213,7 @@ class Proof(object):
                 rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
                 if rc != 0:
                     raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
-                self.circle.push_branch(wt, branch, runner)
+                self.circle.push_branch(wt, branch, runner, cc.get("push_remote"))   # D38: the GitHub remote
                 trig = self.circle.trigger(branch, {param: True}, runner, cc.get("account"))
                 pipeline_id, account = trig["pipeline_id"], trig["account"]
                 self._note_pipeline(pid, pipeline_id, account, cand)
@@ -275,7 +275,7 @@ class Proof(object):
                 self.circle_active = max(0, self.circle_active - 1)
             if cc.get("delete_branch_after", True):
                 try:
-                    runner.git(["push", "origin", "--delete", branch], cwd=wt)
+                    self.circle.delete_branch(wt, branch, runner, cc.get("push_remote"))
                 except Exception as exc:
                     self.log("circleci branch cleanup %s: %s" % (branch, exc))
                 self.git(["-C", str(wt), "branch", "-D", branch])

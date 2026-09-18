@@ -335,3 +335,46 @@ class RecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GithubRemoteTests(unittest.TestCase):
+    """D38: the proof branch must land on the remote CircleCI watches, not on
+    the local repo a v13 worktree's `origin` points at."""
+
+    def _git(self, cwd, *args):
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_follows_local_origins_to_the_first_non_local_url(self):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        hub = tmp / "hub.git"                               # stands in for GitHub: a bare repo
+        subprocess.run(["git", "init", "-q", "--bare", str(hub)], check=True)
+        mid = tmp / "voice-pod"                             # the local intermediate (origin = hub)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(mid)], check=True)
+        self._git(mid, "config", "user.email", "t@t"); self._git(mid, "config", "user.name", "t")
+        (mid / "a").write_text("1\n"); self._git(mid, "add", "-A"); self._git(mid, "commit", "-q", "-m", "base")
+        self._git(mid, "remote", "add", "origin", "ssh://git@example.invalid/owner/repo.git")
+        wt = tmp / "wt"                                     # the worktree: origin = the local mid repo
+        subprocess.run(["git", "clone", "-q", str(mid), str(wt)], check=True)
+        self.assertTrue(vc._is_local_url(self._git(wt, "remote", "get-url", "origin")))
+        self.assertEqual(vc.github_remote(wt), "ssh://git@example.invalid/owner/repo.git")
+        self.assertEqual(vc.github_remote(wt, override="git@github.com:o/r.git"), "git@github.com:o/r.git")
+        # a chain that never leaves the machine is an error, not a silent local push
+        self._git(mid, "remote", "set-url", "origin", str(hub))
+        with self.assertRaises(RuntimeError):
+            vc.github_remote(wt)
+        # push_branch pushes to the resolved remote and proves the branch is there
+        self._git(mid, "remote", "set-url", "origin", "file://" + str(hub))
+        wt_bare = tmp / "wt2"
+        subprocess.run(["git", "clone", "-q", str(mid), str(wt_bare)], check=True)
+        head = self._git(wt_bare, "rev-parse", "HEAD")
+        self._git(wt_bare, "branch", "-f", "vp/proof/x", head)
+        try:
+            vc.push_branch(wt_bare, "vp/proof/x", remote="file://" + str(hub))
+        except RuntimeError as exc:
+            self.fail(str(exc))
+        self.assertTrue(vc.branch_on_remote(wt_bare, "file://" + str(hub), "vp/proof/x"))
+        self.assertEqual(self._git(mid, "branch", "--list", "vp/proof/x"), "", "nothing landed on the local hop")
+        vc.delete_branch(wt_bare, "vp/proof/x", remote="file://" + str(hub))
+        self.assertFalse(vc.branch_on_remote(wt_bare, "file://" + str(hub), "vp/proof/x"))
+        shutil.rmtree(tmp, ignore_errors=True)

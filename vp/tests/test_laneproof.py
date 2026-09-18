@@ -76,8 +76,11 @@ class FakeCircle(object):
         self.calls.append(("preflight", account))
         return True, ""
 
-    def push_branch(self, wt, branch, runner):
+    def push_branch(self, wt, branch, runner, remote=None):
         self.calls.append(("push", branch))
+
+    def delete_branch(self, wt, branch, runner, remote=None):
+        self.calls.append(("delete", branch))
 
     def trigger(self, branch, params, runner, account):
         self.calls.append(("trigger", branch, params, account))

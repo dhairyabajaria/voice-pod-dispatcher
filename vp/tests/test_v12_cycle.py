@@ -563,6 +563,10 @@ class FakeCircle(object):
         cp = subprocess.CompletedProcess
         if argv[0] == "git":
             self.git_calls.append(argv)
+            if "get-url" in argv:                   # D38: the worktree's origin is the GitHub repo here
+                return cp(argv, 0, "git@github.com:dhairyabajaria/voice-pod-NEW.git\n", "")
+            if "ls-remote" in argv:
+                return cp(argv, 0, "a" * 40 + "\trefs/heads/" + argv[-1] + "\n", "")
             return cp(argv, 0, "", "")
         if argv[0] == "security":
             return cp(argv, 0, "fake-secret\n", "")
