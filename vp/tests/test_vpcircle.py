@@ -96,10 +96,10 @@ class TriggerBodyTests(unittest.TestCase):
             "vp/item1",
             {"run_full_suite": True, "dry_run": False, "test_paths": "tests/x"},
             runner=runner,
-            account="1",
+            account="3",
         )
 
-        self.assertEqual(result, {"pipeline_id": "pipeline-123", "account": "1"})
+        self.assertEqual(result, {"pipeline_id": "pipeline-123", "account": "3"})
         self.assertEqual(
             seen["path"],
             f"api/v2/project/{vc.SLUG}/pipeline/run",
@@ -254,7 +254,7 @@ class PollTests(unittest.TestCase):
 
         runner = vc.Runner(run=FakeRun(handler))
         result = vc.poll(
-            "pipe-1", interval=60, deadline_s=5400, runner=runner, account="1",
+            "pipe-1", interval=60, deadline_s=5400, runner=runner, account="3",
             sleep=lambda s: sleeps.append(s), clock=lambda: next(clock_values),
         )
 

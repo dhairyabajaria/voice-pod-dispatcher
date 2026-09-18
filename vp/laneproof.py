@@ -197,36 +197,101 @@ class Proof(object):
 
     # -- circleci --------------------------------------------------------------------------
 
+    class AllBlocked(RuntimeError):
+        """every CircleCI account refused the proof for credits/plan"""
+
+    CREDIT_BLOCK_S = 6 * 3600                 # an account CircleCI refused for credits is skipped this long
+
+    def _accounts(self, cc):
+        """D44: the account order for one proof: roster circleci.account first,
+        then circleci.rotation (default vpcircle.DEFAULT_ROTATION), minus the
+        accounts CircleCI refused for credits within CREDIT_BLOCK_S"""
+        first = str(cc.get("account") or self.circle.ACCOUNTS[0])
+        order = [first] + [str(a) for a in (cc.get("rotation") or getattr(self.circle, "DEFAULT_ROTATION", ()))
+                           if str(a) != first]
+        blocked = getattr(self, "_credit_blocked", {})
+        now = time.monotonic()
+        return [a for a in order if blocked.get(a, 0) <= now], [a for a in order if blocked.get(a, 0) > now]
+
+    def _block_account(self, acct, why):
+        self._credit_blocked = getattr(self, "_credit_blocked", {})
+        self._credit_blocked[acct] = time.monotonic() + self.CREDIT_BLOCK_S
+        self.log("PROOF circleci account %s blocked for credits for %dh: %s"
+                 % (acct, self.CREDIT_BLOCK_S // 3600, why[:160]))
+
     def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None):
         cc = self.circle_cfg()
         runner = self.circle_runner or self.circle.Runner()
         branch = "%s%s-%s" % (cc.get("branch_prefix", "vp/proof/"), pid, cand[:12])
         param = cc.get("param") or "run_full_suite"
+        targets = cc.get("accounts") or None
         pipeline_id, account = None, None
+        pushed = {}                                   # account -> remote the branch was pushed to
         with self._lock:
             self.circle_active += 1
         try:
             try:
-                ok, why = self.circle.project_visible(runner, cc.get("account"))
-                if not ok:
-                    raise RuntimeError("preflight: %s" % why)
                 rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
                 if rc != 0:
                     raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
-                self.circle.push_branch(wt, branch, runner, cc.get("push_remote"))   # D38: the GitHub remote
-                trig = self.circle.trigger(branch, {param: True}, runner, cc.get("account"))
-                pipeline_id, account = trig["pipeline_id"], trig["account"]
-                self._note_pipeline(pid, pipeline_id, account, cand)
-                self.log("PROOF %s %s circleci pipeline %s (account %s)" % (task, pid, pipeline_id, account))
-                res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
-                                       deadline_s=int(cc.get("deadline_min", 90)) * 60,
-                                       runner=runner, account=account,
-                                       abort=lambda: bool((abort and abort()) or self.circle_off()))
+                accounts, skipped = self._accounts(cc)
+                if not accounts:
+                    raise self.AllBlocked("every CircleCI account is blocked for credits: %s" % skipped)
+                res, refusals = None, []
+                for acct in accounts:
+                    # D44: each account triggers its own project on its own GitHub repo --
+                    # push there first, and prove the branch is there (D38)
+                    tgt = self.circle.target(acct, targets)
+                    remote = tgt.get("push_remote") or cc.get("push_remote") or self.circle.github_remote(wt, runner)
+                    ok, why = self.circle.project_visible(runner, acct, targets)
+                    if not ok:
+                        raise RuntimeError("preflight: %s" % why)
+                    self.circle.push_branch(wt, branch, runner, remote)
+                    pushed[acct] = remote
+                    try:
+                        trig = self.circle.trigger(branch, {param: True}, runner, acct, targets=targets, rotate=False)
+                    except RuntimeError as exc:
+                        if self.circle._looks_like_credit_error(str(exc)):
+                            refusals.append((acct, str(exc)[:200]))
+                            self._block_account(acct, str(exc))
+                            continue
+                        raise
+                    pipeline_id, account = trig["pipeline_id"], trig["account"]
+                    self._note_pipeline(pid, pipeline_id, account, cand)
+                    self.log("PROOF %s %s circleci pipeline %s (account %s, %s)" % (task, pid, pipeline_id, account,
+                                                                                   tgt.get("repo") or remote))
+                    res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
+                                           deadline_s=int(cc.get("deadline_min", 90)) * 60,
+                                           runner=runner, account=account, targets=targets,
+                                           abort=lambda: bool((abort and abort()) or self.circle_off()))
+                    blocked = getattr(self.circle, "credit_block", lambda *_a, **_k: None)(res["jobs"], runner,
+                                                                                            account, targets)
+                    if not blocked:
+                        break
+                    # the refusal that only shows AFTER the trigger (account 3, 21:12Z): this
+                    # account is out; the next one gets the same branch on its own repo
+                    refusals.append((acct, blocked[:200]))
+                    self._block_account(acct, blocked)
+                    self.log("PROOF %s %s circleci pipeline %s (account %s) blocked for credits -> next account"
+                             % (task, pid, pipeline_id, account))
+                    res, pipeline_id, account = None, None, None
+                if res is None:
+                    raise self.AllBlocked("; ".join("account %s: %s" % r for r in refusals)
+                                          or "every CircleCI account is blocked for credits: %s" % skipped)
             except self.circle.Cancelled:
                 done = self.circle.cancel_pipeline(pipeline_id, runner, account)
                 rec = {"status": "CANCELLED", "route": "circleci", "proof_id": pid, "sha": cand,
                        "pipeline_id": pipeline_id, "cancelled_workflows": done, "ts": utc_ms()}
                 self._write(pid, rec)
+                return rec
+            except self.AllBlocked as exc:
+                # a plan/credit refusal is the account's condition, never the candidate's:
+                # the driver holds the attempt without a strike (PROOF_BLOCKED_CREDITS)
+                rec = {"status": "BLOCKED_CREDITS", "route": "circleci", "proof_id": pid, "sha": cand,
+                       "pipeline_id": pipeline_id, "account": account, "branch": branch,
+                       "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
+                self._write(pid, rec)
+                self.log("PROOF %s %s -> BLOCKED_CREDITS: %s" % (task, pid, str(exc)[:200]))
                 return rec
             except Exception as exc:
                 rec = {"status": "UNKNOWN", "route": "circleci", "proof_id": pid, "sha": cand,
@@ -235,17 +300,6 @@ class Proof(object):
                        "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> UNKNOWN (circleci: %s)" % (task, pid, str(exc)[:200]))
-                return rec
-            blocked = getattr(self.circle, "credit_block", lambda *_a, **_k: None)(res["jobs"], runner, account)
-            if blocked:
-                # a plan/credit refusal is the account's condition, never the candidate's:
-                # the driver holds the attempt without a strike (PROOF_BLOCKED_CREDITS)
-                rec = {"status": "BLOCKED_CREDITS", "route": "circleci", "proof_id": pid, "sha": cand,
-                       "pipeline_id": pipeline_id, "account": account, "branch": branch,
-                       "reason": "circleci: %s" % blocked[:300], "failed_nodes": [], "ts": utc_ms()}
-                self._write(pid, rec)
-                self.log("PROOF %s %s -> BLOCKED_CREDITS (circleci pipeline %s, account %s): %s"
-                         % (task, pid, pipeline_id, account, blocked[:160]))
                 return rec
             cls = self.circle.classify(res["jobs"], res["failed_tests"])
             status = cls["status"]
@@ -285,10 +339,11 @@ class Proof(object):
             with self._lock:
                 self.circle_active = max(0, self.circle_active - 1)
             if cc.get("delete_branch_after", True):
-                try:
-                    self.circle.delete_branch(wt, branch, runner, cc.get("push_remote"))
-                except Exception as exc:
-                    self.log("circleci branch cleanup %s: %s" % (branch, exc))
+                for acct, remote in (pushed or {"": cc.get("push_remote")}).items():
+                    try:
+                        self.circle.delete_branch(wt, branch, runner, remote)
+                    except Exception as exc:
+                        self.log("circleci branch cleanup %s on %s: %s" % (branch, remote or "origin chain", exc))
                 self.git(["-C", str(wt), "branch", "-D", branch])
 
     # -- F6 ---------------------------------------------------------------------------------

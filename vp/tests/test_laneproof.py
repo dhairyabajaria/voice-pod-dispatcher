@@ -63,6 +63,10 @@ def pipeline(failed_nodes):
 class FakeCircle(object):
     Cancelled = vpcircle.Cancelled
     classify = staticmethod(vpcircle.classify)
+    ACCOUNTS = vpcircle.ACCOUNTS
+    DEFAULT_ROTATION = vpcircle.DEFAULT_ROTATION
+    target = staticmethod(vpcircle.target)
+    _looks_like_credit_error = staticmethod(vpcircle._looks_like_credit_error)
 
     def __init__(self, res):
         self.res = res
@@ -72,21 +76,24 @@ class FakeCircle(object):
         def git(self, args, cwd=None):
             return ""
 
-    def project_visible(self, runner, account):
+    def github_remote(self, wt, runner=None, override=None):
+        return "git@github.com:dhairyabajaria/voice-pod-NEW.git"
+
+    def project_visible(self, runner, account, targets=None):
         self.calls.append(("preflight", account))
         return True, ""
 
     def push_branch(self, wt, branch, runner, remote=None):
-        self.calls.append(("push", branch))
+        self.calls.append(("push", branch, remote))
 
     def delete_branch(self, wt, branch, runner, remote=None):
-        self.calls.append(("delete", branch))
+        self.calls.append(("delete", branch, remote))
 
-    def trigger(self, branch, params, runner, account):
+    def trigger(self, branch, params, runner, account, targets=None, rotate=True):
         self.calls.append(("trigger", branch, params, account))
         return {"pipeline_id": "pipe-206", "account": account or "3"}
 
-    def poll(self, pipeline_id, interval, deadline_s, runner, account, abort):
+    def poll(self, pipeline_id, interval, deadline_s, runner, account, abort, targets=None):
         self.calls.append(("poll", pipeline_id))
         return self.res
 
@@ -225,7 +232,17 @@ def test_circleci_failure_is_unknown_never_a_crash(tmp_path):
 
     p = make_proof(tmp_path, Broken({}), FakeExec({}))
     rec = p.run("L35", "proof-4", wt, base, cand, "platform", [])
-    assert rec["status"] == "UNKNOWN" and "credits exhausted" in rec["reason"]
+    # D44: a credit-shaped trigger error rotates through every account; all refusing
+    # is BLOCKED_CREDITS (held, no strike), and the reason names each account
+    assert rec["status"] == "BLOCKED_CREDITS" and rec["reason"].count("credits exhausted") == 3, rec
+    assert sorted(p._credit_blocked) == ["1", "2", "3"]
+
+    class Broken2(FakeCircle):
+        def trigger(self, *a, **k):
+            raise RuntimeError("boom: 500 from circleci")
+    p = make_proof(tmp_path, Broken2({}), FakeExec({}))
+    rec = p.run("L35", "proof-4b", wt, base, cand, "platform", [])
+    assert rec["status"] == "UNKNOWN" and "boom" in rec["reason"], "a non-credit failure is UNKNOWN as before"
 
 
 # -- item 9: vpcircle configuration -------------------------------------------------
@@ -260,7 +277,7 @@ def test_item9_flip_off_mid_poll_cancels_the_pipeline(tmp_path):
     wt, base, cand = repo(tmp_path)
 
     class Flip(FakeCircle):
-        def poll(self, pipeline_id, interval, deadline_s, runner, account, abort):
+        def poll(self, pipeline_id, interval, deadline_s, runner, account, abort, targets=None):
             (tmp_path / "run" / "CIRCLECI-OFF").write_text("stop\n")
             if abort():
                 raise vpcircle.Cancelled("flipped off")
@@ -323,15 +340,17 @@ def test_circleci_credit_refusal_after_the_trigger_is_blocked_credits_not_a_fail
            "failed_tests": {}, "workflows": [{"id": "w1", "status": "failed"}]}
 
     class Broke(FakeCircle):
-        def credit_block(self, jobs, runner, account):
+        def credit_block(self, jobs, runner, account, targets=None):
             self.calls.append(("credit_block", [j["name"] for j in jobs]))
             return "This job has been blocked because no credits are available on your plan."
     fake = Broke(res)
     p = make_proof(tmp_path, fake, FakeExec({}))
     rec = p.run("L22-HOSTED", "proof-5", wt, base, cand, "platform", [])
-    assert rec["status"] == "BLOCKED_CREDITS" and "no credits" in rec["reason"] and rec["pipeline_id"] == "pipe-206"
+    # D44: every account was tried on its own repo and refused; the reason names each
+    assert rec["status"] == "BLOCKED_CREDITS" and rec["reason"].count("no credits") == 3 and rec["pipeline_id"] is None
     assert ("credit_block", ["lint-and-typecheck"]) in fake.calls
-    assert ("delete", "vp/proof/proof-5-%s" % cand[:12]) in fake.calls, "branch cleaned up"
+    assert [c[3] for c in fake.calls if c[0] == "trigger"] == ["3", "1", "2"]
+    assert any(c[:2] == ("delete", "vp/proof/proof-5-%s" % cand[:12]) for c in fake.calls), "branch cleaned up"
     # the real detector reads the failed job's messages through the runner
     import vpcircle
 
@@ -343,3 +362,47 @@ def test_circleci_credit_refusal_after_the_trigger_is_blocked_credits_not_a_fail
             return subprocess.CompletedProcess([path], 0, json.dumps(body), "")
     assert "no credits" in vpcircle.credit_block([{"status": "failed", "job_number": 11}], R(), "3")
     assert vpcircle.credit_block([{"status": "success", "job_number": 11}], R(), "3") is None
+
+
+def test_circleci_rotates_to_the_next_account_on_its_own_repo_when_one_is_out_of_credits(tmp_path):
+    """D44: account 3 (Pareen Calling, dhairyabajaria/voice-pod-NEW) is refused for
+    credits AFTER the trigger; the proof is re-pushed to account 1's own mirror
+    repo (voicepod-ci-mirror-a) and triggered on ITS project; account 3 is then
+    skipped for CREDIT_BLOCK_S; every pushed remote is cleaned up."""
+    wt, base, cand = repo(tmp_path)
+    res = {"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 11}],
+           "failed_tests": {}, "workflows": [{"id": "w1", "status": "success"}]}
+
+    class Rot(FakeCircle):
+        def credit_block(self, jobs, runner, account, targets=None):
+            self.calls.append(("credit_block", account))
+            return "no credits are available on your plan" if account == "3" else None
+
+        def trigger(self, branch, params, runner, account, targets=None, rotate=True):
+            assert rotate is False, "the caller owns the rotation (the branch must be on the next repo first)"
+            self.calls.append(("trigger", branch, params, account, vpcircle.target(account, targets)["definition_id"]))
+            return {"pipeline_id": "pipe-%s" % account, "account": account}
+    fake = Rot(res)
+    p = make_proof(tmp_path, fake, FakeExec({}))
+    rec = p.run("L22-HOSTED", "proof-6", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS" and rec["pipeline_id"] == "pipe-1" and rec["account"] == "1", rec
+    br = "vp/proof/proof-6-%s" % cand[:12]
+    pushes = [c for c in fake.calls if c[0] == "push"]
+    assert pushes == [("push", br, "git@github.com:dhairyabajaria/voice-pod-NEW.git"),
+                      ("push", br, "git@github.com:voicepod-ci-mirror-a/voice-pod-NEW.git")]
+    trig = [c for c in fake.calls if c[0] == "trigger"]
+    assert [(c[3], c[4]) for c in trig] == [("3", vpcircle.DEFINITION_ID), ("1", "cda494d8-6652-4487-8d96-98267be06312")]
+    assert sorted(c[2] for c in fake.calls if c[0] == "delete") == sorted(r for _, _, r in pushes)
+    assert p._credit_blocked.get("3", 0) > 0 and "1" not in p._credit_blocked
+    # the next proof skips account 3 without pushing to it
+    fake.calls.clear()
+    rec = p.run("L23-HOSTED", "proof-7", wt, base, cand, "platform", [])
+    assert rec["account"] == "1" and [c[3] for c in fake.calls if c[0] == "trigger"] == ["1"]
+    assert [c[2] for c in fake.calls if c[0] == "push"] == ["git@github.com:voicepod-ci-mirror-a/voice-pod-NEW.git"]
+    # every account refused -> BLOCKED_CREDITS (the driver holds, no strike)
+    p._credit_blocked = {a: p._credit_blocked.get("3") for a in ("1", "2", "3")}
+    rec = p.run("L24-HOSTED", "proof-8", wt, base, cand, "platform", [])
+    assert rec["status"] == "BLOCKED_CREDITS" and "blocked for credits" in rec["reason"]
+    # roster overrides reach the target table
+    assert vpcircle.target("2", {"2": {"definition_id": "x"}})["definition_id"] == "x"
+    assert vpcircle.slug_for("2").startswith("circleci/7BDzzoWMeVDmriGVMigj1S/")

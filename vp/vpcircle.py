@@ -73,6 +73,37 @@ DEFINITION_ID = "5c8213d0-1d01-416c-bae6-983da31dd8d2"
 # accounts in ("1", "2", "3").
 ACCOUNTS = tuple(_circleaccount.EXPECTED)
 
+# D44: each keychain account triggers ITS OWN project (org / definition) and
+# checks out ITS OWN GitHub repo, so the proof branch must be pushed to that
+# repo before the trigger.  push_remote None = the worktree's origin chain
+# (vpcircle.github_remote, D38).  Roster `proof.circleci.accounts` overrides
+# any field per account; `proof.circleci.rotation` orders the fallbacks.
+TARGETS = {
+    "3": {"slug": SLUG, "definition_id": DEFINITION_ID, "push_remote": None,
+          "org": "Pareen Calling", "repo": "dhairyabajaria/voice-pod-NEW"},
+    "1": {"slug": "circleci/AUoERWov6KVkJZG4hCBuxU/2RSozHJZM8Qz5jxzjTR6tE",
+          "definition_id": "cda494d8-6652-4487-8d96-98267be06312",
+          "push_remote": "git@github.com:voicepod-ci-mirror-a/voice-pod-NEW.git",
+          "org": "Voice Pod CI Secondary A", "repo": "voicepod-ci-mirror-a/voice-pod-NEW"},
+    "2": {"slug": "circleci/7BDzzoWMeVDmriGVMigj1S/BhwRJt34cg1vNDorZmgA52",
+          "definition_id": "a38ba2a6-da55-4603-a292-3b643b15925d",
+          "push_remote": "git@github.com:voicepod-ci-mirror-b/voice-pod-NEW.git",
+          "org": "Voice Pod CI Secondary B", "repo": "voicepod-ci-mirror-b/voice-pod-NEW"},
+}
+DEFAULT_ROTATION = ("3", "1", "2")
+
+
+def target(account=None, overrides=None):
+    """the project an account triggers: TARGETS[account] under roster overrides"""
+    acct = account or DEFAULT_ROTATION[0]
+    base = dict(TARGETS.get(acct) or {"slug": SLUG, "definition_id": DEFINITION_ID, "push_remote": None})
+    base.update(dict((overrides or {}).get(acct) or {}))
+    return base
+
+
+def slug_for(account=None, overrides=None):
+    return target(account, overrides)["slug"]
+
 # A trigger response is treated as a credit/billing refusal (not a hard
 # failure) when its body text mentions any of these, case-insensitively.
 CREDIT_MARKERS = ("credit", "plan", "payment")
@@ -123,17 +154,18 @@ class Runner:
         return self._run(prefix + command, env=env, capture_output=True, text=True)
 
 
-def project_visible(runner=None, account=None):
+def project_visible(runner=None, account=None, targets=None):
     """GET api/v2/project/<slug> under `account`: (ok, detail).  A 404 here
     means the credential is not a member of the project's org (trial
     attempt 1: account 1 vs "Pareen Calling"), and no branch should be
     pushed for it."""
     runner = runner or Runner()
-    acct = account or ACCOUNTS[0]
-    result = runner.circleci_api(acct, f"api/v2/project/{SLUG}", method="GET")
+    acct = account or DEFAULT_ROTATION[0]
+    slug = slug_for(acct, targets)
+    result = runner.circleci_api(acct, f"api/v2/project/{slug}", method="GET")
     text = ((result.stdout or "") + (result.stderr or "")).strip()
     if result.returncode != 0:
-        return False, f"account {acct} cannot read project {SLUG}: {text[:200]}"
+        return False, f"account {acct} cannot read project {slug}: {text[:200]}"
     return True, acct
 
 
@@ -208,9 +240,10 @@ def delete_branch(worktree, branch, runner=None, remote=None):
     return runner.git(["push", remote, "--delete", branch], cwd=worktree)
 
 
-def _trigger_once(runner, account, branch, parameters):
+def _trigger_once(runner, account, branch, parameters, targets=None):
+    tgt = target(account, targets)
     body = {
-        "definition_id": DEFINITION_ID,
+        "definition_id": tgt["definition_id"],
         "config": {"branch": branch},
         "checkout": {"branch": branch},
         "parameters": parameters,
@@ -218,25 +251,27 @@ def _trigger_once(runner, account, branch, parameters):
     # json.dumps renders a Python bool as a JSON boolean (true/false, not
     # "true"/"false") -- this is what keeps parameter booleans real.
     payload = json.dumps(body)
-    path = f"api/v2/project/{SLUG}/pipeline/run"
+    path = f"api/v2/project/{tgt['slug']}/pipeline/run"
     return runner.circleci_api(account, path, method="POST", data=payload)
 
 
-def trigger(branch, parameters, runner=None, account=None):
+def trigger(branch, parameters, runner=None, account=None, targets=None, rotate=True):
     """circleci api .../pipeline/run -X POST -d '<json>' for `branch` with
     `parameters`. Rotates to the next account exactly once if the first
-    response looks like a credit/plan/payment refusal.
+    response looks like a credit/plan/payment refusal (rotate=False: the
+    caller owns the rotation -- D44: the branch must be pushed to the next
+    account's repo first, laneproof.run_circleci does that).
 
     Returns {"pipeline_id": ..., "account": <account that ran>}.
     """
     runner = runner or Runner()
-    start = account or ACCOUNTS[0]
-    others = [a for a in ACCOUNTS if a != start]
+    start = account or DEFAULT_ROTATION[0]
+    others = [a for a in ACCOUNTS if a != start] if rotate else []
     attempts = [start] + others[:1]  # primary + exactly one retry account
 
     last_text = None
     for i, acct in enumerate(attempts):
-        result = _trigger_once(runner, acct, branch, parameters)
+        result = _trigger_once(runner, acct, branch, parameters, targets)
         text = (result.stdout or "") + (result.stderr or "")
         if result.returncode == 0:
             try:
@@ -286,7 +321,7 @@ def cancel_pipeline(pipeline_id, runner=None, account=None):
     pipeline (a cancelled chain union should not keep burning credits).
     Returns the workflow ids cancelled; never raises."""
     runner = runner or Runner()
-    acct = account or ACCOUNTS[0]
+    acct = account or DEFAULT_ROTATION[0]
     done = []
     try:
         wfs = _get_json(runner, acct, f"api/v2/pipeline/{pipeline_id}/workflow").get("items", [])
@@ -302,7 +337,7 @@ def cancel_pipeline(pipeline_id, runner=None, account=None):
 
 
 def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
-         sleep=time.sleep, clock=time.monotonic, abort=None):
+         sleep=time.sleep, clock=time.monotonic, abort=None, targets=None):
     """Walk pipeline -> workflows -> jobs until every workflow is terminal,
     then fetch failed tests for every failed job with a job_number.
 
@@ -313,7 +348,7 @@ def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
     `abort()` is checked before every sleep; true raises Cancelled.
     """
     runner = runner or Runner()
-    acct = account or ACCOUNTS[0]
+    acct = account or DEFAULT_ROTATION[0]
     started = clock()
 
     while True:
@@ -340,7 +375,7 @@ def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
                 if j.get("status") == "failed" and j.get("job_number") is not None:
                     tests_resp = _get_json(
                         runner, acct,
-                        f"api/v2/project/{SLUG}/{j['job_number']}/tests",
+                        f"api/v2/project/{slug_for(acct, targets)}/{j['job_number']}/tests",
                     )
                     items = tests_resp.get("items", [])
                     # pytest junit results are success | failure | error |
@@ -382,19 +417,19 @@ def _dependency_failed(jobs_by_id, dep_ids):
 NO_CREDIT_MARKERS = ("no-credits", "no credits", "credits are available", "upgrade to continue")
 
 
-def credit_block(jobs, runner=None, account=None):
+def credit_block(jobs, runner=None, account=None, targets=None):
     """The plan/credit refusal that only shows AFTER a successful trigger:
     every job of pipeline ad4709dd (2026-09-18 21:12Z) 'failed' in 75 s with
     the job message 'This job has been blocked because no credits are
     available on your plan' (reason free-plan-no-credits-available).  Reads
     the first failed job's detail; returns that message or None."""
     runner = runner or Runner()
-    acct = account or ACCOUNTS[0]
+    acct = account or DEFAULT_ROTATION[0]
     for j in jobs:
         if j.get("status") != "failed" or j.get("job_number") is None:
             continue
         try:
-            det = _get_json(runner, acct, f"api/v2/project/{SLUG}/job/{j['job_number']}")
+            det = _get_json(runner, acct, f"api/v2/project/{slug_for(acct, targets)}/job/{j['job_number']}")
         except RuntimeError:
             return None
         for m in det.get("messages") or []:
