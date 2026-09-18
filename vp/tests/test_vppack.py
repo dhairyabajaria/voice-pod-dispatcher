@@ -640,6 +640,12 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     wt = env.tmp / "wt" / "REVIEW-FIXSET"
     disp = json.loads((wt / ".vp" / "DISPATCH.json").read_text())
     assert disp["union"] == "union-1" and disp["union_sha"] == tip and disp["union_base_sha"] == sha
+    # D31: the worktree's records attest the reviewed tip, the registered candidate kept alongside
+    utree = git(env.trunk, "rev-parse", tip + "^{tree}")
+    assert (disp["candidate_sha"], disp["tree_sha"], disp["registered_candidate_sha"]) == (tip, utree, sha)
+    con = json.loads((wt / ".vp" / "CONTRACT.json").read_text())["parameters"]
+    assert (con["candidate_sha"], con["tree_sha"], con["registered_candidate_sha"], con["union"]) == (tip, utree, sha, "union-1")
+    assert env.rows()["REVIEW-FIXSET"]["parameters"]["candidate_sha"] == sha, "the scheduler row is untouched"
     assert sorted(disp["union_members"]) == ["P-FIX-A", "P-FIX-B"]
     assert disp["owned_files"] == ["control/evidence/REVIEW-FIXSET/union-1/verdict-packet.json"]
     req = json.loads((wt / ".vp" / "REVIEW_REQUEST.json").read_text())

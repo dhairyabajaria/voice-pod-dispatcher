@@ -1766,6 +1766,22 @@ class LaneDriver(object):
                                                                    len(union.get("members") or [])))
         return union
 
+    def _union_overlay(self, contract, row, union):
+        """copies of the contract/row whose candidate_sha/tree_sha name the
+        union tip (its tree from trunk); the scheduler's row is untouched"""
+        tip = union.get("union_sha")
+        rc, tree, _e = self.git(["-C", str(self.trunk), "rev-parse", tip + "^{tree}"])
+        tree = tree.strip() if rc == 0 else None
+        def overlay(params):
+            params = dict(params or {})
+            params.update({"registered_candidate_sha": params.get("candidate_sha"),
+                           "registered_tree_sha": params.get("tree_sha"),
+                           "candidate_sha": tip, "tree_sha": tree, "union": union.get("union")})
+            return params
+        contract = dict(contract, parameters=overlay(contract.get("parameters")))
+        row = dict(row, parameters=overlay(row.get("parameters")))
+        return contract, row
+
     def write_dispatch_record(self, wt, task, attempt, contract, base, row, union=None):
         """<worktree>/.vp/DISPATCH.json -- the driver's dispatch record for the
         turn (PACKET-FORMAT: REVIEW-* packets read their union id from it and
@@ -1778,6 +1794,7 @@ class LaneDriver(object):
         rec = {"task": task, "attempt": attempt, "union": union, "base_sha": base, "kind": contract.get("kind"),
                "stacked_base": row.get("stacked_base"), "stacked_on": row.get("stacked_on"),
                "union_sha": udoc.get("union_sha"), "union_base_sha": udoc.get("base_sha"),
+               "registered_candidate_sha": ((row.get("parameters") or {}).get("registered_candidate_sha")),
                "union_members": [m.get("task") for m in (udoc.get("members") or [])] or None,
                "candidate_sha": ((row.get("parameters") or {}).get("candidate_sha")),
                "tree_sha": ((row.get("parameters") or {}).get("tree_sha")),
@@ -2815,6 +2832,11 @@ class LaneDriver(object):
         rcfg = self.roles.get(kind) or {}
         wt = self.ensure_worktree(task, base)
         union = self._union_bound(task, base, wt)
+        if union:
+            # D31 (FIXSET-R1 VP-CANDIDATE-METADATA-001): the worktree's own
+            # records attest the reviewed union tip, not the registered
+            # candidate the claim is keyed to (kept as registered_candidate_sha)
+            contract, row = self._union_overlay(contract, row, union)
         self.write_vp_files(wt, task, contract, base, row)
         self.write_dispatch_record(wt, task, attempt, contract, base, row, union=union)
         tdir = self._turn_dir(task, attempt)
