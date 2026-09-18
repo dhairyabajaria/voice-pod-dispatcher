@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 VP = HERE.parent
 sys.path.insert(0, str(VP))
@@ -25,6 +27,41 @@ from vprunners import TurnOutcome, STATUS_DONE  # noqa: E402
 PY = sys.executable
 CONTROL_DIR = VP.parent.parent / "voice-pod" / "advisor-plans" / "outbound-launch"
 SCRIPT = CONTROL_DIR / "orchestration_control.py"
+
+
+def _v13_pack_prereqs():
+    """The v13-pack roster fixture is the real advisor-plans roster from the
+    sibling voice-pod checkout, and it hardcodes absolute paths (its own
+    control.script/control.catalog, and per-server xdg_data_home dirs under
+    the developer's home directory). On a machine without that sibling
+    checkout and those directories (e.g. a bare CI runner) there is nothing
+    to test against, so report why instead of failing on missing files.
+    """
+    roster_path = CONTROL_DIR / "v13-pack" / "roster-v13.json"
+    if not roster_path.exists():
+        return "sibling voice-pod checkout not found: %s" % roster_path
+    try:
+        r = json.loads(roster_path.read_text())
+    except Exception as exc:  # pragma: no cover - defensive
+        return "roster-v13.json unreadable: %s" % exc
+    # vplint.lint_roster_v13 resolves control.script/control.catalog from
+    # run.scheduler/run.catalog when the roster has no explicit "control"
+    # section (the real fixture doesn't). Those are absolute paths baked in
+    # for the developer's own Mac checkout, so check both spots.
+    run = r.get("run", {})
+    ctl = r.get("control", {})
+    for key, run_key in (("script", "scheduler"), ("catalog", "catalog")):
+        p = ctl.get(key) or run.get(run_key)
+        if p and not Path(p).expanduser().exists():
+            return "control.%s does not exist: %s" % (key, p)
+    for name, s in r.get("servers", {}).items():
+        xdg = s.get("xdg_data_home")
+        if xdg and not Path(xdg).exists():
+            return "server %s xdg_data_home missing: %s" % (name, xdg)
+    return None
+
+
+_V13_PACK_SKIP_REASON = _v13_pack_prereqs()
 
 
 def sh(args, cwd=None):
@@ -1519,6 +1556,7 @@ def test_item10_normalize_roster_maps_architect_vocabulary_onto_the_driver():
         lanedriver.normalize_roster(r3)["proof"], "a v12 roster keeps the v12 default"
 
 
+@pytest.mark.skipif(_V13_PACK_SKIP_REASON is not None, reason=str(_V13_PACK_SKIP_REASON))
 def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     import vplint
     src = CONTROL_DIR / "v13-pack" / "roster-v13.json"
@@ -1586,6 +1624,7 @@ def test_item11_gate_hold_parks_the_attempt_and_retries_only_complete(tmp_path, 
 
 # -- pack §4(a): roster copy at start, worktree dependency links ----------------------
 
+@pytest.mark.skipif(_V13_PACK_SKIP_REASON is not None, reason=str(_V13_PACK_SKIP_REASON))
 def test_pack4a_init_run_copies_lints_and_snapshots_the_roster(tmp_path):
     import vplint
     src = tmp_path / "roster-v13.json"

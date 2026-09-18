@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -14,6 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import vpcircle as vc  # noqa: E402
 import circleaccount as c  # noqa: E402
+
+
+# These tests exercise vc.Runner without overriding `binary`, so
+# circleaccount.verified_env falls back to `shutil.which("circleci")`.
+# On a machine without the CircleCI CLI installed (e.g. a bare CI runner)
+# that lookup fails before any of the FakeRun plumbing is reached, which
+# is a missing-prerequisite skip, not a real test failure.
+_HAS_CIRCLECI_CLI = shutil.which("circleci") is not None
+_SKIP_REASON = "circleci CLI is not installed on this machine"
 
 
 _ACCOUNT_RE = re.compile(r"circleci-account-(\d+)")
@@ -71,6 +81,7 @@ class FakeRun:
         raise AssertionError(f"unexpected argv in FakeRun: {argv}")
 
 
+@unittest.skipUnless(_HAS_CIRCLECI_CLI, _SKIP_REASON)
 class TriggerBodyTests(unittest.TestCase):
     def test_trigger_body_has_real_json_booleans(self):
         seen = {}
@@ -173,6 +184,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["reds"][0]["kind"], "unknown")
 
 
+@unittest.skipUnless(_HAS_CIRCLECI_CLI, _SKIP_REASON)
 class RotationTests(unittest.TestCase):
     def test_credit_error_rotates_to_next_account_once(self):
         calls_by_account = []
@@ -211,6 +223,7 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(calls_by_account, ["1"])
 
 
+@unittest.skipUnless(_HAS_CIRCLECI_CLI, _SKIP_REASON)
 class PollTests(unittest.TestCase):
     def test_poll_ends_when_all_workflows_terminal(self):
         state = {"workflow_calls": 0}
