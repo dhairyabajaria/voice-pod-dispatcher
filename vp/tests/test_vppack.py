@@ -567,3 +567,151 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, {"tasks": {}})
     assert plan["targets"] == ["L42", "L06", "L07", "L99"] and plan["subject"] == "union"
     assert "L06 ok" in plan["review_benchmark"] and "<union>" not in plan["review_benchmark"]
+
+
+# -- D27 §9(5a)/(5b): the union integrator and the union-complete dispatch precondition ---------
+
+def _fix_builder(spec, ab):
+    """a builder that lands a distinct file per packet and leaves platform/a.py
+    alone (so two fixes merge cleanly; result_ok edits a.py line 1 per item)"""
+    wt = Path(spec.cwd)
+    (wt / "platform" / ("%s.py" % spec.item.lower().replace("-", "_"))).write_text("fixed = %r\n" % spec.item)
+    out = result_ok(spec, ab, commit=False)
+    git(wt, "checkout", "--", "platform/a.py")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "fix %s" % spec.item)
+    rec = json.loads(Path(spec.out_path).read_text())
+    rec["commit"] = git(wt, "rev-parse", "HEAD")
+    Path(spec.out_path).write_text(json.dumps(rec))
+    return out
+
+
+def _union_env(tmp_path, builder=_fix_builder, deps=("P-FIX-A", "P-FIX-B")):
+    from test_lanedriver import FakeCodex
+    pd = tmp_path / "pack"
+    packet(pd, "P-FIX-A", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix A for L00")
+    packet(pd, "P-FIX-B", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix B for L00")
+    packet(pd, "REVIEW-FIXSET", "NEW:JUNIOR_REVIEW", kind="review", template="JUNIOR_REVIEW", role="junior",
+           deps=list(deps), body="one review of the union of the fixes of L00")
+    pm = pd / "REVIEW-FIXSET" / "PACKET.md"
+    pm.write_text(pm.read_text().replace("  - control/evidence/REVIEW-FIXSET/v13/REGRADE.md",
+                                         "  - control/evidence/REVIEW-FIXSET/<union>/verdict-packet.json")
+                  .replace("---\n", "---\ncoverage_targets: [<union>, L00]\n", 1))
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    codex = FakeCodex()
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": codex, "claude": FakeRunner()})
+    return env, drv, codex
+
+
+def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs_on_its_tip(tmp_path, monkeypatch):
+    from test_lanedriver import register_candidate
+    import lanedriver
+    monkeypatch.setattr(lanedriver.LaneDriver, "_review_gate_check", lambda self, *a: (True, "PASS: fake gate"))
+    env, drv, codex = _union_env(tmp_path)
+    sha, tree = register_candidate(env)
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED", rows
+    members = env.run_root / "unions" / "1" / "members.json"
+    assert members.exists(), (env.run_root / "driver.log").read_text()
+    doc = json.loads(members.read_text())
+    assert doc["union"] == "union-1" and doc["base_sha"] == sha and doc["for"] == ["REVIEW-FIXSET"]
+    assert {m["task"]: m["output_sha"] for m in doc["members"]} == {
+        "P-FIX-A": rows["P-FIX-A"]["output_sha"], "P-FIX-B": rows["P-FIX-B"]["output_sha"]}
+    assert all(m["merge"] == "clean" for m in doc["members"])
+    tip = doc["union_sha"]
+    # the union tip is a real commit in trunk that contains both fixes and descends from the candidate
+    assert git(env.trunk, "merge-base", "--is-ancestor", sha, tip) == ""
+    assert sorted(git(env.trunk, "ls-tree", "--name-only", tip, "platform/").splitlines()) == [
+        "platform/a.py", "platform/p_fix_a.py", "platform/p_fix_b.py"]
+    assert "unions.jsonl" in {p.name for p in (env.run_root / "unions").iterdir()}
+    # the review dispatched on the union tip: worktree HEAD == tip, subject = candidate..tip
+    review = rows["REVIEW-FIXSET"]
+    assert review["state"] != "READY", review
+    wt = env.tmp / "wt" / "REVIEW-FIXSET"
+    disp = json.loads((wt / ".vp" / "DISPATCH.json").read_text())
+    assert disp["union"] == "union-1" and disp["union_sha"] == tip and disp["union_base_sha"] == sha
+    assert sorted(disp["union_members"]) == ["P-FIX-A", "P-FIX-B"]
+    assert disp["owned_files"] == ["control/evidence/REVIEW-FIXSET/union-1/verdict-packet.json"]
+    req = json.loads((wt / ".vp" / "REVIEW_REQUEST.json").read_text())
+    assert (req["base"], req["candidate"], req["subject"]) == (sha, tip, "union")
+    assert req["union"] == "union-1" and sorted(req["union_members"]) == ["P-FIX-A", "P-FIX-B"]
+    assert set(req["coverage_targets"]) >= {"L00", "P-FIX-A", "P-FIX-B"}
+    assert codex.calls and Path(codex.calls[0].cwd) == wt
+    # the verdict packet names the registered candidate (review_gate) AND the union it reviewed
+    vp = json.loads(next((env.run_root / "turns" / "REVIEW-FIXSET").rglob("verdict-packet.json")).read_text())
+    assert vp["candidate_sha"] == sha and vp["union"] == "union-1" and vp["union_sha"] == tip
+    log = (env.run_root / "driver.log").read_text()
+    assert "UNION union-1 %s base=%s for REVIEW-FIXSET members=P-FIX-A,P-FIX-B" % (tip[:12], sha[:12]) in log
+    assert "UNION union-1: REVIEW-FIXSET worktree at %s (2 members)" % tip[:12] in log
+    # idempotent: a later pass cuts no second union for the same member shas
+    settle(drv, 2)
+    assert not (env.run_root / "unions" / "2").exists()
+
+
+def test_union_review_is_held_until_a_union_contains_all_its_depends_on_rows(tmp_path):
+    """§9(5a): a members.json that lacks one of the packet's depends_on rows
+    (or carries a member at a stale output sha) does not dispatch the review."""
+    from test_lanedriver import register_candidate
+    import lanedriver
+    env, drv, codex = _union_env(tmp_path)
+    sha, tree = register_candidate(env)
+    # the integrator is silenced: only a hand-written, incomplete union exists
+    drv._union_step = lambda state: None
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
+    (env.run_root / "unions" / "1").mkdir(parents=True)
+    (env.run_root / "unions" / "1" / "members.json").write_text(json.dumps(
+        {"union": "union-1", "n": 1, "base_sha": sha, "union_sha": sha,
+         "members": [{"task": "P-FIX-A", "output_sha": rows["P-FIX-A"]["output_sha"]}]}))
+    settle(drv, 3)
+    assert env.rows()["REVIEW-FIXSET"]["state"] == "READY", "held: never claimed"
+    assert codex.calls == []
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "REVIEW_UNION_INCOMPLETE" in alerts and "['P-FIX-B']" in alerts
+    assert "HOLD REVIEW-FIXSET 600s REVIEW_UNION_INCOMPLETE" in (env.run_root / "driver.log").read_text()
+    # a stale member sha is as good as a missing one
+    (env.run_root / "unions" / "2").mkdir(parents=True)
+    (env.run_root / "unions" / "2" / "members.json").write_text(json.dumps(
+        {"union": "union-2", "n": 2, "base_sha": sha, "union_sha": sha,
+         "members": [{"task": "P-FIX-A", "output_sha": rows["P-FIX-A"]["output_sha"]},
+                     {"task": "P-FIX-B", "output_sha": "f" * 40}]}))
+    p = drv.packet_for("REVIEW-FIXSET")
+    union, missing = drv._union_for("REVIEW-FIXSET", p, env.rows())
+    assert union is None and missing == ["P-FIX-B"]
+    # a complete union dispatches it (hold dropped on the next ready pass)
+    doc = json.loads((env.run_root / "unions" / "2" / "members.json").read_text())
+    doc["members"][1]["output_sha"] = rows["P-FIX-B"]["output_sha"]
+    (env.run_root / "unions" / "2" / "members.json").write_text(json.dumps(doc))
+    union, missing = drv._union_for("REVIEW-FIXSET", p, env.rows())
+    assert union["union"] == "union-2" and missing == []
+    drv._fail.pop("REVIEW-FIXSET", None)
+    settle(drv, 3)
+    assert env.rows()["REVIEW-FIXSET"]["state"] != "READY"
+    assert codex.calls and json.loads((env.tmp / "wt" / "REVIEW-FIXSET" / ".vp" / "DISPATCH.json").read_text())["union"] == "union-2"
+
+
+def test_union_conflict_is_recorded_and_the_review_stays_held(tmp_path):
+    """two fixes editing the same line: no members.json, a conflict.json + UNION_CONFLICT
+    alert naming the member, the review held; the same member set is not retried every pass"""
+    from test_lanedriver import register_candidate
+    env, drv, codex = _union_env(tmp_path, builder=result_ok)   # result_ok edits platform/a.py line 1 per item
+    sha, tree = register_candidate(env)
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
+    assert not (env.run_root / "unions" / "1" / "members.json").exists()
+    con = json.loads((env.run_root / "unions" / "1" / "conflict.json").read_text())
+    assert con["status"] == "CONFLICT" and con["conflict"]["task"] == "P-FIX-B" and [m["task"] for m in con["members"]] == ["P-FIX-A"]
+    assert "UNION_CONFLICT" in (env.run_root / "alerts.jsonl").read_text()
+    assert env.rows()["REVIEW-FIXSET"]["state"] == "READY" and codex.calls == []
+    assert git(env.trunk, "branch", "--list", "vp/union-1") == ""
+    assert not (env.tmp / "wt" / "union-1").exists()
+    settle(drv, 2)
+    assert not (env.run_root / "unions" / "2").exists(), "the failed member set is tried once"

@@ -52,6 +52,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import laneproof  # noqa: E402
 import vplint     # noqa: E402
+import vpmerge    # noqa: E402
 import vppack     # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
@@ -1069,28 +1070,197 @@ class LaneDriver(object):
 
     REVIEW_SUBJECT_HOLD_S = 600
 
-    def _review_subject_empty(self, task, row, state):
-        """D21: a `<union>` review whose subject would be an empty diff (no
-        review_base, candidate == the row's base, no union members) is held,
-        not dispatched: REVIEW-JUNIOR-UNION-R2 burned a reviewer turn to
-        report F-EMPTY-DIFF because no union tip existed yet."""
+    def _union_review_packet(self, task):
+        """the packet when `task` is a `<union>` review with no review_base
+        (its subject is a union tip the integrator builds), else None"""
         p = self.packet_for(task)
         if not p or p.get("v13_kind") != "review" or "<union>" not in (p.get("coverage_targets") or []):
-            return False
+            return None
         if p.get("review_base"):
+            return None
+        return p
+
+    def _union_members_wanted(self, p):
+        """D27 §9(5a): the scheduler rows a `<union>` review packet's depends_on
+        packets are bound to -- the members its union must contain.  None when
+        a dependency packet is not bound yet."""
+        wanted = {}
+        for dep in (p.get("depends_on") or []):
+            task = next((t for t, pid in self.pack_by_task.items() if pid == dep), None)
+            if not task:
+                return None
+            wanted[dep] = task
+        return wanted
+
+    @staticmethod
+    def _union_docs(run_root):
+        docs = []
+        for m in sorted((Path(run_root) / "unions").glob("*/members.json")):
+            try:
+                doc = json.loads(m.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            doc["_path"] = str(m)
+            docs.append(doc)
+        return sorted(docs, key=lambda d: int(d.get("n") or 0))
+
+    def _union_for(self, task, p, tasks):
+        """the newest union whose members superset-contain the packet's
+        depends_on rows AT THEIR CURRENT output shas (a member re-verified
+        since the union was cut makes that union stale for this review).
+        Returns (union_doc, missing) -- missing names what a fresh union
+        would need; (None, None) when a dependency packet is unbound."""
+        wanted = self._union_members_wanted(p)
+        if wanted is None:
+            return None, None
+        need = {}
+        for pid, t in wanted.items():
+            need[t] = ((tasks.get(t) or {}).get("output_sha") or None)
+        best, missing = None, sorted(need)
+        for doc in self._union_docs(self.run_root):
+            have = {m.get("task"): m.get("output_sha") for m in (doc.get("members") or []) if isinstance(m, dict)}
+            gap = sorted(t for t, sha in need.items() if t not in have or (sha and have[t] != sha))
+            if not gap:
+                best = doc
+            elif len(gap) < len(missing):
+                missing = gap
+        return best, ([] if best else missing)
+
+    def _review_subject_empty(self, task, row, state):
+        """D21/D27: a `<union>` review (no review_base) is dispatched only on a
+        union tip whose members ⊇ the packet's depends_on rows (§9 ruling 5a);
+        otherwise it is held, not dispatched: REVIEW-JUNIOR-UNION-R2 burned a
+        reviewer turn to report F-EMPTY-DIFF because no union tip existed."""
+        p = self._union_review_packet(task)
+        if not p:
+            return False
+        tasks = state.get("tasks") or {}
+        union, missing = self._union_for(task, p, tasks)
+        if union:
             return False
         params = row.get("parameters") or {}
-        if params.get("covered_rows"):
-            return False
-        if any((self.run_root / "unions").glob("*/members.json")):
-            return False
+        if not p.get("depends_on") and (params.get("covered_rows") or self._union_docs(self.run_root)):
+            return False                          # the legacy shape: any union serves a dependency-less review
         cand = (state.get("candidate") or {}).get("sha")
-        self.alert_once("review-subject:%s" % task, "REVIEW_SUBJECT_EMPTY",
-                        "%s: no union tip yet (candidate %s == base, no covered rows, no unions/*/members.json); "
-                        "held, not dispatched, until a union exists" % (task, (cand or "none")[:12]), task)
-        self.note_hold(task, "ready:%s" % row.get("updated_at"), "REVIEW_SUBJECT_EMPTY %s" % task,
-                       self.REVIEW_SUBJECT_HOLD_S)
+        if missing:
+            why = "REVIEW_UNION_INCOMPLETE"
+            text = ("%s: no union contains its depends_on rows %s at their current output shas; "
+                    "held until the integrator cuts one" % (task, missing))
+        else:
+            why = "REVIEW_SUBJECT_EMPTY"
+            text = ("%s: no union tip yet (candidate %s == base, no covered rows, no unions/*/members.json); "
+                    "held, not dispatched, until a union exists" % (task, (cand or "none")[:12]))
+        self.alert_once("review-subject:%s:%s" % (task, ",".join(missing or [])), why, text, task)
+        self.note_hold(task, "ready:%s" % row.get("updated_at"), "%s %s" % (why, task), self.REVIEW_SUBJECT_HOLD_S)
         return True
+
+    # -- D27 §9(5b): the union integrator ----------------------------------------------------
+    UNION_MEMBER_STATES = ("VERIFIED", "INTEGRATED", "ACCEPTED")
+
+    def _union_step(self, state):
+        """cut a union for every `<union>` review whose depends_on rows are all
+        VERIFIED (output_sha in trunk) and not yet together in one union.  The
+        union is `unions/<n>/members.json` + branch vp/union-<n> in trunk: the
+        review's worktree is reset to its tip and the reviewer sees the fix set
+        merged, not the unchanged candidate (BULK-RULING-2026-09-18 §9 ruling 2)."""
+        tasks = state.get("tasks") or {}
+        cand = (state.get("candidate") or {}).get("sha")
+        if not cand:
+            return
+        for task, pid in sorted(self.pack_by_task.items()):
+            p = self._union_review_packet(task)
+            if not p or not p.get("depends_on"):
+                continue
+            row = tasks.get(task) or {}
+            if row.get("state") not in ("PLANNED", "WAITING_DEPENDENCY", "READY"):
+                continue
+            union, missing = self._union_for(task, p, tasks)
+            if union or missing is None:
+                continue
+            wanted = self._union_members_wanted(p) or {}
+            members = []
+            for dep, t in wanted.items():
+                r = tasks.get(t) or {}
+                if r.get("state") not in self.UNION_MEMBER_STATES or not r.get("output_sha"):
+                    members = None
+                    break
+                members.append({"task": t, "packet": dep, "output_sha": r["output_sha"],
+                                "depth": len(self.pack.get(dep, {}).get("depends_on") or [])})
+            if not members:
+                continue
+            key = "union:%s:%s" % (task, ",".join(sorted(m["output_sha"] for m in members)))
+            if key in self._pack_logged:
+                continue                          # this exact member set already failed to merge
+            self._pack_logged.add(key)
+            try:
+                self._build_union(task, cand, members)
+            except Exception as exc:  # noqa: BLE001 -- never take the tick down
+                self.log("UNION build for %s failed: %s: %s" % (task, type(exc).__name__, exc))
+                self.alert("UNION_FAILED", "%s: %s" % (task, str(exc)[:300]), task)
+
+    def _build_union(self, for_task, base, members):
+        udir = self.run_root / "unions"
+        udir.mkdir(parents=True, exist_ok=True)
+        n = max([int(d.name) for d in udir.iterdir() if d.name.isdigit()] or [0]) + 1
+        uid, branch = "union-%d" % n, "vp/union-%d" % n
+        wt = self.worktrees_root / uid
+        if wt.exists():
+            self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
+        self.git(["-C", str(self.trunk), "worktree", "prune"])
+        self.git(["-C", str(self.trunk), "branch", "-D", branch])
+        rc, out, err = self.git(["-C", str(self.trunk), "worktree", "add", str(wt), "-b", branch, base], log=True)
+        if rc != 0:
+            raise ControlError("union worktree add failed: %s" % (err or out)[:300])
+        merged, conflict = [], None
+        try:
+            for m in sorted(members, key=lambda m: (m["depth"], m["task"])):
+                ours = self.head_sha(wt)
+                rc, out, err = self.git(["-C", str(wt), "-c", "user.email=lanedriver@vp", "-c", "user.name=lanedriver",
+                                         "merge", "--no-ff", "--no-edit", "-m", "%s: %s" % (uid, m["task"]),
+                                         m["output_sha"]], log=True)
+                how = "clean"
+                if rc != 0:
+                    # D49 class (inventory counts) merges by arithmetic; anything else is a real conflict
+                    try:
+                        note = vpmerge.resolve_merge(self.git, wt, ours, m["output_sha"])
+                        rc2, o2, e2 = self.git(["-C", str(wt), "-c", "user.email=lanedriver@vp",
+                                                "-c", "user.name=lanedriver", "commit", "--no-edit"], log=True)
+                        if rc2 != 0:
+                            raise vpmerge.Refused("commit after automerge: %s" % (e2 or o2)[:200])
+                        how = "automerge:%s" % json.dumps(note)[:200]
+                    except vpmerge.Refused as exc:
+                        self.git(["-C", str(wt), "merge", "--abort"])
+                        conflict = {"task": m["task"], "output_sha": m["output_sha"],
+                                    "detail": ("%s; %s" % (exc, (out or err)[:200])).strip()}
+                        break
+                merged.append(dict(m, merge=how))
+            union_sha = self.head_sha(wt)
+        finally:
+            self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
+        rec = {"union": uid, "n": n, "base_sha": base, "branch": branch, "for": [for_task],
+               "members": merged, "ts": utc_ms()}
+        if conflict:
+            self.git(["-C", str(self.trunk), "branch", "-D", branch])
+            rec.update({"status": "CONFLICT", "conflict": conflict})
+            (udir / str(n)).mkdir(parents=True, exist_ok=True)
+            (udir / str(n) / "conflict.json").write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+            _append_jsonl(udir / "unions.jsonl", rec, self._lock)
+            self.alert("UNION_CONFLICT", "%s for %s: %s conflicts on %s: %s"
+                       % (uid, for_task, conflict["task"], conflict["output_sha"][:12], conflict["detail"][:200]),
+                       for_task)
+            self.log("UNION %s CONFLICT %s (%s) after %s" % (uid, conflict["task"], conflict["detail"][:120],
+                                                            [m["task"] for m in merged]))
+            return None
+        rec.update({"status": "BUILT", "union_sha": union_sha})
+        (udir / str(n)).mkdir(parents=True, exist_ok=True)
+        (udir / str(n) / "members.json").write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+        _append_jsonl(udir / "unions.jsonl", rec, self._lock)
+        self.log("UNION %s %s base=%s for %s members=%s" % (uid, union_sha[:12], base[:12], for_task,
+                                                           ",".join(m["task"] for m in merged)))
+        with self._lock:
+            for k in [k for k in self._alerted if k.startswith("review-subject:%s" % for_task)]:
+                self._alerted.discard(k)
+        return rec
 
     # -- D16: a verified retry/fix retires the rows it supersedes ----------------------------
     SUPERSEDE_RE = re.compile(r"^(?P<root>.+?)-(?:R(?P<r>\d+)|FIX-(?P<f>\d+))$")
@@ -1196,6 +1366,11 @@ class LaneDriver(object):
             self._supersede_sweep(self.control.state_view())
         except Exception as exc:  # noqa: BLE001
             self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
+        if self.pack:
+            try:
+                self._union_step(self.control.state_view() or {})
+            except Exception as exc:  # noqa: BLE001
+                self.log("UNION step failed: %s: %s" % (type(exc).__name__, exc))
 
     def _pack_record(self, packet, rec):
         d = self.run_root / "packets"
@@ -1506,13 +1681,45 @@ class LaneDriver(object):
                           dict(out, ts=utc_ms(), task=task, role=role, verdict=str(verdict_path)), self._lock)
         return out
 
-    def write_dispatch_record(self, wt, task, attempt, contract, base, row):
+    def _union_bound(self, task, base, wt):
+        """D27: a `<union>` review's worktree is reset to its union tip (the
+        claim base stays the registered candidate, which the union descends
+        from) so the reviewer sees the fix set merged.  Returns the union doc
+        or None for every other task."""
+        p = self._union_review_packet(task)
+        if not p:
+            return None
+        tasks = (self.control.state_view() or {}).get("tasks") or {}
+        union, _missing = self._union_for(task, p, tasks)
+        if not union or not union.get("union_sha"):
+            return None
+        tip = union["union_sha"]
+        rc, _o, _e = self.git(["-C", str(wt), "merge-base", "--is-ancestor", base, tip])
+        if rc != 0:
+            self.alert_once("union-base:%s" % task, "UNION_BASE_MISMATCH",
+                            "%s: %s does not descend from the claim base %s; reviewing the candidate instead"
+                            % (task, union["union"], base[:12]), task)
+            return None
+        if self.head_sha(wt) != tip:
+            rc, out, err = self.git(["-C", str(wt), "reset", "--hard", tip], log=True)
+            if rc != 0:
+                raise ControlError("%s: reset to %s %s failed: %s" % (task, union["union"], tip[:12], (err or out)[:200]))
+            self.log("UNION %s: %s worktree at %s (%d members)" % (union["union"], task, tip[:12],
+                                                                   len(union.get("members") or [])))
+        return union
+
+    def write_dispatch_record(self, wt, task, attempt, contract, base, row, union=None):
         """<worktree>/.vp/DISPATCH.json -- the driver's dispatch record for the
         turn (PACKET-FORMAT: REVIEW-* packets read their union id from it and
-        the `<union>` placeholder in owned_files is substituted here)."""
+        the `<union>` placeholder in owned_files is substituted here).  D27: a
+        review dispatched on a union tip carries that union's id, sha and
+        members instead of the attempt-derived placeholder id."""
         p = self.packet_for(task)
-        union = "union-%s" % attempt
+        udoc = union or {}
+        union = udoc.get("union") or ("union-%s" % attempt)
         rec = {"task": task, "attempt": attempt, "union": union, "base_sha": base, "kind": contract.get("kind"),
+               "union_sha": udoc.get("union_sha"), "union_base_sha": udoc.get("base_sha"),
+               "union_members": [m.get("task") for m in (udoc.get("members") or [])] or None,
                "candidate_sha": ((row.get("parameters") or {}).get("candidate_sha")),
                "tree_sha": ((row.get("parameters") or {}).get("tree_sha")),
                "covered_rows": ((row.get("parameters") or {}).get("covered_rows")),
@@ -2504,8 +2711,9 @@ class LaneDriver(object):
         kind = contract.get("kind") or row.get("kind")
         rcfg = self.roles.get(kind) or {}
         wt = self.ensure_worktree(task, base)
+        union = self._union_bound(task, base, wt)
         self.write_vp_files(wt, task, contract, base, row)
-        self.write_dispatch_record(wt, task, attempt, contract, base, row)
+        self.write_dispatch_record(wt, task, attempt, contract, base, row, union=union)
         tdir = self._turn_dir(task, attempt)
         fkey = attempt
         sid = self._saved_session(tdir)
@@ -3144,7 +3352,16 @@ class LaneDriver(object):
         state = self.control.state_view()
         cand = (state.get("candidate") or {}).get("sha") or base
         p = self.packet_for(task)
-        rp = self._review_packet_plan(task, row, contract, wt, base, cand, state) if p and p.get("v13_kind") == "review" else None
+        union = None
+        if self._union_review_packet(task):
+            union, _m = self._union_for(task, p, state.get("tasks") or {})
+            if union and union.get("union_sha") and self.head_sha(wt) == union["union_sha"]:
+                # D27: the subject is the union diff, base..tip; the verdict
+                # packet still names the registered candidate (review_gate)
+                base, cand = union.get("base_sha") or base, union["union_sha"]
+            else:
+                union = None
+        rp = self._review_packet_plan(task, row, contract, wt, base, cand, state, union=union) if p and p.get("v13_kind") == "review" else None
         if rp:
             base = rp["base"]
             # D17: the reviewer judges the SUBJECT (the target contracts' own
@@ -3157,6 +3374,8 @@ class LaneDriver(object):
         if rp:
             req.update({"subject": rp["subject"], "coverage_targets": rp["targets"],
                         "criteria": rp["criteria"], "packet": p["id"]})
+        if union:
+            req.update({"union": union["union"], "union_members": [m.get("task") for m in union.get("members") or []]})
         (wt / ".vp" / "REVIEW_REQUEST.json").write_text(json.dumps(req, indent=2, sort_keys=True),
                                                         encoding="utf-8")
         out_path = wt / ".vp" / "REVIEW.json"
@@ -3184,7 +3403,8 @@ class LaneDriver(object):
         verdict = doc.get("verdict")
         if verdict == "APPROVE":
             packet = self._verdict_packet(task, row, contract, state, outcome, out_path, tdir, doc,
-                                          targets=(rp or {}).get("targets"), criteria=(rp or {}).get("criteria"))
+                                          targets=(rp or {}).get("targets"), criteria=(rp or {}).get("criteria"),
+                                          union=union)
             if rp:
                 return self._review_packet_finish(task, attempt, row, contract, server, wt, tdir, outcome,
                                                   packet, rp, cand)
@@ -3198,7 +3418,7 @@ class LaneDriver(object):
 
     # -- D17: v13 review packets ------------------------------------------------------------
 
-    def _review_packet_plan(self, task, row, contract, wt, base, cand, state):
+    def _review_packet_plan(self, task, row, contract, wt, base, cand, state, union=None):
         """what a `v13_kind: review` packet asks the driver to review.  Header
         keys (optional): `review_base` (the subject's base sha; default the
         row base -- for SEC-REVIEW-S3 the s3 delta d18363e5..5deac821, not an
@@ -3224,9 +3444,13 @@ class LaneDriver(object):
         targets = []
         for t in (hdr.get("coverage_targets") or []):
             if str(t).strip() == "<union>":
-                # the union's members: the review row's covered_rows (the
-                # INTEGRATED contracts the dispatch record lists)
-                targets += [str(c) for c in (params.get("covered_rows") or [])]
+                # the union's members (D27: the rows the integrator merged),
+                # else the review row's covered_rows (the INTEGRATED contracts
+                # the dispatch record lists)
+                if union:
+                    targets += [str(m.get("task")) for m in (union.get("members") or []) if m.get("task")]
+                else:
+                    targets += [str(c) for c in (params.get("covered_rows") or [])]
             else:
                 targets.append(str(t).strip())
         targets = list(dict.fromkeys(targets)) or [target]
@@ -3250,8 +3474,8 @@ class LaneDriver(object):
         except OSError:
             packet_benchmark = ""
         head = "# Review subject: %s..%s (%s)\n" % (rbase[:12], cand[:12], ", ".join(targets))
-        return {"base": rbase, "targets": targets, "criteria": criteria, "subject": "union" if "union" in
-                str((row.get("parameters") or {}).get("diff_or_scope") or "") else "item",
+        return {"base": rbase, "targets": targets, "criteria": criteria, "subject": "union" if (union or "union" in
+                str((row.get("parameters") or {}).get("diff_or_scope") or "")) else "item",
                 "review_benchmark": head + "".join(lines), "packet_benchmark": packet_benchmark}
 
     def _verdict_owned_path(self, task, p, row):
@@ -3357,7 +3581,8 @@ class LaneDriver(object):
         except OSError:
             pass
 
-    def _verdict_packet(self, task, row, contract, state, outcome, out_path, tdir, doc, targets=None, criteria=None):
+    def _verdict_packet(self, task, row, contract, state, outcome, out_path, tdir, doc, targets=None, criteria=None,
+                        union=None):
         """review_gate packet from the review record; the scheduler validates it
         (runtime log under ~/.codex/sessions, reviewer == the task's child_id).
         `targets`/`criteria` (D17) widen the coverage map to every contract the
@@ -3385,6 +3610,12 @@ class LaneDriver(object):
                   "artifacts": [{"path": str(out_path), "sha256": sha256_file(out_path)}],
                   "coverage": coverage,
                   "model_seen": outcome.model_seen, "summary": doc.get("summary")}
+        if union:
+            # D27: what was actually reviewed (candidate_sha above stays the
+            # registered candidate the gate checks; the union descends from it)
+            packet.update({"union": union.get("union"), "union_sha": union.get("union_sha"),
+                           "union_base_sha": union.get("base_sha"),
+                           "union_members": [m.get("task") for m in union.get("members") or []]})
         p = tdir / "verdict-packet.json"
         p.write_text(json.dumps(packet, indent=2, sort_keys=True), encoding="utf-8")
         return p
