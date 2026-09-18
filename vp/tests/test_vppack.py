@@ -778,6 +778,27 @@ def test_union_conflict_is_recorded_and_the_review_stays_held(tmp_path):
     before = sorted(d.name for d in (env.run_root / "unions").iterdir())
     settle(drv, 2)
     assert sorted(d.name for d in (env.run_root / "unions").iterdir()) == before, "the failed member set is tried once"
+    # D43: a refresh (a new member appears) re-excludes the known conflicts at their
+    # sha without a merge attempt or a fresh INTEGRATION_CONFLICT alert
+    n_alerts = (env.run_root / "alerts.jsonl").read_text().count("INTEGRATION_CONFLICT")
+    n_conf = len(list((env.run_root / "unions").glob("*/conflict.json")))
+    pd = Path(env.roster["run"]["pack_dir"])
+    packet(pd, "P-FIX-C", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix C for L00")
+    drv._pack_logged = set()
+    settle(drv, 6)
+    assert env.rows()["P-FIX-C"]["state"] == "VERIFIED"
+    integ2 = sorted((json.loads(m.read_text()) for m in (env.run_root / "unions").glob("*/members.json")
+                     if json.loads(m.read_text()).get("for") == ["INTEGRATION"]), key=lambda d: d["n"])[-1]
+    # P-FIX-C (result_ok: edits a.py too) is a NEW conflict: tried, excluded, alerted once;
+    # the members excluded before are re-excluded as `known` with no merge and no alert
+    assert integ2["n"] > integ[-1]["n"]
+    ex2 = {e["task"]: e for e in integ2["excluded"]}
+    old = {e["task"] for e in integ[-1]["excluded"]}
+    assert old <= set(ex2) and all(ex2[t].get("known") for t in old)
+    assert "P-FIX-C" in ex2 and not ex2["P-FIX-C"].get("known")
+    assert (env.run_root / "alerts.jsonl").read_text().count("INTEGRATION_CONFLICT") == n_alerts + 1
+    new_conf = len(list((env.run_root / "unions").glob("*/conflict.json"))) - n_conf
+    assert new_conf <= 2, "one integration try for P-FIX-C (+ the review's own partial), never the known members"
 
 
 # -- D28 §10: a dependent build stands on its dependency's verified output ----------------------

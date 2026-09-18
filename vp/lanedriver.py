@@ -1373,7 +1373,14 @@ class LaneDriver(object):
         if key in self._pack_logged:
             return None                           # this exact set already failed to build
         self._pack_logged.add(key)
-        excluded, pool = [], list(members)
+        # D43: a member the last integration union excluded, at the SAME output sha,
+        # is excluded again without a merge attempt or a fresh alert (each refresh
+        # re-cut three conflict dirs and re-alerted the same three members); a
+        # re-verified member (new sha) gets its merge tried again
+        known = {e.get("task"): e for e in (latest or {}).get("excluded") or [] if isinstance(e, dict)}
+        excluded = [dict(m, why=known[m["task"]].get("why", ""), known=True) for m in members
+                    if m["task"] in known and known[m["task"]].get("output_sha") == m["output_sha"]]
+        pool = [m for m in members if not any(e["task"] == m["task"] for e in excluded)]
         for _ in range(self.INTEGRATION_EXCLUDE_MAX + 1):
             try:
                 rec = self._build_union(self.INTEGRATION, base, pool)
@@ -1383,7 +1390,7 @@ class LaneDriver(object):
                 return None
             if rec:
                 if excluded:
-                    rec["excluded"] = excluded
+                    rec["excluded"] = [dict(e) for e in excluded]
                     (self.run_root / "unions" / str(rec["n"]) / "members.json").write_text(
                         json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
                 self.log("UNION %s is the integration union: %d member(s), %d excluded"
