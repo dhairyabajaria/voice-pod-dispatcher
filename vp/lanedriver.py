@@ -54,6 +54,7 @@ import vplint     # noqa: E402
 import vppack     # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
+import vpverify   # noqa: E402
 from vpdriver import (BUILDER_PROMPT, JUNIOR_PROMPT, RESUME_PROMPT,  # noqa: E402
                       estimate_cost, findings_verdicts, sha256_text,
                       validate_findings_recomputed)
@@ -452,6 +453,7 @@ class LaneDriver(object):
         self.alerts_jsonl = self.run_root / "alerts.jsonl"
         self.git_jsonl = self.run_root / "git.jsonl"
         self._sealed_day = None
+        self.activation_id = None       # set by write_activation_record (F16)
         self.fake_runners = False
         self._gate_last = {}
         # §4(c): the packet layer -- loaded from run.pack_dir, bound to tasks by
@@ -1015,14 +1017,24 @@ class LaneDriver(object):
     # -- §4(c) the packet layer -----------------------------------------------------------
 
     def _load_pack(self):
+        """(re)read the pack dir.  Called at start and at every pack reconcile
+        (D23): packets the Architect adds while the driver runs are bound on
+        the next reconcile instead of waiting for a restart.  Lint lines are
+        logged when they change; new/removed packet ids are logged."""
         if not self.pack_dir or not self.pack_dir.is_dir():
             return
+        before = set(self.pack or {})
         try:
-            self.pack, self.pack_lint = vppack.load_pack(self.pack_dir)
+            pack, lint = vppack.load_pack(self.pack_dir)
         except Exception as exc:  # noqa: BLE001 -- a broken pack is reported, not fatal
-            self.pack, self.pack_lint = {}, ["ERROR pack: %s: %s" % (type(exc).__name__, exc)]
-        for line in self.pack_lint:
-            self.log("PACK %s" % line)
+            pack, lint = {}, ["ERROR pack: %s: %s" % (type(exc).__name__, exc)]
+        if lint != getattr(self, "pack_lint", None):
+            for line in lint:
+                self.log("PACK %s" % line)
+        self.pack, self.pack_lint = pack, lint
+        added, gone = sorted(set(pack) - before), sorted(before - set(pack))
+        if before and (added or gone):
+            self.log("PACK dir changed: +%s -%s" % (added, gone))
 
     def packet_for(self, task):
         pid = self.pack_by_task.get(task)
@@ -1067,7 +1079,7 @@ class LaneDriver(object):
     RETIRABLE = ("PLANNED", "WAITING_DEPENDENCY", "READY", "REPAIR_REQUIRED", "BLOCKED", "INVALID_EVIDENCE")
 
     @classmethod
-    def superseded_by(cls, task, tasks):
+    def superseded_by(cls, task, tasks, states=None):
         """rows that a VERIFIED `task` = <ID>-R<n> / <ID>-FIX-<n> supersedes:
         <ID> itself, every <ID>-R<m> with m < n (for -FIX-<n>: every -R<m> and
         every -FIX-<m> with m < n) that exists and sits in a retirable state.
@@ -1095,7 +1107,7 @@ class LaneDriver(object):
                         continue
                 elif not is_fix and k >= n:
                     continue
-            if (row or {}).get("state") in cls.RETIRABLE:
+            if (row or {}).get("state") in (states or cls.RETIRABLE):
                 out.append(t)
         return sorted(out)
 
@@ -1116,6 +1128,26 @@ class LaneDriver(object):
             self.log("SUPERSEDED by %s: %s retired" % (task, ",".join(done)))
             _append_jsonl(self.run_root / "packets" / "closures.jsonl",
                           {"ts": utc_ms(), "op": "supersede", "task": task, "retired": done}, self._lock)
+        # D23 (F-C): a dependent of a superseded row waits on a CANCELLED
+        # parent forever (a retired row never unlocks); point it at the
+        # superseding row.  Unstarted dependents only (rewire's own rule).
+        for target in self.superseded_by(task, tasks, states=self.RETIRABLE + ("CANCELLED",)):
+            for dep, drow in sorted(tasks.items()):
+                deps = list(drow.get("depends_on") or [])
+                if target not in deps or drow.get("state") not in ("PLANNED", "WAITING_DEPENDENCY", "READY"):
+                    continue
+                new_deps = [task if d == target else d for d in deps]
+                try:
+                    self.control.call("rewire", ["--task", dep, "--depends-on"] + new_deps +
+                                      ["--reason", "F-C: %s superseded by %s" % (target, task)])
+                    drow["depends_on"] = new_deps
+                    self.log("SUPERSEDED by %s: %s.depends_on %s -> %s" % (task, dep, target, task))
+                    _append_jsonl(self.run_root / "packets" / "closures.jsonl",
+                                  {"ts": utc_ms(), "op": "supersede-rewire", "task": task, "dependent": dep,
+                                   "from": target, "depends_on": new_deps}, self._lock)
+                except ControlError as exc:
+                    self.alert_once("supersede-rewire:%s:%s" % (task, dep), "REWIRE_REFUSED",
+                                    "%s: rewire of %s from %s refused: %s" % (task, dep, target, str(exc)[:200]), task)
         return done
 
     def _supersede_sweep(self, state):
@@ -1126,7 +1158,7 @@ class LaneDriver(object):
         retired = []
         for t, row in sorted(tasks.items()):
             if (row or {}).get("state") in vppack.ACCEPTED and self.SUPERSEDE_RE.match(t) \
-                    and self.superseded_by(t, tasks):
+                    and self.superseded_by(t, tasks, states=self.RETIRABLE + ("CANCELLED",)):
                 retired += self._supersede(t, tasks)
         return retired
 
@@ -1136,6 +1168,7 @@ class LaneDriver(object):
         if last is not None and time.monotonic() - last < every:
             return
         self._pack_last_mono = time.monotonic()
+        self._load_pack()
         if self.pack:
             try:
                 self._pack_reconcile()
@@ -1676,7 +1709,8 @@ class LaneDriver(object):
 
     # -- comms + seal (plan §2.1 point 5) ---------------------------------------------------
 
-    def comms(self, sender, to, text, kind="message", task=None, ref=None):
+    def comms(self, sender, to, text, kind="message", task=None, ref=None, session_id=None, msg_id=None,
+              from_session=None, to_session=None):
         """Append one line to comms.jsonl.  This is the hook the Claude sessions
         (Chief / Architect / Fixer) call so every cross-session message about the
         run lives in the audit tree next to control.jsonl; the driver itself logs
@@ -1686,20 +1720,50 @@ class LaneDriver(object):
             row["task"] = task
         if ref:
             row["ref"] = ref
+        # the real envelope keys (cross-session message msg_id, the sender's
+        # and receiver's socket / session addresses), verbatim
+        for k, v in (("session_id", session_id), ("msg_id", msg_id),
+                     ("from_session", from_session), ("to_session", to_session)):
+            if v:
+                row[k] = v
         _append_jsonl(self.run_root / "comms.jsonl", row)
         return row
 
     SEAL_SKIP = ("driver.heartbeat", "driver.heartbeat.tmp", "STOP", "DRAIN", "RELOAD")
+    # append-only audit files: a seal fixes their PREFIX (bytes, sha256 of the
+    # first N bytes); a later seal proves the earlier prefix is unchanged
+    APPEND_ONLY_SUFFIXES = (".jsonl", ".log")
+    SEAL_DIR = "seals"
 
-    def seal(self, day=None, force=False):
-        """Daily seal: MANIFEST-<day>.json listing sha256 + size of every file
-        under RUN_ROOT (except the live heartbeat and control flags, and earlier
-        manifests) so the tree can be verified after the fact.  Idempotent per
-        IST day unless `force`."""
+    def last_seal(self):
+        """the newest seals.jsonl line and the sha256 of that line (the chain
+        value the next seal records as prev_hash); (None, None) when unsealed"""
+        try:
+            lines = [l for l in (self.run_root / "seals.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        except OSError:
+            return None, None
+        if not lines:
+            return None, None
+        try:
+            return json.loads(lines[-1]), hashlib.sha256(lines[-1].encode("utf-8")).hexdigest()
+        except ValueError:
+            return None, hashlib.sha256(lines[-1].encode("utf-8")).hexdigest()
+
+    def seal(self, day=None, force=False, reason="manual"):
+        """Seal the audit tree NOW: seals/MANIFEST-<utc ts>.json lists sha256 +
+        size of every file under RUN_ROOT (except the live heartbeat, control
+        flags and manifests); the same body is copied to MANIFEST-<day>.json
+        (the day's latest).  seals.jsonl is a hash chain: every line carries
+        prev_hash = sha256 of the previous line, so a removed or edited seal
+        breaks the chain.  Append-only files (.jsonl/.log) are sealed by
+        prefix.  Every call writes a new seal (`force` is accepted for the old
+        callers and means the same)."""
         day = day or self.ist_now().strftime("%Y-%m-%d")
+        ts = utc_ms()
+        sdir = self.run_root / self.SEAL_DIR
+        snap = sdir / ("MANIFEST-%s.json" % ts.replace(":", "").replace("-", "").replace(".", ""))
         out = self.run_root / ("MANIFEST-%s.json" % day)
-        if out.exists() and not force:
-            return None
+        prev_rec, prev_hash = self.last_seal()
         files, total = {}, 0
         for p in sorted(self.run_root.rglob("*")):
             if not p.is_file() or p.is_symlink():
@@ -1707,7 +1771,7 @@ class LaneDriver(object):
             rel = p.relative_to(self.run_root).as_posix()
             if rel in self.SEAL_SKIP or (rel.startswith("MANIFEST-") and rel.endswith(".json")):
                 continue
-            if rel.startswith("worktrees/") or rel.startswith("trunk/"):
+            if rel.startswith("worktrees/") or rel.startswith("trunk/") or rel.startswith(self.SEAL_DIR + "/"):
                 continue
             try:
                 h = hashlib.sha256()
@@ -1717,23 +1781,34 @@ class LaneDriver(object):
                 size = p.stat().st_size
             except OSError:
                 continue
-            files[rel] = {"sha256": h.hexdigest(), "bytes": size}
+            files[rel] = {"sha256": h.hexdigest(), "bytes": size,
+                          "append_only": rel.endswith(self.APPEND_ONLY_SUFFIXES)}
             total += size
-        body = json.dumps({"day": day, "ts": utc_ms(), "run_root": str(self.run_root),
-                           "sequence": self.control.sequence(), "files": len(files),
+        seq = self.control.sequence()
+        body = json.dumps({"day": day, "ts": ts, "run_root": str(self.run_root), "reason": reason,
+                           "sequence": seq, "prev_hash": prev_hash, "files": len(files),
                            "bytes": total, "entries": files}, indent=2, sort_keys=True)
         manifest_sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
         try:
+            sdir.mkdir(parents=True, exist_ok=True)
+            tmp = snap.with_suffix(".json.tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(str(tmp), str(snap))
             tmp = out.with_suffix(".json.tmp")
             tmp.write_text(body, encoding="utf-8")
             os.replace(str(tmp), str(out))
         except OSError:
             return None
-        _append_jsonl(self.run_root / "seals.jsonl",
-                      {"ts": utc_ms(), "day": day, "manifest": out.name, "sha256": manifest_sha,
-                       "files": len(files), "bytes": total})
-        self.log("SEAL %s files=%d sha256=%s" % (out.name, len(files), manifest_sha[:12]))
-        return out
+        rec = {"ts": ts, "day": day, "manifest": snap.relative_to(self.run_root).as_posix(),
+               "day_manifest": out.name, "sha256": manifest_sha, "prev_hash": prev_hash,
+               "sequence": seq, "reason": reason, "files": len(files), "bytes": total,
+               "control_bytes": (files.get("control.jsonl") or {}).get("bytes", 0)}
+        _append_jsonl(self.run_root / "seals.jsonl", rec)
+        self._last_seal_mono = time.monotonic()
+        self._last_seal_control_bytes = rec["control_bytes"]
+        self.log("SEAL %s files=%d sha256=%s prev=%s (%s)"
+                 % (rec["manifest"], len(files), manifest_sha[:12], (prev_hash or "none")[:12], reason))
+        return snap
 
     # -- F14 render on a timer ----------------------------------------------------------
 
@@ -1755,6 +1830,14 @@ class LaneDriver(object):
         counts = {}
         for row in tasks.values():
             counts[row.get("state")] = counts.get(row.get("state"), 0) + 1
+        # AUDIT-3: everything LEDGER.md takes from driver memory (never a
+        # scheduler event) is logged here, so the ledger is a pure function
+        # of run-state at `sequence` + this line
+        _append_jsonl(self.run_root / "renders.jsonl",
+                      {"ts": utc_ms(), "tick": self.tick_count, "pid": os.getpid(),
+                       "sequence": state.get("sequence"), "spend_usd": round(usd, 4), "tokens": tokens,
+                       "live": sorted(live), "parked": parked, "counts": counts,
+                       "code_version": self.code_version(), "activation_id": self.activation_id}, self._lock)
         lines = ["# LEDGER", "",
                  "run: %s  phase: %s  sequence: %s" % (state.get("run_id", "-"), state.get("phase", "-"),
                                                         state.get("sequence", "-")),
@@ -1846,6 +1929,13 @@ class LaneDriver(object):
                "profiles": profiles, "inputs": inputs, "changed_since_previous": changed,
                "previous_ts": previous.get("ts") if previous else None,
                "missing_profiles": [n for n, d in profiles.items() if d is None]}
+        # the activation's key: every dispatch record names it (turns/*/record.json,
+        # dispatch.json) so a turn joins activation-records.jsonl by id, not by clock
+        rec["activation_id"] = "act-%s-%d-%s" % (rec["ts"].replace(":", "").replace("-", "").replace(".", ""),
+                                                 rec["pid"], hashlib.sha256(json.dumps(
+                                                     {"profiles": profiles, "inputs": inputs},
+                                                     sort_keys=True).encode("utf-8")).hexdigest()[:12])
+        self.activation_id = rec["activation_id"]
         try:
             tmp = out.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
@@ -1861,20 +1951,32 @@ class LaneDriver(object):
         return rec
 
     def _seal_step(self):
-        """seal the previous IST day once its clock has rolled over, and the current
-        day at most once per driver start (so a restart leaves a fresh manifest)"""
+        """seal at driver start, at IST day rollover (closing seal for the day
+        that ended, opening seal for the new one), and periodically: every
+        alerts.seal_every_s (default 3600) or once control.jsonl grew by
+        alerts.seal_every_bytes (default 8 MiB) since the last seal"""
         today = self.ist_now().strftime("%Y-%m-%d")
-        if self._sealed_day == today:
-            return
         try:
-            if self._sealed_day is not None:
-                # day rolled over under a live driver: the closing seal for the
-                # day just ended replaces the provisional one written at start
-                self.seal(self._sealed_day, force=True)
-            self.seal(today)
+            if self._sealed_day != today:
+                if self._sealed_day is not None:
+                    self.seal(self._sealed_day, reason="day-close")
+                self.seal(today, reason="start" if self._sealed_day is None else "day-open")
+                self._sealed_day = today
+                return
+            every = float(self.alerts_cfg.get("seal_every_s", 3600))
+            grow = int(self.alerts_cfg.get("seal_every_bytes", 8 << 20))
+            last = getattr(self, "_last_seal_mono", None)
+            due = last is None or time.monotonic() - last >= every
+            try:
+                cbytes = (self.run_root / "control.jsonl").stat().st_size
+            except OSError:
+                cbytes = 0
+            grown = cbytes - int(getattr(self, "_last_seal_control_bytes", 0) or 0) >= grow
+            if due or grown:
+                self.seal(today, reason="periodic" if due else "control-growth")
         except Exception as exc:  # noqa: BLE001 -- seal must never take the tick down
             self.log("seal failed: %s" % exc)
-        self._sealed_day = today
+            self._sealed_day = today
 
     def _stop_step(self):
         elapsed = time.monotonic() - (self._stop_started or time.monotonic())
@@ -2364,6 +2466,17 @@ class LaneDriver(object):
         tdir = self._turn_dir(task, attempt)
         fkey = attempt
         sid = self._saved_session(tdir)
+        if not (tdir / "dispatch.json").exists():
+            # dispatch-time keys, written once per attempt before any turn:
+            # the base the worktree was cut from and the activation in force
+            try:
+                (tdir / "dispatch.json").write_text(json.dumps(
+                    {"task": task, "attempt": attempt, "base_sha": base, "activation_id": self.activation_id,
+                     "kind": kind, "runner": runner, "code_version": self.code_version(),
+                     "sequence": self.control.sequence(), "ts": utc_ms()}, indent=2, sort_keys=True),
+                    encoding="utf-8")
+            except OSError:
+                pass
         start_after = False
         if needs_start and kind in REVIEW_KINDS:
             # SEC-SESSION-001 (BULK-RULING-2026-09-18): a review is ONE fresh
@@ -3329,6 +3442,7 @@ class LaneDriver(object):
         payload = outcome.to_dict()
         payload.update({"task": task, "attempt": attempt, "n": n, "round": rnd, "role": role,
                         "runner": runner, "server": server, "model": spec.model,
+                        "base_sha": self._base_of(spec.cwd) or None, "activation_id": self.activation_id,
                         "variant": spec.variant, "effort": spec.effort,
                         "prompt_sha256": sha256_text(spec.prompt), "prompt_bytes": len(spec.prompt),
                         "prompt_path": str(tdir / ("%s-prompt.md" % tag)), "cwd": spec.cwd,
@@ -3883,9 +3997,15 @@ def build_parser():
     cm.add_argument("--kind", default="message")
     cm.add_argument("--task")
     cm.add_argument("--ref", help="session id / message id the line answers")
-    se = sub.add_parser("seal", help="write MANIFEST-<day>.json (sha256 of every audit file)")
+    cm.add_argument("--msg-id", dest="msg_id", help="the cross-session message's msg_id, verbatim")
+    cm.add_argument("--session-id", dest="session_id", help="the writing session's id, verbatim")
+    cm.add_argument("--from-session", dest="from_session", help="sender socket/session address, e.g. uds:/tmp/cc-socks/N.sock")
+    cm.add_argument("--to-session", dest="to_session", help="receiver socket/session address")
+    se = sub.add_parser("seal", help="seal the audit tree now: seals/MANIFEST-<ts>.json + MANIFEST-<day>.json, "
+                                     "chained in seals.jsonl (prev_hash); every call writes a new seal")
     se.add_argument("--day", help="IST day YYYY-MM-DD; default today")
-    se.add_argument("--force", action="store_true", help="rewrite an existing manifest")
+    se.add_argument("--force", action="store_true", help="accepted for compatibility (a seal is always written)")
+    se.add_argument("--reason", help="why now (recorded in the seal), e.g. 'incident report written'")
     sub.add_parser("render", help="F14: write LEDGER.md now (the loop also does it on a timer)")
     rl = sub.add_parser("reload", help="D12: write RUN_ROOT/RELOAD; the running driver quiesces, "
                                        "reloads its code in place at active == 0, resumes")
@@ -3896,6 +4016,11 @@ def build_parser():
     rp.add_argument("--reason", required=True)
     rp.add_argument("--regrade", metavar="SHA", help="D21: prove + grade this exact commit of the previous "
                                                    "task again (benchmark amended); no builder round")
+    vf = sub.add_parser("verify", help="AUDIT-3: check every seal (chain, prefixes), replay the scheduler "
+                                       "events against run-state/LEDGER.md, resolve every harvest sha; "
+                                       "writes verify/verify-<ts>.json; exit 1 on any problem")
+    vf.add_argument("--summary", action="store_true", help="print the short form")
+    vf.add_argument("--no-write", action="store_true", help="do not write the report file")
     sub.add_parser("contamination", help="D20 (i): list VERIFIED/INTEGRATED rows whose output_sha is a "
                                          "pre-D20 autofix (reformat) commit; writes packets/contamination-<ts>.json")
     ir = sub.add_parser("init-run", help="copy v13-pack/roster-v13.json -> RUN_ROOT/roster.json (lint, snapshot)")
@@ -3906,17 +4031,20 @@ def build_parser():
 
 
 def cmd_comms(drv, args):
-    row = drv.comms(args.sender, args.to, args.text, kind=args.kind, task=args.task, ref=args.ref)
+    row = drv.comms(args.sender, args.to, args.text, kind=args.kind, task=args.task, ref=args.ref,
+                    session_id=args.session_id, msg_id=args.msg_id, from_session=args.from_session,
+                    to_session=args.to_session)
     print(json.dumps(row))
     return 0
 
 
 def cmd_seal(drv, args):
-    out = drv.seal(args.day, force=args.force)
+    out = drv.seal(args.day, force=True, reason=args.reason or "manual")
     if out is None:
-        print(json.dumps({"status": "EXISTS", "day": args.day or drv.ist_now().strftime("%Y-%m-%d")}))
-        return 0
-    print(json.dumps({"status": "OK", "manifest": str(out)}))
+        print(json.dumps({"status": "FAILED", "day": args.day or drv.ist_now().strftime("%Y-%m-%d")}))
+        return 1
+    rec, _h = drv.last_seal()
+    print(json.dumps({"status": "OK", "manifest": str(out), "seal": rec}, indent=2))
     return 0
 
 
@@ -3970,6 +4098,37 @@ def cmd_contamination(drv, args):
     return 0
 
 
+def cmd_verify(drv, args):
+    """AUDIT-3: seals (chain + prefixes), state replay vs run-state/LEDGER.md,
+    harvest shas vs the trunk.  Read-only; exit 1 when anything fails."""
+    ctl = drv.roster.get("control") or {}
+    control_dir = Path(ctl["state"]).parent
+    rep = vpverify.verify_all(drv.run_root, control_dir, ctl["state"], drv.trunk)
+    rep["ts"] = utc_ms()
+    out = drv.run_root / "verify" / ("verify-%s.json" % rep["ts"].replace(":", "").replace("-", "").replace(".", ""))
+    if not args.no_write:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(rep, indent=2, sort_keys=True), encoding="utf-8")
+        rep["report"] = str(out)
+    if args.summary:
+        s = rep["seals"]; st = rep["state"]; sh = rep["shas"]
+        print(json.dumps({"ok": rep["ok"], "seals": {"n": s["seals"], "chain_ok": s["chain_ok"],
+                                                      "newest": s.get("newest_seal_ts"),
+                                                      "files_checked": s["files_checked"], "problems": s["problems"],
+                                                      "drift_since_newest_seal": len(s.get("drift_since_newest_seal") or [])},
+                          "state": {"events": st.get("events"), "tasks": st.get("tasks"),
+                                    "replay_diffs": len(st.get("replay_diffs") or []),
+                                    "readiness_diffs": len([d for d in st.get("replay_diffs") or [] if d.get("note") == "readiness"]),
+                                    "problems": st.get("problems"), "ledger_lag": st.get("ledger_lag"),
+                                    "events_before_control_jsonl": st.get("events_before_control_jsonl"),
+                                    "events_outside_control_jsonl": st.get("events_outside_control_jsonl")},
+                          "shas": {"harvests": sh["harvests"], "checked": sh["shas_checked"], "problems": sh["problems"]},
+                          "report": rep.get("report")}, indent=2))
+    else:
+        print(json.dumps(rep, indent=2, sort_keys=True))
+    return 0 if rep["ok"] else 1
+
+
 def cmd_reload(drv, args):
     f = drv.run_root / RELOAD_FILE
     f.write_text(json.dumps({"reason": args.reason, "requested_at": utc_ms(), "by": "cli"}) + "\n",
@@ -3984,7 +4143,7 @@ def cmd_reload(drv, args):
 
 
 SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
-               "retry-packet", "reload", "contamination")
+               "retry-packet", "reload", "contamination", "verify")
 
 
 def main(argv=None):
@@ -4035,6 +4194,8 @@ def main(argv=None):
         return cmd_reload(drv, args)
     if args.cmd == "contamination":
         return cmd_contamination(drv, args)
+    if args.cmd == "verify":
+        return cmd_verify(drv, args)
     if args.cmd == "render":
         out = drv.render()
         print(json.dumps({"status": "OK" if out else "FAILED", "ledger": str(out or "")}))

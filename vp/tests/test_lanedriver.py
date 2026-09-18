@@ -1315,29 +1315,62 @@ def test_item7_raw_jsonl_carries_the_runner_stream_and_seal_hashes_the_tree(tmp_
     assert "driver.heartbeat" not in man["entries"] and "roster.json" in man["entries"]
     assert man["entries"]["roster.json"]["sha256"] == \
         hashlib.sha256((env.run_root / "roster.json").read_bytes()).hexdigest()
-    assert drv.seal() is None, "idempotent per day"
-    out = drv.seal(force=True)
+    # AUDIT-1/2: every seal call writes a NEW snapshot under seals/ and chains it
+    out = drv.seal(reason="incident report written")
     man2 = json.loads(out.read_text())
-    assert "turns/L00/%s/raw.jsonl" % tdir.name in man2["entries"]
+    assert out.parent == env.run_root / "seals" and "turns/L00/%s/raw.jsonl" % tdir.name in man2["entries"]
+    assert man2["entries"]["control.jsonl"]["append_only"] is True and man2["entries"]["roster.json"]["append_only"] is False
+    assert man2["reason"] == "incident report written"
+    lines = (env.run_root / "seals.jsonl").read_text().splitlines()
+    seals = [json.loads(l) for l in lines]
+    assert [s["day"] for s in seals] == [day, day] and [s["reason"] for s in seals] == ["start", "incident report written"]
+    assert seals[0]["prev_hash"] is None
+    assert seals[1]["prev_hash"] == hashlib.sha256(lines[0].encode()).hexdigest(), "seals.jsonl is a hash chain"
+    assert man2["prev_hash"] == seals[1]["prev_hash"] and seals[1]["sha256"] == hashlib.sha256(out.read_bytes()).hexdigest()
+    assert json.loads((env.run_root / ("MANIFEST-%s.json" % day)).read_text()) == man2, "the day manifest is the latest"
+    assert "seals/" not in " ".join(man2["entries"]), "snapshots are not self-sealed"
+    # periodic: due by time or by control.jsonl growth, never twice in one tick otherwise
+    n = len(lines)
+    drv.tick()
+    assert len((env.run_root / "seals.jsonl").read_text().splitlines()) == n, "not due yet"
+    drv._last_seal_mono -= 7200
+    drv.tick()
     seals = [json.loads(l) for l in (env.run_root / "seals.jsonl").read_text().splitlines()]
-    assert [s["day"] for s in seals] == [day, day]
+    assert len(seals) == n + 1 and seals[-1]["reason"] == "periodic"
+    drv._last_seal_control_bytes = -(1 << 30)
+    drv.tick()
+    seals = [json.loads(l) for l in (env.run_root / "seals.jsonl").read_text().splitlines()]
+    assert len(seals) == n + 2 and seals[-1]["reason"] == "control-growth"
     # day rollover under a live driver closes yesterday and opens today
     drv._sealed_day = "2000-01-01"
     drv.tick()
     assert (env.run_root / "MANIFEST-2000-01-01.json").exists() and drv._sealed_day == day
+    seals = [json.loads(l) for l in (env.run_root / "seals.jsonl").read_text().splitlines()]
+    assert [x["reason"] for x in seals[-2:]] == ["day-close", "day-open"]
+    # AUDIT-4a: every turn record and the attempt's dispatch.json carry the base and the activation key
+    disp = json.loads((tdir / "dispatch.json").read_text())
+    rec = json.loads((tdir / "record.json").read_text())
+    act = json.loads((env.run_root / "activation-record.json").read_text())
+    assert act["activation_id"].startswith("act-") and disp["activation_id"] == act["activation_id"]
+    assert rec["activation_id"] == act["activation_id"] and rec["base_sha"] == disp["base_sha"] == env.base
 
 
 def test_item7_comms_hook_appends_from_cli_and_alerts_mirror_into_it(tmp_path):
     env = Env(tmp_path)
     env.activate()
     rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "comms", "--from", "fixer",
-                          "--to", "orchestrator", "--text", "item 7 done", "--task", "L00"])
+                          "--to", "orchestrator", "--text", "item 7 done", "--task", "L00",
+                          "--msg-id", "84fcc925-cc17-46f4-8ac3-5be6803c380f",
+                          "--from-session", "uds:/tmp/cc-socks/1.sock", "--to-session", "uds:/tmp/cc-socks/2.sock"])
     assert rc == 0
     drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
     drv.alert("IDLE", "nothing to do", task=None)
     rows = [json.loads(l) for l in (env.run_root / "comms.jsonl").read_text().splitlines()]
     assert rows[0]["from"] == "fixer" and rows[0]["to"] == "orchestrator" and rows[0]["task"] == "L00"
     assert rows[0]["kind"] == "message" and rows[0]["text"] == "item 7 done" and rows[0]["ts"].endswith("Z")
+    # AUDIT-4b: the envelope keys, verbatim
+    assert rows[0]["msg_id"] == "84fcc925-cc17-46f4-8ac3-5be6803c380f"
+    assert rows[0]["from_session"] == "uds:/tmp/cc-socks/1.sock" and rows[0]["to_session"] == "uds:/tmp/cc-socks/2.sock"
     assert rows[1] == {"ts": rows[1]["ts"], "from": "lanedriver", "to": "owner", "kind": "alert:IDLE",
                        "text": "nothing to do"}
     rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "seal"])

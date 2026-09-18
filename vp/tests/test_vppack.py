@@ -377,6 +377,42 @@ def test_retry_packet_regrade_grades_the_same_commit_without_a_builder_round(tmp
     assert rows["P-GAP"]["state"] == "CANCELLED" and rows["P-GAP"]["blocker"]["reason"] == "SUPERSEDED_BY:P-GAP-R1"
 
 
+def test_supersession_rewires_dependents_of_the_superseded_row(tmp_path):
+    """D23 (F-C): L27-V13/L28-V13 waited on CANCELLED L2728-LEAF while
+    L2728-LEAF-R3 was VERIFIED -- a retired row never unlocks.  On
+    supersession every unstarted dependent of the superseded row is rewired
+    to the superseding one; already-CANCELLED parents are covered by the sweep."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+    calls = []
+
+    def fake_call(verb, args=(), allow=(0,)):
+        calls.append((verb, list(args)))
+        return 0, {}
+    drv.control.call = fake_call
+    tasks = {"P-GAP": {"state": "REPAIR_REQUIRED"},
+             "P-GAP-R1": {"state": "VERIFIED"},
+             "L27-V13": {"state": "WAITING_DEPENDENCY", "depends_on": ["P-GAP", "L03"]},
+             "L28-V13": {"state": "WAITING_DEPENDENCY", "depends_on": ["P-GAP"]},
+             "DONE": {"state": "VERIFIED", "depends_on": ["P-GAP"]},
+             "RUN": {"state": "RUNNING", "depends_on": ["P-GAP"]}}
+    assert drv._supersede("P-GAP-R1", tasks) == ["P-GAP"]
+    assert calls[0] == ("retire", ["--task", "P-GAP", "--closer", "P-GAP-R1", "--reason", "SUPERSEDED_BY:P-GAP-R1"])
+    rewires = [(a[1], a[3:a.index("--reason")]) for v, a in calls if v == "rewire"]
+    assert rewires == [("L27-V13", ["P-GAP-R1", "L03"]), ("L28-V13", ["P-GAP-R1"])], "unstarted dependents only"
+    assert tasks["L27-V13"]["depends_on"] == ["P-GAP-R1", "L03"]
+    ops = [json.loads(l) for l in (env.run_root / "packets" / "closures.jsonl").read_text().splitlines()]
+    assert [o["op"] for o in ops] == ["supersede", "supersede-rewire", "supersede-rewire"]
+    # the sweep: parent already CANCELLED (retired before this rule), dependent still waiting
+    calls.clear()
+    tasks2 = {"Q": {"state": "CANCELLED"}, "Q-R2": {"state": "VERIFIED"},
+              "DEP": {"state": "WAITING_DEPENDENCY", "depends_on": ["Q"]}}
+    drv._supersede_sweep({"tasks": tasks2})
+    assert [v for v, _a in calls] == ["rewire"] and tasks2["DEP"]["depends_on"] == ["Q-R2"]
+    assert "SUPERSEDED by Q-R2: DEP.depends_on Q -> Q-R2" in (env.run_root / "driver.log").read_text()
+
+
 def test_supersede_sweep_retires_rows_verified_before_the_rule_existed(tmp_path):
     env = Env(tmp_path)
     env.activate()
