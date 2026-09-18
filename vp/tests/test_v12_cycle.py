@@ -595,6 +595,8 @@ class FakeCircle(object):
             if "/tests" in path:
                 n = int(path.split("/")[-2])
                 return cp(argv, 0, json.dumps({"items": self.tests.get(n, [])}), "")
+            if "/job/" in path:                     # D40: credit_block reads the failed job's messages
+                return cp(argv, 0, json.dumps({"messages": []}), "")
         raise AssertionError("unexpected argv in FakeCircle: %s" % argv)
 
 

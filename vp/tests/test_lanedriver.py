@@ -1005,6 +1005,35 @@ def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypat
     assert "build skipped" in (env.run_root / "driver.log").read_text()
 
 
+def test_proof_blocked_by_circleci_credits_holds_the_attempt_without_a_strike(tmp_path, monkeypatch):
+    """D40: 27 hosted twins went INVALID_EVIDENCE (3 strikes each) on CircleCI's
+    plan/credit refusal; a BLOCKED_CREDITS proof holds the attempt, alerts once,
+    and resumes at the proof when the hold lifts."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    monkeypatch.setattr(lanedriver, "CREDITS_HOLD_S", 0.0)
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "BLOCKED_CREDITS", "reason": "circleci: no credits are available on your plan"},
+                       {"status": "BLOCKED_CREDITS", "reason": "circleci: no credits are available on your plan"},
+                       {"status": "BLOCKED_CREDITS", "reason": "circleci: no credits are available on your plan"},
+                       {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "RUNNING", "held, not failed"
+    assert drv._fail["L02"]["count"] == 0, "a credit refusal is no strike"
+    log = (env.run_root / "driver.log").read_text()
+    assert "HOLD L02" in log and "BLOCKED_CREDITS" in log and "FAIL L02" not in log
+    assert (env.run_root / "OWNER-ALERTS.md").read_text().count("CIRCLECI_NO_CREDITS") == 1
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    assert len(proof.calls) == 4 and len({c[2] for c in proof.calls}) == 1, "the same head, proof only"
+    assert [s.role for s in oc.calls if s.item == "L02"] == ["builder", "grader"], "no rebuild, no extra grade"
+    assert (env.run_root / "OWNER-ALERTS.md").read_text().count("CIRCLECI_NO_CREDITS") == 1, "alerted once"
+
+
 # -- D18/D19: shm gate holds without a strike; repair generations are capped -------------------
 
 def test_proof_blocked_by_shm_holds_the_attempt_without_a_failure_strike(tmp_path, monkeypatch):

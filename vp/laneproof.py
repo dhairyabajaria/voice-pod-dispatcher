@@ -236,6 +236,17 @@ class Proof(object):
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> UNKNOWN (circleci: %s)" % (task, pid, str(exc)[:200]))
                 return rec
+            blocked = getattr(self.circle, "credit_block", lambda *_a, **_k: None)(res["jobs"], runner, account)
+            if blocked:
+                # a plan/credit refusal is the account's condition, never the candidate's:
+                # the driver holds the attempt without a strike (PROOF_BLOCKED_CREDITS)
+                rec = {"status": "BLOCKED_CREDITS", "route": "circleci", "proof_id": pid, "sha": cand,
+                       "pipeline_id": pipeline_id, "account": account, "branch": branch,
+                       "reason": "circleci: %s" % blocked[:300], "failed_nodes": [], "ts": utc_ms()}
+                self._write(pid, rec)
+                self.log("PROOF %s %s -> BLOCKED_CREDITS (circleci pipeline %s, account %s): %s"
+                         % (task, pid, pipeline_id, account, blocked[:160]))
+                return rec
             cls = self.circle.classify(res["jobs"], res["failed_tests"])
             status = cls["status"]
             failed, errors = circle_failed_nodes(res["failed_tests"])

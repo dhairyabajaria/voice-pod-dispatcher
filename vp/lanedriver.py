@@ -101,6 +101,7 @@ FAIL_BACKOFF_S = (60, 120, 300)
 # D18: a proof refused by the shm gate is a BOX condition -- hold the attempt
 # this long, count no failure; heartbeat carries the live segment count
 SHM_HOLD_S = 300.0
+CREDITS_HOLD_S = 1800.0                 # CircleCI plan/credit refusal: hold, no strike, alert once
 SHM_POLL_S = 30.0
 # D19: auto-repair generations per parent row before the driver stops
 # re-instantiating and leaves the row to a human/packet (R-…-B5-1..7 overnight)
@@ -1069,9 +1070,10 @@ class LaneDriver(object):
         if not p or vppack.owner_gate_open(p, self.roster):
             return True
         gate = vppack.twin_gate(p)
+        key = vppack.GATE_ROSTER_KEY.get(gate, gate)          # CIRCLECI rows open with DELIVERY-1
         self.alert_once("owner-gate:%s" % gate, "OWNER_GATE",
                         "%s waits for %s (roster owner_gates.%s is not true); nothing dispatched behind it"
-                        % (p["id"], gate, gate), task)
+                        % (p["id"], gate, key), task)
         return False
 
     # -- D37 (PACKET-FORMAT §6, BULK-RULING §19): hosted twins -------------------------------
@@ -1302,6 +1304,101 @@ class LaneDriver(object):
     # -- D27 §9(5b): the union integrator ----------------------------------------------------
     UNION_MEMBER_STATES = ("VERIFIED", "INTEGRATED", "ACCEPTED")
 
+    INTEGRATION = "INTEGRATION"
+    INTEGRATION_EXCLUDE_MAX = 6
+
+    def _integration_members(self, tasks):
+        """D39 (§20): every accepted non-review row whose output is not yet in
+        trunk -- the superset every `<union>` review and L35 must see"""
+        trunk = self.trunk_sha()
+        out = []
+        for t, r in sorted(tasks.items()):
+            sha = r.get("output_sha")
+            if r.get("state") not in self.UNION_MEMBER_STATES or not sha:
+                continue
+            if (r.get("kind") or "") in REVIEW_KINDS:
+                continue
+            rc, _o, _e = self.git(["-C", str(self.trunk), "cat-file", "-e", "%s^{commit}" % sha])
+            if rc != 0:
+                continue                          # an output this repo does not have (chief-era row)
+            rc, _o, _e = self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", sha, trunk])
+            if rc == 0:
+                continue                          # trunk carries it
+            pid = self.pack_by_task.get(t)
+            out.append({"task": t, "packet": pid or t, "output_sha": sha,
+                        "depth": len(self.pack.get(pid, {}).get("depends_on") or []) if pid else 0})
+        return out
+
+    def _integration_docs(self):
+        return [d for d in self._union_docs(self.run_root) if d.get("for") == [self.INTEGRATION]]
+
+    def _latest_conflict(self):
+        conf = None
+        for d in sorted((self.run_root / "unions").glob("*/conflict.json"), key=lambda q: int(q.parent.name)):
+            try:
+                conf = json.loads(d.read_text(encoding="utf-8")).get("conflict")
+            except (OSError, ValueError):
+                continue
+        return conf or {}
+
+    def _integration_union_step(self, state):
+        """D39 (BULK-RULING §20): cut and keep refreshed ONE integration union
+        of every VERIFIED row.  Unions 1-8 were disjoint partials; the F1-F5
+        re-reviews and L35 need the full superset.  Rebuilt whenever the
+        member set (task -> output sha) changes; a member that conflicts is
+        excluded (INTEGRATION_CONFLICT names it) so the rest still integrate."""
+        tasks = state.get("tasks") or {}
+        members = self._integration_members(tasks)
+        if not members:
+            return None
+        cand = (state.get("candidate") or {}).get("sha")
+        base = cand or self.trunk_sha()
+        want = {m["task"]: m["output_sha"] for m in members}
+        latest = (self._integration_docs() or [None])[-1]
+        if latest and latest.get("status") == "BUILT" and latest.get("base_sha") == base:
+            have = {m.get("task"): m.get("output_sha") for m in latest.get("members") or []}
+            have.update({m.get("task"): m.get("output_sha") for m in latest.get("excluded") or []})
+            if have == want:
+                return latest                     # already the current superset
+        key = "integration:%s" % ",".join(sorted(want.values()))
+        if key in self._pack_logged:
+            return None                           # this exact set already failed to build
+        self._pack_logged.add(key)
+        excluded, pool = [], list(members)
+        for _ in range(self.INTEGRATION_EXCLUDE_MAX + 1):
+            try:
+                rec = self._build_union(self.INTEGRATION, base, pool)
+            except Exception as exc:  # noqa: BLE001 -- never take the tick down
+                self.log("UNION integration build failed: %s: %s" % (type(exc).__name__, exc))
+                self.alert("UNION_FAILED", "%s: %s" % (self.INTEGRATION, str(exc)[:300]), self.INTEGRATION)
+                return None
+            if rec:
+                if excluded:
+                    rec["excluded"] = excluded
+                    (self.run_root / "unions" / str(rec["n"]) / "members.json").write_text(
+                        json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+                self.log("UNION %s is the integration union: %d member(s), %d excluded"
+                         % (rec["union"], len(rec["members"]), len(excluded)))
+                # the superset may be the base/subject a held row was waiting for: lift
+                # every pure hold (count 0 = no failure strike) of a not-yet-started row
+                with self._lock:
+                    waiting = [t for t, ent in self._fail.items() if ent.get("count", 0) == 0
+                               and (tasks.get(t) or {}).get("state") in ("PLANNED", "WAITING_DEPENDENCY", "READY")]
+                    for t in waiting:
+                        self._fail.pop(t, None)
+                    for k in [k for k in self._alerted if k.startswith(("review-subject:", "stack:"))]:
+                        self._alerted.discard(k)
+                return rec
+            conf = self._latest_conflict()        # names the member that did not merge
+            hit = next((m for m in pool if m["task"] == conf.get("task")), None)
+            if not hit:
+                return None
+            pool = [m for m in pool if m is not hit]
+            excluded.append(dict(hit, why=conf.get("detail", "")[:200]))
+            self.alert("INTEGRATION_CONFLICT", "%s conflicts with the integration union (%s); excluded, "
+                       "the Architect owns the merge" % (hit["task"], conf.get("detail", "")[:160]), hit["task"])
+        return None
+
     def _union_step(self, state):
         """cut a union for every `<union>` review whose depends_on rows are all
         VERIFIED (output_sha in trunk) and not yet together in one union.  The
@@ -1528,7 +1625,9 @@ class LaneDriver(object):
             self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
         if self.pack:
             try:
-                self._union_step(self.control.state_view() or {})
+                state = self.control.state_view() or {}
+                self._integration_union_step(state)
+                self._union_step(state)
             except Exception as exc:  # noqa: BLE001
                 self.log("UNION step failed: %s: %s" % (type(exc).__name__, exc))
             try:
@@ -3111,6 +3210,14 @@ class LaneDriver(object):
             self.alert_once("shm-blocked", "PROOF_BLOCKED_SHM",
                             "box at the SysV shm ceiling; proofs are held (shm_segments in the heartbeat): %s"
                             % outcome.detail[:300], task)
+            return
+        if outcome.status == "PROOF_BLOCKED_CREDITS":
+            # CircleCI refused the jobs for plan/credits (2026-09-18: 27 twins went
+            # INVALID_EVIDENCE on it): the owner's condition, never the candidate's
+            self.note_hold(task, fkey, outcome.detail, CREDITS_HOLD_S)
+            self.alert_once("circleci-credits", "CIRCLECI_NO_CREDITS",
+                            "CircleCI blocks every job for plan/credits; hosted proofs are held (no strike) until "
+                            "the owner adds credits or a plan: %s" % outcome.detail[:300], task)
             return
         if result is None:
             count = self.note_failure(task, fkey, "%s: %s" % (outcome.status, outcome.detail),

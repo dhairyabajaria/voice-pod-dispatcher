@@ -483,6 +483,7 @@ def test_union_review_with_an_empty_subject_is_held_not_dispatched(tmp_path):
     env.activate()
     codex = FakeCodex()
     drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": codex})
+    drv._integration_union_step = lambda state: None   # premise: no union of any kind exists yet
     register_candidate(env)
     settle(drv, 3)
     row = env.rows()["REVIEW-UNION"]
@@ -608,7 +609,7 @@ def _union_env(tmp_path, builder=_fix_builder, deps=("P-FIX-A", "P-FIX-B")):
     (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
     env.activate()
     codex = FakeCodex()
-    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": builder})
     drv = env.driver({"opencode": oc, "codex": codex, "claude": FakeRunner()})
     return env, drv, codex
 
@@ -622,47 +623,50 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     settle(drv, 6)
     rows = env.rows()
     assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED", rows
-    members = env.run_root / "unions" / "1" / "members.json"
+    wt = env.tmp / "wt" / "REVIEW-FIXSET"
+    disp = json.loads((wt / ".vp" / "DISPATCH.json").read_text())
+    uid = disp["union"]
+    n = uid.split("-")[1]
+    members = env.run_root / "unions" / n / "members.json"
     assert members.exists(), (env.run_root / "driver.log").read_text()
     doc = json.loads(members.read_text())
-    assert doc["union"] == "union-1" and doc["base_sha"] == sha and doc["for"] == ["REVIEW-FIXSET"]
-    assert doc["branch"] == "vp/v13-union-1" and git(env.trunk, "rev-parse", "vp/v13-union-1") == doc["union_sha"]
+    # D39: the review runs on the INTEGRATION union (every verified row), not a partial of its own
+    assert doc["union"] == uid and doc["base_sha"] == sha and doc["for"] == ["INTEGRATION"]
+    assert doc["branch"] == "vp/v13-%s" % uid and git(env.trunk, "rev-parse", doc["branch"]) == doc["union_sha"]
     # D29: a stale directory at the union path (v12 left union-1..80 of another repo there) is not fatal
-    (env.tmp / "wt" / "union-1").mkdir(parents=True)
+    (env.tmp / "wt" / "union-1").mkdir(parents=True, exist_ok=True)
     (env.tmp / "wt" / "union-1" / "stale").write_text("v12")
-    assert {m["task"]: m["output_sha"] for m in doc["members"]} == {
-        "P-FIX-A": rows["P-FIX-A"]["output_sha"], "P-FIX-B": rows["P-FIX-B"]["output_sha"]}
+    have = {m["task"]: m["output_sha"] for m in doc["members"]}
+    assert have["P-FIX-A"] == rows["P-FIX-A"]["output_sha"] and have["P-FIX-B"] == rows["P-FIX-B"]["output_sha"]
     assert all(m["merge"] == "clean" for m in doc["members"])
     tip = doc["union_sha"]
     # the union tip is a real commit in trunk that contains both fixes and descends from the candidate
     assert git(env.trunk, "merge-base", "--is-ancestor", sha, tip) == ""
-    assert sorted(git(env.trunk, "ls-tree", "--name-only", tip, "platform/").splitlines()) == [
-        "platform/a.py", "platform/p_fix_a.py", "platform/p_fix_b.py"]
+    assert {"platform/a.py", "platform/p_fix_a.py", "platform/p_fix_b.py"} <= set(
+        git(env.trunk, "ls-tree", "--name-only", tip, "platform/").splitlines())
     assert "unions.jsonl" in {p.name for p in (env.run_root / "unions").iterdir()}
     # the review dispatched on the union tip: worktree HEAD == tip, subject = candidate..tip
     review = rows["REVIEW-FIXSET"]
     assert review["state"] != "READY", review
-    wt = env.tmp / "wt" / "REVIEW-FIXSET"
-    disp = json.loads((wt / ".vp" / "DISPATCH.json").read_text())
-    assert disp["union"] == "union-1" and disp["union_sha"] == tip and disp["union_base_sha"] == sha
+    assert disp["union_sha"] == tip and disp["union_base_sha"] == sha
     # D31: the worktree's records attest the reviewed tip, the registered candidate kept alongside
     utree = git(env.trunk, "rev-parse", tip + "^{tree}")
     assert (disp["candidate_sha"], disp["tree_sha"], disp["registered_candidate_sha"]) == (tip, utree, sha)
     con = json.loads((wt / ".vp" / "CONTRACT.json").read_text())["parameters"]
-    assert (con["candidate_sha"], con["tree_sha"], con["registered_candidate_sha"], con["union"]) == (tip, utree, sha, "union-1")
+    assert (con["candidate_sha"], con["tree_sha"], con["registered_candidate_sha"], con["union"]) == (tip, utree, sha, uid)
     assert env.rows()["REVIEW-FIXSET"]["parameters"]["candidate_sha"] == sha, "the scheduler row is untouched"
-    assert sorted(disp["union_members"]) == ["P-FIX-A", "P-FIX-B"]
-    assert disp["owned_files"] == ["control/evidence/REVIEW-FIXSET/union-1/verdict-packet.json"]
+    assert {"P-FIX-A", "P-FIX-B"} <= set(disp["union_members"])
+    assert disp["owned_files"] == ["control/evidence/REVIEW-FIXSET/%s/verdict-packet.json" % uid]
     req = json.loads((wt / ".vp" / "REVIEW_REQUEST.json").read_text())
     assert (req["base"], req["candidate"], req["subject"]) == (sha, tip, "union")
-    assert req["union"] == "union-1" and sorted(req["union_members"]) == ["P-FIX-A", "P-FIX-B"]
+    assert req["union"] == uid and {"P-FIX-A", "P-FIX-B"} <= set(req["union_members"])
     assert set(req["coverage_targets"]) >= {"L00", "P-FIX-A", "P-FIX-B"}
     assert codex.calls and Path(codex.calls[0].cwd) == wt
     # the verdict packet names the registered candidate (review_gate) AND the union it reviewed
     vp = json.loads(next((env.run_root / "turns" / "REVIEW-FIXSET").rglob("verdict-packet.json")).read_text())
     # D30: keyed by the union tip, the registered candidate kept alongside
     assert vp["candidate_sha"] == tip and vp["tree_sha"] == git(env.trunk, "rev-parse", tip + "^{tree}")
-    assert vp["registered_candidate_sha"] == sha and vp["union"] == "union-1" and vp["union_sha"] == tip
+    assert vp["registered_candidate_sha"] == sha and vp["union"] == uid and vp["union_sha"] == tip
     # ... and the real review_gate accepts exactly that key for a non-final role
     import importlib.util
     from test_lanedriver import CONTROL_DIR
@@ -673,11 +677,30 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     with pytest.raises(ValueError):
         gate._union_subject(vp, cand, "final_review") or (_ for _ in ()).throw(ValueError("final never"))
     log = (env.run_root / "driver.log").read_text()
-    assert "UNION union-1 %s base=%s for REVIEW-FIXSET members=P-FIX-A,P-FIX-B" % (tip[:12], sha[:12]) in log
-    assert "UNION union-1: REVIEW-FIXSET worktree at %s (2 members)" % tip[:12] in log
-    # idempotent: a later pass cuts no second union for the same member shas
+    assert "UNION %s %s base=%s for INTEGRATION members=" % (uid, tip[:12], sha[:12]) in log
+    assert "UNION %s is the integration union: %d member(s), 0 excluded" % (uid, len(doc["members"])) in log
+    assert "UNION %s: REVIEW-FIXSET worktree at %s (%d members)" % (uid, tip[:12], len(doc["members"])) in log
+    # refreshed, then idempotent: the newest integration union carries EVERY verified
+    # non-review row (rows that verified after the review's union was cut included),
+    # and a pass with no new member cuts nothing
+    settle(drv, 3)
+    integ = [json.loads(m.read_text()) for m in sorted((env.run_root / "unions").glob("*/members.json"),
+                                                       key=lambda q: int(q.parent.name))
+             if json.loads(m.read_text()).get("for") == ["INTEGRATION"]]
+    rows = env.rows()
+    import subprocess
+    trunk_head = git(env.trunk, "rev-parse", "HEAD")
+
+    def in_trunk(sha):
+        return subprocess.run(["git", "-C", str(env.trunk), "merge-base", "--is-ancestor", sha, trunk_head],
+                              capture_output=True).returncode == 0
+    want = {t: r["output_sha"] for t, r in rows.items() if r.get("state") == "VERIFIED"
+            and (r.get("kind") or "") not in ("junior", "security", "final_review", "adjudicator")
+            and not in_trunk(r["output_sha"])}
+    assert {m["task"]: m["output_sha"] for m in integ[-1]["members"]} == want
+    before = sorted(d.name for d in (env.run_root / "unions").iterdir())
     settle(drv, 2)
-    assert not (env.run_root / "unions" / "2").exists()
+    assert sorted(d.name for d in (env.run_root / "unions").iterdir()) == before
 
 
 def test_union_review_is_held_until_a_union_contains_all_its_depends_on_rows(tmp_path):
@@ -689,6 +712,7 @@ def test_union_review_is_held_until_a_union_contains_all_its_depends_on_rows(tmp
     sha, tree = register_candidate(env)
     # the integrator is silenced: only a hand-written, incomplete union exists
     drv._union_step = lambda state: None
+    drv._integration_union_step = lambda state: None
     settle(drv, 6)
     rows = env.rows()
     assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
@@ -737,15 +761,23 @@ def test_union_conflict_is_recorded_and_the_review_stays_held(tmp_path):
     settle(drv, 6)
     rows = env.rows()
     assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
-    assert not (env.run_root / "unions" / "1" / "members.json").exists()
-    con = json.loads((env.run_root / "unions" / "1" / "conflict.json").read_text())
+    cons = [json.loads(c.read_text()) for c in sorted((env.run_root / "unions").glob("*/conflict.json"),
+                                                      key=lambda q: int(q.parent.name))]
+    mine = [c for c in cons if c["for"] == ["REVIEW-FIXSET"]]
+    assert mine, cons
+    con = mine[-1]
     assert con["status"] == "CONFLICT" and con["conflict"]["task"] == "P-FIX-B" and [m["task"] for m in con["members"]] == ["P-FIX-A"]
     assert "UNION_CONFLICT" in (env.run_root / "alerts.jsonl").read_text()
+    # D39: the integration union excluded the conflicting members instead of failing outright
+    integ = [json.loads(m.read_text()) for m in (env.run_root / "unions").glob("*/members.json")
+             if json.loads(m.read_text()).get("for") == ["INTEGRATION"]]
+    assert integ and integ[-1]["excluded"] and "INTEGRATION_CONFLICT" in (env.run_root / "alerts.jsonl").read_text()
     assert env.rows()["REVIEW-FIXSET"]["state"] == "READY" and codex.calls == []
-    assert git(env.trunk, "branch", "--list", "vp/v13-union-1") == ""
-    assert not (env.tmp / "wt" / "v13-unions" / "union-1").exists()
+    assert git(env.trunk, "branch", "--list", "vp/v13-%s" % con["union"]) == ""
+    assert not (env.tmp / "wt" / "v13-unions" / con["union"]).exists()
+    before = sorted(d.name for d in (env.run_root / "unions").iterdir())
     settle(drv, 2)
-    assert not (env.run_root / "unions" / "2").exists(), "the failed member set is tried once"
+    assert sorted(d.name for d in (env.run_root / "unions").iterdir()) == before, "the failed member set is tried once"
 
 
 # -- D28 §10: a dependent build stands on its dependency's verified output ----------------------
@@ -821,6 +853,7 @@ def test_divergent_dependency_outputs_hold_the_build_until_the_integrator_cuts_t
     oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": result_ok})
     drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
     drv._union_step = lambda state: None          # first: no integrator -> the build holds
+    drv._integration_union_step = lambda state: None
     settle(drv, 6)
     rows = env.rows()
     assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
@@ -828,14 +861,21 @@ def test_divergent_dependency_outputs_hold_the_build_until_the_integrator_cuts_t
     alerts = (env.run_root / "alerts.jsonl").read_text()
     assert "STACKED_BASE_MISSING" in alerts and "divergent dependency outputs ['P-FIX-A', 'P-FIX-B']" in alerts
     assert "HOLD P-ON-BOTH 600s STACKED_BASE_MISSING" in (env.run_root / "driver.log").read_text()
-    # the integrator cuts union-1 of the two and lifts the hold itself; the build stands on its tip
+    # the integrator cuts the integration union (D39: every verified row, the two fixes among
+    # them) and lifts the hold itself; the build stands on its tip
     del drv._union_step
+    del drv._integration_union_step
     settle(drv, 6)
     rows = env.rows()
-    doc = json.loads((env.run_root / "unions" / "1" / "members.json").read_text())
-    assert sorted(m["task"] for m in doc["members"]) == ["P-FIX-A", "P-FIX-B"] and doc["for"] == ["P-ON-BOTH"]
     assert rows["P-ON-BOTH"]["state"] == "VERIFIED", rows["P-ON-BOTH"]
-    assert seen["P-ON-BOTH"]["head"] == doc["union_sha"] and seen["P-ON-BOTH"]["files"] == ["p_fix_a.py", "p_fix_b.py"]
+    docs = [json.loads(m.read_text()) for m in sorted((env.run_root / "unions").glob("*/members.json"),
+                                                      key=lambda q: int(q.parent.name))]
+    # the build stood on the integration union of that moment (a newer one, carrying
+    # P-ON-BOTH itself, is cut once it verifies: the union is kept refreshed)
+    doc = [d for d in docs if d.get("union_sha") == rows["P-ON-BOTH"]["stacked_base"]][0]
+    assert doc["for"] == ["INTEGRATION"] and {"P-FIX-A", "P-FIX-B"} <= {m["task"] for m in doc["members"]}
+    assert "P-ON-BOTH" in {m["task"] for m in docs[-1]["members"]}, "refreshed after the build verified"
+    assert seen["P-ON-BOTH"]["head"] == doc["union_sha"] and {"p_fix_a.py", "p_fix_b.py"} <= set(seen["P-ON-BOTH"]["files"])
     assert rows["P-ON-BOTH"]["stacked_base"] == doc["union_sha"] and rows["P-ON-BOTH"]["stacked_on"] == ["P-FIX-A", "P-FIX-B"]
 
 

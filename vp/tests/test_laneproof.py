@@ -311,3 +311,35 @@ def test_full_suite_routes_to_circleci_when_kinds_names_full(tmp_path):
     assert p.route("platform", "full")[0] == "circleci"
     assert p.route("platform", "targeted")[0] == "box"
     assert p.route("platform")[0] == "box", "no suite given: the proof_kind alone is not listed"
+
+
+def test_circleci_credit_refusal_after_the_trigger_is_blocked_credits_not_a_fail(tmp_path):
+    """pipeline ad4709dd (2026-09-18): every job 'failed' in 75 s with CircleCI's
+    'no credits are available on your plan' message -- the account's condition,
+    reported as BLOCKED_CREDITS (the driver holds without a strike), never as
+    FAIL_INFRA/FAIL_PRODUCT"""
+    wt, base, cand = repo(tmp_path)
+    res = {"jobs": [{"id": "j1", "name": "lint-and-typecheck", "status": "failed", "job_number": 11}],
+           "failed_tests": {}, "workflows": [{"id": "w1", "status": "failed"}]}
+
+    class Broke(FakeCircle):
+        def credit_block(self, jobs, runner, account):
+            self.calls.append(("credit_block", [j["name"] for j in jobs]))
+            return "This job has been blocked because no credits are available on your plan."
+    fake = Broke(res)
+    p = make_proof(tmp_path, fake, FakeExec({}))
+    rec = p.run("L22-HOSTED", "proof-5", wt, base, cand, "platform", [])
+    assert rec["status"] == "BLOCKED_CREDITS" and "no credits" in rec["reason"] and rec["pipeline_id"] == "pipe-206"
+    assert ("credit_block", ["lint-and-typecheck"]) in fake.calls
+    assert ("delete", "vp/proof/proof-5-%s" % cand[:12]) in fake.calls, "branch cleaned up"
+    # the real detector reads the failed job's messages through the runner
+    import vpcircle
+
+    class R(object):
+        def circleci_api(self, account, path, method="GET", data=None):
+            import subprocess
+            body = {"messages": [{"type": "error", "reason": "free-plan-no-credits-available",
+                                  "message": "This job has been blocked because no credits are available on your plan."}]}
+            return subprocess.CompletedProcess([path], 0, json.dumps(body), "")
+    assert "no credits" in vpcircle.credit_block([{"status": "failed", "job_number": 11}], R(), "3")
+    assert vpcircle.credit_block([{"status": "success", "job_number": 11}], R(), "3") is None

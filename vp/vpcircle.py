@@ -379,6 +379,32 @@ def _dependency_failed(jobs_by_id, dep_ids):
     return False
 
 
+NO_CREDIT_MARKERS = ("no-credits", "no credits", "credits are available", "upgrade to continue")
+
+
+def credit_block(jobs, runner=None, account=None):
+    """The plan/credit refusal that only shows AFTER a successful trigger:
+    every job of pipeline ad4709dd (2026-09-18 21:12Z) 'failed' in 75 s with
+    the job message 'This job has been blocked because no credits are
+    available on your plan' (reason free-plan-no-credits-available).  Reads
+    the first failed job's detail; returns that message or None."""
+    runner = runner or Runner()
+    acct = account or ACCOUNTS[0]
+    for j in jobs:
+        if j.get("status") != "failed" or j.get("job_number") is None:
+            continue
+        try:
+            det = _get_json(runner, acct, f"api/v2/project/{SLUG}/job/{j['job_number']}")
+        except RuntimeError:
+            return None
+        for m in det.get("messages") or []:
+            text = "%s %s" % (m.get("reason") or "", m.get("message") or "")
+            if any(k in text.lower() for k in NO_CREDIT_MARKERS):
+                return (m.get("message") or m.get("reason") or "credits").strip()
+        return None
+    return None
+
+
 def classify(jobs, failed_tests):
     """{"status": PASS|FAIL_PRODUCT|FAIL_INFRA|UNKNOWN, "reds": [...]}"""
     jobs_by_id = {j.get("id"): j for j in jobs if j.get("id") is not None}
