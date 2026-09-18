@@ -30,12 +30,44 @@ def hashed(reference):
     return path
 
 
+def _git(repo, args):
+    import subprocess
+    done = subprocess.run(["git", "-C", str(repo)] + list(args), text=True, capture_output=True)
+    return done.returncode, done.stdout.strip()
+
+
+def _union_subject(packet, candidate, role):
+    """D30 (BULK-RULING §12 item 3): a junior/security review of a UNION TIP
+    is keyed by that tip -- packet.union_sha == candidate_sha, tree_sha its
+    tree -- and the tip must descend from the registered candidate in the
+    candidate's repository.  final_review stays bound to the registered
+    candidate itself.  Returns True when the packet is such a review."""
+    tip = packet.get("union_sha")
+    if role == "final_review" or not tip:
+        return False
+    if packet.get("candidate_sha") != tip:
+        raise ValueError("union review must be keyed by its union tip")
+    repo = candidate.get("repository")
+    if not repo or not Path(repo).exists():
+        raise ValueError("union review needs the candidate repository to verify the tip")
+    rc, _ = _git(repo, ["merge-base", "--is-ancestor", candidate["sha"], tip])
+    if rc != 0:
+        raise ValueError("union tip does not descend from the registered candidate")
+    rc, tree = _git(repo, ["rev-parse", tip + "^{tree}"])
+    if rc != 0 or tree != packet.get("tree_sha"):
+        raise ValueError("union tip tree mismatch")
+    return True
+
+
 def validate(packet_path, state, catalog, target, role):
     packet = load(packet_path)
     candidate = state["candidate"]
     if role not in ROLES or packet.get("role") != role:
         raise ValueError("wrong review role")
-    if not candidate.get("sha") or (packet.get("candidate_sha"), packet.get("tree_sha")) != (candidate["sha"], candidate["tree"]):
+    if not candidate.get("sha"):
+        raise ValueError("stale or missing review candidate")
+    union = _union_subject(packet, candidate, role)
+    if not union and (packet.get("candidate_sha"), packet.get("tree_sha")) != (candidate["sha"], candidate["tree"]):
         raise ValueError("stale or missing review candidate")
     if packet.get("verdict") not in {"PASS", "ACCEPT"} or packet.get("unresolved_blocking_findings") != []:
         raise ValueError("review is not a clean PASS/ACCEPT")
@@ -86,8 +118,9 @@ def validate(packet_path, state, catalog, target, role):
         raise ValueError("review supporting artifacts missing")
     for artifact in artifacts:
         hashed(artifact)
-    return {"status": "PASS", "role": role, "candidate_sha": candidate["sha"],
-            "tree_sha": candidate["tree"], "reviewer_session_id": reviewer,
+    return {"status": "PASS", "role": role, "candidate_sha": packet["candidate_sha"],
+            "tree_sha": packet["tree_sha"], "reviewer_session_id": reviewer,
+            "union": packet.get("union") if union else None, "registered_candidate": candidate["sha"],
             "packet": {"path": str(Path(packet_path).resolve()),
                        "sha256": hashlib.sha256(Path(packet_path).read_bytes()).hexdigest()}}
 def _record_time(value):
