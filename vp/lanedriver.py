@@ -2364,7 +2364,15 @@ class LaneDriver(object):
         tdir = self._turn_dir(task, attempt)
         fkey = attempt
         sid = self._saved_session(tdir)
-        if needs_start:
+        start_after = False
+        if needs_start and kind in REVIEW_KINDS:
+            # SEC-SESSION-001 (BULK-RULING-2026-09-18): a review is ONE fresh
+            # codex turn -- no 0-preopen turn, no resume.  The thread the
+            # review turn opens is what `start --child-id` carries, so the
+            # scheduler's start happens right after that turn (row stays
+            # CLAIMED meanwhile; complete accepts CLAIMED).
+            start_after, sid = True, None
+        elif needs_start:
             if not sid:
                 pre = self._spec("reviewer", task, wt, "", rcfg, runner, server, None,
                                  wt / ".vp" / "REVIEW.json", None, 180.0, tdir, "0-preopen", False, 0)
@@ -2381,7 +2389,7 @@ class LaneDriver(object):
                                                    rcfg, wt, tdir, sid)
         elif kind in REVIEW_KINDS:
             outcome, result = self._review_pipeline(task, attempt, row, contract, server, runner,
-                                                    rcfg, wt, tdir, sid, base)
+                                                    rcfg, wt, tdir, sid, base, start_after=start_after)
         else:
             outcome, result = self._single_pipeline(task, attempt, row, contract, server, runner,
                                                     rcfg, wt, tdir, sid, "probe")
@@ -2956,7 +2964,8 @@ class LaneDriver(object):
             self.log("AUTOFIX %s tsc --noEmit rc=%s (reported to the grader via autofix.json)" % (task, tsc_rc))
         return rec
 
-    def _review_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid, base):
+    def _review_pipeline(self, task, attempt, row, contract, server, runner, rcfg, wt, tdir, sid, base,
+                         start_after=False):
         state = self.control.state_view()
         cand = (state.get("candidate") or {}).get("sha") or base
         p = self.packet_for(task)
@@ -2982,6 +2991,17 @@ class LaneDriver(object):
             (wt / ".vp" / "BENCHMARK.md").write_text(rp["packet_benchmark"], encoding="utf-8")
         if outcome.status != STATUS_DONE:
             return outcome, None
+        if start_after:
+            # SEC-SESSION-001: the one review turn opened the thread; bind it now
+            if not outcome.session_id:
+                return vprunners.TurnOutcome(STATUS_INCOMPLETE, "review turn returned no thread id",
+                                             runner=runner), None
+            try:
+                self._start(task, attempt, contract, outcome.session_id)
+            except ControlError as exc:
+                return vprunners.TurnOutcome(STATUS_INCOMPLETE, "start after the review turn: %s" % str(exc)[:200],
+                                             runner=runner), None
+            row = dict(row, child_id=outcome.session_id)
         try:
             doc = json.loads(out_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

@@ -507,7 +507,7 @@ class FakeCodex(FakeRunner):
                "verdicts": [{"id": i, "verdict": "PASS", "evidence": "platform/a.py:1"} for i in req["benchmark_ids"]],
                "findings": [], "evidence": ["platform/a.py:1"], "summary": "fake review"}
         Path(spec.out_path).write_text(json.dumps(doc))
-        return TurnOutcome(STATUS_DONE, "", session_id=spec.session_id, record_path=spec.out_path,
+        return TurnOutcome(STATUS_DONE, "", session_id=spec.session_id or self.thread_id, record_path=spec.out_path,
                            usage={"tokens_in": 9, "tokens_out": 2, "cost": None}, runner="codex",
                            model_seen="gpt-5.6-luna")
 
@@ -529,7 +529,7 @@ def register_candidate(env):
     return sha, tree
 
 
-def test_codex_review_preopens_the_thread_and_starts_with_its_id(tmp_path):
+def test_codex_review_is_one_fresh_turn_and_starts_with_its_thread_id(tmp_path):
     env = Env(tmp_path)
     env.activate()
     sha, tree = register_candidate(env)
@@ -542,11 +542,17 @@ def test_codex_review_preopens_the_thread_and_starts_with_its_id(tmp_path):
     drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": codex, "claude": FakeRunner()})
     settle(drv)
     rows = env.rows()
-    assert len(codex.preopened) == 1, "one pre-open turn before start"
+    # SEC-SESSION-001: no 0-preopen turn; the review is ONE fresh codex turn and
+    # the thread it opens is what `start --child-id` carries (start follows the turn)
+    assert codex.preopened == [], "no pre-open turn"
     assert rows["J1"]["child_id"] == "0199-thread-xyz"
     start = next(l for l in env.control_lines() if l["verb"] == "start" and "J1" in l["argv"])
     assert "0199-thread-xyz" in start["argv"] and "gpt-5.6-luna" in start["argv"]
-    assert codex.calls[0].session_id == "0199-thread-xyz", "the review resumes the pre-opened thread"
+    assert codex.calls[0].session_id is None, "the review opens a fresh thread, never resumes one"
+    assert len([c for c in codex.calls if c.role == "reviewer"]) == 1, "one review turn"
+    assert not list((env.run_root / "turns" / "J1").glob("*/0-preopen*")), "no preopen artefacts"
+    order = [l["verb"] for l in env.control_lines() if "J1" in l["argv"] and l["verb"] in ("claim", "start", "complete")]
+    assert order[:3] == ["claim", "start", "complete"] and order.count("start") == 1
     claim = next(l for l in env.control_lines() if l["verb"] == "claim" and "J1" in l["argv"])
     assert sha in claim["argv"], "review claims bind the registered candidate sha"
     # APPROVE -> complete --verdict; the gate refuses (no native codex rollout in
@@ -818,11 +824,13 @@ def test_quota_on_codex_parks_codex_runner_and_leaves_review_running(tmp_path):
     drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": cx, "claude": FakeRunner()})
     settle(drv)
     rows = env.rows()
-    assert rows["J1"]["state"] == "RUNNING" and rows["L00"]["state"] == "VERIFIED"
+    # SEC-SESSION-001: no preopen, so a review whose one turn parked never
+    # reached `start`; the attempt stays CLAIMED (adoptable) until the park lifts
+    assert rows["J1"]["state"] == "CLAIMED" and rows["L00"]["state"] == "VERIFIED"
     assert drv.runner_state["codex"]["park_status"] == "QUOTA_WEEKLY"
     settle(drv)
-    assert len(cx.calls) == 1, "parked codex: the RUNNING review is not re-adopted"
-    assert env.rows()["J1"]["state"] == "RUNNING"
+    assert len(cx.calls) == 1, "parked codex: the CLAIMED review is not re-adopted"
+    assert env.rows()["J1"]["state"] == "CLAIMED"
 
 
 # -- item 5: the proof step in the driver (F6 itself is tested in test_laneproof) ------------
