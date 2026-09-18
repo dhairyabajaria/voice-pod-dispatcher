@@ -71,7 +71,7 @@ def _jsonl(path):
 def verify_seals(run_root):
     run_root = Path(run_root)
     rows = _jsonl(run_root / "seals.jsonl")
-    problems, drift, prev_hash, checked = [], [], None, 0
+    problems, drift, warnings, prev_hash, prev_prev_hash, checked = [], [], [], None, None, 0
     newest_for = {}                       # rel -> (index, entry) in the newest seal listing it
     manifests = []
     for i, (line, rec) in enumerate(rows):
@@ -80,8 +80,16 @@ def verify_seals(run_root):
             prev_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()
             continue
         if "prev_hash" in rec and rec.get("prev_hash") != prev_hash:
-            problems.append("seal %d (%s): prev_hash %s != sha256 of the previous line %s -- chain broken"
-                            % (i + 1, rec.get("ts"), str(rec.get("prev_hash"))[:12], str(prev_hash)[:12]))
+            prev_rec = rows[i - 1][1] if i else None
+            if i and prev_rec and rec.get("prev_hash") == prev_prev_hash and prev_rec.get("prev_hash") == prev_prev_hash:
+                # two sealers raced before the seal lock existed: both chained
+                # to the same parent (a fork), neither is forged or missing
+                warnings.append("seal %d (%s) and seal %d (%s) both chain to seal %d: concurrent seal fork"
+                                % (i, prev_rec.get("ts"), i + 1, rec.get("ts"), i - 1))
+            else:
+                problems.append("seal %d (%s): prev_hash %s != sha256 of the previous line %s -- chain broken"
+                                % (i + 1, rec.get("ts"), str(rec.get("prev_hash"))[:12], str(prev_hash)[:12]))
+        prev_prev_hash = prev_hash
         prev_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()
         mpath = run_root / rec.get("manifest", "")
         if not mpath.is_file() and rec.get("manifest", "").startswith("MANIFEST-"):
@@ -137,7 +145,8 @@ def verify_seals(run_root):
                 checked += 1
                 if digest != ent["sha256"]:
                     drift.append(rel)
-    return {"seals": len(rows), "files_checked": checked, "problems": problems, "drift_since_newest_seal": drift,
+    return {"seals": len(rows), "files_checked": checked, "problems": problems, "warnings": warnings,
+            "drift_since_newest_seal": drift,
             "newest_seal_ts": (rows[-1][1] or {}).get("ts") if rows else None,
             "chain_ok": not any("chain broken" in p for p in problems)}
 

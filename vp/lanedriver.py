@@ -32,6 +32,7 @@ next start.  stdlib only.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib
 import importlib.util
@@ -1241,8 +1242,12 @@ class LaneDriver(object):
                 "owner-gate:%s" % p["owner_gate"], "OWNER_GATE",
                 "%s waits for %s (roster owner_gates.%s is not true)" % (pid, p["owner_gate"], p["owner_gate"]))
             return False
-        deps = vppack.dependency_tasks(p, self.pack, tasks, bindings)
+        gated = {q for q, qp in self.pack.items() if not vppack.owner_gate_open(qp, self.roster)}
+        deps = vppack.dependency_tasks(p, self.pack, tasks, bindings, gated=gated)
         if deps is None:
+            if ("deps", pid) not in self._pack_logged:
+                self._pack_logged.add(("deps", pid))
+                self.log("PACK %s waits: a dependency packet of %s is not bound yet" % (pid, p.get("depends_on")))
             return False                          # a dependency packet is not bound yet
         parent, how = vppack.parent_for(p, tasks, self.pack)
         if not parent:
@@ -1759,6 +1764,26 @@ class LaneDriver(object):
         prefix.  Every call writes a new seal (`force` is accepted for the old
         callers and means the same)."""
         day = day or self.ist_now().strftime("%Y-%m-%d")
+        # one sealer at a time across processes (the driver and the `seal`
+        # CLI raced once and forked the chain): the lock spans reading the
+        # previous line and appending the new one
+        lock_path = self.run_root / "seals.jsonl.lock"
+        try:
+            lock = open(lock_path, "a+")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            lock = None
+        try:
+            return self._seal_locked(day, reason)
+        finally:
+            if lock is not None:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock.close()
+
+    def _seal_locked(self, day, reason):
         ts = utc_ms()
         sdir = self.run_root / self.SEAL_DIR
         snap = sdir / ("MANIFEST-%s.json" % ts.replace(":", "").replace("-", "").replace(".", ""))
@@ -1771,7 +1796,8 @@ class LaneDriver(object):
             rel = p.relative_to(self.run_root).as_posix()
             if rel in self.SEAL_SKIP or (rel.startswith("MANIFEST-") and rel.endswith(".json")):
                 continue
-            if rel.startswith("worktrees/") or rel.startswith("trunk/") or rel.startswith(self.SEAL_DIR + "/"):
+            if rel.startswith("worktrees/") or rel.startswith("trunk/") or rel.startswith(self.SEAL_DIR + "/") \
+                    or rel == "seals.jsonl.lock":
                 continue
             try:
                 h = hashlib.sha256()
@@ -2878,11 +2904,19 @@ class LaneDriver(object):
         except (OSError, ValueError):
             pass
         pkind = str(hdr.get("proof_kind") or self.proof_cfg.get("default_kind") or "platform")
-        paths = list(hdr.get("test_paths") or [])
-        pending = {"sha": cand, "base": base, "kind": pkind, "paths": paths, "ts": utc_ms()}
+        # F-B (L32): `proof_paths` narrows the BOX proof to the packet's own
+        # box-safe node list (test_paths stays the grader's/hosted scope);
+        # `proof_workers` pins the xdist worker count (1 = serial)
+        paths = list(hdr.get("proof_paths") or hdr.get("test_paths") or [])
+        workers = hdr.get("proof_workers")
+        workers = int(workers) if str(workers or "").strip().isdigit() else None
+        pending = {"sha": cand, "base": base, "kind": pkind, "paths": paths, "workers": workers, "ts": utc_ms()}
         (tdir / "proof-pending.json").write_text(json.dumps(pending, indent=2), encoding="utf-8")
         pid = "proof-%s-%s" % (task, attempt[-15:])
-        rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set())
+        if hdr.get("proof_paths") or workers:
+            self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s" % (task, len(paths), workers))
+        rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set(),
+                             workers=workers)
         status = rec.get("status")
         self._copy_proof_into_worktree(wt, pid, rec)
         outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")

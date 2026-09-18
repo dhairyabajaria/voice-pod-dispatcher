@@ -136,7 +136,7 @@ class Proof(object):
 
     NO_RUN_KINDS = ("docs",)
 
-    def run(self, task, pid, wt, base, cand, kind, paths, abort=None):
+    def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None):
         if kind in self.NO_RUN_KINDS:
             # 06-ROUTING §5: docs-only proofs pass without a run
             rec = {"status": "PASS", "route": "none", "proof_id": pid, "sha": cand, "kind": kind,
@@ -150,7 +150,7 @@ class Proof(object):
         self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
         if route == "circleci":
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort)
-        return self.run_box(task, pid, wt, cand, kind, paths)
+        return self.run_box(task, pid, wt, cand, kind, paths, workers=workers)
 
     # -- box -------------------------------------------------------------------------------
 

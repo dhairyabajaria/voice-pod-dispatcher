@@ -106,6 +106,9 @@ def test_parent_dependencies_parameters_and_closure_plan(tmp_path):
     assert vppack.parent_for(pack["P-REGRADE-2"], t, pack) == ("L00", "depends_on:P-REGRADE-L00")
     assert vppack.parent_for(pack["P-GATED"], t, pack) == ("L00", "body-cite")
     assert vppack.dependency_tasks(pack["P-REGRADE-2"], pack, t) is None, "dependency not instantiated yet"
+    # D23: only an OWNER-GATED dependency packet whose own row is accepted is
+    # satisfied by that row (L34-ACK-DEDUP behind L34's DELIVERY-4 regrade)
+    assert vppack.dependency_tasks(pack["P-REGRADE-2"], pack, t, gated={"P-REGRADE-L00"}) == ["L00"]
     t["P-REGRADE-L00"] = {"state": "READY"}
     assert vppack.dependency_tasks(pack["P-REGRADE-2"], pack, t) == ["P-REGRADE-L00"]
     assert vppack.dependency_tasks(pack["L04"], pack, t) == ["P-REGRADE-L00"]

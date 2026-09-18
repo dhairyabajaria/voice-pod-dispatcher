@@ -200,15 +200,23 @@ def parent_for(packet, tasks, pack, _seen=None):
 GUESSED_PARENT = ("body-cite", "closes:")
 
 
-def dependency_tasks(packet, pack, tasks, bindings=None):
+def dependency_tasks(packet, pack, tasks, bindings=None, gated=()):
     """task ids for `instantiate --depends-on`: every dependency packet's bound
-    task (a direct-bound dependency is its own task).  Unbound -> None (wait)."""
+    task (a direct-bound dependency is its own task).  Unbound -> None (wait).
+    D23: a dependency packet held by an OWNER GATE whose own scheduler row is
+    already accepted (L34 INTEGRATED, its regrade packet behind DELIVERY-4)
+    is satisfied by that row -- L34-ACK-DEDUP must not wait on a gate that
+    guards a regrade of work already accepted."""
     out = []
     for dep in packet["depends_on"]:
         dp = pack.get(dep)
         if not dp:
             return None
         t = bound_task(dp, tasks, bindings)
+        st = dp.get("scheduler_task") or ""
+        if (t is None or t not in tasks) and dep in gated and not st.startswith("NEW:") \
+                and (tasks.get(st) or {}).get("state") in ACCEPTED:
+            t = st
         if t is None or t not in tasks:
             return None
         if t not in out:

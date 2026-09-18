@@ -841,8 +841,9 @@ class FakeProof(object):
         self.calls = []
         self.cfg = {}
 
-    def run(self, task, pid, wt, base, cand, kind, paths, abort=None):
+    def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None):
         self.calls.append((task, pid, cand, kind, paths))
+        self.workers = getattr(self, "workers", []) + [workers]
         rec = dict(self.results.pop(0) if self.results else {"status": "PASS"})
         rec.update({"proof_id": pid, "sha": cand, "route": "fake"})
         d = Path(wt).parents[1] / "run" / "proofs" if False else None
@@ -885,6 +886,27 @@ def test_proof_pass_verifies_and_fail_product_is_repair_required(tmp_path):
     drv.tick()
     rep = [t for t in env.rows() if t.startswith("R-L02")]
     assert rep and env.rows()[rep[0]]["parameters"]["defect_id"] == "platform-tests-test_a.py::test_x"
+
+
+def test_proof_paths_and_proof_workers_narrow_the_box_proof(tmp_path, monkeypatch):
+    """F-B (L32): `proof_paths` in the packet header is what the BOX proof
+    runs (test_paths stays the grader's scope); `proof_workers: 1` is passed
+    through to the proof runner."""
+    orig = lanedriver.LaneDriver.render_packet
+
+    def render(contract, base, row=None, test_paths=None, proof_kind=None):
+        return orig(contract, base, row, test_paths, proof_kind).replace(
+            "max_rounds:", "proof_paths:\n  - platform/tests/test_dbfree.py\nproof_workers: 1\nmax_rounds:", 1)
+    monkeypatch.setattr(lanedriver.LaneDriver, "render_packet", staticmethod(render))
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
+    env.activate()
+    proof = FakeProof([])
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()},
+                     proof=proof)
+    settle(drv, 2)
+    assert env.rows()["L02"]["state"] == "VERIFIED"
+    assert proof.calls[0][4] == ["platform/tests/test_dbfree.py"] and proof.workers == [1]
+    assert "PROOF L02 scope: 1 path(s) from proof_paths, workers=1" in (env.run_root / "driver.log").read_text()
 
 
 def test_proof_red_once_is_repaired_in_the_next_round(tmp_path):
