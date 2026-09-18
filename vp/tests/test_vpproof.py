@@ -92,6 +92,121 @@ def test_preflight_never_runs_ipcrm_unless_reap_is_on():
     assert res["removed"] == 2 and res["errors"] == [], res
 
 
+# -- D18: a timed-out proof unwinds its fixtures and leaks no postmaster ------------------------
+
+PLATFORM_PY = Path("/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/chief9-recovery/platform/.venv/bin/python")
+
+CONFTEST = """import os, time, pytest
+
+@pytest.fixture(scope="session")
+def cluster():
+    # stands for temporary_postgres(): the try/finally is the only teardown
+    mark = os.path.join(os.environ["MARK_DIR"], "up-" + os.environ.get("PYTEST_XDIST_WORKER", "main"))
+    open(mark, "w").write("up")
+    try:
+        yield mark
+    finally:
+        open(mark.replace("up-", "down-"), "w").write("torn down")
+"""
+
+TESTS = """import time
+
+def test_hangs_a(cluster):
+    time.sleep(600)
+
+def test_hangs_b(cluster):
+    time.sleep(600)
+"""
+
+
+def _project(tmp):
+    d = tmp / "proj"
+    d.mkdir()
+    (d / "conftest.py").write_text(CONFTEST)
+    (d / "test_hang.py").write_text(TESTS)
+    return d
+
+
+def test_sigint_first_lets_every_xdist_worker_run_its_finally(tmp_path):
+    """the real mechanism: killpg(SIGINT) on pytest -n 2 -> KeyboardInterrupt in
+    the controller AND both workers -> session fixtures unwind (pg_ctl stop
+    would run here); SIGTERM/SIGKILL never get a turn."""
+    import os, subprocess, time
+    if not PLATFORM_PY.exists():
+        return
+    proj = _project(tmp_path)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    env = dict(os.environ, MARK_DIR=str(marks), PYTHONDONTWRITEBYTECODE="1")
+    log = tmp_path / "run.log"
+    with open(log, "w") as fh:
+        proc = subprocess.Popen([str(PLATFORM_PY), "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                                 "-n", "2", "--dist", "loadfile", "test_hang.py", "test_hang.py"],
+                                cwd=str(proj), env=env, stdin=subprocess.DEVNULL, stdout=fh,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.time() + 60
+        while time.time() < deadline and len(list(marks.glob("up-*"))) < 1:
+            time.sleep(0.2)
+        assert list(marks.glob("up-*")), "the workers never started: %s" % log.read_text()[-800:]
+        time.sleep(1.0)
+        notes = []
+        rc, steps = vpproof.stop_group(proc, notes.append, grace_int=45.0, grace_term=10.0)
+    ups = sorted(p.name for p in marks.glob("up-*"))
+    downs = sorted(p.name for p in marks.glob("down-*"))
+    assert steps == ["SIGINT"], (steps, notes, log.read_text()[-800:])
+    assert [d.replace("down-", "") for d in downs] == [u.replace("up-", "") for u in ups], \
+        "every worker that brought a cluster up tore it down: ups=%s downs=%s\n%s" % (ups, downs, log.read_text()[-800:])
+    assert proc.poll() is not None
+
+
+def test_escalates_to_sigkill_when_the_group_ignores_int_and_term(tmp_path):
+    import subprocess, sys
+    proc = subprocess.Popen([sys.executable, "-c",
+                             "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(600)"],
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+    import time
+    time.sleep(1.5)                                   # let it install SIG_IGN first
+    notes = []
+    rc, steps = vpproof.stop_group(proc, notes.append, grace_int=1.0, grace_term=1.0)
+    assert steps == ["SIGINT", "SIGTERM", "SIGKILL"], (steps, notes)
+    assert rc != 0 and any("SIGINT did not stop" in n for n in notes)
+
+
+def test_reap_stops_only_clusters_under_the_proofs_own_temp_root(tmp_path, monkeypatch):
+    root = tmp_path / "vpproof-x"
+    mine = root / "voicepod-test-pg-session-gw0-abc" / "pgdata"
+    mine.mkdir(parents=True)
+    (mine / "postmaster.pid").write_text("4242\n/x\n")
+    other = tmp_path / "voicepod-test-pg-someone-else" / "pgdata"      # NOT under root
+    other.mkdir(parents=True)
+    (other / "postmaster.pid").write_text("7\n")
+    (root / "voicepod-test-pg-clean-exit").mkdir()                       # no pgdata: nothing to stop
+    monkeypatch.setattr(vpproof, "pg_ctl_path", lambda py: "/fake/pg_ctl")
+    calls, notes = [], []
+
+    class CP(object):
+        returncode = 0
+        stdout = "server stopped"
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return CP()
+    out = vpproof.reap_run_postmasters(root, "python", notes.append, run=run)
+    assert calls == [["/fake/pg_ctl", "-D", str(mine), "-m", "immediate", "-w", "-t", "20", "stop"]], calls
+    assert out == [{"pgdata": str(mine), "pid": 4242, "stopped": True, "detail": "server stopped"}]
+    assert "stopped" in notes[0] and str(other) not in "".join(notes)
+    assert vpproof.reap_run_postmasters(tmp_path / "nothing-here", "python", notes.append, run=run) == []
+
+
+def test_shm_gate_threshold_and_live_count():
+    assert vpproof.shm_block_threshold(32, {}) == 24
+    assert vpproof.shm_block_threshold(32, {"shm_block_at": 20}) == 20
+    assert vpproof.shm_block_threshold(8, {}) == 4
+    n = vpproof.shm_segment_count()
+    assert n is None or n >= 0
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

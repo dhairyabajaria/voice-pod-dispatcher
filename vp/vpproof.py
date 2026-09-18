@@ -29,9 +29,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -255,6 +257,109 @@ def shm_preflight(log, reap=False, run=subprocess.run, ipcs_text=None, alive=_pi
     return res
 
 
+
+# -- D18: a timed-out proof must not leak postmasters ------------------------------------
+# pgserver starts postgres with `pg_ctl start`; the postmaster setsid()s into its
+# own process group, so killpg on pytest's group never reaches it.  Only the
+# try/finally in platform/testsupport/postgres.py (temporary_postgres) and
+# pgserver's atexit hook stop it, and SIGTERM/SIGKILL skip both.  So: SIGINT
+# first (KeyboardInterrupt: pytest and every xdist worker unwind their
+# fixtures, pg_ctl stop runs, bounded at 30 s by pgserver_lock), a grace of at
+# least 45 s, then SIGTERM, then SIGKILL; and whatever still runs under the
+# proof's OWN temp root (TMPDIR is per proof) is stopped by exact pgdata path.
+KILL_GRACE_INT_S = 60.0
+KILL_GRACE_TERM_S = 30.0
+PG_PREFIX = "voicepod-test-pg-"
+
+
+def stop_group(proc, log, grace_int=KILL_GRACE_INT_S, grace_term=KILL_GRACE_TERM_S,
+               killpg=os.killpg, getpgid=os.getpgid):
+    """SIGINT -> grace -> SIGTERM -> grace -> SIGKILL on the proof's process
+    group; returns (rc, escalation list)."""
+    steps = []
+    for sig, grace in ((signal.SIGINT, grace_int), (signal.SIGTERM, grace_term), (signal.SIGKILL, None)):
+        try:
+            killpg(getpgid(proc.pid), sig)
+            steps.append(sig.name)
+        except OSError as exc:
+            steps.append("%s: %s" % (sig.name, exc))
+        try:
+            rc = proc.wait(timeout=grace) if grace is not None else proc.wait()
+            log("timeout: group stopped after %s (rc=%s)" % (" -> ".join(steps), rc))
+            return rc, steps
+        except subprocess.TimeoutExpired:
+            log("timeout: %s did not stop the group within %ss" % (sig.name, grace))
+    return proc.wait(), steps
+
+
+def pg_ctl_path(python):
+    """pgserver's bundled pg_ctl for the venv `python` runs the proof with."""
+    try:
+        out = subprocess.run([python, "-c", "import pgserver._commands as c; print(c.POSTGRES_BIN_PATH)"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                             timeout=60).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    cand = Path(out) / "pg_ctl" if out else None
+    return str(cand) if cand and cand.exists() else None
+
+
+def reap_run_postmasters(tmp_root, python, log, run=subprocess.run):
+    """Stop every cluster the proof itself created: postmaster.pid files under
+    THIS proof's temp root only (identity by exact path, never a pattern kill),
+    `pg_ctl -D <pgdata> -m immediate stop` each.  Returns the list of
+    {pgdata, pid, stopped}."""
+    tmp_root = Path(tmp_root)
+    found = sorted(tmp_root.glob("%s*/pgdata/postmaster.pid" % PG_PREFIX))
+    if not found:
+        return []
+    pg_ctl = pg_ctl_path(python)
+    out = []
+    for pidfile in found:
+        pgdata = pidfile.parent
+        try:
+            pid = int((pidfile.read_text(encoding="utf-8").splitlines() or ["0"])[0].strip() or 0)
+        except (OSError, ValueError):
+            pid = 0
+        rec = {"pgdata": str(pgdata), "pid": pid, "stopped": False, "detail": ""}
+        if pg_ctl is None:
+            rec["detail"] = "pg_ctl not found"
+        else:
+            try:
+                cp = run([pg_ctl, "-D", str(pgdata), "-m", "immediate", "-w", "-t", "20", "stop"],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
+                rec["stopped"] = cp.returncode == 0
+                rec["detail"] = (cp.stdout or "").strip()[-160:]
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                rec["detail"] = str(exc)[:160]
+        if not rec["stopped"] and pid and not _pid_alive(pid):
+            rec["stopped"] = True
+            rec["detail"] = (rec["detail"] + " (postmaster already gone)").strip()
+        log("reap %s pid=%s -> %s %s" % (pgdata, pid, "stopped" if rec["stopped"] else "STILL RUNNING", rec["detail"]))
+        out.append(rec)
+    return out
+
+
+def shm_segment_count():
+    """live SysV shm segments (`ipcs -m`), or None when ipcs is unavailable."""
+    try:
+        text = subprocess.run(["ipcs", "-m"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sum(1 for ln in text.splitlines() if ln.split()[:1] == ["m"])
+
+
+def shm_block_threshold(limit, proof_cfg):
+    """the roster's proof.shm_block_at, else limit - 8 (one 4-worker run's
+    segments plus margin under kern.sysv.shmmni; 24 on the 32-slot Mac)."""
+    try:
+        v = int(proof_cfg.get("shm_block_at") or 0)
+    except (TypeError, ValueError):
+        v = 0
+    return v if v > 0 else max(4, int(limit) - 8)
+
+
 def _classify_vitest(rc, log_text, timed_out):
     """vitest run: 'Test Files  N passed (N)' / 'Tests  N passed (N)' summary lines;
     a failing file prints ' FAIL  path > name' lines. rc 1 with
@@ -363,6 +468,9 @@ def run_proof(args):
         env = dict(os.environ)
         env["PATH"] = NODE22_BIN + os.pathsep + env.get("PATH", "")
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        py_for_reap = str(wt / "platform" / ".venv" / "bin" / "python")
+        if not Path(py_for_reap).exists():
+            py_for_reap = str(Path(trunk) / "platform" / ".venv" / "bin" / "python")
         if args.proof_kind == "portal":
             # vitest runs from portal/; packet paths are repo-relative
             rel = [p[len("portal/"):] if p.startswith("portal/") else p for p in paths]
@@ -390,6 +498,7 @@ def run_proof(args):
                 py = str(Path(trunk) / "platform" / ".venv" / "bin" / "python")
             argv = [py, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                     "-n", str(args.workers), "--dist", "loadfile"]
+            py_for_reap = py
             if args.kind == "targeted":
                 argv += paths
             else:
@@ -406,6 +515,33 @@ def run_proof(args):
                          "`ipcrm -m` them (ids %s), or set roster proof.shm_reap: true so "
                          "vpproof removes them before each platform leg"
                          % (left, shm["limit"], " ".join(str(i) for i in shm["ids"][:40])))
+            # D18 (c): a box near the shm ceiling gets NO proof -- launching one
+            # would red on "could not create shared memory segment", cost a
+            # FAIL_CAP strike and leak more.  BLOCKED_SHM is a box condition,
+            # not the candidate's: the driver holds the task, never counts it.
+            live = shm_segment_count()
+            live = shm["total"] if live is None else live
+            block_at = shm_block_threshold(shm["limit"], proof_cfg)
+            shm["live_after_preflight"] = live
+            shm["block_at"] = block_at
+            if live >= block_at:
+                counts = {"reason": "PROOF_BLOCKED_SHM: %d live SysV shm segments >= %d (limit %d); "
+                                    "postgres could not start -- owner: reboot or `ipcrm -m` the "
+                                    "orphans" % (live, block_at, shm["limit"]),
+                          "shm_preflight": shm, "paths": paths}
+                log(counts["reason"])
+                st.alert("PROOF_BLOCKED_SHM", counts["reason"])
+                _rec(args, st, args.proof_id, "BLOCKED_SHM", counts=counts, artifacts=str(meta_path))
+                meta_path.write_text(json.dumps({"ts": utc_ms(), "status": "BLOCKED_SHM", "counts": counts,
+                                                 "notes": notes}, indent=2), encoding="utf-8")
+                print(json.dumps({"status": "BLOCKED_SHM", "counts": counts}))
+                return 0
+        # D18 (b): every cluster this proof creates lives under its own temp
+        # root (platform/testsupport/postgres.py honours TMPDIR), so a post-kill
+        # reap can name each pgdata exactly and touch nothing else on the box
+        tmp_root = Path(tempfile.mkdtemp(prefix="vpproof-%s-" % re.sub(r"[^A-Za-z0-9_.-]", "_", args.proof_id)[-40:]))
+        env["TMPDIR"] = str(tmp_root)
+        env["VPPROOF_TMP_ROOT"] = str(tmp_root)
         started = utc_ms()
         timed_out = False
         with open(log_path, "w", encoding="utf-8") as fh:
@@ -434,28 +570,29 @@ def run_proof(args):
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                     stdout=fh, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+            escalation = []
             try:
                 rc = proc.wait(timeout=timeout_min * 60)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except OSError:
-                    pass
-                try:
-                    rc = proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except OSError:
-                        pass
-                    rc = proc.wait()
-            fh.write("\n# vpproof end %s rc=%s timed_out=%s\n" % (utc_ms(), rc, timed_out))
+                rc, escalation = stop_group(
+                    proc, log,
+                    grace_int=float(proof_cfg.get("kill_grace_int_s", KILL_GRACE_INT_S)),
+                    grace_term=float(proof_cfg.get("kill_grace_term_s", KILL_GRACE_TERM_S)))
+            reaped = reap_run_postmasters(tmp_root, env.get("VPPROOF_PYTHON") or py_for_reap, log)
+            leftover = [r for r in reaped if not r["stopped"]]
+            if not leftover:
+                shutil.rmtree(str(tmp_root), ignore_errors=True)
+            fh.write("\n# vpproof end %s rc=%s timed_out=%s escalation=%s reaped=%s\n"
+                     % (utc_ms(), rc, timed_out, json.dumps(escalation), json.dumps(reaped)))
         text = log_path.read_text(encoding="utf-8", errors="replace")
         status, counts = (_classify_vitest if args.proof_kind == "portal" else _classify)(rc, text, timed_out)
         counts["started"] = started
         counts["ended"] = utc_ms()
         counts["paths"] = paths
+        counts["escalation"] = escalation
+        counts["reaped_postmasters"] = reaped
+        counts["tmp_root"] = str(tmp_root)
         if shm is not None:
             counts["shm_preflight"] = shm
         meta = {"ts": utc_ms(), "proof_id": args.proof_id, "sha": args.sha,

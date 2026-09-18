@@ -918,6 +918,54 @@ def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypat
     assert "build skipped" in (env.run_root / "driver.log").read_text()
 
 
+# -- D18/D19: shm gate holds without a strike; repair generations are capped -------------------
+
+def test_proof_blocked_by_shm_holds_the_attempt_without_a_failure_strike(tmp_path, monkeypatch):
+    monkeypatch.setattr(lanedriver, "SHM_HOLD_S", 0.0)
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "BLOCKED_SHM", "reason": "PROOF_BLOCKED_SHM: 26 live segments >= 24"},
+                       {"status": "BLOCKED_SHM", "reason": "PROOF_BLOCKED_SHM: 26 live segments >= 24"},
+                       {"status": "BLOCKED_SHM", "reason": "PROOF_BLOCKED_SHM: 26 live segments >= 24"},
+                       {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "RUNNING", "held, not failed"
+    log = (env.run_root / "driver.log").read_text()
+    assert "HOLD L02" in log and "FAIL L02" not in log
+    assert "PROOF_BLOCKED_SHM" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    settle(drv, 3)                                    # three more adoptions: two more holds, then PASS
+    assert env.rows()["L02"]["state"] == "VERIFIED"
+    assert "FAIL L02" not in (env.run_root / "driver.log").read_text(), "box holds never count as strikes"
+    assert len(proof.calls) == 4
+    hb = json.loads((env.run_root / "driver.heartbeat").read_text())
+    assert "shm_segments" in hb
+
+
+def test_repair_generations_are_capped(tmp_path):
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": []},
+                                      "alerts": {"frontier_every_s": 0, "idle_every_min": 30}})
+    env.activate()
+
+    def grader(spec, ab):
+        # L02 fails its grade; every auto-repair of it fails too
+        return findings("FAIL")(spec, ab)
+    runner = by_role({"builder": result_ok, "grader": grader, "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 12)
+    rows = env.rows()
+    repairs = sorted(t for t in rows if t.startswith("R-L02-"))
+    assert repairs == ["R-L02-B1-1", "R-L02-B1-2"], repairs
+    assert all(rows[t]["state"] == "REPAIR_REQUIRED" for t in repairs)
+    assert rows["L02"]["state"] == "REPAIR_REQUIRED"
+    assert (env.run_root / "repairs" / "L02.capped.json").exists()
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert alerts.count("REPAIR_CAPPED") == 1
+    assert "repair generations capped at 2" in (env.run_root / "driver.log").read_text()
+
+
 # -- D11: [hosted] rows never block; [box] UNKNOWNs -> proof, then one regrade --------------------
 
 def _with_hosted_row(monkeypatch):

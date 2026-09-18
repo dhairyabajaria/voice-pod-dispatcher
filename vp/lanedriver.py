@@ -93,6 +93,13 @@ DEFAULT_ROUTE_BINDINGS = {
 MAX_RESUMES = 3
 FAIL_CAP = 3
 FAIL_BACKOFF_S = (60, 120, 300)
+# D18: a proof refused by the shm gate is a BOX condition -- hold the attempt
+# this long, count no failure; heartbeat carries the live segment count
+SHM_HOLD_S = 300.0
+SHM_POLL_S = 30.0
+# D19: auto-repair generations per parent row before the driver stops
+# re-instantiating and leaves the row to a human/packet (R-…-B5-1..7 overnight)
+REPAIR_GENERATIONS = 2
 DEFAULT_INTERVAL = 5.0
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -835,9 +842,35 @@ class LaneDriver(object):
                    "%s failure %d/%d: %s" % (task, count, FAIL_CAP, detail[:300]), task)
         return count
 
+    def note_hold(self, task, key, detail, hold_s):
+        """back the attempt off for hold_s WITHOUT a failure strike (a box
+        condition such as PROOF_BLOCKED_SHM, not the candidate's)."""
+        with self._lock:
+            ent = self._fail.get(task)
+            if ent is None or ent["key"] != key:
+                ent = {"count": 0, "next_try": 0.0, "key": key, "stuck": False}
+                self._fail[task] = ent
+            ent["next_try"] = time.monotonic() + float(hold_s)
+        self.log("HOLD %s %.0fs %s" % (task, hold_s, detail[:200]))
+
     def clear_failures(self, task):
         with self._lock:
             self._fail.pop(task, None)
+
+    def shm_segments(self):
+        """live SysV shm segment count (`ipcs -m`), sampled at most every
+        SHM_POLL_S; None when ipcs is unavailable."""
+        now = time.monotonic()
+        cached = getattr(self, "_shm_sample", None)
+        if cached and now - cached[0] < SHM_POLL_S:
+            return cached[1]
+        try:
+            rc, out, _ = self.exec.run(["ipcs", "-m"], timeout_s=30)
+            n = sum(1 for ln in out.splitlines() if ln.split()[:1] == ["m"]) if rc == 0 else None
+        except Exception:  # noqa: BLE001
+            n = None
+        self._shm_sample = (now, n)
+        return n
 
     # -- git / worktree ----------------------------------------------------------------
 
@@ -1589,7 +1622,8 @@ class LaneDriver(object):
                    "idle_since": self._idle_since, "spawned_total": self.spawned_total,
                    "code_version": self.code_version(), "reloads": self._reload_count,
                    "reload_pending": self._reload_pending is not None,
-                   "reload_failed": bool(self._reload_failed)}
+                   "reload_failed": bool(self._reload_failed),
+                   "shm_segments": self.shm_segments()}
         if extra:
             payload.update(extra)
         try:
@@ -2319,6 +2353,13 @@ class LaneDriver(object):
             # after the park lifts; a quota never fails the task
             self.park_after(outcome, server, runner)
             self.log("PARKED %s %s: %s (attempt stays RUNNING)" % (task, attempt, outcome.status))
+            return
+        if outcome.status == "PROOF_BLOCKED_SHM":
+            # the box is at the shm ceiling: hold this attempt (no strike), alert once
+            self.note_hold(task, fkey, outcome.detail, SHM_HOLD_S)
+            self.alert_once("shm-blocked", "PROOF_BLOCKED_SHM",
+                            "box at the SysV shm ceiling; proofs are held (shm_segments in the heartbeat): %s"
+                            % outcome.detail[:300], task)
             return
         if result is None:
             count = self.note_failure(task, fkey, "%s: %s" % (outcome.status, outcome.detail),
@@ -3231,6 +3272,10 @@ class LaneDriver(object):
                 self._pack_logged.add(("norepair", parent))
                 self.log("FRONTIER %s REPAIR_REQUIRED left to the pack / review flow (no auto-repair)" % parent)
             return False
+        if prow.get("template_id") == "REPAIR":
+            # D19: a red repair is its parent's next generation, never a parent
+            # of its own (R-R-R-L02-B1-1-B1-1-B1-1 nested without end)
+            return False
         # a harvest-less hold (Chief-era row, no driver attempt) has nothing to repair from
         if not self._last_harvest(parent):
             return False
@@ -3247,6 +3292,22 @@ class LaneDriver(object):
         defect = (fails[0]["id"] if fails else "REPAIR").replace("/", "-")
         n = 1 + sum(1 for t, r in tasks.items()
                     if r.get("template_id") == "REPAIR" and (r.get("parameters") or {}).get("parent_contract_id") == parent)
+        cap = int(self.conc.get("repair_generations", REPAIR_GENERATIONS))
+        if n > cap:
+            # D19: every generation so far ended without VERIFIED; the driver
+            # stops here and leaves the row for a human / a pack packet (the
+            # scheduler refuses `block` on REPAIR_REQUIRED, so the parking is
+            # the driver's: repairs/<parent>.capped.json + one alert)
+            marker = self.run_root / "repairs" / ("%s.capped.json" % parent)
+            if not marker.exists():
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(json.dumps({"parent": parent, "generations": n - 1, "cap": cap,
+                                              "defect": defect, "ts": utc_ms()}, indent=2), encoding="utf-8")
+                self.alert("REPAIR_CAPPED", "%s: %d auto-repair generations ended without VERIFIED (cap %d); "
+                           "no further repair is instantiated -- needs a human or a pack packet (defect %s)"
+                           % (parent, n - 1, cap, defect), parent)
+                self.log("FRONTIER %s repair generations capped at %d (defect %s)" % (parent, cap, defect))
+            return False
         task = "R-%s-%s-%d" % (parent, defect, n)
         if task in tasks:
             return False
