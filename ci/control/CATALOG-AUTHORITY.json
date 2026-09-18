@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "status": "AUTHORITATIVE",
+  "catalog": "advisor-plans/outbound-launch/lane-contracts.json",
+  "catalog_sha256": "c9bd97e03214cf352d5fa2b74fce8b775874b66da07466af8df64d897eee787f",
+  "scheduler": "advisor-plans/outbound-launch/orchestration_control.py",
+  "scheduler_sha256": "c2bfaac77d51993ac1c659b8b6ec7b6e0d8dad79a3ce2874bac18c0ead3f8078",
+  "review_validator": "advisor-plans/outbound-launch/review_gate.py",
+  "review_validator_sha256": "c26d4813b2100bfa9b907502c7b5c36691e4868331da027f33de284138530fa6",
+  "recovery_amendment": "advisor-plans/outbound-launch/SINGLE-CHIEF-RECOVERY.md",
+  "recovery_amendment_sha256": "f90c4e54d6dac19d4d3ecdfcdd2a739ee5c0a1b2c26d11998bf5a13aa49b8763",
+  "requirement_rebinding_tool": "advisor-plans/outbound-launch/requirement_rebinding.py",
+  "requirement_rebinding_tool_sha256": "837d8e4408346f9e738727cba0c84fbee3ed5b6551e9ad1a5c1054341907cd0b",
+  "revised_plan": "advisor-plans/outbound-launch/REVISED-EXECUTION-PLAN.md",
+  "revised_plan_sha256": "ae59f335d1521ceed36ac076f3cae3beaa65c607af579ae2198800f64647b54d",
+  "legacy_catalog": "chief9-recovery/orchestration/plans/dispatch-contracts.json",
+  "legacy_catalog_status": "RETIRED_DO_NOT_DISPATCH",
+  "activation_rule": "Refuse startup when catalog/scheduler hashes differ or a second active catalog is declared. For the Chief25/26 recovery, bind both A/B queues to one exact successor thread after the old fleet is stopped; follow SINGLE-CHIEF-RECOVERY.md. File notifications do not prove runtime wake-up.",
+  "updated_at": "2026-09-18T11:51:18Z"
+}

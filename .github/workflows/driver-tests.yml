@@ -1,0 +1,35 @@
+name: driver tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dispatcher
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: python -m pip install --quiet pytest ruff
+      - name: rebuild the scheduler dir the suite imports (../voice-pod/advisor-plans/outbound-launch)
+        run: |
+          mkdir -p voice-pod/advisor-plans/outbound-launch/v13-pack
+          cp dispatcher/ci/control/orchestration_control.py dispatcher/ci/control/review_gate.py dispatcher/ci/control/CATALOG-AUTHORITY.json voice-pod/advisor-plans/outbound-launch/
+          cp dispatcher/ci/control/v13-pack/roster-v13.json voice-pod/advisor-plans/outbound-launch/v13-pack/
+          python dispatcher/ci/verify_snapshot.py "$GITHUB_WORKSPACE/test-authority.json"
+          git config --global user.email ci@vp
+          git config --global user.name ci
+          git config --global init.defaultBranch main
+      - name: driver suite
+        env:
+          VP_TEST_AUTHORITY: ${{ github.workspace }}/test-authority.json
+        run: |
+          cd dispatcher
+          python -m pytest vp/tests -q -p no:cacheprovider

@@ -1,0 +1,322 @@
+{
+  "_comment": "v13 roster (Architect, 2026-09-17 18:29 IST). Copied by the Fixer to RUN_ROOT/roster.json. Owner ruling O1: all OpenCode on go2 :4102; go1/go3 fallbacks only; zen never. No secrets here.",
+  "run": {
+    "id_prefix": "run-v13-",
+    "cn": "/Users/dhairyabajaria/Claude Code/Calling New",
+    "trunk": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/chief9-recovery",
+    "trunk_branch": "successor/s3",
+    "trunk_base_sha": "5deac821fbb129aabc149af95f729a1f8049638a",
+    "worktrees": "/Users/dhairyabajaria/Claude Code/Calling New/vp-worktrees",
+    "audit_root": "/Users/dhairyabajaria/Claude Code/Calling New/test-logs/audit",
+    "run_root": "/Users/dhairyabajaria/Claude Code/Calling New/test-logs/audit/run-v13-20260917",
+    "packets_dir": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/advisor-plans/outbound-launch/v13-pack/03-PACKETS",
+    "scheduler": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/advisor-plans/outbound-launch/orchestration_control.py",
+    "run_state": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/advisor-plans/outbound-launch/orchestration-state/run-state.json",
+    "catalog": "/Users/dhairyabajaria/Claude Code/Calling New/voice-pod/advisor-plans/outbound-launch/lane-contracts.json",
+    "stop_file": "STOP",
+    "stop_grace_s": 120
+  },
+  "night": {
+    "tz": "Asia/Kolkata",
+    "pause_on_disk_gb": 25,
+    "status_line_every_min": 30,
+    "render_every_min": 15,
+    "seal_at_local": "06:00"
+  },
+  "concurrency": {
+    "round_cap": 4,
+    "max_unions_in_flight": 1,
+    "union_trigger_items": 2,
+    "union_trigger_hours": 0.5,
+    "max_proofs_in_flight": 3,
+    "proof_wait_max_min": 90,
+    "max_minutes_per_turn": {
+      "build": 45,
+      "grade": 15,
+      "probe": 20,
+      "review": 30,
+      "security": 45,
+      "final": 60,
+      "integrate": 60,
+      "ruling": 20
+    },
+    "codex_max": 3,
+    "claude_max": 2,
+    "spawn_stagger_s": 2
+  },
+  "budget": {
+    "max_cost_usd_per_run": 400,
+    "max_cost_usd_per_item": 10,
+    "claude_max_budget_usd_per_call": 5,
+    "codex_weekly_token_cap": 60000000,
+    "count_cache_reads": true
+  },
+  "backoff": {
+    "rate_min": 15,
+    "degraded_min": 10,
+    "degraded_max_min": 60,
+    "quota_rolling_extra_min": 2,
+    "probe_before_unpark": true,
+    "park_alert_after_min": 120,
+    "drain_default_deadline_min": 30
+  },
+  "servers": {
+    "go2": {
+      "url": "http://127.0.0.1:4102",
+      "xdg_data_home": "/Users/dhairyabajaria/.local/share/vp-go2",
+      "launchd": "com.voicepod.opencode-go2",
+      "max_concurrent": 8,
+      "role": "primary",
+      "parked": false
+    },
+    "go1": {
+      "url": "http://127.0.0.1:4101",
+      "xdg_data_home": "/Users/dhairyabajaria/.local/share/vp-go1",
+      "launchd": "com.voicepod.opencode-go1",
+      "max_concurrent": 2,
+      "role": "fallback",
+      "parked": true
+    },
+    "go3": {
+      "url": "http://127.0.0.1:4103",
+      "xdg_data_home": "/Users/dhairyabajaria/.local/share/vp-go3",
+      "launchd": "com.voicepod.opencode-go3",
+      "max_concurrent": 2,
+      "role": "fallback",
+      "parked": true
+    }
+  },
+  "fallback_order": [
+    "go2",
+    "go1",
+    "go3"
+  ],
+  "zen_fallback": false,
+  "groups": {
+    "1": {
+      "server": "go2",
+      "domain": "outbound slices + Wave A repairs"
+    },
+    "2": {
+      "server": "go2",
+      "domain": "consent / SMS / voice / security"
+    },
+    "3": {
+      "server": "go2",
+      "domain": "portal + qualification lanes"
+    },
+    "4": {
+      "server": "go2",
+      "domain": "verification / ops / CI"
+    },
+    "5": {
+      "server": "go2",
+      "domain": "chain / review / docs / evidence"
+    },
+    "infra": {
+      "server": "go2",
+      "domain": "dispatcher / CI config"
+    }
+  },
+  "pin_policy": "item_to_server_on_first_assign",
+  "roles": {
+    "builder": {
+      "runner": "opencode",
+      "agent": "vp-builder",
+      "model": "opencode-go/muse-spark-1.3-contributor",
+      "variant": "xhigh",
+      "server": "go2"
+    },
+    "integrator": {
+      "runner": "opencode",
+      "agent": "vp-builder",
+      "model": "opencode-go/muse-spark-1.3-contributor",
+      "variant": "xhigh",
+      "server": "go2",
+      "max_concurrent": 1
+    },
+    "grader": {
+      "runner": "opencode",
+      "agent": "vp-junior",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "variant": "high",
+      "server": "go2",
+      "max_concurrent": 4
+    },
+    "probe": {
+      "runner": "opencode",
+      "agent": "vp-infra",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "variant": "high",
+      "server": "go2",
+      "max_concurrent": 4
+    },
+    "infra": {
+      "runner": "opencode",
+      "agent": "vp-infra",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "variant": "xhigh",
+      "server": "go2"
+    },
+    "junior": {
+      "runner": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "xhigh",
+      "sandbox": "workspace-write",
+      "schema": "REVIEW_SCHEMA.json",
+      "per_union": true,
+      "max_concurrent": 2,
+      "review_gate_role": "junior"
+    },
+    "security": {
+      "runner": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "sandbox": "read-only",
+      "schema": "REVIEW_SCHEMA.json",
+      "max_concurrent": 1,
+      "review_gate_role": "security"
+    },
+    "final": {
+      "runner": "codex",
+      "model": "gpt-5.6-sol-1m",
+      "effort": "high",
+      "sandbox": "read-only",
+      "schema": "REVIEW_SCHEMA.json",
+      "fresh_session": true,
+      "max_concurrent": 1,
+      "review_gate_role": "final_review",
+      "model_until_alias_added": "gpt-5.6-sol"
+    },
+    "adjudicator": {
+      "runner": "codex",
+      "model": "gpt-5.6-terra",
+      "effort": "xhigh",
+      "sandbox": "read-only",
+      "after_failed_repairs": 2
+    },
+    "ruling": {
+      "runner": "claude",
+      "model": "claude-opus-5",
+      "effort": "medium",
+      "settings": "integrator.json",
+      "max_turns": 40
+    },
+    "advisor": {
+      "runner": "agy",
+      "model": "gemini-3.8-flash-high",
+      "blocking": false
+    }
+  },
+  "kind_map": {
+    "builder": "builder",
+    "design": "builder",
+    "integration": "integrator",
+    "probe": "probe",
+    "control": "probe",
+    "verification": "grader",
+    "grader": "grader",
+    "operations": "infra",
+    "provider": "infra",
+    "security_build": "security",
+    "junior": "junior",
+    "final_review": "final",
+    "adjudicator": "adjudicator",
+    "ruling": "ruling",
+    "advisor": "advisor"
+  },
+  "pricing": {
+    "codex": {
+      "billing": "subscription",
+      "models": {
+        "gpt-5.6-luna": {
+          "input_per_1m": 0,
+          "cached_input_per_1m": 0,
+          "output_per_1m": 0
+        },
+        "gpt-5.6-sol": {
+          "input_per_1m": 0,
+          "cached_input_per_1m": 0,
+          "output_per_1m": 0
+        },
+        "gpt-5.6-sol-1m": {
+          "input_per_1m": 0,
+          "cached_input_per_1m": 0,
+          "output_per_1m": 0
+        },
+        "gpt-5.6-terra": {
+          "input_per_1m": 0,
+          "cached_input_per_1m": 0,
+          "output_per_1m": 0
+        }
+      }
+    },
+    "agy": {
+      "billing": "free",
+      "models": {
+        "gemini-3.8-flash-high": {
+          "input_per_1m": 0,
+          "cached_input_per_1m": 0,
+          "output_per_1m": 0
+        }
+      }
+    }
+  },
+  "proof": {
+    "box_slots": 1,
+    "portal_slots": 1,
+    "shm_reap": true,
+    "floor_rebaseline": true,
+    "floor_suites": [
+      "platform",
+      "agent",
+      "portal"
+    ],
+    "circleci": {
+      "enabled": true,
+      "mode": "overflow",
+      "kinds": [
+        "full"
+      ],
+      "param": "run_full_suite",
+      "branch_prefix": "vp/proof/",
+      "account": "3",
+      "definition_id": "5c8213d0-1d01-416c-bae6-983da31dd8d2",
+      "project_slug": "circleci/ENeXGDVeXvRGEyPGm5rywd/csivA8jTLotdwZbp17ACv",
+      "poll_interval_s": 60,
+      "deadline_min": 90,
+      "delete_branch_after": true,
+      "max_pipelines_in_flight": 2,
+      "max_pipelines_per_day": 1000,
+      "flake_rerun_max": 10,
+      "flip_off_watcher": false
+    }
+  },
+  "packet": {
+    "shared_files": [
+      "TECHNICAL.md",
+      "platform/tests/test_permission_matrix.py",
+      "platform/tests/test_capability_contract.py",
+      "platform/tests/test_capability_route_gate.py",
+      "platform/tests/test_docs_truth.py"
+    ],
+    "require_tags": [
+      "box",
+      "hosted"
+    ],
+    "verified_local_on_box_rows": true
+  },
+  "review": {
+    "junior_minor_fix_list": "04-REVIEW-POLICY.md#minor",
+    "unknown_is_never_pass": true,
+    "regrade_same_commit_on_unknown_once": true,
+    "adjudicate_after_failed_repairs": 2
+  },
+  "logging": {
+    "prompt_verbatim": true,
+    "control_jsonl": true,
+    "git_jsonl": true,
+    "comms_jsonl": true,
+    "costs_jsonl": true
+  }
+}
