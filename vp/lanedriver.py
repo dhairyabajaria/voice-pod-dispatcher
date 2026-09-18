@@ -363,9 +363,15 @@ def normalize_roster(data):
         ctl["catalog"] = run["catalog"]
     if run.get("packets_dir") and not run.get("pack_dir"):
         run["pack_dir"] = run["packets_dir"]
-    for srv in (r.get("servers") or {}).values():
+    servers = r.get("servers") or {}
+    for name in [n for n, srv in servers.items() if not isinstance(srv, dict)]:
+        # D42: a note or a typo among the servers is dropped, never fatal (a string here
+        # killed the driver on a roster reload, 2026-09-18 22:59Z)
+        servers.pop(name)
+    for srv in servers.values():
         if "parked" not in srv and srv.get("role") == "fallback":
             srv["parked"] = True
+    r["roles"] = {k: v for k, v in (r.get("roles") or {}).items() if isinstance(v, dict)}
     night = r.get("night") or {}
     alerts = r.setdefault("alerts", {})
     if night.get("render_every_min") and "render_every_s" not in alerts:
@@ -732,11 +738,14 @@ class LaneDriver(object):
             return
         try:
             data = normalize_roster(json.loads(self.roster_path.read_text(encoding="utf-8")))
-        except ValueError:
+            with self._lock:
+                self._apply_roster(data)
+        except Exception as exc:  # noqa: BLE001 -- D42: a bad roster edit never takes the driver down
+            self._roster_mtime = m                # report once per edit, keep the last good roster
+            self.alert("ROSTER_REJECTED", "roster.json edit at mtime %s not applied, the previous roster stays "
+                       "live: %s: %s" % (m, type(exc).__name__, str(exc)[:200]))
             return
         self._roster_mtime = m
-        with self._lock:
-            self._apply_roster(data)
         snap = snapshot_roster(self.run_root, self.roster_path.read_bytes())
         self.log("roster reloaded (mtime changed) -> %s" % (snap.name if snap else "no snapshot"))
 

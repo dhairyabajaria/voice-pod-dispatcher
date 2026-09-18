@@ -1590,6 +1590,35 @@ def test_item10_normalize_roster_maps_architect_vocabulary_onto_the_driver():
 
 
 @pytest.mark.skipif(_V13_PACK_SKIP_REASON is not None, reason=str(_V13_PACK_SKIP_REASON))
+def test_a_malformed_roster_edit_is_rejected_not_fatal(tmp_path):
+    """D42: a note string among `servers` (2026-09-18 22:59Z) crashed the driver in
+    normalize_roster on a hot reload.  Now: non-dict server/role entries are dropped,
+    and any other reload failure is ROSTER_REJECTED with the last good roster kept."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()})
+    roster = json.loads((env.run_root / "roster.json").read_text())
+    roster["servers"]["_note"] = "go2/go3 out of credits: everything on go1"
+    roster["roles"]["_note"] = "see servers"
+    assert "_note" not in lanedriver.normalize_roster(roster)["servers"]
+    assert "_note" not in lanedriver.normalize_roster(roster)["roles"]
+    (env.run_root / "roster.json").write_text(json.dumps(roster, indent=2))
+    drv._roster_mtime = 0
+    drv.tick()                                        # would have raised AttributeError before D42
+    assert "_note" not in drv.servers and "_note" not in drv.roles
+    assert "roster reloaded" in (env.run_root / "driver.log").read_text()
+    # a roster whose shape normalize_roster cannot read at all: rejected, previous roster live
+    before = dict(drv.servers)
+    (env.run_root / "roster.json").write_text(json.dumps({"servers": "nope", "roles": 3, "run": []}))
+    drv._roster_mtime = 0
+    drv.tick()
+    assert drv.servers == before
+    assert "ROSTER_REJECTED" in (env.run_root / "alerts.jsonl").read_text()
+    n = (env.run_root / "alerts.jsonl").read_text().count("ROSTER_REJECTED")
+    drv.tick()
+    assert (env.run_root / "alerts.jsonl").read_text().count("ROSTER_REJECTED") == n, "reported once per edit"
+
+
 def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     import vplint
     src = CONTROL_DIR / "v13-pack" / "roster-v13.json"
