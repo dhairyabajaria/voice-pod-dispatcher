@@ -1508,7 +1508,7 @@ def test_d71_canary_gate_holds_every_other_circleci_twin_until_the_canary_answer
                body="parent %s for L00" % pid)
         (pd / pid / "BENCHMARK.md").write_text(BM_CIRCLECI_ONLY.format(id=pid))
     canary = {"task": "P-A-HOSTED", "armed_at": "2026-09-19T15:00:00Z", "released_at": None,
-              "release_on": ["PASS", "FAIL"], "outcome": None, "reason": "§21.2 test"}
+              "release_on": ["PASS"], "outcome": None, "reason": "§21.2 test"}
     env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
                                       "packet": {"twin_dependents": []},
                                       "owner_gates": {"DELIVERY-1": True},
@@ -1540,17 +1540,29 @@ def test_d71_canary_gate_holds_every_other_circleci_twin_until_the_canary_answer
     assert json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]["released_at"] is None
     # a real answer: pipeline_id + PASS -> released, recorded in the roster, the held twin claims
     time.sleep(0.05)
-    # D71a: the proof vocabulary is FAIL_PRODUCT; roster release_on says FAIL -- a real
-    # pipeline that failed the product IS an answer (2026-09-19 19:03Z: pipeline 722a0b89)
+    # §38 / D71b: a red answer on a real pipeline (FAIL_PRODUCT, 2026-09-19 19:03Z pipeline
+    # 722a0b89) is a real answer -- CANARY_ANSWERED_RED once -- but KEEPS the hold
     (proofs / "proof-P-A-HOSTED-2.json").write_text(json.dumps(
-        {"proof_id": "proof-P-A-HOSTED-2", "status": "FAIL_PRODUCT", "pipeline_id": "pipe-123", "route": "circleci"}))
+        {"proof_id": "proof-P-A-HOSTED-2", "status": "FAIL_PRODUCT", "pipeline_id": "pipe-red", "route": "circleci",
+         "failed_nodes": ["t.py::a", "t.py::b"]}))
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-B-HOSTED"]["state"] == "READY", "a red canary keeps the hold"
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert alerts.count("CANARY_ANSWERED_RED") == 1 and "FAIL_PRODUCT on pipeline pipe-red" in alerts and "2 red node(s)" in alerts
+    assert alerts.count("CANARY_NOT_ANSWERED") == 1, "a red answer is not 'not answered'"
+    assert json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]["released_at"] is None
+    # PASS on a real pipeline releases
+    time.sleep(0.05)
+    (proofs / "proof-P-A-HOSTED-3.json").write_text(json.dumps(
+        {"proof_id": "proof-P-A-HOSTED-3", "status": "PASS", "pipeline_id": "pipe-123", "route": "circleci"}))
     settle(drv, 8)
     rows = env.rows()
     assert rows["P-B-HOSTED"]["state"] == "VERIFIED", rows["P-B-HOSTED"]
     log = (env.run_root / "driver.log").read_text()
-    assert "CANARY_RELEASED P-A-HOSTED: pipeline pipe-123 -> FAIL_PRODUCT" in log
+    assert "CANARY_RELEASED P-A-HOSTED: pipeline pipe-123 -> PASS" in log
     rc = json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]
-    assert rc["released_at"] and rc["outcome"] == "FAIL_PRODUCT" and rc["pipeline_id"] == "pipe-123"
+    assert rc["released_at"] and rc["outcome"] == "PASS" and rc["pipeline_id"] == "pipe-123"
     assert (env.run_root / "alerts.jsonl").read_text().count("CANARY_RELEASED") == 1
     assert "ROSTER_REJECTED" not in log, "the driver's own roster write re-applies clean"
     # the lint rule
@@ -1558,6 +1570,8 @@ def test_d71_canary_gate_holds_every_other_circleci_twin_until_the_canary_answer
     bad["proof"]["circleci"]["canary"] = {"task": "P-A", "release_on": ["MAYBE"], "armed_at": "yesterday"}
     msgs = vplint.lint_roster_v13(bad)
     assert any("is not a hosted twin" in m for m in msgs) and any("release_on" in m for m in msgs)
+    bad["proof"]["circleci"]["canary"]["release_on"] = ["PASS", "FAIL"]      # §38: FAIL may not release
+    assert any("release_on must be [PASS]" in m for m in vplint.lint_roster_v13(bad))
     assert any("armed_at" in m for m in msgs)
     bad["proof"]["circleci"]["canary"] = {"task": "P-ZZ-HOSTED"}
     assert any("no packet P-ZZ" in m for m in vplint.lint_roster_v13(bad))

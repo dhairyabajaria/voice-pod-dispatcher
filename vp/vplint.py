@@ -539,9 +539,11 @@ def lint_roster_v13(r):
                 out.append("ERROR roster: proof.circleci.canary.task %r is not a hosted twin (<ID>-HOSTED[-<GATE>])" % task)
             elif pack_dir and not os.path.exists(os.path.join(pack_dir, parent, "PACKET.md")):
                 out.append("ERROR roster: proof.circleci.canary.task %r: no packet %s in %s" % (task, parent, pack_dir))
-            bad = [x for x in (canary.get("release_on") or ["PASS", "FAIL"]) if x not in ("PASS", "FAIL")]
+            # §38 (D71b): PASS only -- a red answer keeps the hold, it never releases the twins
+            bad = [x for x in (canary.get("release_on") or ["PASS"]) if x != "PASS"]
             if bad:
-                out.append("ERROR roster: proof.circleci.canary.release_on must be a subset of [PASS, FAIL]; got %s" % bad)
+                out.append("ERROR roster: proof.circleci.canary.release_on must be [PASS] (§38: a red answer keeps "
+                           "the hold); got %s" % bad)
             for f in ("armed_at", "released_at"):
                 v = canary.get(f)
                 if v is not None and not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$", str(v)):

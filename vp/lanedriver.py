@@ -1293,10 +1293,11 @@ class LaneDriver(object):
             return
         status = str(rec.get("status") or "")
         pipeline = rec.get("pipeline_id")
-        release_on = [str(x) for x in (c.get("release_on") or ["PASS", "FAIL"])]
-        # D71a (2026-09-19 19:03Z): the proof vocabulary says FAIL_PRODUCT, the roster
-        # says FAIL -- pipeline 722a0b89 answered FAIL_PRODUCT (6 real reds, floor job
-        # green) and the literal match called it "not a real answer"
+        # §38 (D71b): the canary releases on PASS only; a red answer on a real pipeline
+        # (FAIL_PRODUCT / FAIL_INFRA) is a real answer -- logged CANARY_ANSWERED_RED,
+        # never urgent -- and KEEPS the hold: one pipeline per union tip, never one per
+        # twin (7 x ~2,300 credits saved on 722a0b89's known-red tip)
+        release_on = [str(x) for x in (c.get("release_on") or ["PASS"])]
         answers = set(release_on) | ({"FAIL_PRODUCT"} if "FAIL" in release_on else set())
         if pipeline and status in answers:
             ts = utc_ms()
@@ -1317,6 +1318,13 @@ class LaneDriver(object):
             with self._lock:
                 for k in [k for k in self._pack_logged if isinstance(k, tuple) and k[0] == "canary-hold"]:
                     self._pack_logged.discard(k)
+            return
+        if pipeline and status in ("FAIL_PRODUCT", "FAIL_INFRA"):
+            self.alert_once("canary-red:%s" % rec.get("proof_id"), "CANARY_ANSWERED_RED",
+                            "%s answered %s on pipeline %s (proof %s, %d red node(s)): a real answer, hold stays "
+                            "(§38: one pipeline per union tip); repair packets, then re-arm on the next union"
+                            % (c["task"], status, pipeline, rec.get("proof_id"), len(rec.get("failed_nodes") or [])),
+                            c["task"])
             return
         self.alert_once("canary-unanswered:%s" % rec.get("proof_id"), "CANARY_NOT_ANSWERED",
                         "%s proof %s is not a real answer: status %s, pipeline_id %s, route %s: %s -- hold stays; "
