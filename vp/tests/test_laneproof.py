@@ -234,8 +234,8 @@ def test_circleci_failure_is_unknown_never_a_crash(tmp_path):
     rec = p.run("L35", "proof-4", wt, base, cand, "platform", [])
     # D44: a credit-shaped trigger error rotates through every account; all refusing
     # is BLOCKED_CREDITS (held, no strike), and the reason names each account
-    assert rec["status"] == "BLOCKED_CREDITS" and rec["reason"].count("credits exhausted") == 3, rec
-    assert sorted(p._credit_blocked) == ["1", "2", "3"]
+    assert rec["status"] == "BLOCKED_CREDITS" and rec["reason"].count("credits exhausted") == 6, rec
+    assert sorted(p._credit_blocked) == ["1", "2", "3", "A1", "A2", "A3"]
 
     class Broken2(FakeCircle):
         def trigger(self, *a, **k):
@@ -347,9 +347,10 @@ def test_circleci_credit_refusal_after_the_trigger_is_blocked_credits_not_a_fail
     p = make_proof(tmp_path, fake, FakeExec({}))
     rec = p.run("L22-HOSTED", "proof-5", wt, base, cand, "platform", [])
     # D44: every account was tried on its own repo and refused; the reason names each
-    assert rec["status"] == "BLOCKED_CREDITS" and rec["reason"].count("no credits") == 3 and rec["pipeline_id"] is None
+    assert rec["status"] == "BLOCKED_CREDITS" and rec["reason"].count("no credits") >= 3 and rec["pipeline_id"] is None
+    assert sorted(p._credit_blocked) == sorted(FakeCircle.DEFAULT_ROTATION), "every account was refused"
     assert ("credit_block", ["lint-and-typecheck"]) in fake.calls
-    assert [c[3] for c in fake.calls if c[0] == "trigger"] == ["3", "1", "2"]
+    assert [c[3] for c in fake.calls if c[0] == "trigger"] == ["3", "1", "2", "A1", "A2", "A3"]
     assert any(c[:2] == ("delete", "vp/proof/proof-5-%s" % cand[:12]) for c in fake.calls), "branch cleaned up"
     # the real detector reads the failed job's messages through the runner
     import vpcircle
@@ -400,7 +401,7 @@ def test_circleci_rotates_to_the_next_account_on_its_own_repo_when_one_is_out_of
     assert rec["account"] == "1" and [c[3] for c in fake.calls if c[0] == "trigger"] == ["1"]
     assert [c[2] for c in fake.calls if c[0] == "push"] == ["git@github.com:voicepod-ci-mirror-a/voice-pod-NEW.git"]
     # every account refused -> BLOCKED_CREDITS (the driver holds, no strike)
-    p._credit_blocked = {a: p._credit_blocked.get("3") for a in ("1", "2", "3")}
+    p._credit_blocked = {a: p._credit_blocked.get("3") for a in vpcircle.DEFAULT_ROTATION}
     rec = p.run("L24-HOSTED", "proof-8", wt, base, cand, "platform", [])
     assert rec["status"] == "BLOCKED_CREDITS" and "blocked for credits" in rec["reason"]
     # roster overrides reach the target table

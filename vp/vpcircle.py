@@ -89,8 +89,23 @@ TARGETS = {
           "definition_id": "a38ba2a6-da55-4603-a292-3b643b15925d",
           "push_remote": "git@github.com:voicepod-ci-mirror-b/voice-pod-NEW.git",
           "org": "Voice Pod CI Secondary B", "repo": "voicepod-ci-mirror-b/voice-pod-NEW"},
+    # 2026-09-19: three more free accounts (Documents/Codex/2026-09-19/i-x20/outputs/
+    # circleci-a1-a2-a3-setup.md); their repos' main carries .circleci/config.yml but
+    # tracks nothing else, so every proof pushes its own branch there like mirror-a/b
+    "A1": {"slug": "circleci/CSZi7Pw8QgkjdRaRZLj3bi/VETg6T1BByH52PsSfYKmAE",
+           "definition_id": "9481bb27-a41a-42d5-b531-de36e939719c",
+           "push_remote": "git@github.com:voicepod-ci-a1/voice-pod-NEW.git",
+           "org": "Voice Pod CI Mirror A", "repo": "voicepod-ci-a1/voice-pod-NEW"},
+    "A2": {"slug": "circleci/VGTkmCrP3rdFBeQd8e8isp/1322e1d2-3c0e-43e6-a832-33b7dc77b05c",
+           "definition_id": "7d17b83e-708b-4efd-b550-3705b221f188",
+           "push_remote": "git@github.com:voicepod-ci-a2/voice-pod-NEW.git",
+           "org": "Voice Pod CI Mirror B", "repo": "voicepod-ci-a2/voice-pod-NEW"},
+    "A3": {"slug": "circleci/PFL9XcTHmMQkUPPrF83WFQ/b392bf4a-bfdd-4073-bec1-500063db7145",
+           "definition_id": "b230e38b-07c8-4326-8b07-45dc1687a405",
+           "push_remote": "git@github.com:voicepod-ci-a3/voice-pod-NEW.git",
+           "org": "Voice Pod CI Mirror C", "repo": "voicepod-ci-a3/voice-pod-NEW"},
 }
-DEFAULT_ROTATION = ("3", "1", "2")
+DEFAULT_ROTATION = ("3", "1", "2", "A1", "A2", "A3")
 
 
 def target(account=None, overrides=None):
