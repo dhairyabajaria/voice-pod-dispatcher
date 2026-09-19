@@ -257,3 +257,20 @@ def test_d59_a_successful_reload_lifts_stuck_strikes(tmp_path):
     recs = _reloads(env)
     assert recs and recs[-1]["ok"] and recs[-1]["stuck_lifted"] == ["L00"]
     assert "RELOAD lifted STUCK strikes for ['L00']" in (env.run_root / "driver.log").read_text()
+
+
+def test_d74_circleaccount_is_a_reload_target(tmp_path):
+    """D74: circleaccount.py (dispatcher/, imported by vpcircle) holds the
+    CircleCI account allow-list; the live driver kept the pre-be57344 copy
+    (no A1/A2/A3) because the module was neither in RELOAD_ORDER nor under
+    dispatcher/vp, so the canary L06-HOSTED-R2 struck 'Unknown CircleCI
+    account' twice on 2026-09-19 17:18Z.  It must reload, before vpcircle."""
+    import lanedriver
+    order = lanedriver.RELOAD_ORDER
+    assert "circleaccount" in order and order.index("circleaccount") < order.index("vpcircle")
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()}, interval=0.2)
+    names = [n for n, _ in drv.reload_targets()]
+    assert "circleaccount" in names, names
+    assert names.index("circleaccount") < names.index("vpcircle") < names.index("lanedriver")

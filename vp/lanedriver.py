@@ -338,7 +338,7 @@ DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
 # active == 0, reload these helper modules in dependency order, load a fresh copy
 # of lanedriver.py and rebind every live object's class to it, resume.
 RELOAD_FILE = "RELOAD"
-RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "vpcircle", "vpdriver", "vpproof", "vpmerge",
+RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpdriver", "vpproof", "vpmerge",
                 "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
 
@@ -2887,7 +2887,8 @@ class LaneDriver(object):
         for name in getattr(self, "reload_modules", RELOAD_ORDER):
             mod = sys.modules.get(name)
             f = getattr(mod, "__file__", None)
-            if f and Path(f).resolve().parent == self.here:
+            # D74: circleaccount.py lives one level up (dispatcher/), imported by vpcircle
+            if f and Path(f).resolve().parent in (self.here, self.here.parent):
                 out.append((name, Path(f).resolve()))
         for name in getattr(self, "reload_extra", []):
             mod = sys.modules.get(name)
