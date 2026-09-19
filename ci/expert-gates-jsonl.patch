@@ -1,0 +1,65 @@
+diff --git a/vp/lanedriver.py b/vp/lanedriver.py
+index fb6d9f4..c14a8c1 100644
+--- a/vp/lanedriver.py
++++ b/vp/lanedriver.py
+@@ -535,8 +535,30 @@ class LaneDriver(object):
+         self.spawned_total = 0
+         self.completed = []             # (task, attempt, outcome) for tests / handoff
+ 
++    def _note_gate_flips(self, data):
++        """D64: gates.jsonl -- one line per owner_gates value seen: every gate at
++        startup (why=startup) and every later change (why=reload, from->to). The
++        dashboard reads a gate's age from here; roster.N.json mtimes are only
++        the fallback. No lock: the reload path already holds self._lock and the
++        driver is the only writer."""
++        gates = data.get("owner_gates")
++        gates = {k: bool(v) for k, v in gates.items() if not str(k).startswith("_")} if isinstance(gates, dict) else {}
++        prev = getattr(self, "_gates_seen", None)
++        path = self.run_root / "gates.jsonl"
++        ts = utc_ms()
++        if prev is None:
++            for g in sorted(gates):
++                _append_jsonl(path, {"ts": ts, "gate": g, "from": None, "to": gates[g], "why": "startup"})
++        else:
++            for g in sorted(set(gates) | set(prev)):
++                if gates.get(g) != prev.get(g):
++                    _append_jsonl(path, {"ts": ts, "gate": g, "from": prev.get(g), "to": gates.get(g), "why": "reload"})
++                    self.log("GATE %s %s -> %s" % (g, prev.get(g), gates.get(g)))
++        self._gates_seen = gates
++
+     def _apply_roster(self, data):
+         self.roster = data
++        self._note_gate_flips(data)
+         self.night = data.get("night", {})
+         self.conc = data.get("concurrency", {})
+         self.budget = data.get("budget", {})
+diff --git a/vp/tests/test_lanedriver.py b/vp/tests/test_lanedriver.py
+index af72e47..87bb948 100644
+--- a/vp/tests/test_lanedriver.py
++++ b/vp/tests/test_lanedriver.py
+@@ -1962,3 +1962,25 @@ def test_d60_alert_severity_is_pattern_based_and_survives_a_restart(tmp_path):
+     # the legacy kind floor still pages a first STUCK
+     drv2.alert("STUCK", "3 failures", task="OTHER")
+     assert pages[-1] == "STUCK attention"
++
++
++def test_d64_gates_jsonl_records_startup_values_and_every_flip(tmp_path):
++    env = Env(tmp_path, roster_extra={"owner_gates": {"DELIVERY-1": False, "DELIVERY-2": True, "_comment": "x"}})
++    env.activate()
++    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
++    rows = [json.loads(l) for l in (env.run_root / "gates.jsonl").read_text().splitlines()]
++    assert [(r["gate"], r["from"], r["to"], r["why"]) for r in rows] == [
++        ("DELIVERY-1", None, False, "startup"), ("DELIVERY-2", None, True, "startup")]
++    # a roster edit that flips one gate and adds one writes exactly those two lines
++    env.roster["owner_gates"] = {"DELIVERY-1": True, "DELIVERY-2": True, "DELIVERY-3": False}
++    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
++    os.utime(env.run_root / "roster.json", None)
++    drv._roster_mtime = None
++    drv._reload_roster_if_changed()
++    rows = [json.loads(l) for l in (env.run_root / "gates.jsonl").read_text().splitlines()]
++    assert [(r["gate"], r["from"], r["to"], r["why"]) for r in rows[2:]] == [
++        ("DELIVERY-1", False, True, "reload"), ("DELIVERY-3", None, False, "reload")]
++    assert "GATE DELIVERY-1 False -> True" in (env.run_root / "driver.log").read_text()
++    # an unchanged roster (a code reload re-applies it) writes nothing
++    drv._apply_roster(drv.roster)
++    assert len((env.run_root / "gates.jsonl").read_text().splitlines()) == 4

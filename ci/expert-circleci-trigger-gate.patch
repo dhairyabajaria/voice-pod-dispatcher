@@ -1,0 +1,276 @@
+diff --git a/vp/laneproof.py b/vp/laneproof.py
+index e3039c6..2221466 100644
+--- a/vp/laneproof.py
++++ b/vp/laneproof.py
+@@ -49,7 +49,7 @@ def utc_ms():
+ class Proof(object):
+ 
+     def __init__(self, run_root, here, cn, git, exec_, log, alert, proof_cfg, circle=None,
+-                 circle_runner=None, python=None):
++                 circle_runner=None, python=None, gate_open=None):
+         self.run_root = Path(run_root)
+         self.here = Path(here)
+         self.cn = Path(cn)
+@@ -61,6 +61,9 @@ class Proof(object):
+         self.circle = circle or vpcircle
+         self.circle_runner = circle_runner
+         self.python = python or sys.executable
++        # D65: callable() -> bool read at TRIGGER time (the driver passes a lambda over
++        # its live roster); None = no owner gate on CircleCI triggers
++        self.gate_open = gate_open
+         self._lock = threading.Lock()
+         self.box_active = 0
+         self.circle_active = 0
+@@ -110,27 +113,66 @@ class Proof(object):
+                 return "box", "overflow: box free (%d/%d)" % (self.box_active, slots)
+             return "circleci", "overflow: box busy (%d/%d)" % (self.box_active, slots)
+ 
++    TRIGGERED = "triggered"
++    # D65: every trigger attempt leaves a ledger row; only TRIGGERED rows spend a pipeline
++    REFUSED_GATE, REFUSED_CAP, REFUSED_OFF = "refused_gate", "refused_cap", "refused_off"
++    CREDITS_BLOCKED, TRIGGER_FAILED = "credits_blocked", "trigger_failed"
++
+     def pipelines_today(self):
++        """pipelines actually triggered today (UTC): rows without a status are the
++        pre-D65 ledger, which recorded successful triggers only"""
+         ledger = self.run_root / "proofs" / "circleci-pipelines.jsonl"
+         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+         n = 0
+         try:
+             for line in ledger.read_text(encoding="utf-8").splitlines():
+                 try:
+-                    if json.loads(line).get("ts", "")[:10] == today:
+-                        n += 1
++                    row = json.loads(line)
+                 except ValueError:
+-                    pass
++                    continue
++                if row.get("ts", "")[:10] == today and row.get("status", self.TRIGGERED) == self.TRIGGERED:
++                    n += 1
+         except OSError:
+             pass
+         return n
+ 
+-    def _note_pipeline(self, pid, pipeline_id, account, cand):
++    def _note_pipeline(self, pid, pipeline_id, account, cand, status=TRIGGERED, reason=None):
+         ledger = self.run_root / "proofs" / "circleci-pipelines.jsonl"
+         ledger.parent.mkdir(parents=True, exist_ok=True)
++        row = {"ts": utc_ms(), "proof_id": pid, "pipeline_id": pipeline_id, "account": account, "sha": cand,
++               "status": status}
++        if reason:
++            row["reason"] = str(reason)[:300]
+         with open(ledger, "a", encoding="utf-8") as fh:
+-            fh.write(json.dumps({"ts": utc_ms(), "proof_id": pid, "pipeline_id": pipeline_id,
+-                                 "account": account, "sha": cand}) + "\n")
++            fh.write(json.dumps(row) + "\n")
++
++    class Refused(RuntimeError):
++        """a trigger our own gate/cap/off-switch refused at trigger time (not CircleCI)"""
++
++        def __init__(self, status, why):
++            RuntimeError.__init__(self, why)
++            self.status = status
++
++    def _trigger_refusal(self, cc):
++        """-> (status, why) when a trigger must not happen NOW, else None. route()
++        asked the same questions when the proof was routed; a pipeline is spent at
++        the trigger, so they are asked again here (2026-09-18 21:25-21:32Z: 11
++        account-3 pipelines from rounds routed before DELIVERY-1 closed)."""
++        if self.gate_open is not None:
++            try:
++                open_ = bool(self.gate_open())
++            except Exception as exc:  # noqa: BLE001 -- an unreadable gate is a closed gate
++                return self.REFUSED_GATE, "owner gate unreadable at trigger time: %s" % str(exc)[:120]
++            if not open_:
++                return self.REFUSED_GATE, "owner gate DELIVERY-1 not open at trigger time"
++        if self.circle_off():
++            return self.REFUSED_OFF, "circleci flipped off (%s) at trigger time" % OFF_FILE
++        cap = cc.get("max_pipelines_per_day")
++        if cap is not None and int(cap) > 0:
++            n = self.pipelines_today()
++            if n >= int(cap):
++                return self.REFUSED_CAP, "%d pipelines triggered today >= max_pipelines_per_day %d" % (n, int(cap))
++        return None
+ 
+     # -- entry -----------------------------------------------------------------------------
+ 
+@@ -251,6 +293,10 @@ class Proof(object):
+                     raise self.AllBlocked("every CircleCI account is blocked for credits: %s" % skipped)
+                 res, refusals = None, []
+                 for acct in accounts:
++                    refusal = self._trigger_refusal(cc)
++                    if refusal:
++                        self._note_pipeline(pid, None, acct, cand, status=refusal[0], reason=refusal[1])
++                        raise self.Refused(*refusal)
+                     # D44: each account triggers its own project on its own GitHub repo --
+                     # push there first, and prove the branch is there (D38)
+                     tgt = self.circle.target(acct, targets)
+@@ -264,9 +310,11 @@ class Proof(object):
+                         trig = self.circle.trigger(branch, {param: True}, runner, acct, targets=targets, rotate=False)
+                     except RuntimeError as exc:
+                         if self.circle._looks_like_credit_error(str(exc)):
++                            self._note_pipeline(pid, None, acct, cand, status=self.CREDITS_BLOCKED, reason=str(exc))
+                             refusals.append((acct, str(exc)[:200]))
+                             self._block_account(acct, str(exc))
+                             continue
++                        self._note_pipeline(pid, None, acct, cand, status=self.TRIGGER_FAILED, reason=str(exc))
+                         raise
+                     pipeline_id, account = trig["pipeline_id"], trig["account"]
+                     self._note_pipeline(pid, pipeline_id, account, cand)
+@@ -284,6 +332,7 @@ class Proof(object):
+                     # account is out; the next one gets the same branch on its own repo
+                     refusals.append((acct, blocked[:200]))
+                     self._block_account(acct, blocked)
++                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.CREDITS_BLOCKED, reason=blocked)
+                     self.log("PROOF %s %s circleci pipeline %s (account %s) blocked for credits -> next account"
+                              % (task, pid, pipeline_id, account))
+                     res, pipeline_id, account = None, None, None
+@@ -296,6 +345,20 @@ class Proof(object):
+                        "pipeline_id": pipeline_id, "cancelled_workflows": done, "ts": utc_ms()}
+                 self._write(pid, rec)
+                 return rec
++            except self.Refused as exc:
++                # our own gate/cap/off switch said no at trigger time: no pipeline was spent
++                if exc.status == self.REFUSED_CAP and paths:
++                    # a targeted suite can still run on the box, exactly as route() would have sent it
++                    self.log("PROOF %s %s circleci refused (%s) -> box" % (task, pid, exc))
++                    return self.run_box(task, pid, wt, cand, kind, paths)
++                status = {self.REFUSED_GATE: "BLOCKED_GATE", self.REFUSED_CAP: "BLOCKED_CAP",
++                          self.REFUSED_OFF: "BLOCKED_OFF"}[exc.status]
++                rec = {"status": status, "route": "circleci", "proof_id": pid, "sha": cand, "kind": kind,
++                       "pipeline_id": None, "account": None, "branch": branch,
++                       "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
++                self._write(pid, rec)
++                self.log("PROOF %s %s -> %s: %s" % (task, pid, status, str(exc)[:200]))
++                return rec
+             except self.AllBlocked as exc:
+                 # a plan/credit refusal is the account's condition, never the candidate's:
+                 # the driver holds the attempt without a strike (PROOF_BLOCKED_CREDITS)
+diff --git a/vp/tests/test_laneproof.py b/vp/tests/test_laneproof.py
+index 582266e..ee93048 100644
+--- a/vp/tests/test_laneproof.py
++++ b/vp/tests/test_laneproof.py
+@@ -428,3 +428,108 @@ def test_circleci_rotates_to_the_next_account_on_its_own_repo_when_one_is_out_of
+     # roster overrides reach the target table
+     assert vpcircle.target("2", {"2": {"definition_id": "x"}})["definition_id"] == "x"
+     assert vpcircle.slug_for("2").startswith("circleci/7BDzzoWMeVDmriGVMigj1S/")
++
++
++# -- D65: the gate, the cap and the off switch are re-asked at TRIGGER time; every trigger
++#    attempt leaves a ledger row; only triggered rows count against the day --------------------
++
++def _ledger(tmp_path):
++    p = tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl"
++    return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
++
++
++def test_d65_gate_closed_at_trigger_time_refuses_without_a_push_and_leaves_a_row(tmp_path):
++    """2026-09-18 21:25-21:32Z: 11 account-3 pipelines were triggered by rounds routed
++    before DELIVERY-1 closed. The gate is a live callable read at the trigger."""
++    wt, base, cand = repo(tmp_path)
++    fake = FakeCircle({"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 1}],
++                       "failed_tests": {}, "workflows": []})
++    gate = {"open": True}
++    p = make_proof(tmp_path, fake, FakeExec({}))
++    p.gate_open = lambda: gate["open"]
++    rec = p.run("L22-HOSTED", "proof-g1", wt, base, cand, "platform", [])
++    assert rec["status"] == "PASS"
++    rows = _ledger(tmp_path)
++    assert [r["status"] for r in rows] == ["triggered"] and rows[0]["pipeline_id"] == "pipe-206"
++    gate["open"] = False                                  # the owner closes the gate between routing and trigger
++    fake.calls.clear()
++    rec = p.run("L23-HOSTED", "proof-g2", wt, base, cand, "platform", [])
++    assert rec["status"] == "BLOCKED_GATE" and rec["route"] == "circleci" and rec["pipeline_id"] is None
++    assert "not open at trigger time" in rec["reason"]
++    assert not [c for c in fake.calls if c[0] in ("push", "trigger")], "nothing pushed, nothing triggered"
++    rows = _ledger(tmp_path)
++    assert rows[-1]["status"] == "refused_gate" and rows[-1]["proof_id"] == "proof-g2" and rows[-1]["pipeline_id"] is None
++    assert p.pipelines_today() == 1, "a refused trigger spends nothing"
++    # an unreadable gate is a closed gate
++    p.gate_open = lambda: 1 / 0
++    rec = p.run("L24-HOSTED", "proof-g3", wt, base, cand, "platform", [])
++    assert rec["status"] == "BLOCKED_GATE" and "unreadable" in rec["reason"]
++    # no gate callable (tests, dry runs) = no gate
++    p.gate_open = None
++    assert p.run("L25-HOSTED", "proof-g4", wt, base, cand, "platform", [])["status"] == "PASS"
++
++
++def test_d65_daily_cap_is_enforced_per_trigger_targeted_falls_to_box_full_is_blocked(tmp_path):
++    wt, base, cand = repo(tmp_path)
++    fake = FakeCircle({"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 1}],
++                       "failed_tests": {}, "workflows": []})
++    ex = FakeExec({})
++    p = make_proof(tmp_path, fake, ex, cfg={"circleci": {"enabled": True, "mode": "all", "kinds": ["platform", "full"],
++                                                         "account": "3", "max_pipelines_per_day": 2}})
++    assert p.run("A", "proof-c1", wt, base, cand, "platform", ["platform/a.py"])["status"] == "PASS"
++    assert p.run("B", "proof-c2", wt, base, cand, "platform", ["platform/a.py"])["status"] == "PASS"
++    assert p.pipelines_today() == 2
++    # route() would already say box now; but a proof routed a moment earlier reaches the trigger:
++    p.route = lambda kind, suite=None: ("circleci", "routed before the cap")
++    fake.calls.clear()
++    rec = p.run("C", "proof-c3", wt, base, cand, "platform", ["platform/a.py"])
++    assert rec["status"] == "PASS" and rec["route"] == "box", rec              # targeted: the box takes it
++    assert not [c for c in fake.calls if c[0] == "trigger"]
++    rec = p.run("D-HOSTED", "proof-c4", wt, base, cand, "platform", [])       # full suite: never on the box
++    assert rec["status"] == "BLOCKED_CAP" and "max_pipelines_per_day 2" in rec["reason"]
++    rows = _ledger(tmp_path)
++    assert [r["status"] for r in rows] == ["triggered", "triggered", "refused_cap", "refused_cap"]
++    assert p.pipelines_today() == 2, "refused rows never count"
++    # the pre-D65 ledger (no status field) still counts as triggered
++    with open(tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl", "a") as fh:
++        fh.write(json.dumps({"ts": laneproof.utc_ms(), "pipeline_id": "legacy", "account": "3"}) + "\n")
++    assert p.pipelines_today() == 3
++
++
++def test_d65_credit_and_trigger_failures_leave_rows_that_do_not_count(tmp_path):
++    wt, base, cand = repo(tmp_path)
++    res = {"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 1}],
++           "failed_tests": {}, "workflows": []}
++
++    class Flaky(FakeCircle):
++        def trigger(self, branch, params, runner, account, targets=None, rotate=True):
++            self.calls.append(("trigger", branch, params, account))
++            if account == "3":
++                raise RuntimeError("HTTP 402: no credits are available on your plan")
++            if account == "1":
++                raise RuntimeError("HTTP 500: upstream")
++            return {"pipeline_id": "pipe-%s" % account, "account": account}
++    fake = Flaky(res)
++    p = make_proof(tmp_path, fake, FakeExec({}), cfg={"circleci": {"enabled": True, "mode": "all", "kinds": ["platform"],
++                                                                   "account": "3", "rotation": ["3", "1", "2"]}})
++    rec = p.run("X", "proof-f1", wt, base, cand, "platform", [])
++    assert rec["status"] == "UNKNOWN" and "HTTP 500" in rec["reason"]
++    rows = _ledger(tmp_path)
++    assert [(r["account"], r["status"]) for r in rows] == [("3", "credits_blocked"), ("1", "trigger_failed")]
++    assert "402" in rows[0]["reason"] and p.pipelines_today() == 0
++    # a refusal that shows only AFTER the trigger is recorded against its pipeline id
++    class Late(FakeCircle):
++        def credit_block(self, jobs, runner, account, targets=None):
++            return "no credits are available on your plan" if account == "2" else None
++
++        def trigger(self, branch, params, runner, account, targets=None, rotate=True):
++            return {"pipeline_id": "pipe-%s" % account, "account": account}
++    p2 = make_proof(tmp_path / "two", Late(res), FakeExec({}), cfg={"circleci": {"enabled": True, "mode": "all",
++                                                                                 "kinds": ["platform"], "account": "2",
++                                                                                 "rotation": ["2", "A1"]}})
++    rec = p2.run("Y", "proof-f2", wt, base, cand, "platform", [])
++    assert rec["status"] == "PASS" and rec["account"] == "A1"
++    rows = _ledger(tmp_path / "two")
++    assert [(r["account"], r["status"], r["pipeline_id"]) for r in rows] == [
++        ("2", "triggered", "pipe-2"), ("2", "credits_blocked", "pipe-2"), ("A1", "triggered", "pipe-A1")]
++    assert p2.pipelines_today() == 2, "the blocked pipeline was still spent"
+diff --git a/vp/lanedriver.py b/vp/lanedriver.py
+index fb6d9f4..9f96f35 100644
+--- a/vp/lanedriver.py
++++ b/vp/lanedriver.py
+@@ -514,7 +514,9 @@ class LaneDriver(object):
+ 
+         self.proof = proof or laneproof.Proof(
+             self.run_root, self.here, self.cn, self.git, self.exec, self.log, self.alert,
+-            self.roster.get("proof", {}), python=ctl.get("python") or sys.executable)
++            self.roster.get("proof", {}), python=ctl.get("python") or sys.executable,
++            # D65: re-read at every trigger from the LIVE roster (a lambda, never a captured value)
++            gate_open=lambda: vppack.gate_open("CIRCLECI", self.roster))
+ 
+         self._lock = threading.Lock()
+         self._live = {}                 # task -> attempt_id
