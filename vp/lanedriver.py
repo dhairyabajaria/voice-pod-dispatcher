@@ -2488,19 +2488,23 @@ class LaneDriver(object):
         if not slugs:
             return None
         out = Path(wt) / ".vp" / "MIGRATION.json"
-        if out.exists():
-            try:
-                have = json.loads(out.read_text(encoding="utf-8"))
-                if sorted(e.get("slug") for e in have) == sorted(slugs):
-                    return have
-            except (OSError, ValueError):
-                pass
+        # (D80a: recomputed on every attempt start, never trusted from the file --
+        # a round that begins after a lineage fix must see the corrected number)
         base_dir = Path(wt) / "platform" / "db" / "migrations"
+        # D80a: a retried packet (<id>-R<n>, PACKET_RETRIED 20:33Z) keeps the
+        # number its lineage already holds -- every task bound to the same packet
+        # id and every -R/-V13 ancestor; the LOWEST number is the original.
+        # Without this the retry was handed 268 beside the retired task's 267.
+        pid = self.pack_by_task.get(task)
+        lineage = {task, self._pack_root(task)}
+        lineage.update(t for t, p in self.pack_by_task.items() if pid and p == pid)
         entries = []
         try:
             _rc, listing = self.control.call("migration", ["list"])
-            mine = {rec.get("slug"): int(n) for n, rec in ((listing or {}).get("allocations") or {}).items()
-                    if rec.get("task") == task}
+            mine = {}
+            for n, rec in sorted(((listing or {}).get("allocations") or {}).items(), key=lambda kv: int(kv[0])):
+                if rec.get("task") in lineage and rec.get("slug") not in mine:
+                    mine[rec.get("slug")] = int(n)
             for slug in slugs:
                 if slug in mine:
                     number, reused = mine[slug], True
@@ -2508,8 +2512,8 @@ class LaneDriver(object):
                     args = ["allocate", "--task", task, "--slug", slug]
                     if base_dir.is_dir():
                         args += ["--base-dir", str(base_dir)]
-                    if mine:
-                        args.append("--another")   # the task already holds a number for another slug
+                    if any(rec.get("task") == task for rec in ((listing or {}).get("allocations") or {}).values()):
+                        args.append("--another")   # this task id already holds a number for another slug
                     _rc, data = self.control.call("migration", args)
                     number, reused = int((data or {}).get("number")), bool((data or {}).get("reused"))
                     mine[slug] = number
@@ -2529,8 +2533,9 @@ class LaneDriver(object):
         pk = Path(wt) / ".vp" / "PACKET.md"
         try:
             cur = pk.read_text(encoding="utf-8")
-            if "> MIGRATION NUMBERS" not in cur:
-                pk.write_text(head + cur, encoding="utf-8")
+            if cur.startswith("> MIGRATION NUMBERS"):
+                cur = cur.split("\n\n", 1)[1] if "\n\n" in cur else ""
+            pk.write_text(head + cur, encoding="utf-8")
         except OSError:
             pass
         for e in entries:

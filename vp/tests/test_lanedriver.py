@@ -2205,14 +2205,36 @@ def test_d80_migration_numbers_are_allocated_by_the_driver_at_claim_time(tmp_pat
     assert st["migrations"]["302"]["task"] == "L02" and st["migrations"]["302"]["slug"] == "l09_sandbox_import"
     # a second call (next round / adoption) reuses the file, allocates nothing new
     again = drv._allocate_migrations(wt, "L02")
-    assert again == got and len(json.loads(env.state.read_text())["migrations"]) == 1
-    # a lost MIGRATION.json (fresh worktree after a restart) is rebuilt from the state, not re-allocated
-    (wt / ".vp" / "MIGRATION.json").unlink()
+    assert again[0]["number"] == 302 and again[0]["reused"] is True
+    assert len(json.loads(env.state.read_text())["migrations"]) == 1
+    # a stale MIGRATION.json (a wrong number from before a fix) is corrected from the
+    # state, not trusted; the PACKET.md head line is replaced, not stacked
+    (wt / ".vp" / "MIGRATION.json").write_text(json.dumps([dict(rec[0], number=999)]))
     rebuilt = drv._allocate_migrations(wt, "L02")
+    pk = (wt / ".vp" / "PACKET.md").read_text()
+    assert pk.count("> MIGRATION NUMBERS") == 1 and "302_l09" in pk and "2. run the allocator" in pk
     assert rebuilt[0]["number"] == 302 and rebuilt[0]["reused"] is True
     assert len(json.loads(env.state.read_text())["migrations"]) == 1
     log = (env.run_root / "driver.log").read_text()
     assert "MIGRATION L02 l09_sandbox_import -> platform/db/migrations/302_l09_sandbox_import.sql (allocated)" in log
+    # D80a: a retry of the packet (new task id, same packet binding / -R suffix)
+    # keeps the lineage's number instead of taking the next one
+    drv.pack_by_task["L02"] = "PKT-L02"
+    drv.pack_by_task["L02-R1"] = "PKT-L02"
+    wt3 = env.tmp / "wt-d80-r1"
+    (wt3 / ".vp").mkdir(parents=True)
+    (wt3 / ".vp" / "PACKET.md").write_text("# retry\n")
+    real_call = drv.control.call
+
+    def no_allocate(verb, args=(), allow=(0,)):
+        assert not (verb == "migration" and args and args[0] == "allocate"), "a retry must not allocate"
+        return real_call(verb, args, allow)
+    monkeypatch.setattr(drv.control, "call", no_allocate)
+    got_r1 = drv._allocate_migrations(wt3, "L02-R1")
+    assert [(e["number"], e["reused"]) for e in got_r1] == [(302, True)], "the retry inherits 302"
+    assert "302_l09_sandbox_import.sql" in (wt3 / ".vp" / "PACKET.md").read_text()
+    assert len(json.loads(env.state.read_text())["migrations"]) == 1, "nothing new in run-state"
+    monkeypatch.setattr(drv.control, "call", real_call)
     # no placeholder: nothing happens, nothing written
     monkeypatch.setattr(drv, "packet_for", lambda task: {"id": task, "owned_files": ["platform/core/x.py"]})
     wt2 = env.tmp / "wt-d80-none"
