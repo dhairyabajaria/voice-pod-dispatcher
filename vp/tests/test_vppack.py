@@ -1514,3 +1514,38 @@ def test_d71_canary_gate_holds_every_other_circleci_twin_until_the_canary_answer
     assert any("armed_at" in m for m in msgs)
     bad["proof"]["circleci"]["canary"] = {"task": "P-ZZ-HOSTED"}
     assert any("no packet P-ZZ" in m for m in vplint.lint_roster_v13(bad))
+
+
+def test_d72_ruled_sticky_exclusion_keeps_a_member_out_of_every_integration_union(tmp_path):
+    """§31 verb 1: R-L18-TOCTOU-C is SUBSUMED_BY_TRUNK (patch-id twin of a trunk
+    commit); the ruling lives in RUN_ROOT/unions/exclusions.json and every cut
+    excludes that member at that sha as `known`, with the ruling as `why`, no
+    merge attempt, no INTEGRATION_CONFLICT; a re-verified member (new sha) is
+    merged again."""
+    from test_lanedriver import register_candidate
+    env, drv, codex = _union_env(tmp_path)
+    sha, _tree = register_candidate(env)
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED"
+    integ = sorted((json.loads(m.read_text()) for m in (env.run_root / "unions").glob("*/members.json")
+                    if json.loads(m.read_text()).get("for") == ["INTEGRATION"]), key=lambda d: d["n"])
+    assert integ and {m["task"] for m in integ[-1]["members"]} >= {"P-FIX-A", "P-FIX-B"} and not integ[-1].get("excluded")
+    # the ruling: P-FIX-B is subsumed by trunk at its current sha
+    (env.run_root / "unions" / "exclusions.json").write_text(json.dumps({
+        "P-FIX-B": {"output_sha": rows["P-FIX-B"]["output_sha"], "ruling": "§31",
+                    "reason": "SUBSUMED_BY_TRUNK: output is the patch-id twin of trunk c0aff64f", "ts": "2026-09-19T15:00:00Z"}}))
+    pd = Path(env.roster["run"]["pack_dir"])
+    packet(pd, "P-FIX-C", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix C for L00")
+    drv._pack_logged = set()
+    n_alerts = (env.run_root / "alerts.jsonl").read_text().count("INTEGRATION_CONFLICT")
+    settle(drv, 6)
+    assert env.rows()["P-FIX-C"]["state"] == "VERIFIED"
+    integ2 = sorted((json.loads(m.read_text()) for m in (env.run_root / "unions").glob("*/members.json")
+                     if json.loads(m.read_text()).get("for") == ["INTEGRATION"]), key=lambda d: d["n"])[-1]
+    assert integ2["n"] > integ[-1]["n"]
+    ex = {e["task"]: e for e in integ2.get("excluded") or []}
+    assert set(ex) == {"P-FIX-B"} and ex["P-FIX-B"]["known"] and "SUBSUMED_BY_TRUNK" in ex["P-FIX-B"]["why"]
+    assert {m["task"] for m in integ2["members"]} >= {"P-FIX-A", "P-FIX-C"} and "P-FIX-B" not in {m["task"] for m in integ2["members"]}
+    assert (env.run_root / "alerts.jsonl").read_text().count("INTEGRATION_CONFLICT") == n_alerts, "a ruling is not a conflict"
+    assert "P-FIX-B" not in git(env.trunk, "log", "--format=%s", "%s..%s" % (sha, integ2["union_sha"]))

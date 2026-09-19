@@ -1526,6 +1526,16 @@ class LaneDriver(object):
                 continue
         return conf or {}
 
+    def _sticky_exclusions(self):
+        """RUN_ROOT/unions/exclusions.json -- Architect-ruled members the integration
+        union never merges (SUBSUMED_BY_TRUNK and the like); the file is the ruling's
+        durable form, the ledger row its record."""
+        try:
+            doc = json.loads((self.run_root / "unions" / "exclusions.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return {str(k): v for k, v in (doc or {}).items() if isinstance(v, dict)}
+
     def _integration_union_step(self, state):
         """D39 (BULK-RULING §20): cut and keep refreshed ONE integration union
         of every VERIFIED row.  Unions 1-8 were disjoint partials; the F1-F5
@@ -1554,6 +1564,15 @@ class LaneDriver(object):
         # re-cut three conflict dirs and re-alerted the same three members); a
         # re-verified member (new sha) gets its merge tried again
         known = {e.get("task"): e for e in (latest or {}).get("excluded") or [] if isinstance(e, dict)}
+        # D72 (§31 verb 1): a ruled exclusion is sticky across every cut -- RUN_ROOT/
+        # unions/exclusions.json {task: {output_sha, reason, ruling, ts}}; it applies
+        # while the member is at that sha (a re-verified member gets its merge tried)
+        sticky = self._sticky_exclusions()
+        for m in members:
+            st = sticky.get(m["task"])
+            if st and (not st.get("output_sha") or st["output_sha"] == m["output_sha"]):
+                known[m["task"]] = {"task": m["task"], "output_sha": m["output_sha"],
+                                    "why": "%s (%s)" % (st.get("reason") or "ruled exclusion", st.get("ruling") or "sticky")}
         excluded = [dict(m, why=known[m["task"]].get("why", ""), known=True) for m in members
                     if m["task"] in known and known[m["task"]].get("output_sha") == m["output_sha"]]
         pool = [m for m in members if not any(e["task"] == m["task"] for e in excluded)]
