@@ -3901,6 +3901,12 @@ class LaneDriver(object):
                 start = int(rst["round"]) + 1
             elif rst.get("stage") == "built" and self.head_sha(wt) == rst.get("head"):
                 start, skip_build = int(rst["round"]), True
+            if start > max_rounds:
+                # D79a: rounds.json can name a round past a cap that shrank meanwhile
+                # (a hosted twin parked in round 3, cap now 1): the loop would run
+                # zero rounds and the attempt would be re-adopted every tick
+                self.log("ROUND %s clamps %d -> %d (cap shrank; resuming the last round)" % (task, start, max_rounds))
+                start = max_rounds
             if start > 1 or skip_build:
                 self.log("ROUND %s resumes at %d/%d after the park (%s round %s)"
                          % (task, start, max_rounds, rst.get("stage"), rst.get("round")))
