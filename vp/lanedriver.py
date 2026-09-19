@@ -339,7 +339,7 @@ DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
 # active == 0, reload these helper modules in dependency order, load a fresh copy
 # of lanedriver.py and rebind every live object's class to it, resume.
 RELOAD_FILE = "RELOAD"
-RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpdriver", "vpproof", "vpmerge",
+RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpdriver", "vp_box_lock", "vpproof", "vpmerge",
                 "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
 

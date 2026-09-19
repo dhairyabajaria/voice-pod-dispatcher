@@ -41,9 +41,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vpstore  # noqa: E402
+import vp_box_lock  # noqa: E402
 
-LOCK_NAMES = ("box.lock.d", "portal.lock.d")
-STALE_S = 5 * 60
+# D76b: the lock lives in vp_box_lock (shared with scripts); these names stay importable
+LOCK_NAMES = vp_box_lock.LOCK_NAMES
+STALE_S = vp_box_lock.STALE_S
 NODE22_BIN = str(Path.home() / ".local" / "node-v22.11.0-darwin-arm64" / "bin")
 
 _FAILED_RE = re.compile(r"^(FAILED|ERROR) (\S+)", re.M)
@@ -73,108 +75,8 @@ def _pid_alive(pid):
 # locks
 # --------------------------------------------------------------------------
 
-class BoxLocks(object):
-    def __init__(self, cn, sha, proof_id, log=None):
-        self.cn = Path(cn)
-        self.sha = sha
-        self.proof_id = proof_id
-        self.token = uuid.uuid4().hex
-        self.held = []
-        self.log = log or (lambda s: None)
-
-    def _owner_path(self, name):
-        return self.cn / name / "owner.json"
-
-    def _try_one(self, name):
-        d = self.cn / name
-        try:
-            os.mkdir(str(d))
-        except FileExistsError:
-            # stale?
-            op = self._owner_path(name)
-            try:
-                owner = json.loads(op.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                owner = {}
-            pid = owner.get("pid")
-            ts = owner.get("mono_epoch") or 0
-            if pid and _pid_alive(pid):
-                return False, "held by pid %s (%s)" % (pid, owner.get("proof_id"))
-            if not pid or (time.time() - float(ts or 0)) > STALE_S:
-                self.log("reclaiming stale %s (owner=%s)" % (name, owner))
-                try:
-                    op.unlink()
-                except OSError:
-                    pass
-                try:
-                    os.rmdir(str(d))
-                except OSError:
-                    return False, "stale but not removable"
-                try:
-                    os.mkdir(str(d))
-                except FileExistsError:
-                    return False, "lost the race"
-            else:
-                return False, "recent owner without live pid; waiting"
-        except OSError as exc:
-            return False, "mkdir failed: %s" % exc
-        self._owner_path(name).write_text(json.dumps({
-            "pid": os.getpid(), "token": self.token, "ts": utc_ms(),
-            "mono_epoch": time.time(), "sha": self.sha, "proof_id": self.proof_id,
-            "owner": "vpproof"}, indent=2), encoding="utf-8")
-        self.held.append(name)
-        return True, ""
-
-    def acquire(self, wait_max_s):
-        deadline = time.monotonic() + wait_max_s
-        reason = ""
-        while True:
-            for name in LOCK_NAMES:
-                if name in self.held:
-                    continue
-                ok, reason = self._try_one(name)
-                if not ok:
-                    break
-            if len(self.held) == len(LOCK_NAMES):
-                return True, ""
-            self.release()          # never hold one while waiting for the other
-            if time.monotonic() > deadline:
-                return False, reason
-            time.sleep(5)
-
-    def release(self):
-        for name in list(self.held):
-            op = self._owner_path(name)
-            try:
-                owner = json.loads(op.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                owner = {}
-            if owner.get("token") == self.token:
-                try:
-                    op.unlink()
-                except OSError:
-                    pass
-                try:
-                    os.rmdir(str(self.cn / name))
-                except OSError:
-                    pass
-            self.held.remove(name)
-
-
-def lock_status(cn):
-    out = {}
-    for name in LOCK_NAMES:
-        d = Path(cn) / name
-        if not d.exists():
-            out[name] = {"held": False}
-            continue
-        try:
-            owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            owner = {}
-        out[name] = {"held": True, "owner": owner,
-                     "alive": bool(owner.get("pid") and _pid_alive(owner["pid"]))}
-    return out
+BoxLocks = vp_box_lock.BoxLocks
+lock_status = vp_box_lock.lock_status
 
 
 # --------------------------------------------------------------------------
@@ -466,7 +368,11 @@ def run_proof(args):
     def log(s):
         notes.append("%s %s" % (utc_ms(), s))
 
-    locks = BoxLocks(cn, args.sha, args.proof_id, log)
+    paths_for_tier = [p for p in (args.paths or "").split(",") if p.strip()]
+    tier = args.tier or vp_box_lock.tier_for(args.kind, paths_for_tier, proof_cfg)
+    log("box lock tier %s (%s, %d paths)" % (tier, args.kind, len(paths_for_tier)))
+    locks = BoxLocks(cn, args.sha, args.proof_id, log, tier=tier, proof_kind=args.proof_kind,
+                     alert=lambda k, t: st.alert(k, t))
     ok, why = locks.acquire(wait_max * 60)
     if not ok:
         counts = {"reason": "box busy: %s" % why, "waited_min": wait_max}
@@ -639,6 +545,8 @@ def main(argv=None):
     r.add_argument("--paths", default="")
     r.add_argument("--timeout-min", type=int, default=None)
     r.add_argument("--wait-max-min", type=int, default=None)
+    r.add_argument("--tier", default=None, choices=[vp_box_lock.EXCLUSIVE, vp_box_lock.SLOT],
+                   help="D76b: box lock tier (default: full or > proof.targeted_max_paths paths = exclusive)")
     r.add_argument("--workers", type=int, default=4)
     r.add_argument("--cn", default=None)
     r.add_argument("--no-record", action="store_true",
