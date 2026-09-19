@@ -1034,6 +1034,41 @@ def test_proof_blocked_by_circleci_credits_holds_the_attempt_without_a_strike(tm
     assert (env.run_root / "OWNER-ALERTS.md").read_text().count("CIRCLECI_NO_CREDITS") == 1, "alerted once"
 
 
+def test_credits_held_claim_is_released_when_a_ready_packet_waits_on_its_paths(tmp_path, monkeypatch):
+    """D46a: 2026-09-19 06:54Z L09-SEED-FIX (READY, same seed files) waited on
+    ADMISSION-SEED-FIX-HOSTED-R1's ACTIVE claim while every CircleCI account refused
+    credits -- the D40 hold fenced the box off the repair.  With a waiter, the
+    credits refusal releases the claim (INVALID_EVIDENCE, reason BLOCKED_CREDITS_RELEASED,
+    no strike) and the waiter claims; without a waiter D40 still holds."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    monkeypatch.setattr(lanedriver, "CREDITS_HOLD_S", 0.0)
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    cat = catalog()
+    cat["contracts"].append({"id": "L05", "title": "task L05", "chief": "B", "kind": "builder",
+                             "depends_on": ["L00"], "owned_paths": ["platform/a.py"],
+                             "build_steps": ["do L05"], "verification": ["L05 verified"],
+                             "acceptance": ["L05 accepted"], "role": ROLE_MUSE})
+    env.catalog.write_text(json.dumps(cat, indent=1))
+    env.activate()
+    proof = FakeProof([{"status": "BLOCKED_CREDITS", "reason": "circleci: no credits are available on your plan"},
+                       {"status": "PASS"}, {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 3)
+    rows = env.rows()
+    first = [t for t in ("L02", "L05") if rows[t]["state"] == "INVALID_EVIDENCE"]
+    assert len(first) == 1, rows
+    other = "L05" if first == ["L02"] else "L02"
+    log = (env.run_root / "driver.log").read_text()
+    assert "RELEASE %s: credits refused and %s waits on its paths" % (first[0], other) in log
+    assert "HOLD %s" % first[0] not in log and "FAIL %s" % first[0] not in log
+    assert lanedriver.CREDITS_RELEASED in json.dumps(rows[first[0]])
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows[other]["state"] == "VERIFIED", rows[other]
+    assert (env.run_root / "OWNER-ALERTS.md").read_text().count("CIRCLECI_NO_CREDITS") == 1
+
+
 # -- D18/D19: shm gate holds without a strike; repair generations are capped -------------------
 
 def test_proof_blocked_by_shm_holds_the_attempt_without_a_failure_strike(tmp_path, monkeypatch):

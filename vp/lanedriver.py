@@ -102,6 +102,7 @@ FAIL_BACKOFF_S = (60, 120, 300)
 # this long, count no failure; heartbeat carries the live segment count
 SHM_HOLD_S = 300.0
 CREDITS_HOLD_S = 1800.0                 # CircleCI plan/credit refusal: hold, no strike, alert once
+CREDITS_RELEASED = "BLOCKED_CREDITS_RELEASED"   # D46a: reason prefix when a credits-held claim is released
 SHM_POLL_S = 30.0
 # D19: auto-repair generations per parent row before the driver stops
 # re-instantiating and leaves the row to a human/packet (R-…-B5-1..7 overnight)
@@ -3244,10 +3245,25 @@ class LaneDriver(object):
         if outcome.status == "PROOF_BLOCKED_CREDITS":
             # CircleCI refused the jobs for plan/credits (2026-09-18: 27 twins went
             # INVALID_EVIDENCE on it): the owner's condition, never the candidate's
-            self.note_hold(task, fkey, outcome.detail, CREDITS_HOLD_S)
             self.alert_once("circleci-credits", "CIRCLECI_NO_CREDITS",
                             "CircleCI blocks every job for plan/credits; hosted proofs are held (no strike) until "
                             "the owner adds credits or a plan: %s" % outcome.detail[:300], task)
+            waiting = self._credits_waiter(task)
+            if waiting:
+                # D46a: a held claim must not fence a READY packet off its paths
+                # (2026-09-19 06:54Z: L09-SEED-FIX waited on ADMISSION-SEED-FIX-HOSTED-R1's
+                # claim while every account refused).  Release: INVALID_EVIDENCE with a
+                # reason the retry sweep recognises; `retry-packet` re-instantiates it
+                # once credits return.
+                self.clear_failures(task)
+                self.log("RELEASE %s: credits refused and %s waits on its paths -> INVALID_EVIDENCE (retry-packet later)"
+                         % (task, waiting))
+                self._complete(task, attempt, "INVALID_EVIDENCE", tdir,
+                               evidence=[tdir / "record.json"],
+                               reason="%s: %s; claim released for %s (D46a)"
+                               % (CREDITS_RELEASED, outcome.detail[:200], waiting))
+                return
+            self.note_hold(task, fkey, outcome.detail, CREDITS_HOLD_S)
             return
         if result is None:
             count = self.note_failure(task, fkey, "%s: %s" % (outcome.status, outcome.detail),
@@ -3263,6 +3279,33 @@ class LaneDriver(object):
                        output_sha=result.get("output_sha"), tree_sha=result.get("tree_sha"),
                        reason=result.get("reason"), verdict=result.get("verdict"),
                        fails=result.get("fails"), wt=wt, kind=kind, hosted_owed=result.get("hosted_owed"))
+
+    def _credits_waiter(self, task):
+        """D46a: the READY task (if any) whose claim paths collide with `task`'s
+        ACTIVE claim -- the one a credits hold would fence off the box."""
+        state = self.control.state_view() or {}
+        mine = None
+        for c in (state.get("claims") or {}).values():
+            if c.get("task_id") == task and c.get("state") == "ACTIVE":
+                mine = c.get("paths") or []
+                break
+        if not mine:
+            return None
+        try:
+            rows = self.control.ready().get("ready") or []
+        except Exception:
+            return None
+        for row in sorted(rows, key=lambda r: r.get("task_id") or ""):
+            other = row.get("task_id")
+            if not other or other == task:
+                continue
+            try:
+                paths = self._claim_paths(self.control.contract(other, row), row)
+            except Exception:
+                continue
+            if self._conflicts(paths, {"claims": {"x": {"state": "ACTIVE", "paths": mine, "task_id": task}}}):
+                return other
+        return None
 
     def _saved_session(self, tdir):
         try:
