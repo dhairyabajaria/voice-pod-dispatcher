@@ -1619,6 +1619,7 @@ def test_a_malformed_roster_edit_is_rejected_not_fatal(tmp_path):
     assert (env.run_root / "alerts.jsonl").read_text().count("ROSTER_REJECTED") == n, "reported once per edit"
 
 
+@pytest.mark.skipif(_V13_PACK_SKIP_REASON is not None, reason=str(_V13_PACK_SKIP_REASON))
 def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     import vplint
     src = CONTROL_DIR / "v13-pack" / "roster-v13.json"
