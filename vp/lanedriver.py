@@ -3076,11 +3076,17 @@ class LaneDriver(object):
             if not rcfg:
                 continue
             runner = rcfg.get("runner", "opencode")
-            server = self._pick_server(rcfg) if runner == "opencode" else None
-            if runner == "opencode" and server is None:
-                continue
             attempt = row.get("attempt_id")
             if not attempt:
+                continue
+            pinned = self._saved_server(self._turn_dir(task, attempt)) if runner == "opencode" else None
+            if pinned and pinned in self.servers:
+                # D47: adopt on the server that holds the session; if it is parked
+                # or full, wait for it (_try_acquire below) rather than switch
+                server = pinned
+            else:
+                server = self._pick_server(rcfg) if runner == "opencode" else None
+            if runner == "opencode" and server is None:
                 continue
             needs_start = False
             if row["state"] == "CLAIMED":
@@ -3211,7 +3217,7 @@ class LaneDriver(object):
                 if not sid:
                     self.note_failure(task, fkey, "codex preopen: %s" % detail, kind="STALLED")
                     return
-                self._save_session(tdir, sid, runner)
+                self._save_session(tdir, sid, runner, server)
                 self.log("PREOPEN %s %s codex thread %s" % (task, attempt, sid))
             self._start(task, attempt, contract, sid)
             row = dict(row, child_id=sid)
@@ -3307,17 +3313,29 @@ class LaneDriver(object):
                 return other
         return None
 
-    def _saved_session(self, tdir):
+    def _session_record(self, tdir):
         try:
-            return json.loads((tdir / "session.json").read_text(encoding="utf-8")).get("session_id")
+            return json.loads((tdir / "session.json").read_text(encoding="utf-8")) or {}
         except (OSError, ValueError):
-            return None
+            return {}
 
-    def _save_session(self, tdir, sid, runner):
+    def _saved_session(self, tdir):
+        return self._session_record(tdir).get("session_id")
+
+    def _saved_server(self, tdir):
+        """D47: the opencode server the attempt's session lives on.  A session id
+        is local to ONE server (its own opencode.db); resuming it elsewhere is
+        `404 Session not found` (2026-09-19 08:10-08:23Z: both L09-SEED-FIX
+        attempts died on 3 such strikes after go2 was un-parked and adoption
+        re-picked the server)."""
+        return self._session_record(tdir).get("server")
+
+    def _save_session(self, tdir, sid, runner, server=None):
         if sid:
             try:
                 (tdir / "session.json").write_text(json.dumps({"session_id": sid, "runner": runner,
-                                                              "ts": utc_ms()}), encoding="utf-8")
+                                                              "server": server, "ts": utc_ms()}),
+                                                   encoding="utf-8")
             except OSError:
                 pass
 
@@ -4204,7 +4222,7 @@ class LaneDriver(object):
                 pass
             outcome = self.runners[runner].run(spec, abort_flag=self._abort)
             sid = outcome.session_id or sid
-            self._save_session(tdir, sid, runner)
+            self._save_session(tdir, sid, runner, server)
             if self._stopping and outcome.status != STATUS_DONE:
                 outcome.status, outcome.detail = STATUS_ABORTED, "STOP"
             cost, est, basis = estimate_cost(self.pricing, runner, spec.model, outcome.usage)

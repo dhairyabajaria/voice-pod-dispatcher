@@ -467,6 +467,46 @@ def test_stop_aborts_children_and_restart_adopts_the_attempt(tmp_path):
     assert (env.run_root / "STOP-HANDOFF.json").exists() is False or True
 
 
+def test_adoption_resumes_the_session_on_the_server_that_holds_it(tmp_path):
+    """D47: a session id lives in ONE opencode server's db.  2026-09-19 08:10-08:23Z
+    both L09-SEED-FIX attempts died on 3x `404 Session not found`: the turn ran on
+    go2, the thread ended, and adoption re-picked go1 (sorted first) for the resume.
+    The attempt's server is saved with the session and adoption pins to it."""
+    servers = {"go1": {"url": "http://127.0.0.1:1", "max_concurrent": 0, "xdg_data_home": str(tmp_path / "x1")},
+               "go2": {"url": "http://127.0.0.1:2", "max_concurrent": 8, "xdg_data_home": str(tmp_path / "x2")}}
+    env = Env(tmp_path, roster_extra={"servers": servers})
+    env.activate()
+    oc = FakeRunner(script=[wait_abort], default=result_ok)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    drv.tick()
+    assert env.rows()["L00"]["state"] == "RUNNING"
+    for _ in range(100):
+        if oc.calls:
+            break
+        time.sleep(0.05)
+    assert oc.calls[0].server_url == "http://127.0.0.1:2", "go1 has no capacity: dispatched to go2"
+    (env.run_root / "STOP").write_text("")
+    drv.tick()
+    time.sleep(1.2)
+    drv.tick()
+    drv.join(timeout=30)
+    drv.tick()
+    assert env.rows()["L00"]["state"] == "RUNNING"
+    rec = json.loads((env.run_root / "turns" / "L00" / env.rows()["L00"]["attempt_id"] / "session.json").read_text())
+    assert rec["server"] == "go2" and rec["session_id"] == "ses_L00"
+    # restart with go1 wide open: without the pin, sorted() picks go1 and the resume 404s
+    roster = json.loads((env.run_root / "roster.json").read_text())
+    roster["servers"]["go1"]["max_concurrent"] = 8
+    (env.run_root / "roster.json").write_text(json.dumps(roster, indent=1))
+    (env.run_root / "STOP").unlink()
+    oc2 = FakeRunner(default=result_ok)
+    drv2 = env.driver({"opencode": oc2, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv2)
+    assert env.rows()["L00"]["state"] == "VERIFIED"
+    assert oc2.calls[0].session_id == "ses_L00"
+    assert oc2.calls[0].server_url == "http://127.0.0.1:2", "resumed on the server that holds the session"
+
+
 def test_idle_runs_frontier_and_alerts_every_30_min_not_every_tick(tmp_path, monkeypatch):
     env = Env(tmp_path)
     env.activate()
