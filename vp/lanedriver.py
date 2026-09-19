@@ -2890,7 +2890,16 @@ class LaneDriver(object):
             self._code_hashes = after
             self._reload_failed = None
             self._apply_roster(self.roster)
-            rec.update({"ok": True, "module": new_name})
+            # D59: a STUCK task (FAIL_CAP strikes, same ready key) never retries on its
+            # own; the code that failed it just changed, so the strikes are lifted
+            # (L09-SEED-FIX-HOSTED 3/3 on a claim the reload fixed, 2026-09-19 14:38Z)
+            with self._lock:
+                lifted = sorted(t for t, e in self._fail.items() if e.get("stuck"))
+                for t in lifted:
+                    self._fail.pop(t, None)
+            if lifted:
+                self.log("RELOAD lifted STUCK strikes for %s (fresh try on the new code)" % lifted)
+            rec.update({"ok": True, "module": new_name, "stuck_lifted": lifted})
             self.log("RELOAD ok #%d %s -> %s changed=%s (%s)"
                      % (self._reload_count, self._short(before), self._short(after), changed, reason))
             self.alert("RELOAD", "code reloaded in place (#%d): %s; version %s -> %s"

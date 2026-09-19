@@ -235,3 +235,25 @@ def test_real_driver_process_reloads_an_edited_module_without_restarting(tmp_pat
             proc.wait(timeout=10)
     err = proc.stderr.read().decode(errors="replace")
     assert "Traceback" not in err, err[-2000:]
+
+
+def test_d59_a_successful_reload_lifts_stuck_strikes(tmp_path):
+    """D59: a STUCK task (FAIL_CAP strikes on one ready key) never retries by
+    itself; the code that failed it just changed, so a successful reload drops
+    those strikes (L09-SEED-FIX-HOSTED 3/3 on a claim the reload fixed)."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()}, interval=0.2)
+    drv.reload_modules = ()
+    drv._code_hashes = drv.code_hashes()
+    for _ in range(3):
+        drv.note_failure("L00", "k1", "claim exited 1: not a row with an output_sha")
+    drv.note_failure("L01", "k1", "one strike only")
+    assert drv._fail["L00"]["stuck"] and drv._backed_off("L00", "k1")
+    drv.hot_reload("test")
+    assert "L00" not in drv._fail, "stuck strikes lifted by the reload"
+    assert drv._fail["L01"]["count"] == 1, "a task below the cap keeps its backoff"
+    assert not drv._backed_off("L00", "k1")
+    recs = _reloads(env)
+    assert recs and recs[-1]["ok"] and recs[-1]["stuck_lifted"] == ["L00"]
+    assert "RELOAD lifted STUCK strikes for ['L00']" in (env.run_root / "driver.log").read_text()
