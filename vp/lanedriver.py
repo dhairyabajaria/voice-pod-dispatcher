@@ -3905,7 +3905,7 @@ class LaneDriver(object):
                 # D79a: rounds.json can name a round past a cap that shrank meanwhile
                 # (a hosted twin parked in round 3, cap now 1): the loop would run
                 # zero rounds and the attempt would be re-adopted every tick
-                self.log("ROUND %s clamps %d -> %d (cap shrank; resuming the last round)" % (task, start, max_rounds))
+                self.log("ROUND %s clamps %d -> %d: resumed past max_rounds (D79)" % (task, start, max_rounds))
                 start = max_rounds
             if start > 1 or skip_build:
                 self.log("ROUND %s resumes at %d/%d after the park (%s round %s)"
@@ -4004,6 +4004,11 @@ class LaneDriver(object):
     def _proof_evidence(self, prec):
         if not prec:
             return []
+        # D79b: the record names its own file (proofs/<pid>-p<pipeline8>.json for a
+        # CircleCI answer); pre-D79b records live at proofs/<pid>.json
+        rel = prec.get("record")
+        if rel:
+            return [self.run_root / rel]
         return [self.run_root / "proofs" / ("%s.json" % prec.get("proof_id"))]
 
     @staticmethod
@@ -4546,11 +4551,18 @@ class LaneDriver(object):
         return max(found, key=lambda r: str(r.get("ts") or "")) if found else None
 
     def _write_proof_record(self, pid, rec):
+        """D79b: a reuse copy is filed as proofs/<pid>-reuse-<ts>.json -- it never
+        overwrites the record it was taken from (same proof_id AND same pipeline
+        when a resumed round reuses its own earlier answer, 19:27:59Z) nor any
+        other pipeline's record; the copy names its own file in `record`."""
         d = self.run_root / "proofs"
+        name = "%s.json" % pid
+        if rec.get("reused_from"):
+            name = "%s-reuse-%s.json" % (pid, utc_ms().replace(":", "").replace("-", "").replace(".", ""))
+        rec["record"] = "proofs/%s" % name
         try:
             d.mkdir(parents=True, exist_ok=True)
-            (d / ("%s.json" % pid)).write_text(json.dumps(rec, indent=2, sort_keys=True, default=str),
-                                              encoding="utf-8")
+            (d / name).write_text(json.dumps(rec, indent=2, sort_keys=True, default=str), encoding="utf-8")
         except OSError as exc:
             self.log("PROOF record %s not written: %s" % (pid, exc))
 

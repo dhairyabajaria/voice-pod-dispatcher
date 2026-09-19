@@ -128,7 +128,12 @@ WORKFLOW_TERMINAL = {"success", "failed", "error", "canceled", "unauthorized"}
 
 # Job statuses that, on their own (independent of failed-test counts), mean
 # an infrastructure failure rather than a product one.
-INFRA_JOB_STATUSES = {"infrastructure_fail", "timedout", "canceled"}
+INFRA_JOB_STATUSES = {"infrastructure_fail", "timedout"}
+
+# D79b: a cancelled job (someone pressed cancel, or the driver's own
+# cancel_pipeline) is NOT an answer about the candidate -- never PASS, never
+# FAIL_PRODUCT/FAIL_INFRA with reds, and never reusable (lanedriver D79).
+CANCELLED_JOB_STATUSES = {"canceled"}
 
 # Job statuses that mean the job is done and will not change again.
 JOB_TERMINAL_STATUSES = {
@@ -424,7 +429,7 @@ def _dependency_failed(jobs_by_id, dep_ids):
         if dep is None:
             continue
         status = dep.get("status")
-        if status == "failed" or status in INFRA_JOB_STATUSES:
+        if status == "failed" or status in INFRA_JOB_STATUSES or status in CANCELLED_JOB_STATUSES:
             return True
     return False
 
@@ -455,14 +460,27 @@ def credit_block(jobs, runner=None, account=None, targets=None):
     return None
 
 
-def classify(jobs, failed_tests):
-    """{"status": PASS|FAIL_PRODUCT|FAIL_INFRA|UNKNOWN, "reds": [...]}"""
+def classify(jobs, failed_tests, workflows=None):
+    """{"status": PASS|FAIL_PRODUCT|FAIL_INFRA|CANCELLED|UNKNOWN, "reds": [...]}
+
+    D79b: any cancelled job, or any cancelled workflow (`workflows`, the
+    pipeline's workflow rows when the caller has them), makes the whole
+    pipeline CANCELLED whatever the other jobs say: a run that was stopped
+    is not an answer about the candidate."""
     jobs_by_id = {j.get("id"): j for j in jobs if j.get("id") is not None}
 
     reds = []
     has_product = False
     has_infra = False
     has_unknown = False
+    has_cancelled = False
+    for wf in workflows or ():
+        if wf.get("status") in CANCELLED_JOB_STATUSES:
+            has_cancelled = True
+            reds.append({
+                "job": None, "job_number": None, "status": wf.get("status"),
+                "kind": "cancelled", "reason": "workflow %s cancelled" % (wf.get("name") or wf.get("id")),
+            })
 
     for job in jobs:
         status = job.get("status")
@@ -486,6 +504,14 @@ def classify(jobs, failed_tests):
                     "job": name, "job_number": job_number, "status": status,
                     "kind": "infra", "reason": "failed with zero failed tests",
                 })
+            continue
+
+        if status in CANCELLED_JOB_STATUSES:
+            has_cancelled = True
+            reds.append({
+                "job": name, "job_number": job_number, "status": status,
+                "kind": "cancelled", "reason": status,
+            })
             continue
 
         if status in INFRA_JOB_STATUSES:
@@ -517,7 +543,9 @@ def classify(jobs, failed_tests):
             "kind": "unknown", "reason": f"unrecognised status {status!r}",
         })
 
-    if has_product:
+    if has_cancelled:
+        overall = "CANCELLED"
+    elif has_product:
         overall = "FAIL_PRODUCT"
     elif has_infra:
         overall = "FAIL_INFRA"
@@ -535,10 +563,18 @@ def _write_json(path, obj):
 
 
 def record(run_root, sha, pipeline, jobs, failed_tests, classified):
-    """Write proofs/<sha>/{pipeline.json,jobs.json,tests-failed.json,
-    classified.json} under run_root. Each file is stamped with a UTC-ms
-    "ts". Returns the proofs/<sha> directory path."""
+    """Write proofs/<sha>/<pipeline_id>/{pipeline.json,jobs.json,
+    tests-failed.json,classified.json} under run_root (proofs/<sha>/ when the
+    pipeline dict carries no id). Each file is stamped with a UTC-ms "ts".
+    Returns the directory path.
+
+    D79b: one directory per pipeline id -- three pipelines on one sha
+    (2026-09-19: 722a0b89 answered with 62 reds, then two cancelled rounds)
+    overwrote each other in proofs/<sha>/ and the real answer was lost."""
     out_dir = Path(run_root) / "proofs" / str(sha)
+    pipeline_id = (pipeline or {}).get("pipeline_id") if isinstance(pipeline, dict) else None
+    if pipeline_id:
+        out_dir = out_dir / str(pipeline_id)
     ts = _now_ms()
     _write_json(out_dir / "pipeline.json", {"ts": ts, "pipeline": pipeline})
     _write_json(out_dir / "jobs.json", {"ts": ts, "jobs": jobs})

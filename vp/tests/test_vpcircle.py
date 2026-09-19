@@ -153,10 +153,35 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["reds"][0]["kind"], "infra")
 
     def test_infrastructure_fail_status_is_fail_infra(self):
-        for status in ("infrastructure_fail", "timedout", "canceled"):
+        for status in ("infrastructure_fail", "timedout"):
             jobs = [{"id": "a", "name": "agent", "status": status, "job_number": 3}]
             result = vc.classify(jobs, {})
             self.assertEqual(result["status"], "FAIL_INFRA", status)
+
+    def test_d79b_a_cancelled_job_or_workflow_is_cancelled_never_pass_or_fail(self):
+        """D79b: a cancelled run is not an answer -- even when other jobs in the
+        same pipeline failed with real reds (f2ae535d, 2026-09-19) or passed."""
+        jobs = [{"id": "a", "name": "agent", "status": "canceled", "job_number": 3}]
+        self.assertEqual(vc.classify(jobs, {})["status"], "CANCELLED")
+        self.assertEqual(vc.classify(jobs, {})["reds"][0]["kind"], "cancelled")
+        mixed = [
+            {"id": "ok", "name": "lint", "status": "success", "job_number": 1},
+            {"id": "red", "name": "shard-1", "status": "failed", "job_number": 2},
+            {"id": "cut", "name": "shard-2", "status": "canceled", "job_number": 3},
+        ]
+        result = vc.classify(mixed, {2: [{"name": "test_x", "result": "failure"}]})
+        self.assertEqual(result["status"], "CANCELLED")
+        self.assertEqual(sorted(r["kind"] for r in result["reds"]), ["cancelled", "product"])
+        # a cancelled WORKFLOW with every job green (cancel landed between jobs)
+        green = [{"id": "ok", "name": "lint", "status": "success", "job_number": 1}]
+        self.assertEqual(vc.classify(green, {})["status"], "PASS")
+        result = vc.classify(green, {}, workflows=[{"id": "w1", "name": "test", "status": "canceled"}])
+        self.assertEqual(result["status"], "CANCELLED")
+        self.assertIn("workflow test cancelled", result["reds"][0]["reason"])
+        # a job not_run behind a cancelled dependency is still a dependency failure
+        chain = [{"id": "cut", "name": "up", "status": "canceled", "job_number": 1},
+                 {"id": "down", "name": "gate", "status": "not_run", "job_number": None, "dependencies": ["cut"]}]
+        self.assertEqual(vc.classify(chain, {})["status"], "CANCELLED")
 
     def test_not_run_after_failed_dependency_is_fail_infra(self):
         jobs = [
@@ -322,7 +347,11 @@ class RecordTests(unittest.TestCase):
                 classified={"status": "PASS", "reds": []},
             )
             expect = out_dir
-            self.assertEqual(expect, Path(tmp) / "proofs" / "abc1234")
+            # D79b: one record directory per pipeline id under the sha
+            self.assertEqual(expect, Path(tmp) / "proofs" / "abc1234" / "pipe-1")
+            self.assertEqual(vc.record(tmp, "abc1234", pipeline={}, jobs=[], failed_tests={},
+                                       classified={"status": "PASS", "reds": []}),
+                             Path(tmp) / "proofs" / "abc1234", "no pipeline id: the old flat layout")
             names = {"pipeline.json", "jobs.json", "tests-failed.json", "classified.json"}
             for name in names:
                 path = out_dir / name

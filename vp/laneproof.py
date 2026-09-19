@@ -416,10 +416,20 @@ class Proof(object):
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> UNKNOWN (circleci: %s)" % (task, pid, str(exc)[:200]))
                 return rec
-            cls = self.circle.classify(res["jobs"], res["failed_tests"])
+            try:
+                cls = self.circle.classify(res["jobs"], res["failed_tests"], workflows=res.get("workflows"))
+            except TypeError:                     # an older classify without the D79b kwarg
+                cls = self.circle.classify(res["jobs"], res["failed_tests"])
             status = cls["status"]
             failed, errors = circle_failed_nodes(res["failed_tests"])
             flake = None
+            if status == "CANCELLED":
+                # D79b: a cancelled workflow/job is no answer about the candidate --
+                # recorded as CANCELLED (the driver retries after the backoff, the
+                # canary does not release, D79 never reuses it), never as a
+                # PASS/FAIL_* that later rounds or the reuse check could trust
+                self.log("PROOF %s %s circleci pipeline %s was cancelled (%d job(s)/workflow(s)) -> CANCELLED"
+                         % (task, pid, pipeline_id, len(cls["reds"])))
             if status == "FAIL_PRODUCT" and failed:
                 nodes = self.untouched_red_nodes(wt, base, cand, failed, cc)
                 if nodes:
@@ -444,6 +454,8 @@ class Proof(object):
                    "paths": paths, "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
                    "flake_suspect": flake, "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
+                   "reason": ("circleci pipeline %s cancelled: not an answer (D79b)" % pipeline_id
+                              if status == "CANCELLED" else None),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
             self._write(pid, rec)
@@ -515,9 +527,31 @@ class Proof(object):
                    "finding filed. Nodes: %s" % (pid, pipeline_id, len(nodes), ", ".join(nodes)), task)
         return finding
 
+    ANSWERS = ("PASS", "FAIL_PRODUCT", "FAIL_INFRA")
+
     def _write(self, pid, rec):
+        """RUN_ROOT/proofs/<pid>.json, or <pid>-p<pipeline8>.json when the record
+        names a CircleCI pipeline: one record per pipeline id (D79b).  A record
+        without a pipeline never overwrites one that holds a real pipeline
+        answer -- it lands beside it under a timestamped name.  The file's own
+        relative path is written into the record as `record`.
+
+        Why: on 2026-09-19 three rounds of one attempt reused one proof_id and
+        each round's write clobbered the previous pipeline's answer (722a0b89's
+        62 reds became f2ae535d's cancelled 0)."""
         d = self.run_root / "proofs"
         d.mkdir(parents=True, exist_ok=True)
-        (d / ("%s.json" % pid)).write_text(json.dumps(rec, indent=2, sort_keys=True, default=str),
-                                          encoding="utf-8")
-        return d / ("%s.json" % pid)
+        pipe = rec.get("pipeline_id")
+        name = "%s-p%s.json" % (pid, str(pipe)[:8]) if pipe else "%s.json" % pid
+        if not pipe and (d / name).exists():
+            try:
+                old = json.loads((d / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                old = {}
+            if old.get("pipeline_id") and old.get("status") in self.ANSWERS:
+                name = "%s-%s.json" % (pid, utc_ms().replace(":", "").replace("-", "").replace(".", ""))
+                self.log("PROOF %s keeps its pipeline answer (%s %s); writing %s beside it"
+                         % (pid, old.get("pipeline_id"), old.get("status"), name))
+        rec["record"] = "proofs/%s" % name
+        (d / name).write_text(json.dumps(rec, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        return d / name

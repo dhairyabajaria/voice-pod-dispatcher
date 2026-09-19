@@ -1056,6 +1056,39 @@ def test_park_inside_a_later_round_resumes_at_that_round_not_at_round_one(tmp_pa
     assert log.count("ROUND L02 1/2 fails") == 1 and "ROUND L02 resumes at 2/2" in log  # Env max_rounds == 2
 
 
+def test_d79a_a_saved_round_past_a_shrunken_cap_is_clamped_to_the_cap(tmp_path, monkeypatch):
+    """D79a/D79b: L06-HOSTED-R3 parked in round 3, then D79 cut hosted twins to
+    max_rounds 1: `range(3, 2)` ran zero rounds and the attempt was re-adopted
+    every tick.  The resumed round clamps to the cap with the literal reason
+    "resumed past max_rounds (D79)" and the attempt finishes."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
+    env.activate()
+    proof = FakeProof([{"status": "PASS"}] * 4)
+    grades = iter([findings("FAIL"), findings("PASS")])
+    builds = iter([result_ok, status("DEGRADED", "service_overloaded"), result_ok])
+
+    def routed(spec, ab):
+        if spec.item != "L02":
+            return routed_pass(spec, ab)
+        return (next(grades) if spec.role == "grader" else next(builds))(spec, ab)
+    oc = FakeRunner(default=routed)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    saved = json.loads((tdir / "rounds.json").read_text())
+    saved["round"] = 5                                    # a round the (now smaller) cap of 2 never reaches
+    (tdir / "rounds.json").write_text(json.dumps(saved))
+    for srv in drv.servers.values():
+        srv["park_reason"] = srv["park_status"] = None
+        srv["parked_until"] = 0.0
+    settle(drv, 2)
+    assert env.rows()["L02"]["state"] == "VERIFIED", "the clamped round ran and finished the attempt"
+    log = (env.run_root / "driver.log").read_text()
+    assert "ROUND L02 clamps 6 -> 2: resumed past max_rounds (D79)" in log
+    assert "ROUND L02 resumes at 2/2" in log
+
+
 def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypatch):
     monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
     env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
@@ -2135,5 +2168,9 @@ def test_d79_a_recorded_answer_is_reused_instead_of_re_proving_the_same_head(tmp
     copied = json.loads((wt / ".vp" / "PROOF.json").read_text())
     assert copied["reused_from"] == "proof-L02-earlier" and copied["pipeline_id"] == "pipe-real"
     assert copied["proof_id"] != "proof-L02-earlier", "recorded under this attempt's own pid"
-    assert any(p.name.startswith("proof-L02-") and p.name != "proof-L02-earlier.json" for p in proofs.iterdir())
+    # D79b: the reuse copy is filed under its own -reuse-<ts> name, names that
+    # file in `record`, and the record it was taken from is untouched
+    copies = [p for p in proofs.iterdir() if "-reuse-" in p.name and p.name.startswith("proof-L02-")]
+    assert len(copies) == 1 and copied["record"] == "proofs/%s" % copies[0].name
+    assert json.loads((proofs / "proof-L02-earlier.json").read_text()).get("reused_from") is None
     assert not (tdir / "proof-pending.json").exists()

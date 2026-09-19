@@ -153,7 +153,10 @@ def test_untouched_red_reruns_on_the_box_green_is_pass_with_trunk_finding(tmp_pa
     assert finding["kind"] == "TRUNK_FLAKE_SUSPECT" and finding["pipeline_id"] == "pipe-206"
     assert finding["nodes"] == ["platform/tests/test_flaky.py::test_race"]
     assert [a[0] for a in alerts] == ["TRUNK_FLAKE_SUSPECT"]
-    assert json.loads((tmp_path / "run" / "proofs" / "proof-1.json").read_text())["status"] == "PASS"
+    # D79b: a CircleCI record is filed per pipeline id, and names its own file
+    assert rec["record"] == "proofs/proof-1-ppipe-206.json"
+    assert json.loads((tmp_path / "run" / "proofs" / "proof-1-ppipe-206.json").read_text())["status"] == "PASS"
+    assert not (tmp_path / "run" / "proofs" / "proof-1.json").exists()
     assert ("trigger", "vp/proof/proof-1-%s" % cand[:12], {"run_full_suite": True}, "3") in circle.calls
     assert any("box re-run" in m for m in logs)
     # branch cleaned up locally
@@ -572,3 +575,50 @@ def test_d76_box_proof_is_held_below_the_memory_floor_and_runs_above_it(tmp_path
     p.cfg["memory_hold_below_pct"] = 0                # roster can switch the gate off
     p.memory_pct = lambda: 1
     assert p.run("L40", "proof-mem-4", wt, base, cand, "platform", ["platform/tests/test_x.py"])["status"] == "PASS"
+
+
+def test_d79b_a_cancelled_pipeline_records_cancelled_and_keeps_the_earlier_answer(tmp_path):
+    """D79b (2026-09-19): one attempt's three rounds reused one proof_id; round 1
+    answered FAIL_PRODUCT on pipeline 722a0b89 (62 reds), rounds 2/3 were
+    cancelled and their writes clobbered that answer (0 reds, FAIL_INFRA).  Now:
+    one record per pipeline id, a cancelled workflow is CANCELLED, and a
+    pipeline-less record never overwrites a real pipeline answer."""
+    wt, base, cand = repo(tmp_path)
+    red = pipeline([("platform/tests/test_x.py", "test_a"), ("platform/tests/test_x.py", "test_b")])
+    circle = FakeCircle(red)
+    ex = FakeExec({})
+    p = make_proof(tmp_path, circle, ex)
+    rec1 = p.run("L06", "proof-1", wt, base, cand, "platform", [])
+    assert rec1["status"] == "FAIL_PRODUCT" and rec1["pipeline_id"] == "pipe-206"
+    f1 = tmp_path / "run" / "proofs" / "proof-1-ppipe-206.json"
+    assert f1.exists() and rec1["record"] == "proofs/proof-1-ppipe-206.json"
+    assert len(json.loads(f1.read_text())["failed_nodes"]) == 2
+    # round 2: a different pipeline, cancelled while its first shard was already red
+    cut = pipeline([("platform/tests/test_x.py", "test_a")])
+    cut["jobs"].append({"id": "j-cut", "name": "shard-2", "status": "canceled", "job_number": 342,
+                        "workflow_id": "w1"})
+    cut["workflows"] = [{"id": "w1", "name": "test", "status": "canceled"}]
+    circle.res = cut
+    circle.trigger = lambda branch, params, runner, account, targets=None, rotate=True: {
+        "pipeline_id": "pipe-207", "account": account or "3"}
+    logs = []
+    p.log = logs.append
+    rec2 = p.run("L06", "proof-1", wt, base, cand, "platform", [])
+    assert rec2["status"] == "CANCELLED" and rec2["pipeline_id"] == "pipe-207"
+    assert "cancelled" in rec2["reason"] and "D79b" in rec2["reason"]
+    assert rec2["record"] == "proofs/proof-1-ppipe-207.json"
+    assert any("was cancelled" in m and "CANCELLED" in m for m in logs)
+    # round 1's answer is untouched, byte for byte
+    kept = json.loads(f1.read_text())
+    assert kept["status"] == "FAIL_PRODUCT" and kept["pipeline_id"] == "pipe-206" and len(kept["failed_nodes"]) == 2
+    # a pipeline-less record (a gate refusal, a box run) never clobbers a pipeline answer either
+    (tmp_path / "run" / "proofs" / "proof-9.json").write_text(json.dumps(
+        {"status": "PASS", "pipeline_id": "pipe-1", "route": "circleci"}))
+    out = p._write("proof-9", {"status": "BLOCKED_GATE", "route": "circleci", "pipeline_id": None})
+    assert out.name != "proof-9.json" and out.name.startswith("proof-9-") and out.exists()
+    assert json.loads((tmp_path / "run" / "proofs" / "proof-9.json").read_text())["status"] == "PASS"
+    assert any("keeps its pipeline answer" in m for m in logs)
+    # ...but a record without any pipeline answer is simply replaced
+    p._write("proof-8", {"status": "BLOCKED_GATE", "pipeline_id": None})
+    out = p._write("proof-8", {"status": "BLOCKED_CAP", "pipeline_id": None})
+    assert out.name == "proof-8.json" and json.loads(out.read_text())["status"] == "BLOCKED_CAP"
