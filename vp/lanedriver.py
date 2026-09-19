@@ -3568,8 +3568,29 @@ class LaneDriver(object):
         pending = self._proof_pending(tdir)
         resume_proof = bool(needs_proof and pending and self.head_sha(wt) == pending.get("sha"))
         regrade = self._regrade_for(task)
-        for rnd in range(1, max_rounds + 1):
-            if rnd == 1 and regrade:
+        # D53: a park (DEGRADED/RATE/quota) inside a later round used to re-enter
+        # here at round 1 on adoption: the regrade/proof/grade of the OLD head
+        # ran again (2 extra proofs + 2 grader turns on LINT-TYPECHECK-TRUNK-R1,
+        # 2026-09-19 11:33-12:08Z) and the ROUND counter never reached the cap.
+        # rounds.json carries the round and its stage across the park.
+        rst = self._round_state(tdir)
+        start, skip_build = 1, False
+        if rst:
+            if rst.get("stage") == "graded":
+                start = int(rst["round"]) + 1
+            elif rst.get("stage") == "built" and self.head_sha(wt) == rst.get("head"):
+                start, skip_build = int(rst["round"]), True
+            if start > 1 or skip_build:
+                self.log("ROUND %s resumes at %d/%d after the park (%s round %s)"
+                         % (task, start, max_rounds, rst.get("stage"), rst.get("round")))
+                if fpath.exists():
+                    _doc, fails, unknown = findings_verdicts(fpath)
+        for rnd in range(start, max_rounds + 1):
+            if skip_build:
+                skip_build = False
+                self.log("BUILD %s round %d already on %s (build skipped)" % (task, rnd, rst["head"][:12]))
+                outcome = vprunners.TurnOutcome(STATUS_DONE, "build resumed", runner="build")
+            elif rnd == 1 and regrade:
                 # D21: the packet's benchmark was amended; the previous task's
                 # exact commit is proved and graded again, no builder round
                 why = self._regrade_reset(task, wt, regrade)
@@ -3595,6 +3616,7 @@ class LaneDriver(object):
                 self._note_unrun_checks(task, out_path)
                 self._autofix(wt, task, tdir)
             head = self.head_sha(wt)
+            self._save_round(tdir, rnd, "built", head)
             prec = None
             if needs_proof:
                 pout, prec = self._proof_step(task, attempt, row, contract, wt, tdir, head,
@@ -3640,6 +3662,7 @@ class LaneDriver(object):
                                           prec, owed)
             self.log("ROUND %s %d/%d fails=%s unknown=%s%s" % (task, rnd, max_rounds, fails, blocking,
                                                              " hosted_owed=%s" % owed if owed else ""))
+            self._save_round(tdir, rnd, "graded", head)
         head = self.head_sha(wt)
         reason = "%d rounds; FAIL %s" % (max_rounds, ",".join(fails)[:300])
         if not fails and blocking:
@@ -3719,6 +3742,19 @@ class LaneDriver(object):
             return (Path(wt) / ".vp" / "BASE").read_text(encoding="utf-8").strip()
         except OSError:
             return ""
+
+    @staticmethod
+    def _round_state(tdir):
+        try:
+            return json.loads((Path(tdir) / "rounds.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _save_round(tdir, rnd, stage, head):
+        (Path(tdir) / "rounds.json").write_text(
+            json.dumps({"round": rnd, "stage": stage, "head": head, "ts": utc_ms()}, indent=2),
+            encoding="utf-8")
 
     @staticmethod
     def _proof_pending(tdir):

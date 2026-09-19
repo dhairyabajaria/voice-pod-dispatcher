@@ -1021,6 +1021,41 @@ def test_proof_red_once_is_repaired_in_the_next_round(tmp_path):
     assert "fails=['platform/tests/test_a.py::test_x']" in log
 
 
+def test_park_inside_a_later_round_resumes_at_that_round_not_at_round_one(tmp_path, monkeypatch):
+    """D53: LINT-TYPECHECK-TRUNK-R1 2026-09-19 11:33-12:08Z: the round-2 builder
+    parked (DEGRADED, then RATE) and every adoption re-entered the rounds at 1:
+    the old head was proved and graded again (same fail), the counter never
+    moved, the cap could not fire.  rounds.json carries the round across the park."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"], "default_kind": "platform"}})
+    env.activate()
+    proof = FakeProof([{"status": "PASS"}] * 4)
+    grades = iter([findings("FAIL"), findings("PASS")])
+    builds = iter([result_ok, status("DEGRADED", "service_overloaded"), result_ok])
+
+    def routed(spec, ab):
+        if spec.item != "L02":
+            return routed_pass(spec, ab)
+        return (next(grades) if spec.role == "grader" else next(builds))(spec, ab)
+    oc = FakeRunner(default=routed)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    assert env.rows()["L02"]["state"] == "RUNNING", "parked in round 2, attempt stays for adoption"
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    assert json.loads((tdir / "rounds.json").read_text())["stage"] == "graded"
+    for srv in drv.servers.values():
+        srv["park_reason"] = srv["park_status"] = None
+        srv["parked_until"] = 0.0
+    settle(drv, 2)
+    assert env.rows()["L02"]["state"] == "VERIFIED"
+    l02 = [s for s in oc.calls if s.item == "L02"]
+    assert [s.role for s in l02] == ["builder", "grader", "builder", "builder", "grader"], \
+        "adoption goes straight to the round-2 builder: no second proof/grade of the round-1 head"
+    assert len(proof.calls) == 2
+    log = (env.run_root / "driver.log").read_text()
+    assert log.count("ROUND L02 1/2 fails") == 1 and "ROUND L02 resumes at 2/2" in log  # Env max_rounds == 2
+
+
 def test_proof_unknown_keeps_the_head_and_retries_proof_only(tmp_path, monkeypatch):
     monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
     env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
