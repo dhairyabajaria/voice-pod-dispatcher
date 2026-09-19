@@ -533,3 +533,42 @@ def test_d65_credit_and_trigger_failures_leave_rows_that_do_not_count(tmp_path):
     assert [(r["account"], r["status"], r["pipeline_id"]) for r in rows] == [
         ("2", "triggered", "pipe-2"), ("2", "credits_blocked", "pipe-2"), ("A1", "triggered", "pipe-A1")]
     assert p2.pipelines_today() == 2, "the blocked pipeline was still spent"
+
+
+def test_d76_memory_free_pct_parses_memory_pressure():
+    """D76: the gate reads memory_pressure's own percentage (the audit runner's
+    launch gate), None when the command is missing or says something else."""
+    class R(object):
+        def __init__(self, out): self.stdout, self.stderr = out, ""
+    out = "The system has 17179869184 (4194304 pages with a page size of 4096).\n\nStats: \n" \
+          "Pages free: 12345 \n...\nSystem-wide memory free percentage: 41%\n"
+    assert laneproof.memory_free_pct(run=lambda *a, **k: R(out)) == 41
+    assert laneproof.memory_free_pct(run=lambda *a, **k: R("nonsense")) is None
+    def missing(*a, **k):
+        raise OSError("no memory_pressure")
+    assert laneproof.memory_free_pct(run=missing) is None
+
+
+def test_d76_box_proof_is_held_below_the_memory_floor_and_runs_above_it(tmp_path):
+    """D76: a box-routed proof asks memory_pressure first; below
+    proof.memory_hold_below_pct (default 30) it returns BLOCKED_MEMORY without
+    launching vpproof (no Postgres spun up), above it the proof runs as before."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle(pipeline([]))
+    ex = FakeExec({})
+    alerts, logs = [], []
+    p = make_proof(tmp_path, circle, ex, cfg={"circleci": {"enabled": False}}, alerts=alerts, logs=logs)
+    p.memory_pct = lambda: 22
+    rec = p.run("L40", "proof-mem-1", wt, base, cand, "platform", ["platform/tests/test_x.py"])
+    assert rec["status"] == "BLOCKED_MEMORY" and rec["route"] == "box"
+    assert "22% < 30%" in rec["reason"]
+    assert not [a for a in ex.calls if "vpproof.py" in " ".join(map(str, a))], "vpproof never launched"
+    assert any("BLOCKED_MEMORY" in m for m in logs)
+    p.memory_pct = lambda: 45
+    rec = p.run("L40", "proof-mem-2", wt, base, cand, "platform", ["platform/tests/test_x.py"])
+    assert rec["status"] == "PASS" and rec["route"] == "box"
+    p.memory_pct = lambda: None                       # unreadable: never a hold
+    assert p.run("L40", "proof-mem-3", wt, base, cand, "platform", ["platform/tests/test_x.py"])["status"] == "PASS"
+    p.cfg["memory_hold_below_pct"] = 0                # roster can switch the gate off
+    p.memory_pct = lambda: 1
+    assert p.run("L40", "proof-mem-4", wt, base, cand, "platform", ["platform/tests/test_x.py"])["status"] == "PASS"

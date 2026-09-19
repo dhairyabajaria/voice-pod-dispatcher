@@ -2015,3 +2015,57 @@ def test_d64_gates_jsonl_records_startup_values_and_every_flip(tmp_path):
     # an unchanged roster (a code reload re-applies it) writes nothing
     drv._apply_roster(drv.roster)
     assert len((env.run_root / "gates.jsonl").read_text().splitlines()) == 4
+
+
+def test_d76_memory_hold_keeps_the_attempt_without_a_strike_and_alerts_once_per_episode(tmp_path, monkeypatch):
+    """D76: a box proof refused for memory (PROOF_BLOCKED_MEMORY) is the box's
+    condition, never the candidate's: held without a strike (like GATE/CAP/OFF),
+    re-asked after MEMORY_HOLD_S, alerted once per hold episode; the proof runs
+    on the same head once memory is back."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    monkeypatch.setattr(lanedriver, "MEMORY_HOLD_S", 0.0)
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "BLOCKED_MEMORY", "reason": "box memory free 22% < 30% (memory_pressure)"},
+                       {"status": "BLOCKED_MEMORY", "reason": "box memory free 24% < 30% (memory_pressure)"},
+                       {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    drv.memory_free_pct = lambda: 22
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "RUNNING", "held, not failed"
+    assert drv._fail["L02"]["count"] == 0, "the box's condition is no strike"
+    log = (env.run_root / "driver.log").read_text()
+    assert "HOLD L02" in log and "BLOCKED_MEMORY" in log and "FAIL L02" not in log
+    settle(drv, 6)
+    assert env.rows()["L02"]["state"] == "VERIFIED"
+    assert len(proof.calls) == 3 and len({c[2] for c in proof.calls}) == 1, "the same head, proof only"
+    assert [s.role for s in oc.calls if s.item == "L02"] == ["builder", "grader"], "no rebuild"
+    md = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert md.count("PROOF_BLOCKED_MEMORY") == 1, "two holds in one episode alert once"
+    drv.memory_free_pct = lambda: 45
+    assert drv._guards() is True
+    assert "memory-blocked" not in drv._alerted, "recovery re-arms the once-per-episode alert"
+
+
+def test_d76_memory_stop_pauses_every_claim_below_20_percent(tmp_path):
+    """D76: below night.memory_stop_below_pct (default 20) _guards pauses ALL new
+    claims (alert MEMORY once, heartbeat memory_paused), and lifts the pause when
+    memory recovers -- the disk-pause shape."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv.memory_free_pct = lambda: 18
+    assert drv._guards() is False and drv._memory_paused
+    assert drv._guards() is False
+    md = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert md.count("MEMORY") >= 1 and "18% < 20%" in md
+    drv.write_heartbeat()
+    hb = json.loads((env.run_root / "driver.heartbeat").read_text())
+    assert hb["memory_paused"] is True and hb["memory_free_pct"] == 18
+    drv.memory_free_pct = lambda: 33
+    assert drv._guards() is True and not drv._memory_paused
+    assert "memory recovered: 33%" in (env.run_root / "driver.log").read_text()
+    drv.memory_free_pct = lambda: None                 # unreadable: never pauses
+    assert drv._guards() is True

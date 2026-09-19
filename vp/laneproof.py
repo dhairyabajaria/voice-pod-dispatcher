@@ -20,6 +20,8 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -44,6 +46,21 @@ OFF_FILE = "CIRCLECI-OFF"
 def utc_ms():
     now = datetime.datetime.now(datetime.timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
+
+
+MEMORY_PRESSURE_RE = re.compile(r"free percentage:\s*(\d+)%")
+
+
+def memory_free_pct(run=subprocess.run):
+    """D76: the box's free memory as macOS `memory_pressure` reports it
+    ("System-wide memory free percentage: 41%"), the same number the old audit
+    runner gated launches on; None when the command is missing or unparsable."""
+    try:
+        res = run(["memory_pressure"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = MEMORY_PRESSURE_RE.search((res.stdout or "") + (res.stderr or ""))
+    return int(m.group(1)) if m else None
 
 
 class Proof(object):
@@ -193,7 +210,29 @@ class Proof(object):
         self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
         if route == "circleci":
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort)
+        held = self.memory_hold()
+        if held:
+            # D76: the box is short of memory (a proof spins up 4 Postgres + 4 pytest
+            # workers): the box's condition, never the candidate's -- the driver holds
+            # the attempt without a strike (PROOF_BLOCKED_MEMORY) and re-asks each tick
+            rec = {"status": "BLOCKED_MEMORY", "route": "box", "proof_id": pid, "sha": cand, "kind": kind,
+                   "paths": paths, "reason": held, "failed_nodes": [], "ts": utc_ms()}
+            self._write(pid, rec)
+            self.log("PROOF %s %s -> BLOCKED_MEMORY: %s" % (task, pid, held))
+            return rec
         return self.run_box(task, pid, wt, cand, kind, paths, workers=workers)
+
+    def memory_hold(self):
+        """D76: -> reason when free memory is below proof.memory_hold_below_pct
+        (default 30, the audit runner's launch gate), else None.  A pre-D76
+        instance after a hot reload has no `memory_pct`: read it with getattr."""
+        floor = int(self.cfg.get("memory_hold_below_pct", 30) or 0)
+        if floor <= 0:
+            return None
+        pct = (getattr(self, "memory_pct", None) or memory_free_pct)()
+        if pct is None or pct >= floor:
+            return None
+        return "box memory free %d%% < %d%% (memory_pressure)" % (pct, floor)
 
     # -- box -------------------------------------------------------------------------------
 

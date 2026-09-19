@@ -105,6 +105,7 @@ FAIL_BACKOFF_S = (60, 120, 300)
 SHM_HOLD_S = 300.0
 CREDITS_HOLD_S = 1800.0                 # CircleCI plan/credit refusal: hold, no strike, alert once
 GATE_HOLD_S = 600.0                     # D57: our own gate/cap/off refusal at trigger time: hold, no strike
+MEMORY_HOLD_S = 60.0                    # D76: box short of memory: hold, no strike, re-ask about every tick
 CREDITS_RELEASED = "BLOCKED_CREDITS_RELEASED"   # D46a: reason prefix when a credits-held claim is released
 SHM_POLL_S = 30.0
 # D19: auto-repair generations per parent row before the driver stops
@@ -697,6 +698,13 @@ class LaneDriver(object):
         except OSError:
             return None
 
+    def memory_free_pct(self):
+        """D76: `memory_pressure`'s free percentage (None off-macOS / unparsable)"""
+        try:
+            return laneproof.memory_free_pct()
+        except Exception:
+            return None
+
     def spent(self):
         usd, tokens = 0.0, {}
         try:
@@ -725,6 +733,22 @@ class LaneDriver(object):
         elif self._disk_paused:
             self._disk_paused = False
             self.log("disk recovered: %.1f GB" % gb)
+        # D76: below memory_stop_below_pct (default 20) no new claims at all; between
+        # that and proof.memory_hold_below_pct (30) only box proofs are held (laneproof)
+        pct = self.memory_free_pct()
+        stop = float(self.night.get("memory_stop_below_pct", 20))
+        paused = getattr(self, "_memory_paused", False)
+        if pct is not None and pct < stop:
+            if not paused:
+                self._memory_paused = True
+                self.alert("MEMORY", "free memory %d%% < %.0f%% (memory_pressure): no new claims until it recovers"
+                           % (pct, stop))
+        elif paused:
+            self._memory_paused = False
+            self.log("memory recovered: %s%%" % pct)
+        if pct is not None and pct >= float(self.proof_cfg.get("memory_hold_below_pct", 30) or 0):
+            with self._lock:
+                self._alerted.discard("memory-blocked")   # the next hold episode alerts again
         usd, tokens = self.spent()
         cap = self.budget.get("max_cost_usd_per_run")
         if cap is not None and usd >= float(cap) and not self._budget_stop:
@@ -749,7 +773,7 @@ class LaneDriver(object):
                 self.log("UNPARK runner %s: token cap raised" % runner)
         self._authority_check()
         return (not self._budget_stop and not self._disk_paused and not self._authority_stop
-                and not self._reload_failed)
+                and not self._reload_failed and not getattr(self, "_memory_paused", False))
 
     # -- §4(d) authority: the scheduler + review_gate the driver runs are the pinned ones ---
 
@@ -2485,6 +2509,8 @@ class LaneDriver(object):
                               "max_usd": self.budget.get("max_cost_usd_per_run"),
                               "stopped": self._budget_stop},
                    "disk_gb": round(self.disk_gb() or 0, 1), "disk_paused": self._disk_paused,
+                   "memory_free_pct": self.memory_free_pct(),
+                   "memory_paused": getattr(self, "_memory_paused", False),
                    "sequence": self.control.sequence(), "ist": self.ist_now().strftime("%H:%M"),
                    "idle_since": self._idle_since, "spawned_total": self.spawned_total,
                    "code_version": self.code_version(), "reloads": self._reload_count,
@@ -3570,6 +3596,14 @@ class LaneDriver(object):
                                % (CREDITS_RELEASED, outcome.detail[:200], waiting))
                 return
             self.note_hold(task, fkey, outcome.detail, CREDITS_HOLD_S)
+            return
+        if outcome.status == "PROOF_BLOCKED_MEMORY":
+            # D76: the box is short of memory: hold (no strike), alert once per hold
+            # episode (_guards clears the key when memory recovers), re-ask each tick
+            self.alert_once("memory-blocked", "PROOF_BLOCKED_MEMORY",
+                            "box short of memory; box proofs are held (no strike) until memory_pressure's free %% "
+                            "is back above proof.memory_hold_below_pct: %s" % outcome.detail[:300], task)
+            self.note_hold(task, fkey, outcome.detail, MEMORY_HOLD_S)
             return
         if outcome.status in ("PROOF_BLOCKED_GATE", "PROOF_BLOCKED_CAP", "PROOF_BLOCKED_OFF"):
             # D57: our own gate / daily cap / off switch refused the trigger (D65): the
