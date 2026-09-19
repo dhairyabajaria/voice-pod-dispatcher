@@ -89,10 +89,11 @@ REVIEW_PROMPT = (
 # records, so every runtime criterion was an honest UNKNOWN
 PROOFS_RULE = ("Runtime criteria ([box]/[hosted]): PASS when .vp/PROOFS.json records a PASS proof at the "
                "member's output sha whose paths cover the criterion's tests — cite the proof_id; UNKNOWN only "
-               "when no such record exists. Collection-baseline freshness: a union tip is pre-merge and its "
-               "baseline is expected to be stale; L35 Step 6 rebaselines it before the trunk merge. Record the "
-               "merge count from `scripts/ci_collection_floor.py freshness --branch vp/proof/review` "
-               "(informational mode) and do not FAIL the union on it.")
+               "when no such record exists. Collection-baseline provenance: a union tip is pre-merge, so "
+               "measured_commit, the test-ID diff and the merge count in platform/tests/collection_baseline.json "
+               "are expected to stop at the base; L35 Step 6 rebaselines at the union tip before the trunk merge. "
+               "Record the merge count from `scripts/ci_collection_floor.py freshness --branch vp/proof/review` "
+               "(informational mode) and do not FAIL the union on baseline staleness or provenance.")
 
 BUILD_KINDS = ("builder", "control", "security_build", "integration")
 RED_OUTCOMES = ("REPAIR_REQUIRED", "INVALID_EVIDENCE", "BLOCKED")

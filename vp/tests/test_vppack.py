@@ -581,7 +581,9 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     assert "L06 ok" in plan["review_benchmark"] and "<union>" not in plan["review_benchmark"]
     # D77 (§36 F.2): the head carries the PROOFS.json rule; with no records every entry is empty
     assert "PASS when .vp/PROOFS.json records a PASS proof" in plan["review_benchmark"]
-    assert "do not FAIL the union on it" in plan["review_benchmark"]
+    # D77a (Architect, after SEC-REVIEW-S3-FIXSET-R3 failed B108 on provenance): staleness AND provenance
+    assert "do not FAIL the union on baseline staleness or provenance" in plan["review_benchmark"]
+    assert "measured_commit, the test-ID diff and the merge count" in plan["review_benchmark"]
     assert [e["task"] for e in plan["proofs"]["entries"]] == ["L42", "L06", "L07", "L99"]
     assert all(e["proof_id"] is None and e["output_sha"] is None for e in plan["proofs"]["entries"])
     # with records: the newest PASS at the member's output sha wins over an older FAIL / a newer non-PASS
