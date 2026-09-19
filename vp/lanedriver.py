@@ -2974,8 +2974,13 @@ class LaneDriver(object):
         docs = [d for d in self._integration_docs() if d.get("status") == "BUILT"]
         latest = docs[-1] if docs else None
         members = {m.get("task"): m.get("output_sha") for m in (latest or {}).get("members") or []}
-        missing = [r for r in req if (tasks.get(r) or {}).get("state") not in self.UNION_MEMBER_STATES]
-        not_carried = [r for r in req if r not in missing and r not in members]
+        # a require names a PACKET: any of its rows (L09-SEED-FIX, -R1, -R2, ...) counts
+        def rows_of(pid):
+            return [t for t in tasks if t == pid or self.pack_by_task.get(t) == pid]
+        landed = {r: [t for t in rows_of(r) if (tasks.get(t) or {}).get("state") in self.UNION_MEMBER_STATES]
+                  for r in req}
+        missing = [r for r in req if not landed[r]]
+        not_carried = [r for r in req if landed[r] and not any(t in members for t in landed[r])]
         if ptask not in members or members.get(ptask) != out:
             not_carried.append(ptask)
         if missing or not_carried or not latest:
