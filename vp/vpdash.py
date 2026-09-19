@@ -330,7 +330,24 @@ class Dash(object):
                 bound = True          # the previous snapshot had another value: `since` is exact
                 break
             out[g] = {"gate": g, "open": cur, "since_ts": vpjourney.iso(datetime.fromtimestamp(since, timezone.utc)) if since else None,
-                      "since_exact": bound, "age_s": int(time.time() - since) if since else None}
+                      "since_exact": bound, "age_s": int(time.time() - since) if since else None, "source": "roster.N.json mtimes"}
+        # D64: the driver's gates.jsonl names the flip exactly; it wins where it has one
+        flips = {}
+        try:
+            for r in vpjourney.TailReader(self.run_root / "gates.jsonl").read_new():
+                g = r.get("gate")
+                if g not in out:
+                    continue
+                if r.get("why") == "reload" and bool(r.get("to")) == out[g]["open"]:
+                    flips[g] = r.get("ts")
+                elif r.get("why") == "reload":
+                    flips.pop(g, None)          # flipped away later; the snapshot bound stands
+        except Exception:
+            pass
+        for g, t in flips.items():
+            a = age_s(t)
+            if a is not None:
+                out[g].update({"since_ts": t, "since_exact": True, "age_s": a, "source": "gates.jsonl"})
         return out, len(snaps) - 1
 
     def decisions_view(self, roots, alerts, now):

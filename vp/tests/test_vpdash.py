@@ -110,6 +110,13 @@ def test_decisions_panel_gate_age_from_snapshots_and_held_rows(tmp_path):
     d2 = gates["DELIVERY-2"]
     assert d2["open"] is True and d2["since_exact"] is False                                   # true in every snapshot: lower bound only
     assert dec["closed_gates_holding_work"] == 1 and dec["rows_held_by_closed_gates"] == 1
+    assert d1["source"] == "roster.N.json mtimes"
+    # D64: once the driver writes gates.jsonl the flip time is exact and wins
+    (d.run_root / "gates.jsonl").write_text(json.dumps({"ts": ts(9), "gate": "DELIVERY-1", "from": None, "to": True, "why": "startup"}) + "\n"
+                                            + json.dumps({"ts": ts(9, 30), "gate": "DELIVERY-1", "from": True, "to": False, "why": "reload"}) + "\n")
+    d.refresh()
+    g = {g["gate"]: g for g in d.snapshot["decisions"]["gates"]}["DELIVERY-1"]
+    assert g["source"] == "gates.jsonl" and g["since_ts"] == ts(9, 30) and g["since_exact"] is True
     assert [r["id"] for r in dec["open_rulings"]] == ["R2"]
     assert dec["blocked_by_reason"] == [{"reason": "OWNER_GATE: (no reason)", "rows": 1, "roots": ["P-FIX"]}]
 
