@@ -3060,6 +3060,40 @@ class LaneDriver(object):
                       "why": "hosted twin of %s on the integration union %s (D46: requires %s)"
                              % (ptask, latest.get("union"), ",".join(req))}
 
+    def _base_invariant(self, task, row, base, stacked, tasks):
+        """D63: the one dispatch-time rule the stacking patches (D28/D32/D37/D46)
+        each approximate for their own case -- every dependency this row must
+        build on (scheduler depends_on, the stack plan's members and `on`, a
+        hosted twin's parent) whose PACKET has a VERIFIED/INTEGRATED output must
+        be an ancestor of the base about to be claimed.  Returns the violations
+        [(dep, sha12)]; empty means claim.  Catalog rows are not checked (they
+        integrate through unions/L35), any row of the dependency's packet counts
+        (a -Rn successor carried in the union satisfies its predecessor), and a
+        row's own packet is never its dependency (a retry replaces, not builds on)."""
+        deps = list(row.get("depends_on") or [])
+        if stacked:
+            deps += [m.get("task") for m in stacked.get("members") or []]
+            deps += list(stacked.get("on") or [])
+        p = self.packet_for(task)
+        if p and vppack.is_hosted_twin(p) and p.get("twin_of"):
+            deps += [t for t in tasks if t == p["twin_of"] or self.pack_by_task.get(t) == p["twin_of"]]
+        own = self.pack_by_task.get(task)
+        bad, seen = [], set()
+        for dep in deps:
+            pid = self.pack_by_task.get(dep)
+            if not dep or pid in seen or not pid or pid == own or not (tasks.get(dep) or {}).get("dynamic"):
+                continue
+            seen.add(pid)
+            shas = [(tasks[t] or {}).get("output_sha") for t in tasks
+                    if self.pack_by_task.get(t) == pid and (tasks[t] or {}).get("state") in self.UNION_MEMBER_STATES
+                    and (tasks[t] or {}).get("output_sha")]
+            if not shas:
+                continue
+            if any(self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", sha, base])[0] == 0 for sha in shas):
+                continue
+            bad.append((dep, shas[-1][:12]))
+        return bad
+
     def _dispatch_ready(self, state):
         try:
             rows = self.control.ready().get("ready") or []
@@ -3111,6 +3145,16 @@ class LaneDriver(object):
                 # kind infra, was claimed on trunk 21:55Z)
                 base, stacked = self._stacked_base(task, row, state)
                 if not base:
+                    continue
+                # D63: whatever the stacking code decided, the base a build is claimed on
+                # must contain every VERIFIED dependency output (reviews are not checked
+                # here: their subject, the union tip, is composed after the claim)
+                bad = self._base_invariant(task, row, base, stacked, state.get("tasks") or {})
+                if bad:
+                    self.alert_once("base-invariant:%s:%s" % (task, ",".join(d for d, _s in bad)), "BASE_INVARIANT",
+                                    "%s: base %s does not contain the VERIFIED output of %s; not claimed, held %ss"
+                                    % (task, base[:12], ", ".join("%s@%s" % b for b in bad), self.STACK_HOLD_S), task)
+                    self.note_hold(task, self._ready_key(row), "BASE_INVARIANT %s" % task, self.STACK_HOLD_S)
                     continue
             else:
                 base = self._base_for(row, state)

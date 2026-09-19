@@ -982,6 +982,64 @@ def test_build_whose_scheduler_dependency_is_a_verified_fix_not_in_its_base_is_h
     assert rows["P-STACKED"]["state"] == "VERIFIED" and rows["P-STACKED"]["stacked_on"] == ["P-DEP"]
 
 
+def test_d63_base_invariant_holds_a_claim_whose_base_lacks_a_verified_dependency(tmp_path, monkeypatch):
+    """D63: with every stacking patch blind (no stack plan, no D32 check) the
+    dispatch-time invariant alone refuses to claim P-STACKED on a trunk that
+    does not contain P-DEP's VERIFIED output; with the patches back it builds
+    stacked and the invariant stays silent; with the invariant itself silenced
+    the row is claimed on bare trunk (the guard is on the path, not decorative)."""
+    import lanedriver
+    pd = tmp_path / "pack"
+    packet(pd, "P-DEP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="first fix for L00")
+    packet(pd, "P-STACKED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", deps=["P-DEP"],
+           body="builds on P-DEP for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    oc = by_role({"builder": _fix_builder, "grader": findings("PASS"), "probe": result_ok})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    monkeypatch.setattr(lanedriver.LaneDriver, "_stack_plan", lambda self, task, tasks: None)
+    monkeypatch.setattr(lanedriver.LaneDriver, "_unstacked_deps", lambda self, row, tasks, plan: [])
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-DEP"]["state"] == "VERIFIED"
+    assert rows["P-STACKED"]["state"] == "READY", rows["P-STACKED"]["state"]
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "BASE_INVARIANT" in alerts and "P-DEP@%s" % rows["P-DEP"]["output_sha"][:12] in alerts
+    assert "STACK_REQUIRED" not in alerts, "the D32 check was silenced: the invariant caught it alone"
+    assert "HOLD P-STACKED 600s BASE_INVARIANT" in (env.run_root / "driver.log").read_text()
+    # the stacking patches back: the row builds on the dependency, the invariant agrees
+    monkeypatch.undo()
+    drv.clear_failures("P-STACKED")
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["P-STACKED"]["state"] == "VERIFIED" and rows["P-STACKED"]["stacked_on"] == ["P-DEP"]
+    assert (env.run_root / "alerts.jsonl").read_text().count("BASE_INVARIANT") == 1
+    # a fresh run with the invariant silenced and the patches blind claims on bare trunk:
+    # the negative control that proves the guard above did the holding
+    pd2 = tmp_path / "pack2"
+    packet(pd2, "Q-DEP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix for L00")
+    packet(pd2, "Q-STACKED", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", deps=["Q-DEP"],
+           body="builds on Q-DEP for L00")
+    (tmp_path / "two").mkdir()
+    env2 = Env(tmp_path / "two", roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                               "proof": {"require_for_kinds": []}})
+    env2.roster["run"]["pack_dir"] = str(pd2)
+    (env2.run_root / "roster.json").write_text(json.dumps(env2.roster, indent=2))
+    env2.activate()
+    drv2 = env2.driver({"opencode": by_role({"builder": _fix_builder, "grader": findings("PASS"), "probe": result_ok}),
+                        "codex": FakeRunner(), "claude": FakeRunner()})
+    monkeypatch.setattr(lanedriver.LaneDriver, "_stack_plan", lambda self, task, tasks: None)
+    monkeypatch.setattr(lanedriver.LaneDriver, "_unstacked_deps", lambda self, row, tasks, plan: [])
+    monkeypatch.setattr(lanedriver.LaneDriver, "_base_invariant", lambda self, task, row, base, stacked, tasks: [])
+    settle(drv2, 6)
+    rows2 = env2.rows()
+    assert rows2["Q-STACKED"]["state"] == "VERIFIED" and not rows2["Q-STACKED"].get("stacked_on"), rows2["Q-STACKED"]
+    assert "BASE_INVARIANT" not in (env2.run_root / "alerts.jsonl").read_text()
+
+
 def test_a_retry_going_red_alerts_fail_after_retry(tmp_path):
     pd = tmp_path / "pack"
     packet(pd, "P-GAP", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="gap for L00")
