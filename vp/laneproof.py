@@ -134,6 +134,7 @@ class Proof(object):
     # D65: every trigger attempt leaves a ledger row; only TRIGGERED rows spend a pipeline
     REFUSED_GATE, REFUSED_CAP, REFUSED_OFF = "refused_gate", "refused_cap", "refused_off"
     CREDITS_BLOCKED, TRIGGER_FAILED = "credits_blocked", "trigger_failed"
+    REPOLLED = "repolled"                          # D81: an open pipeline polled again, not a trigger
 
     def pipelines_today(self):
         """pipelines actually triggered today (UTC): rows without a status are the
@@ -321,17 +322,33 @@ class Proof(object):
         targets = cc.get("accounts") or None
         pipeline_id, account = None, None
         pushed = {}                                   # account -> remote the branch was pushed to
+        prior = self.triggered_pipeline(cand)
         with self._lock:
             self.circle_active += 1
         try:
             try:
-                rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
-                if rc != 0:
-                    raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
-                accounts, skipped = self._accounts(cc)
-                if not accounts:
-                    raise self.AllBlocked("every CircleCI account is blocked for credits: %s" % skipped)
-                res, refusals = None, []
+                if prior:
+                    # D81 (20:46Z): the poll of a real, still-running pipeline died
+                    # ("identity request failed") -> UNKNOWN -> the retry re-triggered
+                    # a second pipeline for the same sha.  Re-poll the one we have.
+                    pipeline_id, account = prior["pipeline_id"], prior.get("account")
+                    self.log("PROOF %s %s re-polls circleci pipeline %s (account %s) recorded by %s: "
+                             "no new trigger (D81)" % (task, pid, pipeline_id, account, prior.get("proof_id")))
+                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.REPOLLED,
+                                        reason="D81: from %s" % prior.get("proof_id"))
+                    res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
+                                           deadline_s=int(cc.get("deadline_min", 90)) * 60,
+                                           runner=runner, account=account, targets=targets,
+                                           abort=lambda: bool((abort and abort()) or self.circle_off()))
+                    accounts = []
+                else:
+                    rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
+                    if rc != 0:
+                        raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
+                    accounts, skipped = self._accounts(cc)
+                    if not accounts:
+                        raise self.AllBlocked("every CircleCI account is blocked for credits: %s" % skipped)
+                    res, refusals = None, []
                 for acct in accounts:
                     refusal = self._trigger_refusal(cc)
                     if refusal:
@@ -376,7 +393,7 @@ class Proof(object):
                     self.log("PROOF %s %s circleci pipeline %s (account %s) blocked for credits -> next account"
                              % (task, pid, pipeline_id, account))
                     res, pipeline_id, account = None, None, None
-                if res is None:
+                if res is None and not prior:
                     raise self.AllBlocked("; ".join("account %s: %s" % r for r in refusals)
                                           or "every CircleCI account is blocked for credits: %s" % skipped)
             except self.circle.Cancelled:
@@ -528,6 +545,30 @@ class Proof(object):
         return finding
 
     ANSWERS = ("PASS", "FAIL_PRODUCT", "FAIL_INFRA")
+
+    OPEN_STATUSES = ("UNKNOWN",)
+
+    def triggered_pipeline(self, cand):
+        """D81: the newest CircleCI record for this sha whose pipeline was really
+        triggered but whose answer never came back (status UNKNOWN: the poll
+        died, the pipeline did not) -> {pipeline_id, account, proof_id}, else None.
+        A PASS/FAIL_* is D79's business (reuse), CANCELLED/BLOCKED_* are closed."""
+        d = self.run_root / "proofs"
+        best = None
+        try:
+            files = sorted(d.glob("proof-*.json"))
+        except OSError:
+            return None
+        for f in files:
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (rec.get("sha") == cand and rec.get("route") == "circleci" and rec.get("pipeline_id")
+                    and rec.get("status") in self.OPEN_STATUSES):
+                if best is None or str(rec.get("ts") or "") > str(best.get("ts") or ""):
+                    best = rec
+        return best
 
     def _write(self, pid, rec):
         """RUN_ROOT/proofs/<pid>.json, or <pid>-p<pipeline8>.json when the record

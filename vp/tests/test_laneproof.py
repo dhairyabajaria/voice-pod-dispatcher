@@ -622,3 +622,44 @@ def test_d79b_a_cancelled_pipeline_records_cancelled_and_keeps_the_earlier_answe
     p._write("proof-8", {"status": "BLOCKED_GATE", "pipeline_id": None})
     out = p._write("proof-8", {"status": "BLOCKED_CAP", "pipeline_id": None})
     assert out.name == "proof-8.json" and json.loads(out.read_text())["status"] == "BLOCKED_CAP"
+
+
+def test_d81_a_retry_repolls_the_pipeline_whose_poll_died_instead_of_triggering_again(tmp_path):
+    """D81 (2026-09-19 20:46Z): pipeline eb3f3dc9 was triggered, the poll died
+    ("identity request failed") -> UNKNOWN -> the retry would have triggered a
+    second pipeline for the same sha (~2,300 credits) while the first still ran.
+    A record that is UNKNOWN with a real pipeline_id is re-polled, never re-triggered."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle({"jobs": [{"id": "j2", "name": "lint", "status": "success", "job_number": 342}],
+                         "failed_tests": {}, "workflows": [{"id": "w1", "status": "success"}]})
+    polls = {"n": 0}
+
+    def poll(pipeline_id, interval, deadline_s, runner, account, abort, targets=None):
+        polls["n"] += 1
+        circle.calls.append(("poll", pipeline_id, account))
+        if polls["n"] == 1:
+            raise RuntimeError("Account 3: identity request failed; command was not run")
+        return circle.res
+    circle.poll = poll
+    logs = []
+    p = make_proof(tmp_path, circle, FakeExec({}), logs=logs)
+    rec1 = p.run("L09", "proof-1", wt, base, cand, "platform", [])
+    assert rec1["status"] == "UNKNOWN" and rec1["pipeline_id"] == "pipe-206"
+    assert p.triggered_pipeline(cand)["pipeline_id"] == "pipe-206"
+    triggers = [c for c in circle.calls if c[0] == "trigger"]
+    assert len(triggers) == 1
+    # the retry (same or another pid): no push, no trigger, the same pipeline polled again
+    rec2 = p.run("L09", "proof-1", wt, base, cand, "platform", [])
+    assert rec2["status"] == "PASS" and rec2["pipeline_id"] == "pipe-206" and rec2["account"] == "3"
+    assert len([c for c in circle.calls if c[0] == "trigger"]) == 1, "no second trigger"
+    assert len([c for c in circle.calls if c[0] == "push"]) == 1, "no second push"
+    assert [c for c in circle.calls if c[0] == "poll"] == [("poll", "pipe-206", "3"), ("poll", "pipe-206", "3")]
+    assert any("re-polls circleci pipeline pipe-206" in m and "D81" in m for m in logs)
+    rows = [json.loads(l) for l in (tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl").read_text().splitlines()]
+    assert [r["status"] for r in rows] == ["triggered", "repolled"], "the re-poll is not a trigger (daily cap)"
+    # once answered, nothing is open for that sha any more (D79 reuse takes over)
+    assert p.triggered_pipeline(cand) is None
+    # a CANCELLED or BLOCKED record with a pipeline id is closed, not open
+    (tmp_path / "run" / "proofs" / "proof-x-pdead.json").write_text(json.dumps(
+        {"sha": "deadbeef", "route": "circleci", "pipeline_id": "pipe-9", "status": "CANCELLED", "ts": "2026-09-19T20:00:00.000Z"}))
+    assert p.triggered_pipeline("deadbeef") is None
