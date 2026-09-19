@@ -119,3 +119,35 @@ def test_vpproof_keeps_its_lock_names_and_computes_the_tier():
     import lanedriver
     assert "vp_box_lock" in lanedriver.RELOAD_ORDER
     assert lanedriver.RELOAD_ORDER.index("vp_box_lock") < lanedriver.RELOAD_ORDER.index("vpproof")
+
+
+def test_d76b_1_small_proofs_yield_to_a_waiting_exclusive_so_it_cannot_starve(tmp_path):
+    """D76b-1 (Expert Coder): mkdir locks are not FIFO -- a newcomer small proof
+    could win a freed slot ahead of a waiting full proof forever.  The exclusive
+    keeps box.lock.d while it waits and small proofs yield whenever box.lock.d
+    exists, so the slots drain to the exclusive."""
+    a = bl.BoxLocks(tmp_path, "s1", "small-a", tier=bl.SLOT)
+    assert a.acquire(0, sleep=NOSLEEP)[0]
+    full = bl.BoxLocks(tmp_path, "f", "full-1", tier=bl.EXCLUSIVE)
+    rounds = []
+    def one_round(_s):
+        rounds.append(1)
+        if len(rounds) == 1:
+            # while the exclusive waits it holds box.lock.d; a newcomer small yields
+            assert full.held == [bl.BOX] and (tmp_path / bl.BOX).exists()
+            b = bl.BoxLocks(tmp_path, "s2", "small-b", tier=bl.SLOT)
+            ok, why = b.acquire(0, sleep=NOSLEEP)
+            assert not ok and "yielding" in why and b.held == []
+            a.release()                        # the running small finishes
+        if len(rounds) > 3:
+            raise AssertionError("exclusive never got the slots")
+    assert full.acquire(60, sleep=one_round) == (True, "")
+    assert full.held == [bl.BOX, bl.SLOTS[0], bl.SLOTS[1], bl.PORTAL]
+    full.release()
+    assert held(tmp_path) == []
+    # a timed-out exclusive leaves nothing behind (box.lock.d is not leaked)
+    c = bl.BoxLocks(tmp_path, "s3", "small-c", tier=bl.SLOT)
+    assert c.acquire(0, sleep=NOSLEEP)[0]
+    full2 = bl.BoxLocks(tmp_path, "f", "full-2", tier=bl.EXCLUSIVE)
+    assert not full2.acquire(0, sleep=NOSLEEP)[0] and full2.held == [] and not (tmp_path / bl.BOX).exists()
+    c.release()

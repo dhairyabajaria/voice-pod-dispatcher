@@ -15,9 +15,13 @@ mkdir directories under CN with an owner.json {pid, token, ts, proof_id, tier}:
 Fixed acquisition order prevents deadlock: an exclusive holder takes box.lock.d
 FIRST, then slot-0, slot-1, (portal), and releases in reverse; two exclusives
 serialise on box.lock.d, an exclusive waits for both slots to drain, small
-proofs only ever contend on the slots.  A waiter never holds one lock while
-waiting for another (all-or-nothing per round).  A lock whose owner pid is
-dead is reaped (logged + alerted), never waited on forever.
+proofs only ever contend on the slots.  Starvation-freedom (D76b-1, Expert
+Coder 2026-09-19): an exclusive waiter KEEPS box.lock.d while it waits for the
+slots to drain, and a small proof yields (does not try a slot) whenever
+box.lock.d exists -- so newcomers cannot win a freed slot ahead of the
+exclusive.  Slot holders never wait on anything while holding a slot, so a
+pending exclusive cannot deadlock them.  A lock whose owner pid is dead is
+reaped (logged + alerted), never waited on forever.
 
 CLI (the same helper for scripts):
 
@@ -149,15 +153,25 @@ class BoxLocks(object):
         self.held.append(name)
         return True, ""
 
+    def _box_pending(self):
+        """box.lock.d exists (an exclusive holds or waits): small proofs yield"""
+        return (self.cn / BOX).exists()
+
     def _round(self):
-        """one all-or-nothing attempt in the fixed order; -> (ok, reason)"""
+        """one attempt in the fixed order; -> (ok, reason).  An exclusive keeps
+        box.lock.d between rounds (its claim on the box); everything else is
+        all-or-nothing -- a partial hold is released before waiting."""
         reason = ""
         if self.tier == EXCLUSIVE:
             for name in self.names:
+                if name in self.held:
+                    continue
                 ok, reason = self._try_one(name)
                 if not ok:
                     return False, reason
             return True, ""
+        if self._box_pending():
+            return False, "yielding to the exclusive holder/waiter of %s" % BOX
         got_slot = False
         for name in SLOTS:
             ok, reason = self._try_one(name)
@@ -180,13 +194,17 @@ class BoxLocks(object):
             ok, reason = self._round()
             if ok:
                 return True, ""
-            self.release()          # never hold one while waiting for another
+            # never hold a slot while waiting; an exclusive keeps only box.lock.d
+            self.release(keep=(BOX,) if self.tier == EXCLUSIVE else ())
             if time.monotonic() > deadline:
+                self.release()
                 return False, reason
             sleep(5)
 
-    def release(self):
+    def release(self, keep=()):
         for name in reversed(list(self.held)):
+            if name in keep:
+                continue
             op = self._owner_path(name)
             try:
                 owner = json.loads(op.read_text(encoding="utf-8"))
