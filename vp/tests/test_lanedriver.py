@@ -2174,3 +2174,58 @@ def test_d79_a_recorded_answer_is_reused_instead_of_re_proving_the_same_head(tmp
     assert len(copies) == 1 and copied["record"] == "proofs/%s" % copies[0].name
     assert json.loads((proofs / "proof-L02-earlier.json").read_text()).get("reused_from") is None
     assert not (tdir / "proof-pending.json").exists()
+
+
+def test_d80_migration_numbers_are_allocated_by_the_driver_at_claim_time(tmp_path, monkeypatch):
+    """D80 (F13): a packet with platform/db/migrations/NNN_<slug>.sql in its
+    owned_files gets the number from `migration allocate` when the driver
+    prepares the worktree (the builder cannot reach the scheduler: not in the
+    worktree, cwd-relative --state).  Idempotent across rounds/restarts; the
+    ceiling follows the worktree's own migrations dir."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()})
+    wt = env.tmp / "wt-d80"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / ".vp" / "PACKET.md").write_text("# packet\n2. run the allocator\n")
+    mig = wt / "platform" / "db" / "migrations"
+    mig.mkdir(parents=True)
+    (mig / "301_union_member_added_this.sql").write_text("-- a member's migration above the floor\n")
+    monkeypatch.setattr(drv, "packet_for", lambda task: {
+        "id": task, "owned_files": ["platform/core/x.py", "platform/db/migrations/NNN_l09_sandbox_import.sql",
+                                    "TECHNICAL.md"]})
+    got = drv._allocate_migrations(wt, "L02")
+    assert [(e["number"], e["slug"], e["reused"]) for e in got] == [(302, "l09_sandbox_import", False)], \
+        "ceiling = the worktree's highest file (301), not the roster floor"
+    rec = json.loads((wt / ".vp" / "MIGRATION.json").read_text())
+    assert rec[0]["file"] == "platform/db/migrations/302_l09_sandbox_import.sql" and rec[0]["task"] == "L02"
+    pk = (wt / ".vp" / "PACKET.md").read_text()
+    assert pk.startswith("> MIGRATION NUMBERS") and "302_l09_sandbox_import.sql" in pk and pk.count("> MIGRATION NUMBERS") == 1
+    st = json.loads(env.state.read_text())
+    assert st["migrations"]["302"]["task"] == "L02" and st["migrations"]["302"]["slug"] == "l09_sandbox_import"
+    # a second call (next round / adoption) reuses the file, allocates nothing new
+    again = drv._allocate_migrations(wt, "L02")
+    assert again == got and len(json.loads(env.state.read_text())["migrations"]) == 1
+    # a lost MIGRATION.json (fresh worktree after a restart) is rebuilt from the state, not re-allocated
+    (wt / ".vp" / "MIGRATION.json").unlink()
+    rebuilt = drv._allocate_migrations(wt, "L02")
+    assert rebuilt[0]["number"] == 302 and rebuilt[0]["reused"] is True
+    assert len(json.loads(env.state.read_text())["migrations"]) == 1
+    log = (env.run_root / "driver.log").read_text()
+    assert "MIGRATION L02 l09_sandbox_import -> platform/db/migrations/302_l09_sandbox_import.sql (allocated)" in log
+    # no placeholder: nothing happens, nothing written
+    monkeypatch.setattr(drv, "packet_for", lambda task: {"id": task, "owned_files": ["platform/core/x.py"]})
+    wt2 = env.tmp / "wt-d80-none"
+    (wt2 / ".vp").mkdir(parents=True)
+    assert drv._allocate_migrations(wt2, "L02") is None and not (wt2 / ".vp" / "MIGRATION.json").exists()
+    # the allocator refusing (a finished task) is a logged alert, never a crash
+    monkeypatch.setattr(drv, "packet_for", lambda task: {
+        "id": task, "owned_files": ["platform/db/migrations/NNN_never.sql"]})
+    assert drv._allocate_migrations(wt2, "NO-SUCH-TASK") is None
+    # a hosted twin never allocates: it proves the parent's output
+    monkeypatch.setattr(drv, "packet_for", lambda task: {
+        "id": task, "twin_of": "L02", "v13_kind": "HOSTED-TWIN", "runner_role": "proof",
+        "owned_files": ["platform/db/migrations/NNN_twin.sql"]})
+    assert drv._allocate_migrations(wt2, "L02") is None
+    log = (env.run_root / "driver.log").read_text()
+    assert "MIGRATION NO-SUCH-TASK allocate failed" in log and "MIGRATION_ALLOC_FAILED" in log

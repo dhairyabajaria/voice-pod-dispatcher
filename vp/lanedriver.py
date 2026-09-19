@@ -2464,6 +2464,79 @@ class LaneDriver(object):
         except OSError:
             pass
 
+    MIGRATION_PLACEHOLDER = re.compile(r"(?:^|/)migrations/NNN_([a-z0-9_]+)\.sql$")
+
+    def _allocate_migrations(self, wt, task):
+        """D80 (F13): a packet whose owned_files carry platform/db/migrations/
+        NNN_<slug>.sql gets its number from `migration allocate` HERE, at
+        claim time, and finds it in <wt>/.vp/MIGRATION.json (+ a head line in
+        .vp/PACKET.md).  The builder never calls the scheduler: the script is
+        not in any worktree and its --state/--catalog are cwd-relative, so
+        L09-SANDBOX-SEED-WRITER's builder (19:53Z) failed the call and typed
+        267 itself.  Idempotent: numbers already allocated to the task (a
+        driver restart, a later round) are reused, never re-allocated; a
+        failure is logged + alerted once and the attempt goes on (the builder
+        disputes B2 as before)."""
+        packet = self.packet_for(task)
+        if not packet or vppack.is_hosted_twin(packet):
+            return None                       # a twin proves the parent's output; it owns no number
+        slugs = []
+        for f in packet.get("owned_files") or []:
+            m = self.MIGRATION_PLACEHOLDER.search(str(f))
+            if m and m.group(1) not in slugs:
+                slugs.append(m.group(1))
+        if not slugs:
+            return None
+        out = Path(wt) / ".vp" / "MIGRATION.json"
+        if out.exists():
+            try:
+                have = json.loads(out.read_text(encoding="utf-8"))
+                if sorted(e.get("slug") for e in have) == sorted(slugs):
+                    return have
+            except (OSError, ValueError):
+                pass
+        base_dir = Path(wt) / "platform" / "db" / "migrations"
+        entries = []
+        try:
+            _rc, listing = self.control.call("migration", ["list"])
+            mine = {rec.get("slug"): int(n) for n, rec in ((listing or {}).get("allocations") or {}).items()
+                    if rec.get("task") == task}
+            for slug in slugs:
+                if slug in mine:
+                    number, reused = mine[slug], True
+                else:
+                    args = ["allocate", "--task", task, "--slug", slug]
+                    if base_dir.is_dir():
+                        args += ["--base-dir", str(base_dir)]
+                    if mine:
+                        args.append("--another")   # the task already holds a number for another slug
+                    _rc, data = self.control.call("migration", args)
+                    number, reused = int((data or {}).get("number")), bool((data or {}).get("reused"))
+                    mine[slug] = number
+                entries.append({"number": number, "name": "%03d" % number, "slug": slug,
+                                "file": "platform/db/migrations/%03d_%s.sql" % (number, slug),
+                                "task": task, "reused": reused, "ts": utc_ms()})
+        except (ControlError, ValueError, TypeError) as exc:
+            self.log("MIGRATION %s allocate failed: %s" % (task, str(exc)[:300]))
+            self.alert_once("migration-alloc:%s" % task, "MIGRATION_ALLOC_FAILED",
+                            "%s: migration allocate failed at claim time; the builder has no number "
+                            "(.vp/MIGRATION.json missing): %s" % (task, str(exc)[:300]), task)
+            return None
+        out.write_text(json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8")
+        head = ("> MIGRATION NUMBERS (allocated by the driver at claim time, F13/D80 -- do NOT run "
+                "`migration allocate` yourself; it is recorded in run-state): %s. Details: .vp/MIGRATION.json\n\n"
+                % "; ".join("%s -> %s" % (e["slug"], e["file"]) for e in entries))
+        pk = Path(wt) / ".vp" / "PACKET.md"
+        try:
+            cur = pk.read_text(encoding="utf-8")
+            if "> MIGRATION NUMBERS" not in cur:
+                pk.write_text(head + cur, encoding="utf-8")
+        except OSError:
+            pass
+        for e in entries:
+            self.log("MIGRATION %s %s -> %s (%s)" % (task, e["slug"], e["file"], "reused" if e["reused"] else "allocated"))
+        return entries
+
     # -- heartbeat / STOP ----------------------------------------------------------------
 
     def stop_requested(self):
@@ -3537,6 +3610,7 @@ class LaneDriver(object):
             contract, row = self._union_overlay(contract, row, union)
         self.write_vp_files(wt, task, contract, base, row)
         self.write_dispatch_record(wt, task, attempt, contract, base, row, union=union)
+        self._allocate_migrations(wt, task)
         tdir = self._turn_dir(task, attempt)
         fkey = attempt
         sid = self._saved_session(tdir)
