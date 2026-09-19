@@ -2069,3 +2069,71 @@ def test_d76_memory_stop_pauses_every_claim_below_20_percent(tmp_path):
     assert "memory recovered: 33%" in (env.run_root / "driver.log").read_text()
     drv.memory_free_pct = lambda: None                 # unreadable: never pauses
     assert drv._guards() is True
+
+
+def test_d79_reusable_proof_picks_a_real_answer_for_the_same_sha_kind_and_paths(tmp_path):
+    """D79 (Architect, 2026-09-19 19:0xZ): the round loop re-proved the same
+    sha every round and on CircleCI that is a NEW pipeline per round
+    (L06-HOSTED-R3 round 2 -> 9914a1d4).  A recorded real answer -- a circleci
+    record with a pipeline_id or a box record, status PASS/FAIL_PRODUCT -- for
+    the same sha + kind + paths is reused; anything else is not an answer."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "a" * 40
+    def rec(pid, **kw):
+        d = {"proof_id": pid, "sha": sha, "kind": "platform", "paths": ["t/a.py"], "route": "circleci",
+             "pipeline_id": "p-" + pid, "status": "FAIL_PRODUCT", "ts": "2026-09-19T19:00:00.000Z"}
+        d.update(kw)
+        (proofs / (pid + ".json")).write_text(json.dumps(d))
+    rec("proof-X-1")                                                   # real red answer
+    rec("proof-X-2", status="PASS", ts="2026-09-19T19:05:00.000Z")     # newer real green answer
+    rec("proof-X-3", status="UNKNOWN", pipeline_id=None, ts="2026-09-19T19:09:00.000Z")   # not an answer
+    rec("proof-X-4", status="CANCELLED", ts="2026-09-19T19:10:00.000Z")                    # not an answer
+    rec("proof-X-5", status="FAIL_PRODUCT", pipeline_id=None, ts="2026-09-19T19:11:00.000Z")  # circleci w/o pipeline
+    rec("proof-X-6", kind="portal", ts="2026-09-19T19:12:00.000Z")                          # other kind
+    rec("proof-X-7", paths=["t/b.py"], ts="2026-09-19T19:13:00.000Z")                        # other paths
+    rec("proof-X-8", route="none", pipeline_id=None, ts="2026-09-19T19:14:00.000Z")          # docs-only route
+    best = drv._reusable_proof(sha, "platform", ["t/a.py"])
+    assert best and best["proof_id"] == "proof-X-2", best
+    assert drv._reusable_proof(sha, "platform", ["t/a.py"], exclude="proof-X-2")["proof_id"] == "proof-X-1"
+    assert drv._reusable_proof(sha, "platform", ["t/b.py"])["proof_id"] == "proof-X-7"
+    assert drv._reusable_proof(sha, "platform", []) is None
+    assert drv._reusable_proof("b" * 40, "platform", ["t/a.py"]) is None
+    rec("proof-X-9", route="box", pipeline_id=None, ts="2026-09-19T19:20:00.000Z")            # a completed box run counts
+    assert drv._reusable_proof(sha, "platform", ["t/a.py"])["proof_id"] == "proof-X-9"
+
+
+def test_d79_a_recorded_answer_is_reused_instead_of_re_proving_the_same_head(tmp_path, monkeypatch):
+    """flow: the proof of L02's head is UNKNOWN (infra) once; before the retry a
+    real record for that sha/kind/paths appears (e.g. the cancelled pipeline's
+    predecessor, or a sibling attempt) -> the retry logs PROOF REUSED, asks the
+    Proof for nothing, and grades on the reused record."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "UNKNOWN", "reason": "circleci: cancelled"}, {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    settle(drv, 2)
+    assert env.rows()["L02"]["state"] == "RUNNING" and len(proof.calls) == 1
+    _task, pid, cand, kind, paths = proof.calls[0]
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    (proofs / "proof-L02-earlier.json").write_text(json.dumps(
+        {"proof_id": "proof-L02-earlier", "sha": cand, "kind": kind, "paths": paths, "route": "circleci",
+         "pipeline_id": "pipe-real", "status": "PASS", "failed_nodes": [], "ts": "2026-09-19T19:00:00.000Z"}))
+    settle(drv)
+    assert env.rows()["L02"]["state"] == "VERIFIED"
+    assert len(proof.calls) == 1, "no second proof run: the recorded answer was reused"
+    log = (env.run_root / "driver.log").read_text()
+    assert "PROOF REUSED proof-L02-earlier sha=%s -> PASS (circleci pipeline pipe-real" % cand[:12] in log
+    tdir = next((env.run_root / "turns" / "L02").iterdir())
+    wt = env.tmp / "wt" / "L02"
+    copied = json.loads((wt / ".vp" / "PROOF.json").read_text())
+    assert copied["reused_from"] == "proof-L02-earlier" and copied["pipeline_id"] == "pipe-real"
+    assert copied["proof_id"] != "proof-L02-earlier", "recorded under this attempt's own pid"
+    assert any(p.name.startswith("proof-L02-") and p.name != "proof-L02-earlier.json" for p in proofs.iterdir())
+    assert not (tdir / "proof-pending.json").exists()

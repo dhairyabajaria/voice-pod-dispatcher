@@ -3875,6 +3875,12 @@ class LaneDriver(object):
         gcfg = self.roles.get("grader") or {}
         grunner = gcfg.get("runner", "opencode")
         max_rounds = int(self.conc.get("max_rounds", 3))
+        ptw = self.packet_for(task)
+        if ptw and vppack.is_hosted_twin(ptw):
+            # D79: a hosted twin's head cannot change (no source in owned_files), so
+            # a second round only re-proves the same sha -- and on CircleCI that was a
+            # NEW pipeline per round (L06-HOSTED-R3 round 2 -> 9914a1d4 on A2, 19:06Z)
+            max_rounds = 1
         out_path = wt / ".vp" / "RESULT.json"
         fpath = wt / ".vp" / "FINDINGS.json"
         outcome, fails, blocking, owed, prec = None, [], [], [], None
@@ -4103,8 +4109,20 @@ class LaneDriver(object):
         pid = "proof-%s-%s" % (task, attempt[-15:])
         if hdr.get("proof_paths") or workers:
             self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s" % (task, len(paths), workers))
-        rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set(),
-                             workers=workers)
+        prior = self._reusable_proof(cand, pkind, paths, exclude=pid)
+        if prior is not None:
+            # D79: the same sha + kind + paths already has a real answer (a CircleCI
+            # pipeline or a completed box run, PASS/FAIL_PRODUCT): reuse it, never
+            # trigger again.  Recorded under this attempt's pid with reused_from.
+            rec = dict(prior)
+            rec.update({"proof_id": pid, "reused_from": prior.get("proof_id"), "ts": utc_ms()})
+            self._write_proof_record(pid, rec)
+            self.log("PROOF REUSED %s sha=%s -> %s (%s%s; no new run for %s)"
+                     % (prior.get("proof_id"), cand[:12], rec.get("status"), rec.get("route"),
+                        " pipeline %s" % rec.get("pipeline_id") if rec.get("pipeline_id") else "", pid))
+        else:
+            rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set(),
+                                 workers=workers)
         status = rec.get("status")
         self._copy_proof_into_worktree(wt, pid, rec)
         outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")
@@ -4496,6 +4514,39 @@ class LaneDriver(object):
             entries.append(e)
         return {"generated": utc_ms(), "subject_sha": cand, "union": (union or {}).get("union"),
                 "rule": PROOFS_RULE, "entries": entries}
+
+    REUSABLE_STATUSES = ("PASS", "FAIL_PRODUCT")
+
+    def _reusable_proof(self, sha, kind, paths, exclude=None):
+        """D79: the newest real answer already recorded for sha + kind + paths --
+        a circleci record with a pipeline_id, or a box record -- with status
+        PASS/FAIL_PRODUCT; None otherwise (FAIL_INFRA/UNKNOWN/CANCELLED/BLOCKED_*
+        are not answers and the proof runs again)."""
+        want = [str(x) for x in (paths or [])]
+        found = []
+        for rec in self._proof_index().get(sha) or []:
+            if rec.get("proof_id") == exclude or rec.get("kind") != kind:
+                continue
+            if [str(x) for x in (rec.get("paths") or [])] != want:
+                continue
+            if rec.get("status") not in self.REUSABLE_STATUSES:
+                continue
+            route = rec.get("route")
+            if route == "circleci" and not rec.get("pipeline_id"):
+                continue
+            if route not in ("circleci", "box"):
+                continue
+            found.append(rec)
+        return max(found, key=lambda r: str(r.get("ts") or "")) if found else None
+
+    def _write_proof_record(self, pid, rec):
+        d = self.run_root / "proofs"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / ("%s.json" % pid)).write_text(json.dumps(rec, indent=2, sort_keys=True, default=str),
+                                              encoding="utf-8")
+        except OSError as exc:
+            self.log("PROOF record %s not written: %s" % (pid, exc))
 
     def _verdict_owned_path(self, task, p, row):
         """the packet's verdict-packet.json under owned_files, with <union>
