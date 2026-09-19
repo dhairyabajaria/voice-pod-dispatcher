@@ -2532,12 +2532,17 @@ class LaneDriver(object):
                 % "; ".join("%s -> %s" % (e["slug"], e["file"]) for e in entries))
         pk = Path(wt) / ".vp" / "PACKET.md"
         try:
+            # D80b: the note goes AFTER the front matter -- prepended before the
+            # opening `---` it broke parse_front_matter, _proof_step read no
+            # test_paths and sent a FULL suite to CircleCI (eb3f3dc9, 20:45Z)
             cur = pk.read_text(encoding="utf-8")
-            if cur.startswith("> MIGRATION NUMBERS"):
-                cur = cur.split("\n\n", 1)[1] if "\n\n" in cur else ""
-            pk.write_text(head + cur, encoding="utf-8")
-        except OSError:
-            pass
+            cur = re.sub(r"(?m)^> MIGRATION NUMBERS[^\n]*\n\n?", "", cur)
+            m = re.match(r"(?s)\A---\n.*?\n---\n", cur)
+            cut = m.end() if m else 0
+            pk.write_text(cur[:cut] + ("\n" if cut else "") + head + cur[cut:].lstrip("\n"), encoding="utf-8")
+            vplint.parse_front_matter(pk.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self.log("MIGRATION %s PACKET.md note not written: %s" % (task, exc))
         for e in entries:
             self.log("MIGRATION %s %s -> %s (%s)" % (task, e["slug"], e["file"], "reused" if e["reused"] else "allocated"))
         return entries

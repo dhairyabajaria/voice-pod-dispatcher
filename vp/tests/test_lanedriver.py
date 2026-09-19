@@ -2182,12 +2182,13 @@ def test_d80_migration_numbers_are_allocated_by_the_driver_at_claim_time(tmp_pat
     prepares the worktree (the builder cannot reach the scheduler: not in the
     worktree, cwd-relative --state).  Idempotent across rounds/restarts; the
     ceiling follows the worktree's own migrations dir."""
+    import vplint
     env = Env(tmp_path)
     env.activate()
     drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()})
     wt = env.tmp / "wt-d80"
     (wt / ".vp").mkdir(parents=True)
-    (wt / ".vp" / "PACKET.md").write_text("# packet\n2. run the allocator\n")
+    (wt / ".vp" / "PACKET.md").write_text("---\nitem: L02\ntest_paths:\n  - platform/tests/test_a.py\n---\n# packet\n2. run the allocator\n")
     mig = wt / "platform" / "db" / "migrations"
     mig.mkdir(parents=True)
     (mig / "301_union_member_added_this.sql").write_text("-- a member's migration above the floor\n")
@@ -2200,7 +2201,11 @@ def test_d80_migration_numbers_are_allocated_by_the_driver_at_claim_time(tmp_pat
     rec = json.loads((wt / ".vp" / "MIGRATION.json").read_text())
     assert rec[0]["file"] == "platform/db/migrations/302_l09_sandbox_import.sql" and rec[0]["task"] == "L02"
     pk = (wt / ".vp" / "PACKET.md").read_text()
-    assert pk.startswith("> MIGRATION NUMBERS") and "302_l09_sandbox_import.sql" in pk and pk.count("> MIGRATION NUMBERS") == 1
+    assert pk.startswith("---\nitem: L02") and "\n---\n\n> MIGRATION NUMBERS" in pk and "302_l09_sandbox_import.sql" in pk
+    assert pk.count("> MIGRATION NUMBERS") == 1 and pk.rstrip().endswith("2. run the allocator")
+    # D80b: the front matter still parses -- _proof_step must keep seeing test_paths
+    hdr, _ = vplint.parse_front_matter(pk)
+    assert hdr["test_paths"] == ["platform/tests/test_a.py"]
     st = json.loads(env.state.read_text())
     assert st["migrations"]["302"]["task"] == "L02" and st["migrations"]["302"]["slug"] == "l09_sandbox_import"
     # a second call (next round / adoption) reuses the file, allocates nothing new
@@ -2213,6 +2218,7 @@ def test_d80_migration_numbers_are_allocated_by_the_driver_at_claim_time(tmp_pat
     rebuilt = drv._allocate_migrations(wt, "L02")
     pk = (wt / ".vp" / "PACKET.md").read_text()
     assert pk.count("> MIGRATION NUMBERS") == 1 and "302_l09" in pk and "2. run the allocator" in pk
+    assert vplint.parse_front_matter(pk)[0]["test_paths"] == ["platform/tests/test_a.py"]
     assert rebuilt[0]["number"] == 302 and rebuilt[0]["reused"] is True
     assert len(json.loads(env.state.read_text())["migrations"]) == 1
     log = (env.run_root / "driver.log").read_text()
