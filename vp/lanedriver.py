@@ -338,7 +338,7 @@ DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
 # of lanedriver.py and rebind every live object's class to it, resume.
 RELOAD_FILE = "RELOAD"
 RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "vpcircle", "vpdriver", "vpproof", "vpmerge",
-                "vprunners", "vppack", "laneproof", "lanedryrun")
+                "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
 
 KIND_MAP = {"builder": "builder", "design": "builder", "integration": "integrator",
