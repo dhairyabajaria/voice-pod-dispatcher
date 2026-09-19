@@ -1109,6 +1109,37 @@ def test_proof_blocked_by_circleci_credits_holds_the_attempt_without_a_strike(tm
     assert (env.run_root / "OWNER-ALERTS.md").read_text().count("CIRCLECI_NO_CREDITS") == 1, "alerted once"
 
 
+def test_proof_refused_by_our_gate_or_cap_holds_the_attempt_without_a_strike(tmp_path, monkeypatch):
+    """D57 (on D65): a trigger our own owner gate / daily cap / off switch refused
+    comes back as PROOF_BLOCKED_GATE|CAP|OFF; without this branch the generic
+    runner-failure path strikes it out in 3 backoffs (the D40 shape). Also: the
+    live Proof outlives a hot reload, so gate_open is re-attached on roster apply."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    monkeypatch.setattr(lanedriver, "GATE_HOLD_S", 0.0)
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "BLOCKED_GATE", "reason": "circleci: owner gate DELIVERY-1 not open at trigger time"},
+                       {"status": "BLOCKED_CAP", "reason": "circleci: 40 pipelines triggered today >= max_pipelines_per_day 40"},
+                       {"status": "BLOCKED_OFF", "reason": "circleci: circleci flipped off (CIRCLECI-OFF) at trigger time"},
+                       {"status": "PASS"}])
+    oc = FakeRunner(default=routed_pass)
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, proof=proof)
+    assert callable(getattr(proof, "gate_open", None)), "gate_open is attached to the live Proof on roster apply"
+    settle(drv, 2)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "RUNNING", "held, not failed"
+    assert drv._fail["L02"]["count"] == 0, "our own refusal is no strike"
+    log = (env.run_root / "driver.log").read_text()
+    assert "HOLD L02" in log and "BLOCKED_GATE" in log and "FAIL L02" not in log
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    assert len(proof.calls) == 4 and len({c[2] for c in proof.calls}) == 1, "the same head, proof only"
+    assert [s.role for s in oc.calls if s.item == "L02"] == ["builder", "grader"], "no rebuild, no extra grade"
+    md = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert md.count("PROOF_BLOCKED_GATE") == 1 and md.count("PROOF_BLOCKED_CAP") == 1 and md.count("PROOF_BLOCKED_OFF") == 1
+
+
 def test_credits_held_claim_is_released_when_a_ready_packet_waits_on_its_paths(tmp_path, monkeypatch):
     """D46a: 2026-09-19 06:54Z L09-SEED-FIX (READY, same seed files) waited on
     ADMISSION-SEED-FIX-HOSTED-R1's ACTIVE claim while every CircleCI account refused
@@ -1962,3 +1993,25 @@ def test_d60_alert_severity_is_pattern_based_and_survives_a_restart(tmp_path):
     # the legacy kind floor still pages a first STUCK
     drv2.alert("STUCK", "3 failures", task="OTHER")
     assert pages[-1] == "STUCK attention"
+
+
+def test_d64_gates_jsonl_records_startup_values_and_every_flip(tmp_path):
+    env = Env(tmp_path, roster_extra={"owner_gates": {"DELIVERY-1": False, "DELIVERY-2": True, "_comment": "x"}})
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+    rows = [json.loads(l) for l in (env.run_root / "gates.jsonl").read_text().splitlines()]
+    assert [(r["gate"], r["from"], r["to"], r["why"]) for r in rows] == [
+        ("DELIVERY-1", None, False, "startup"), ("DELIVERY-2", None, True, "startup")]
+    # a roster edit that flips one gate and adds one writes exactly those two lines
+    env.roster["owner_gates"] = {"DELIVERY-1": True, "DELIVERY-2": True, "DELIVERY-3": False}
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    os.utime(env.run_root / "roster.json", None)
+    drv._roster_mtime = None
+    drv._reload_roster_if_changed()
+    rows = [json.loads(l) for l in (env.run_root / "gates.jsonl").read_text().splitlines()]
+    assert [(r["gate"], r["from"], r["to"], r["why"]) for r in rows[2:]] == [
+        ("DELIVERY-1", False, True, "reload"), ("DELIVERY-3", None, False, "reload")]
+    assert "GATE DELIVERY-1 False -> True" in (env.run_root / "driver.log").read_text()
+    # an unchanged roster (a code reload re-applies it) writes nothing
+    drv._apply_roster(drv.roster)
+    assert len((env.run_root / "gates.jsonl").read_text().splitlines()) == 4

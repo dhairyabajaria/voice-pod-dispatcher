@@ -104,6 +104,7 @@ FAIL_BACKOFF_S = (60, 120, 300)
 # this long, count no failure; heartbeat carries the live segment count
 SHM_HOLD_S = 300.0
 CREDITS_HOLD_S = 1800.0                 # CircleCI plan/credit refusal: hold, no strike, alert once
+GATE_HOLD_S = 600.0                     # D57: our own gate/cap/off refusal at trigger time: hold, no strike
 CREDITS_RELEASED = "BLOCKED_CREDITS_RELEASED"   # D46a: reason prefix when a credits-held claim is released
 SHM_POLL_S = 30.0
 # D19: auto-repair generations per parent row before the driver stops
@@ -514,7 +515,11 @@ class LaneDriver(object):
 
         self.proof = proof or laneproof.Proof(
             self.run_root, self.here, self.cn, self.git, self.exec, self.log, self.alert,
-            self.roster.get("proof", {}), python=ctl.get("python") or sys.executable)
+            self.roster.get("proof", {}), python=ctl.get("python") or sys.executable,
+            # D65: re-read at every trigger from the LIVE roster (a lambda, never a captured value)
+            gate_open=lambda: vppack.gate_open("CIRCLECI", self.roster))
+        if getattr(self.proof, "gate_open", None) is None:      # an injected proof gets the same gate
+            self.proof.gate_open = lambda: vppack.gate_open("CIRCLECI", self.roster)
 
         self._lock = threading.Lock()
         self._live = {}                 # task -> attempt_id
@@ -535,8 +540,30 @@ class LaneDriver(object):
         self.spawned_total = 0
         self.completed = []             # (task, attempt, outcome) for tests / handoff
 
+    def _note_gate_flips(self, data):
+        """D64: gates.jsonl -- one line per owner_gates value seen: every gate at
+        startup (why=startup) and every later change (why=reload, from->to). The
+        dashboard reads a gate's age from here; roster.N.json mtimes are only
+        the fallback. No lock: the reload path already holds self._lock and the
+        driver is the only writer."""
+        gates = data.get("owner_gates")
+        gates = {k: bool(v) for k, v in gates.items() if not str(k).startswith("_")} if isinstance(gates, dict) else {}
+        prev = getattr(self, "_gates_seen", None)
+        path = self.run_root / "gates.jsonl"
+        ts = utc_ms()
+        if prev is None:
+            for g in sorted(gates):
+                _append_jsonl(path, {"ts": ts, "gate": g, "from": None, "to": gates[g], "why": "startup"})
+        else:
+            for g in sorted(set(gates) | set(prev)):
+                if gates.get(g) != prev.get(g):
+                    _append_jsonl(path, {"ts": ts, "gate": g, "from": prev.get(g), "to": gates.get(g), "why": "reload"})
+                    self.log("GATE %s %s -> %s" % (g, prev.get(g), gates.get(g)))
+        self._gates_seen = gates
+
     def _apply_roster(self, data):
         self.roster = data
+        self._note_gate_flips(data)
         self.night = data.get("night", {})
         self.conc = data.get("concurrency", {})
         self.budget = data.get("budget", {})
@@ -566,6 +593,9 @@ class LaneDriver(object):
         self.regrade_once = bool((data.get("review") or {}).get("regrade_same_commit_on_unknown_once", True))
         if getattr(self, "proof", None) is not None:
             self.proof.cfg = dict(self.proof_cfg)
+            # D57: the live Proof outlives code reloads (the ctor is not re-run): the
+            # D65 trigger-time gate is (re)attached here, over the live roster
+            self.proof.gate_open = lambda: vppack.gate_open("CIRCLECI", self.roster)
 
     # -- logging / alerts -------------------------------------------------------------
 
@@ -3414,6 +3444,15 @@ class LaneDriver(object):
                                % (CREDITS_RELEASED, outcome.detail[:200], waiting))
                 return
             self.note_hold(task, fkey, outcome.detail, CREDITS_HOLD_S)
+            return
+        if outcome.status in ("PROOF_BLOCKED_GATE", "PROOF_BLOCKED_CAP", "PROOF_BLOCKED_OFF"):
+            # D57: our own gate / daily cap / off switch refused the trigger (D65): the
+            # run's condition, never the candidate's -- hold without a strike, like
+            # credits (the generic branch below would strike it out in 3 backoffs)
+            self.alert_once("circleci-%s" % outcome.status, outcome.status,
+                            "CircleCI trigger refused at trigger time; hosted proofs are held (no strike) until "
+                            "the gate/cap/off switch changes: %s" % outcome.detail[:300], task)
+            self.note_hold(task, fkey, outcome.detail, GATE_HOLD_S)
             return
         if result is None:
             count = self.note_failure(task, fkey, "%s: %s" % (outcome.status, outcome.detail),

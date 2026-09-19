@@ -49,7 +49,7 @@ def utc_ms():
 class Proof(object):
 
     def __init__(self, run_root, here, cn, git, exec_, log, alert, proof_cfg, circle=None,
-                 circle_runner=None, python=None):
+                 circle_runner=None, python=None, gate_open=None):
         self.run_root = Path(run_root)
         self.here = Path(here)
         self.cn = Path(cn)
@@ -61,6 +61,9 @@ class Proof(object):
         self.circle = circle or vpcircle
         self.circle_runner = circle_runner
         self.python = python or sys.executable
+        # D65: callable() -> bool read at TRIGGER time (the driver passes a lambda over
+        # its live roster); None = no owner gate on CircleCI triggers
+        self.gate_open = gate_open
         self._lock = threading.Lock()
         self.box_active = 0
         self.circle_active = 0
@@ -110,27 +113,67 @@ class Proof(object):
                 return "box", "overflow: box free (%d/%d)" % (self.box_active, slots)
             return "circleci", "overflow: box busy (%d/%d)" % (self.box_active, slots)
 
+    TRIGGERED = "triggered"
+    # D65: every trigger attempt leaves a ledger row; only TRIGGERED rows spend a pipeline
+    REFUSED_GATE, REFUSED_CAP, REFUSED_OFF = "refused_gate", "refused_cap", "refused_off"
+    CREDITS_BLOCKED, TRIGGER_FAILED = "credits_blocked", "trigger_failed"
+
     def pipelines_today(self):
+        """pipelines actually triggered today (UTC): rows without a status are the
+        pre-D65 ledger, which recorded successful triggers only"""
         ledger = self.run_root / "proofs" / "circleci-pipelines.jsonl"
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         n = 0
         try:
             for line in ledger.read_text(encoding="utf-8").splitlines():
                 try:
-                    if json.loads(line).get("ts", "")[:10] == today:
-                        n += 1
+                    row = json.loads(line)
                 except ValueError:
-                    pass
+                    continue
+                if row.get("ts", "")[:10] == today and row.get("status", self.TRIGGERED) == self.TRIGGERED:
+                    n += 1
         except OSError:
             pass
         return n
 
-    def _note_pipeline(self, pid, pipeline_id, account, cand):
+    def _note_pipeline(self, pid, pipeline_id, account, cand, status=TRIGGERED, reason=None):
         ledger = self.run_root / "proofs" / "circleci-pipelines.jsonl"
         ledger.parent.mkdir(parents=True, exist_ok=True)
+        row = {"ts": utc_ms(), "proof_id": pid, "pipeline_id": pipeline_id, "account": account, "sha": cand,
+               "status": status}
+        if reason:
+            row["reason"] = str(reason)[:300]
         with open(ledger, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"ts": utc_ms(), "proof_id": pid, "pipeline_id": pipeline_id,
-                                 "account": account, "sha": cand}) + "\n")
+            fh.write(json.dumps(row) + "\n")
+
+    class Refused(RuntimeError):
+        """a trigger our own gate/cap/off-switch refused at trigger time (not CircleCI)"""
+
+        def __init__(self, status, why):
+            RuntimeError.__init__(self, why)
+            self.status = status
+
+    def _trigger_refusal(self, cc):
+        """-> (status, why) when a trigger must not happen NOW, else None. route()
+        asked the same questions when the proof was routed; a pipeline is spent at
+        the trigger, so they are asked again here (2026-09-18 21:25-21:32Z: 11
+        account-3 pipelines from rounds routed before DELIVERY-1 closed)."""
+        gate_open = getattr(self, "gate_open", None)   # a pre-D65 instance after a hot reload
+        if gate_open is not None:
+            try:
+                open_ = bool(gate_open())
+            except Exception as exc:  # noqa: BLE001 -- an unreadable gate is a closed gate
+                return self.REFUSED_GATE, "owner gate unreadable at trigger time: %s" % str(exc)[:120]
+            if not open_:
+                return self.REFUSED_GATE, "owner gate DELIVERY-1 not open at trigger time"
+        if self.circle_off():
+            return self.REFUSED_OFF, "circleci flipped off (%s) at trigger time" % OFF_FILE
+        cap = cc.get("max_pipelines_per_day")
+        if cap is not None and int(cap) > 0:
+            n = self.pipelines_today()
+            if n >= int(cap):
+                return self.REFUSED_CAP, "%d pipelines triggered today >= max_pipelines_per_day %d" % (n, int(cap))
+        return None
 
     # -- entry -----------------------------------------------------------------------------
 
@@ -251,6 +294,10 @@ class Proof(object):
                     raise self.AllBlocked("every CircleCI account is blocked for credits: %s" % skipped)
                 res, refusals = None, []
                 for acct in accounts:
+                    refusal = self._trigger_refusal(cc)
+                    if refusal:
+                        self._note_pipeline(pid, None, acct, cand, status=refusal[0], reason=refusal[1])
+                        raise self.Refused(*refusal)
                     # D44: each account triggers its own project on its own GitHub repo --
                     # push there first, and prove the branch is there (D38)
                     tgt = self.circle.target(acct, targets)
@@ -264,9 +311,11 @@ class Proof(object):
                         trig = self.circle.trigger(branch, {param: True}, runner, acct, targets=targets, rotate=False)
                     except RuntimeError as exc:
                         if self.circle._looks_like_credit_error(str(exc)):
+                            self._note_pipeline(pid, None, acct, cand, status=self.CREDITS_BLOCKED, reason=str(exc))
                             refusals.append((acct, str(exc)[:200]))
                             self._block_account(acct, str(exc))
                             continue
+                        self._note_pipeline(pid, None, acct, cand, status=self.TRIGGER_FAILED, reason=str(exc))
                         raise
                     pipeline_id, account = trig["pipeline_id"], trig["account"]
                     self._note_pipeline(pid, pipeline_id, account, cand)
@@ -284,6 +333,7 @@ class Proof(object):
                     # account is out; the next one gets the same branch on its own repo
                     refusals.append((acct, blocked[:200]))
                     self._block_account(acct, blocked)
+                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.CREDITS_BLOCKED, reason=blocked)
                     self.log("PROOF %s %s circleci pipeline %s (account %s) blocked for credits -> next account"
                              % (task, pid, pipeline_id, account))
                     res, pipeline_id, account = None, None, None
@@ -295,6 +345,20 @@ class Proof(object):
                 rec = {"status": "CANCELLED", "route": "circleci", "proof_id": pid, "sha": cand,
                        "pipeline_id": pipeline_id, "cancelled_workflows": done, "ts": utc_ms()}
                 self._write(pid, rec)
+                return rec
+            except self.Refused as exc:
+                # our own gate/cap/off switch said no at trigger time: no pipeline was spent
+                if exc.status == self.REFUSED_CAP and paths:
+                    # a targeted suite can still run on the box, exactly as route() would have sent it
+                    self.log("PROOF %s %s circleci refused (%s) -> box" % (task, pid, exc))
+                    return self.run_box(task, pid, wt, cand, kind, paths)
+                status = {self.REFUSED_GATE: "BLOCKED_GATE", self.REFUSED_CAP: "BLOCKED_CAP",
+                          self.REFUSED_OFF: "BLOCKED_OFF"}[exc.status]
+                rec = {"status": status, "route": "circleci", "proof_id": pid, "sha": cand, "kind": kind,
+                       "pipeline_id": None, "account": None, "branch": branch,
+                       "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
+                self._write(pid, rec)
+                self.log("PROOF %s %s -> %s: %s" % (task, pid, status, str(exc)[:200]))
                 return rec
             except self.AllBlocked as exc:
                 # a plan/credit refusal is the account's condition, never the candidate's:

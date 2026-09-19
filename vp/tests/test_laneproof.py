@@ -428,3 +428,108 @@ def test_circleci_rotates_to_the_next_account_on_its_own_repo_when_one_is_out_of
     # roster overrides reach the target table
     assert vpcircle.target("2", {"2": {"definition_id": "x"}})["definition_id"] == "x"
     assert vpcircle.slug_for("2").startswith("circleci/7BDzzoWMeVDmriGVMigj1S/")
+
+
+# -- D65: the gate, the cap and the off switch are re-asked at TRIGGER time; every trigger
+#    attempt leaves a ledger row; only triggered rows count against the day --------------------
+
+def _ledger(tmp_path):
+    p = tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl"
+    return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_d65_gate_closed_at_trigger_time_refuses_without_a_push_and_leaves_a_row(tmp_path):
+    """2026-09-18 21:25-21:32Z: 11 account-3 pipelines were triggered by rounds routed
+    before DELIVERY-1 closed. The gate is a live callable read at the trigger."""
+    wt, base, cand = repo(tmp_path)
+    fake = FakeCircle({"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 1}],
+                       "failed_tests": {}, "workflows": []})
+    gate = {"open": True}
+    p = make_proof(tmp_path, fake, FakeExec({}))
+    p.gate_open = lambda: gate["open"]
+    rec = p.run("L22-HOSTED", "proof-g1", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS"
+    rows = _ledger(tmp_path)
+    assert [r["status"] for r in rows] == ["triggered"] and rows[0]["pipeline_id"] == "pipe-206"
+    gate["open"] = False                                  # the owner closes the gate between routing and trigger
+    fake.calls.clear()
+    rec = p.run("L23-HOSTED", "proof-g2", wt, base, cand, "platform", [])
+    assert rec["status"] == "BLOCKED_GATE" and rec["route"] == "circleci" and rec["pipeline_id"] is None
+    assert "not open at trigger time" in rec["reason"]
+    assert not [c for c in fake.calls if c[0] in ("push", "trigger")], "nothing pushed, nothing triggered"
+    rows = _ledger(tmp_path)
+    assert rows[-1]["status"] == "refused_gate" and rows[-1]["proof_id"] == "proof-g2" and rows[-1]["pipeline_id"] is None
+    assert p.pipelines_today() == 1, "a refused trigger spends nothing"
+    # an unreadable gate is a closed gate
+    p.gate_open = lambda: 1 / 0
+    rec = p.run("L24-HOSTED", "proof-g3", wt, base, cand, "platform", [])
+    assert rec["status"] == "BLOCKED_GATE" and "unreadable" in rec["reason"]
+    # no gate callable (tests, dry runs) = no gate
+    p.gate_open = None
+    assert p.run("L25-HOSTED", "proof-g4", wt, base, cand, "platform", [])["status"] == "PASS"
+
+
+def test_d65_daily_cap_is_enforced_per_trigger_targeted_falls_to_box_full_is_blocked(tmp_path):
+    wt, base, cand = repo(tmp_path)
+    fake = FakeCircle({"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 1}],
+                       "failed_tests": {}, "workflows": []})
+    ex = FakeExec({})
+    p = make_proof(tmp_path, fake, ex, cfg={"circleci": {"enabled": True, "mode": "all", "kinds": ["platform", "full"],
+                                                         "account": "3", "max_pipelines_per_day": 2}})
+    assert p.run("A", "proof-c1", wt, base, cand, "platform", ["platform/a.py"])["status"] == "PASS"
+    assert p.run("B", "proof-c2", wt, base, cand, "platform", ["platform/a.py"])["status"] == "PASS"
+    assert p.pipelines_today() == 2
+    # route() would already say box now; but a proof routed a moment earlier reaches the trigger:
+    p.route = lambda kind, suite=None: ("circleci", "routed before the cap")
+    fake.calls.clear()
+    rec = p.run("C", "proof-c3", wt, base, cand, "platform", ["platform/a.py"])
+    assert rec["status"] == "PASS" and rec["route"] == "box", rec              # targeted: the box takes it
+    assert not [c for c in fake.calls if c[0] == "trigger"]
+    rec = p.run("D-HOSTED", "proof-c4", wt, base, cand, "platform", [])       # full suite: never on the box
+    assert rec["status"] == "BLOCKED_CAP" and "max_pipelines_per_day 2" in rec["reason"]
+    rows = _ledger(tmp_path)
+    assert [r["status"] for r in rows] == ["triggered", "triggered", "refused_cap", "refused_cap"]
+    assert p.pipelines_today() == 2, "refused rows never count"
+    # the pre-D65 ledger (no status field) still counts as triggered
+    with open(tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl", "a") as fh:
+        fh.write(json.dumps({"ts": laneproof.utc_ms(), "pipeline_id": "legacy", "account": "3"}) + "\n")
+    assert p.pipelines_today() == 3
+
+
+def test_d65_credit_and_trigger_failures_leave_rows_that_do_not_count(tmp_path):
+    wt, base, cand = repo(tmp_path)
+    res = {"jobs": [{"id": "j1", "name": "platform-shard", "status": "success", "job_number": 1}],
+           "failed_tests": {}, "workflows": []}
+
+    class Flaky(FakeCircle):
+        def trigger(self, branch, params, runner, account, targets=None, rotate=True):
+            self.calls.append(("trigger", branch, params, account))
+            if account == "3":
+                raise RuntimeError("HTTP 402: no credits are available on your plan")
+            if account == "1":
+                raise RuntimeError("HTTP 500: upstream")
+            return {"pipeline_id": "pipe-%s" % account, "account": account}
+    fake = Flaky(res)
+    p = make_proof(tmp_path, fake, FakeExec({}), cfg={"circleci": {"enabled": True, "mode": "all", "kinds": ["platform"],
+                                                                   "account": "3", "rotation": ["3", "1", "2"]}})
+    rec = p.run("X", "proof-f1", wt, base, cand, "platform", [])
+    assert rec["status"] == "UNKNOWN" and "HTTP 500" in rec["reason"]
+    rows = _ledger(tmp_path)
+    assert [(r["account"], r["status"]) for r in rows] == [("3", "credits_blocked"), ("1", "trigger_failed")]
+    assert "402" in rows[0]["reason"] and p.pipelines_today() == 0
+    # a refusal that shows only AFTER the trigger is recorded against its pipeline id
+    class Late(FakeCircle):
+        def credit_block(self, jobs, runner, account, targets=None):
+            return "no credits are available on your plan" if account == "2" else None
+
+        def trigger(self, branch, params, runner, account, targets=None, rotate=True):
+            return {"pipeline_id": "pipe-%s" % account, "account": account}
+    p2 = make_proof(tmp_path / "two", Late(res), FakeExec({}), cfg={"circleci": {"enabled": True, "mode": "all",
+                                                                                 "kinds": ["platform"], "account": "2",
+                                                                                 "rotation": ["2", "A1"]}})
+    rec = p2.run("Y", "proof-f2", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS" and rec["account"] == "A1"
+    rows = _ledger(tmp_path / "two")
+    assert [(r["account"], r["status"], r["pipeline_id"]) for r in rows] == [
+        ("2", "triggered", "pipe-2"), ("2", "credits_blocked", "pipe-2"), ("A1", "triggered", "pipe-A1")]
+    assert p2.pipelines_today() == 2, "the blocked pipeline was still spent"
