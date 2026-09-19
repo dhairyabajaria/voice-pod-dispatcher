@@ -1270,15 +1270,18 @@ class LaneDriver(object):
     REVIEW_SUBJECT_HOLD_S = 600
 
     def _union_review_packet(self, task):
-        """the packet when `task` is a `<union>` review with no review_base
-        (its subject is a union tip the integrator builds), else None"""
+        """the packet when `task` is a `<union>` review (its subject is a union
+        tip the integrator builds; review_base only moves the diff base), else None"""
         return self._union_review(self.packet_for(task))
 
     @staticmethod
     def _union_review(p):
+        """D58 (§30): any review packet with `<union>` in coverage_targets, with or
+        without review_base.  The review_base exclusion sent REVIEW-JUNIOR-S3-F1..F5
+        (§20 shape: review_base + <union>) to the trunk delta d18363e5..5deac821
+        five times while union-17 existed: cand is the union tip, the diff base
+        stays review_base (_review_packet_plan)."""
         if not p or p.get("v13_kind") != "review" or "<union>" not in (p.get("coverage_targets") or []):
-            return None
-        if p.get("review_base"):
             return None
         return p
 

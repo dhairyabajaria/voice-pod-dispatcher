@@ -592,7 +592,7 @@ def _fix_builder(spec, ab):
     return out
 
 
-def _union_env(tmp_path, builder=_fix_builder, deps=("P-FIX-A", "P-FIX-B")):
+def _union_env(tmp_path, builder=_fix_builder, deps=("P-FIX-A", "P-FIX-B"), review_base=None):
     from test_lanedriver import FakeCodex
     pd = tmp_path / "pack"
     packet(pd, "P-FIX-A", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix A for L00")
@@ -603,6 +603,8 @@ def _union_env(tmp_path, builder=_fix_builder, deps=("P-FIX-A", "P-FIX-B")):
     pm.write_text(pm.read_text().replace("  - control/evidence/REVIEW-FIXSET/v13/REGRADE.md",
                                          "  - control/evidence/REVIEW-FIXSET/<union>/verdict-packet.json")
                   .replace("---\n", "---\ncoverage_targets: [<union>, L00]\n", 1))
+    if review_base:
+        pm.write_text(pm.read_text().replace("---\n", "---\nreview_base: %s\n" % review_base, 1))
     env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
                                       "proof": {"require_for_kinds": []}})
     env.roster["run"]["pack_dir"] = str(pd)
@@ -1354,3 +1356,47 @@ def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_ver
     rec = json.loads((env.run_root / "hosted" / "P-PAR.json").read_text())
     assert {k: v["verdict"] for k, v in rec["hosted_rows"].items()} == {"B2": "PASS", "B3": "PASS", "B4": "PASS"}
     assert rec["box_only"] is False
+
+
+def test_d58_union_review_with_a_review_base_reviews_the_union_tip_from_that_base(tmp_path, monkeypatch):
+    """§30: REVIEW-JUNIOR-S3-F1..F5 carry review_base (the s3 delta's base) AND
+    <union>; _union_review excluded review_base packets, so all five reviewed the
+    trunk delta again although union-17 existed.  Now: candidate = union tip,
+    base = review_base, subject = union."""
+    from test_lanedriver import FakeCodex, register_candidate, git
+    import lanedriver
+    monkeypatch.setattr(lanedriver.LaneDriver, "_review_gate_check", lambda self, *a: (True, "PASS: fake gate"))
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "proof": {"require_for_kinds": []}})
+    # review_base = the first trunk commit; the registered candidate is a later one (the s3 delta shape)
+    (env.trunk / "platform" / "a.py").write_text("x = 3  # delta\n")
+    git(env.trunk, "commit", "-qam", "delta")
+    pd = tmp_path / "pack"
+    packet(pd, "P-FIX-A", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix A for L00")
+    packet(pd, "P-FIX-B", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", body="fix B for L00")
+    packet(pd, "REVIEW-FIXSET", "NEW:JUNIOR_REVIEW", kind="review", template="JUNIOR_REVIEW", role="junior",
+           deps=["P-FIX-A", "P-FIX-B"], body="one review of the union of the fixes of L00")
+    pm = pd / "REVIEW-FIXSET" / "PACKET.md"
+    pm.write_text(pm.read_text().replace("  - control/evidence/REVIEW-FIXSET/v13/REGRADE.md",
+                                         "  - control/evidence/REVIEW-FIXSET/<union>/verdict-packet.json")
+                  .replace("---\n", "---\ncoverage_targets: [<union>, L00]\nreview_base: %s\n" % env.base, 1))
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    codex = FakeCodex()
+    oc = by_role({"builder": _fix_builder, "grader": findings("PASS"), "probe": _fix_builder})
+    drv = env.driver({"opencode": oc, "codex": codex, "claude": FakeRunner()})
+    sha, _tree = register_candidate(env)
+    assert sha != env.base
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["P-FIX-A"]["state"] == "VERIFIED" and rows["P-FIX-B"]["state"] == "VERIFIED", rows
+    wt = env.tmp / "wt" / "REVIEW-FIXSET"
+    disp = json.loads((wt / ".vp" / "DISPATCH.json").read_text())
+    tip = disp["union_sha"]
+    assert tip and tip != sha, "dispatched on a union tip"
+    req = json.loads((wt / ".vp" / "REVIEW_REQUEST.json").read_text())
+    assert req["candidate"] == tip, "the union tip is the candidate, not the trunk"
+    assert req["base"] == env.base, "the diff base is review_base, not the union's base"
+    assert req["subject"] == "union" and req["union"] == disp["union"]
+    assert "<union>" not in req["coverage_targets"] and {"P-FIX-A", "P-FIX-B"} <= set(req["union_members"])
