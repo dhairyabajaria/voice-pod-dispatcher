@@ -17,7 +17,7 @@ sys.path.insert(0, str(HERE))
 
 import vplint  # noqa: E402
 import vppack  # noqa: E402
-from test_lanedriver import Env, FakeRunner, by_role, findings, git, result_ok, settle  # noqa: E402
+from test_lanedriver import Env, FakeRunner, TurnOutcome, by_role, findings, git, result_ok, settle  # noqa: E402
 
 FM = """---
 item: {id}
@@ -1107,6 +1107,61 @@ def test_hosted_twins_one_per_gate_held_by_their_own_gate(tmp_path):
     (pd / "P-ONE" / "BENCHMARK.md").write_text("- B2 [invariant] [hosted] y\n")
     pack, lint = vppack.load_pack(pd)
     assert "P-ONE-HOSTED" not in pack and any("P-ONE B2 is [hosted] but names no (gate" in l for l in lint)
+
+
+def test_hosted_twin_proves_the_integration_union_tip_once_the_required_repairs_are_carried(tmp_path):
+    """D46 (Architect §22/§24): with roster packet.twin_base = integration_union, a
+    full-suite twin waits (no strike) until every `requires` row is VERIFIED and the
+    integration union carries it and the parent; then it is cut from the union tip,
+    not the parent's output alone (trunk's full suite is red until those land)."""
+    pd = tmp_path / "pack"
+    packet(pd, "P-PAR", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="DELIVERY-2B",
+           body="parent for L00")
+    (pd / "P-PAR" / "BENCHMARK.md").write_text(BM_HOSTED.format(id="P-PAR"))
+    packet(pd, "P-FIX", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="none",
+           body="the seed fix for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "packet": {"twin_dependents": [],
+                                                 "twin_base": {"kind": "integration_union", "requires": ["P-FIX"]}},
+                                      "owner_gates": {"DELIVERY-1": True},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    seen = {}
+    gate = {"P-FIX": True}          # P-FIX's builder is refused until the test opens it
+
+    def builder(spec, ab):
+        if gate.get(spec.item):
+            return TurnOutcome("RUNNER_EMPTY", "held by the test", runner="fake")
+        wt = Path(spec.cwd)
+        seen[spec.item] = {"base": (wt / ".vp" / "BASE").read_text().strip()}
+        return _fix_builder(spec, ab)
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": builder})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 8)
+    rows = env.rows()
+    assert rows["P-PAR"]["state"] == "VERIFIED"
+    par_out = rows["P-PAR"]["output_sha"]
+    assert rows["P-PAR-HOSTED-CIRCLECI"]["state"] in ("READY", "PLANNED", "WAITING_DEPENDENCY"), rows["P-PAR-HOSTED-CIRCLECI"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "TWIN_BASE_WAIT P-PAR-HOSTED-CIRCLECI: requires not VERIFIED ['P-FIX']" in log
+    assert "P-PAR-HOSTED-CIRCLECI" not in seen, "never cut from the parent output alone"
+    # the repair lands, the integration union carries both, the twin proves the union tip
+    gate["P-FIX"] = False
+    drv._fail.pop("P-FIX", None)
+    settle(drv, 10)
+    rows = env.rows()
+    assert rows["P-FIX"]["state"] == "VERIFIED"
+    cc = rows["P-PAR-HOSTED-CIRCLECI"]
+    assert cc["state"] == "VERIFIED", cc
+    docs = [d for d in drv._integration_docs() if d.get("status") == "BUILT"]
+    # cut from the integration union that was the tip at claim time: it carries the
+    # parent and the repair (the union re-cut after the twin verified carries the twin too)
+    tip = next(d for d in docs if d["union_sha"] == cc["stacked_base"])
+    assert {m["task"] for m in tip["members"]} >= {"P-PAR", "P-FIX"} and tip["union_sha"] != par_out
+    assert set(cc["stacked_on"]) >= {"P-PAR", "P-FIX"}
+    assert seen["P-PAR-HOSTED-CIRCLECI"]["base"] == tip["union_sha"]
 
 
 def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_verdicts(tmp_path):

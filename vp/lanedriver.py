@@ -2939,6 +2939,9 @@ class LaneDriver(object):
             if not out:
                 self.note_hold(task, self._ready_key(row), "TWIN_PARENT_OUTPUT %s" % task, self.STACK_HOLD_S)
                 return None, None
+            tb = (self.roster.get("packet") or {}).get("twin_base") or {}
+            if tb.get("kind") == "integration_union":
+                return self._twin_union_base(task, row, p, ptask, out, tasks, tb)
             # §19(3): the hosted proof runs on exactly the tree the box verified
             return out, {"members": [{"task": ptask, "packet": p["twin_of"], "output_sha": out, "depth": 0}],
                          "on": [ptask], "base": out, "why": "hosted twin of %s: its VERIFIED output" % ptask}
@@ -2959,6 +2962,33 @@ class LaneDriver(object):
                            self.STACK_HOLD_S)
             return None, plan
         return plan["base"], plan
+
+    def _twin_union_base(self, task, row, p, ptask, out, tasks, tb):
+        """D46 (Architect §22/§24): a full-suite hosted twin proves the INTEGRATION
+        union tip, not its parent's output alone -- trunk's full suite is red
+        (ISSUE-L09-FENCE-BREAKS-FULL-SUITE-SEEDS) until the repairs named in
+        roster packet.twin_base.requires are VERIFIED and carried by the union.
+        Held (no strike) until: every required row is a union member, the parent's
+        output is one too, and the newest integration union is BUILT."""
+        req = [str(x) for x in (tb.get("requires") or [])]
+        docs = [d for d in self._integration_docs() if d.get("status") == "BUILT"]
+        latest = docs[-1] if docs else None
+        members = {m.get("task"): m.get("output_sha") for m in (latest or {}).get("members") or []}
+        missing = [r for r in req if (tasks.get(r) or {}).get("state") not in self.UNION_MEMBER_STATES]
+        not_carried = [r for r in req if r not in missing and r not in members]
+        if ptask not in members or members.get(ptask) != out:
+            not_carried.append(ptask)
+        if missing or not_carried or not latest:
+            why = "TWIN_BASE_WAIT %s: requires not VERIFIED %s; not in the integration union %s" % (
+                task, missing, not_carried)
+            self.note_hold(task, self._ready_key(row), why, self.STACK_HOLD_S)
+            return None, None
+        base = latest["union_sha"]
+        return base, {"members": [{"task": t, "packet": self.pack_by_task.get(t) or t, "output_sha": sha, "depth": 0}
+                                  for t, sha in sorted(members.items())],
+                      "on": [ptask] + req, "base": base,
+                      "why": "hosted twin of %s on the integration union %s (D46: requires %s)"
+                             % (ptask, latest.get("union"), ",".join(req))}
 
     def _dispatch_ready(self, state):
         try:
