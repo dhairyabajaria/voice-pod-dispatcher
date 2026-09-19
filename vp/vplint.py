@@ -498,9 +498,12 @@ def lint_roster_v13(r):
         if (roles.get(kind) or {}).get("runner") == b:
             out.append("ERROR roster: %s runner equals builder runner (%s): independence lost" % (kind, b))
     conc = n.get("concurrency") or {}
-    if conc.get("codex_max") != 3 or conc.get("claude_max") != 2:
-        out.append("ERROR roster: concurrency.codex_max 3 / claude_max 2 required; got %s / %s"
-                   % (conc.get("codex_max"), conc.get("claude_max")))
+    # D75 (2026-09-19): the owner raised codex_max from the plan's 3 to 20;
+    # the lint now bounds it (1..20) instead of pinning it; claude_max stays 2
+    cm = conc.get("codex_max")
+    if not isinstance(cm, int) or not 1 <= cm <= 20 or conc.get("claude_max") != 2:
+        out.append("ERROR roster: concurrency.codex_max 1..20 / claude_max 2 required; got %s / %s"
+                   % (cm, conc.get("claude_max")))
     proof = n.get("proof") or {}
     if proof.get("box_slots") != 1 or proof.get("shm_reap") is not True:
         out.append("ERROR roster: proof.box_slots 1 and proof.shm_reap true required")

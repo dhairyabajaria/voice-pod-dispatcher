@@ -1555,3 +1555,16 @@ def test_d72_ruled_sticky_exclusion_keeps_a_member_out_of_every_integration_unio
     assert {m["task"] for m in integ2["members"]} >= {"P-FIX-A", "P-FIX-C"} and "P-FIX-B" not in {m["task"] for m in integ2["members"]}
     assert (env.run_root / "alerts.jsonl").read_text().count("INTEGRATION_CONFLICT") == n_alerts, "a ruling is not a conflict"
     assert "P-FIX-B" not in git(env.trunk, "log", "--format=%s", "%s..%s" % (sha, integ2["union_sha"]))
+
+
+def test_d75_codex_max_is_bounded_not_pinned():
+    """D75: the owner raised concurrency.codex_max 3 -> 20 (2026-09-19); the
+    roster lint bounds it to 1..20 (claude_max still pinned at 2) instead of
+    refusing every value but 3, which had rejected the edit."""
+    def msgs(cm, clm=2):
+        r = {"run": {"scheduler": "x"}, "concurrency": {"codex_max": cm, "claude_max": clm}}
+        return [m for m in vplint.lint_roster_v13(r) if "codex_max" in m]
+    assert msgs(20) == [] and msgs(3) == [] and msgs(1) == []
+    assert any("codex_max 1..20" in m for m in msgs(21))
+    assert any("codex_max 1..20" in m for m in msgs(0))
+    assert any("claude_max 2" in m for m in msgs(3, 3))
