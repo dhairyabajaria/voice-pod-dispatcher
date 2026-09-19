@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import pytest
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -1444,3 +1445,72 @@ def test_d58_union_review_with_a_review_base_reviews_the_union_tip_from_that_bas
     assert req["base"] == env.base, "the diff base is review_base, not the union's base"
     assert req["subject"] == "union" and req["union"] == disp["union"]
     assert "<union>" not in req["coverage_targets"] and {"P-FIX-A", "P-FIX-B"} <= set(req["union_members"])
+
+
+BM_CIRCLECI_ONLY = ("- B1 [evidence] [box] {id} regraded — check: control/evidence/{id}/v13/REGRADE.md\n"
+                    "- B2 [invariant] [hosted] full CircleCI matrix green on the sha (gate: CIRCLECI)\n")
+
+
+def test_d71_canary_gate_holds_every_other_circleci_twin_until_the_canary_answers(tmp_path):
+    """§21.2 (Architect, 2026-09-19): roster proof.circleci.canary armed -> only the
+    canary's CIRCLECI twin claims; the rest are held (no claim, no strike).  A
+    proof record without a real pipeline_id/answer (FAIL_INFRA) keeps the hold and
+    raises CANARY_NOT_ANSWERED; a record with pipeline_id + PASS releases: the
+    driver writes released_at/outcome into the roster and the held twin claims."""
+    pd = tmp_path / "pack"
+    for pid in ("P-A", "P-B"):
+        packet(pd, pid, "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="CIRCLECI",
+               body="parent %s for L00" % pid)
+        (pd / pid / "BENCHMARK.md").write_text(BM_CIRCLECI_ONLY.format(id=pid))
+    canary = {"task": "P-A-HOSTED", "armed_at": "2026-09-19T15:00:00Z", "released_at": None,
+              "release_on": ["PASS", "FAIL"], "outcome": None, "reason": "§21.2 test"}
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "packet": {"twin_dependents": []},
+                                      "owner_gates": {"DELIVERY-1": True},
+                                      "proof": {"require_for_kinds": [], "circleci": {"canary": canary}}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    assert [m for m in vplint.lint_roster_v13(env.roster) if "proof.circleci.canary" in m] == []
+    oc = by_role({"builder": _fix_builder, "grader": findings("PASS"), "probe": _fix_builder})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 10)
+    rows = env.rows()
+    assert rows["P-A"]["state"] == "VERIFIED" and rows["P-B"]["state"] == "VERIFIED"
+    assert rows["P-A-HOSTED"]["state"] == "VERIFIED", "the canary's own twin claims"
+    assert rows["P-B-HOSTED"]["state"] in ("READY", "PLANNED", "WAITING_DEPENDENCY"), rows["P-B-HOSTED"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "HOLD: CANARY_PENDING P-A-HOSTED holds P-B-HOSTED" in log
+    assert "FAIL P-B-HOSTED" not in log and drv._fail.get("P-B-HOSTED", {}).get("count", 0) == 0
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    # a non-answer: no pipeline, infra failure -> hold stays, CANARY_NOT_ANSWERED once
+    (proofs / "proof-P-A-HOSTED-1.json").write_text(json.dumps(
+        {"proof_id": "proof-P-A-HOSTED-1", "status": "FAIL_INFRA", "pipeline_id": None,
+         "route": "circleci", "reason": "circleci: no credits"}))
+    settle(drv, 2)
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert alerts.count("CANARY_NOT_ANSWERED") == 1 and "CANARY_RELEASED" not in alerts
+    assert env.rows()["P-B-HOSTED"]["state"] != "VERIFIED"
+    assert json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]["released_at"] is None
+    # a real answer: pipeline_id + PASS -> released, recorded in the roster, the held twin claims
+    time.sleep(0.05)
+    (proofs / "proof-P-A-HOSTED-2.json").write_text(json.dumps(
+        {"proof_id": "proof-P-A-HOSTED-2", "status": "PASS", "pipeline_id": "pipe-123", "route": "circleci"}))
+    settle(drv, 8)
+    rows = env.rows()
+    assert rows["P-B-HOSTED"]["state"] == "VERIFIED", rows["P-B-HOSTED"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "CANARY_RELEASED P-A-HOSTED: pipeline pipe-123 -> PASS" in log
+    rc = json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]
+    assert rc["released_at"] and rc["outcome"] == "PASS" and rc["pipeline_id"] == "pipe-123"
+    assert (env.run_root / "alerts.jsonl").read_text().count("CANARY_RELEASED") == 1
+    assert "ROSTER_REJECTED" not in log, "the driver's own roster write re-applies clean"
+    # the lint rule
+    bad = json.loads(json.dumps(env.roster))
+    bad["proof"]["circleci"]["canary"] = {"task": "P-A", "release_on": ["MAYBE"], "armed_at": "yesterday"}
+    msgs = vplint.lint_roster_v13(bad)
+    assert any("is not a hosted twin" in m for m in msgs) and any("release_on" in m for m in msgs)
+    assert any("armed_at" in m for m in msgs)
+    bad["proof"]["circleci"]["canary"] = {"task": "P-ZZ-HOSTED"}
+    assert any("no packet P-ZZ" in m for m in vplint.lint_roster_v13(bad))

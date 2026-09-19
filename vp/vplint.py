@@ -522,6 +522,27 @@ def lint_roster_v13(r):
             if bad:
                 out.append("ERROR roster: proof.circleci.%s names unknown accounts %s (vpcircle.TARGETS %s)"
                            % (field, bad, sorted(known)))
+    # §21.2 (D71): the canary gate -- task names a hosted twin of a pack packet,
+    # release_on is a subset of {PASS, FAIL}, timestamps are ISO-8601 Z or null
+    canary = cc.get("canary")
+    if canary is not None:
+        if not isinstance(canary, dict) or not canary.get("task"):
+            out.append("ERROR roster: proof.circleci.canary must be null or an object with a task")
+        else:
+            task = str(canary["task"])
+            parent = re.sub(r"-HOSTED(-[A-Z0-9-]+)?$", "", re.sub(r"-R\d+$", "", task))
+            pack_dir = os.path.expanduser(str(run.get("pack_dir") or ""))
+            if "-HOSTED" not in task:
+                out.append("ERROR roster: proof.circleci.canary.task %r is not a hosted twin (<ID>-HOSTED[-<GATE>])" % task)
+            elif pack_dir and not os.path.exists(os.path.join(pack_dir, parent, "PACKET.md")):
+                out.append("ERROR roster: proof.circleci.canary.task %r: no packet %s in %s" % (task, parent, pack_dir))
+            bad = [x for x in (canary.get("release_on") or ["PASS", "FAIL"]) if x not in ("PASS", "FAIL")]
+            if bad:
+                out.append("ERROR roster: proof.circleci.canary.release_on must be a subset of [PASS, FAIL]; got %s" % bad)
+            for f in ("armed_at", "released_at"):
+                v = canary.get(f)
+                if v is not None and not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$", str(v)):
+                    out.append("ERROR roster: proof.circleci.canary.%s must be ISO-8601 Z or null; got %r" % (f, v))
     if (n.get("night") or {}).get("pause_on_disk_gb") != 25:
         out.append("ERROR roster: night.pause_on_disk_gb 25 required")
     return out

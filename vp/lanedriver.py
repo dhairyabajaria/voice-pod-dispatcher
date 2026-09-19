@@ -1200,6 +1200,89 @@ class LaneDriver(object):
                           {"ts": utc_ms(), "packet": tid, "op": "rewire", "depends_on": deps,
                            "twin": twin_task}, self._lock)
 
+    # -- §21.2 canary gate (D71) ------------------------------------------------------
+
+    def _canary(self):
+        """roster proof.circleci.canary or None (absent/null = no gate, today's behaviour)"""
+        c = (self.proof_cfg.get("circleci") or {}).get("canary")
+        return c if isinstance(c, dict) and c.get("task") else None
+
+    def _is_canary_row(self, task, c):
+        return task == c["task"] or self._pack_root(task) == c["task"] or self.pack_by_task.get(task) == c["task"]
+
+    def _canary_hold(self, task):
+        """§21.2 (Architect, 2026-09-19): while the canary is armed (task set,
+        released_at null) only the canary's own CIRCLECI twin may claim; every
+        other CIRCLECI twin is held -- no claim, no strike, no pipeline.  The
+        D46 release order ("L06-HOSTED first, then the 47") was prose only and
+        47 twins released with the canary still parked INVALID_EVIDENCE."""
+        c = self._canary()
+        if not c or c.get("released_at"):
+            return False
+        p = self.packet_for(task)
+        if not p or not vppack.is_hosted_twin(p) or p.get("twin_gate") != "CIRCLECI":
+            return False
+        if self._is_canary_row(task, c):
+            return False
+        if ("canary-hold", task) not in self._pack_logged:
+            self._pack_logged.add(("canary-hold", task))
+            self.log("HOLD: CANARY_PENDING %s holds %s (no claim, no strike, no pipeline)" % (c["task"], task))
+        return True
+
+    def _canary_proof(self, c, tasks):
+        """the newest proof record of the canary's rows (proofs/proof-<row>-*.json), or None"""
+        rows = [t for t in tasks if self._is_canary_row(t, c)]
+        recs = []
+        for t in rows:
+            for f in (self.run_root / "proofs").glob("proof-%s-*.json" % t):
+                try:
+                    recs.append((f.stat().st_mtime, json.loads(f.read_text(encoding="utf-8"))))
+                except (OSError, ValueError):
+                    continue
+        return max(recs, key=lambda x: x[0])[1] if recs else None
+
+    def _canary_step(self, state):
+        """release = the canary's proof record carries a real pipeline_id and a
+        status in release_on (PASS/FAIL are answers; FAIL_INFRA/UNKNOWN/BLOCKED_*
+        /box are not).  The driver writes released_at + outcome into the roster
+        (the roster reload snapshots it) and emits CANARY_RELEASED; a non-answer
+        keeps the hold and alerts CANARY_NOT_ANSWERED once per proof -- the
+        Architect decides, the driver never re-arms or retries the canary."""
+        c = self._canary()
+        if not c or c.get("released_at"):
+            return
+        rec = self._canary_proof(c, state.get("tasks") or {})
+        if not rec:
+            return
+        status = str(rec.get("status") or "")
+        pipeline = rec.get("pipeline_id")
+        release_on = [str(x) for x in (c.get("release_on") or ["PASS", "FAIL"])]
+        if pipeline and status in release_on:
+            ts = utc_ms()
+            try:
+                data = json.loads(self.roster_path.read_text(encoding="utf-8"))
+                cc = data.setdefault("proof", {}).setdefault("circleci", {}).setdefault("canary", {})
+                cc.update({"released_at": ts, "outcome": status, "pipeline_id": pipeline,
+                           "proof_id": rec.get("proof_id")})
+                normalize_roster(json.loads(json.dumps(data)))
+                self.roster_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001 -- the release must still be visible
+                self.alert("CANARY_RELEASE_UNRECORDED", "%s: roster write failed: %s" % (c["task"], exc), c["task"])
+            self.proof_cfg.setdefault("circleci", {}).setdefault("canary", {}).update(
+                {"released_at": ts, "outcome": status, "pipeline_id": pipeline})
+            self.log("CANARY_RELEASED %s: pipeline %s -> %s; held CIRCLECI twins are claimable" % (c["task"], pipeline, status))
+            self.alert("CANARY_RELEASED", "%s answered %s on pipeline %s (proof %s); the held CIRCLECI twins "
+                       "are claimable under the existing caps/rotation" % (c["task"], status, pipeline, rec.get("proof_id")), c["task"])
+            with self._lock:
+                for k in [k for k in self._pack_logged if isinstance(k, tuple) and k[0] == "canary-hold"]:
+                    self._pack_logged.discard(k)
+            return
+        self.alert_once("canary-unanswered:%s" % rec.get("proof_id"), "CANARY_NOT_ANSWERED",
+                        "%s proof %s is not a real answer: status %s, pipeline_id %s, route %s: %s -- hold stays; "
+                        "Architect decides (the driver never retries the canary)"
+                        % (c["task"], rec.get("proof_id"), status or "?", pipeline, rec.get("route"),
+                           str(rec.get("reason") or "")[:200]), c["task"])
+
     def _twin_slot_full(self, task):
         """§19 throughput: a CIRCLECI twin is one pipeline; never more of them
         live than roster proof.circleci.max_in_flight (default 2), so the
@@ -1732,6 +1815,10 @@ class LaneDriver(object):
             self._supersede_sweep(self.control.state_view())
         except Exception as exc:  # noqa: BLE001
             self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
+        try:
+            self._canary_step(self.control.state_view() or {})
+        except Exception as exc:  # noqa: BLE001
+            self.log("CANARY step failed: %s: %s" % (type(exc).__name__, exc))
         if self.pack:
             try:
                 state = self.control.state_view() or {}
@@ -3169,6 +3256,8 @@ class LaneDriver(object):
                                 "no roster role for kind %r (task %s); not dispatched" % (kind, task))
                 continue
             if not self._owner_gate_open(task):
+                continue
+            if self._canary_hold(task):
                 continue
             if self._twin_slot_full(task):
                 continue
