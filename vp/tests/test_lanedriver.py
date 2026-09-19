@@ -1699,7 +1699,8 @@ def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     import vplint
     src = CONTROL_DIR / "v13-pack" / "roster-v13.json"
     r = json.loads(src.read_text())
-    assert vplint.lint_roster_v13(r) == []
+    # §29: go2 primary; go1 unparked is a fallback (WARN, never ERROR)
+    assert [m for m in vplint.lint_roster_v13(r) if m.startswith("ERROR")] == []
     # the driver consumes it as-is (control derived from run.*, roles via kind_map)
     env = Env(tmp_path)
     env.activate()
@@ -1712,18 +1713,34 @@ def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     (env.run_root / "roster.json").write_text(json.dumps(r, indent=2))
     drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
     assert drv.roles["verification"]["runner"] == "opencode" and drv.roles["final_review"]["runner"] == "codex"
-    assert drv.servers["go1"]["parked"] and not drv.servers["go2"]["parked"]
+    assert not drv.servers["go2"]["parked"] and drv.servers["go3"]["parked"]
     assert drv.control.script.endswith("orchestration_control.py")
     settle(drv, 2)
     assert env.rows()["L00"]["state"] == "VERIFIED"
     # the v13 lint bites on the item-10 numbers
     bad = json.loads(src.read_text())
+    bad["servers"]["go2"]["parked"] = True
     bad["servers"]["go3"]["parked"] = False
+    bad["fallback_order"] = ["go1"]
+    bad["roles"]["builder"]["server"] = "go1"
     bad["proof"]["shm_reap"] = False
     bad["roles"].pop("infra")
+    bad["proof"]["circleci"]["account"] = "9"
+    bad["proof"]["circleci"]["rotation"] = ["A1", "Z9"]
     msgs = vplint.lint_roster_v13(bad)
-    assert any("live servers" in m for m in msgs) and any("shm_reap" in m for m in msgs)
+    assert any("servers.go2 must be unparked" in m for m in msgs) and any("shm_reap" in m for m in msgs)
+    assert any("fallback_order must start with go2" in m for m in msgs)
+    assert any("unparked server go3 is missing from fallback_order" in m for m in msgs)
     assert any("kind operations has no role" in m for m in msgs)
+    # §29: the CircleCI vocabulary is vpcircle.TARGETS, nothing literal in the lint
+    assert any("proof.circleci.account '9' not in vpcircle.TARGETS" in m for m in msgs)
+    assert any("proof.circleci.rotation names unknown accounts ['Z9']" in m for m in msgs)
+    import vpcircle
+    good = json.loads(src.read_text())
+    good["roles"]["grader"]["server"] = "go1"
+    assert any("kind grader binds server go1; roles must bind the primary go2" in m
+               for m in vplint.lint_roster_v13(good))
+    assert str(good["proof"]["circleci"]["account"]) in vpcircle.TARGETS
 
 
 # -- item 11: a review-gate refusal parks the finished attempt, never re-runs it -------
@@ -1769,7 +1786,7 @@ def test_pack4a_init_run_copies_lints_and_snapshots_the_roster(tmp_path):
     r = json.loads((CONTROL_DIR / "v13-pack" / "roster-v13.json").read_text())
     r["run"]["run_root"] = str(tmp_path / "RUN")
     src.write_text(json.dumps(r, indent=2))
-    assert vplint.lint_roster(str(src)) == []
+    assert [m for m in vplint.lint_roster(str(src)) if m.startswith("ERROR")] == []  # §29: go1 fallback is a WARN
     assert lanedriver.main(["init-run", "--source", str(src)]) == 0
     run_root = tmp_path / "RUN"
     assert (run_root / "roster.json").read_bytes() == src.read_bytes()

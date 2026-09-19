@@ -457,8 +457,19 @@ def lint_roster_v13(r):
         out.append("ERROR roster: run.pack_dir does not exist: %s" % n["run"]["pack_dir"])
     servers = n.get("servers") or {}
     live = [s for s, cfg in servers.items() if not cfg.get("parked")]
-    if live != ["go2"]:
-        out.append("ERROR roster: live servers must be exactly [go2] (go1/go3 parked); got %s" % live)
+    order = [str(x) for x in (n.get("fallback_order") or r.get("fallback_order") or [])]
+    # §29 (O1): go2 is the primary; other unparked servers are fallbacks, never the
+    # role binding (2026-09-18T22Z: roles were rebound to go1 and never reverted)
+    if "go2" not in live:
+        out.append("ERROR roster: servers.go2 must be unparked (primary); live servers %s" % live)
+    if not order or order[0] != "go2":
+        out.append("ERROR roster: fallback_order must start with go2; got %s" % order)
+    for s_ in live:
+        if s_ not in order:
+            out.append("ERROR roster: unparked server %s is missing from fallback_order %s" % (s_, order))
+    for s_ in live:
+        if s_ != "go2":
+            out.append("WARN roster: %s is unparked: a fallback; primary is go2" % s_)
     go2 = servers.get("go2") or {}
     if go2.get("max_concurrent") != 8 or not str(go2.get("url", "")).endswith(":4102"):
         out.append("ERROR roster: go2 must be :4102 with max_concurrent 8; got %s" % json.dumps(go2))
@@ -477,6 +488,9 @@ def lint_roster_v13(r):
                 out.append("ERROR roster: kind %s names unknown server %r" % (kind, srv))
             elif servers[srv].get("parked"):
                 out.append("ERROR roster: kind %s routes to parked server %s" % (kind, srv))
+            elif order and srv != order[0]:
+                out.append("ERROR roster: kind %s binds server %s; roles must bind the primary %s"
+                           % (kind, srv, order[0]))
             if not rc.get("model"):
                 out.append("ERROR roster: kind %s has no model" % kind)
     b = (roles.get("builder") or {}).get("runner")
@@ -491,8 +505,23 @@ def lint_roster_v13(r):
     if proof.get("box_slots") != 1 or proof.get("shm_reap") is not True:
         out.append("ERROR roster: proof.box_slots 1 and proof.shm_reap true required")
     cc = proof.get("circleci") or {}
-    if str(cc.get("account", "3")) != "3":
-        out.append("ERROR roster: proof.circleci.account must be \"3\"; got %r" % cc.get("account"))
+    # §29: the account vocabulary lives in vpcircle.TARGETS only (no literal here)
+    try:
+        import vpcircle
+        known = set(vpcircle.TARGETS)
+    except ImportError:
+        known = None
+    if known is None:
+        out.append("WARN roster: vpcircle not importable; CircleCI account checks skipped")
+    else:
+        acct = cc.get("account")
+        if acct is None or str(acct) not in known:
+            out.append("ERROR roster: proof.circleci.account %r not in vpcircle.TARGETS %s" % (acct, sorted(known)))
+        for field in ("rotation", "spread"):
+            bad = [str(a) for a in (cc.get(field) or []) if str(a) not in known]
+            if bad:
+                out.append("ERROR roster: proof.circleci.%s names unknown accounts %s (vpcircle.TARGETS %s)"
+                           % (field, bad, sorted(known)))
     if (n.get("night") or {}).get("pause_on_disk_gb") != 25:
         out.append("ERROR roster: night.pause_on_disk_gb 25 required")
     return out
