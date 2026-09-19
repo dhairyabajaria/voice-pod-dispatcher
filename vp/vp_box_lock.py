@@ -110,6 +110,13 @@ class BoxLocks(object):
     def _owner_path(self, name):
         return self.cn / name / "owner.json"
 
+    @staticmethod
+    def _dir_age(d):
+        try:
+            return time.time() - os.stat(str(d)).st_mtime
+        except OSError:
+            return 0.0
+
     def _try_one(self, name):
         d = self.cn / name
         try:
@@ -121,12 +128,12 @@ class BoxLocks(object):
             except (OSError, ValueError):
                 owner = {}
             pid = owner.get("pid")
-            ts = owner.get("mono_epoch") or 0
             if pid and self.alive(pid):
                 return False, "held by pid %s (%s, %s)" % (pid, owner.get("proof_id"), owner.get("tier"))
-            if not pid or (time.time() - float(ts or 0)) > STALE_S:
-                # dead holder (or an ownerless dir older than STALE_S): reap it, say so
-                why = "owner pid %s is dead" % pid if pid else "no live owner for > %ds" % STALE_S
+            if pid or self._dir_age(d) > STALE_S:
+                # a dead holder is reaped at once (ruling: never wait on a corpse); an
+                # ownerless dir only after STALE_S (the mkdir -> owner.json write window)
+                why = "owner pid %s is dead" % pid if pid else "no owner for > %ds" % STALE_S
                 self.log("reaping %s: %s (owner=%s)" % (name, why, owner))
                 self.alert("BOX_LOCK_REAPED", "%s reaped for %s: %s; owner was %s" % (name, self.proof_id, why,
                                                                                        json.dumps(owner)))
@@ -143,7 +150,7 @@ class BoxLocks(object):
                 except FileExistsError:
                     return False, "lost the race"
             else:
-                return False, "recent owner without live pid; waiting"
+                return False, "ownerless %s being written; waiting" % name
         except OSError as exc:
             return False, "mkdir failed: %s" % exc
         self._owner_path(name).write_text(json.dumps({
@@ -154,8 +161,31 @@ class BoxLocks(object):
         return True, ""
 
     def _box_pending(self):
-        """box.lock.d exists (an exclusive holds or waits): small proofs yield"""
-        return (self.cn / BOX).exists()
+        """box.lock.d is held by a LIVE exclusive (holding or waiting): small
+        proofs yield.  A dead exclusive's box.lock.d is reaped here (alerted),
+        otherwise every small proof would yield to a corpse forever."""
+        d = self.cn / BOX
+        if not d.exists():
+            return False
+        try:
+            owner = json.loads(self._owner_path(BOX).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            owner = {}
+        pid = owner.get("pid")
+        if pid and self.alive(pid):
+            return True
+        if pid or self._dir_age(d) > STALE_S:
+            why = "owner pid %s is dead" % pid if pid else "no owner for > %ds" % STALE_S
+            self.log("reaping %s: %s (owner=%s)" % (BOX, why, owner))
+            self.alert("BOX_LOCK_REAPED", "%s reaped by %s: %s; owner was %s" % (BOX, self.proof_id, why,
+                                                                                 json.dumps(owner)))
+            for fn in (lambda: self._owner_path(BOX).unlink(), lambda: os.rmdir(str(d))):
+                try:
+                    fn()
+                except OSError:
+                    pass
+            return d.exists()
+        return True                                   # ownerless but recent: being written; yield
 
     def _round(self):
         """one attempt in the fixed order; -> (ok, reason).  An exclusive keeps

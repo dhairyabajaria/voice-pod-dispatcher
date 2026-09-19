@@ -151,3 +151,34 @@ def test_d76b_1_small_proofs_yield_to_a_waiting_exclusive_so_it_cannot_starve(tm
     full2 = bl.BoxLocks(tmp_path, "f", "full-2", tier=bl.EXCLUSIVE)
     assert not full2.acquire(0, sleep=NOSLEEP)[0] and full2.held == [] and not (tmp_path / bl.BOX).exists()
     c.release()
+
+
+def test_d76b_1b_exclusive_killed_while_holding_box_lock_is_reaped_by_the_next_small_proof(tmp_path):
+    """acceptance (b): a real exclusive holder process is killed while it holds
+    box.lock.d (+ both slots); the next small proof reaps the corpse's locks
+    with a BOX_LOCK_REAPED alert and runs instead of yielding forever."""
+    import signal
+    import time
+    holder = subprocess.Popen([sys.executable, str(VP / "vp_box_lock.py"), "exclusive", "--cn", str(tmp_path),
+                               "--wait-max-min", "1", "--proof-id", "doomed-full", "--", sys.executable, "-c",
+                               "import time; time.sleep(60)"])
+    for _ in range(100):
+        if (tmp_path / bl.BOX).exists() and all((tmp_path / n).exists() for n in bl.SLOTS):
+            break
+        time.sleep(0.05)
+    assert json.loads((tmp_path / bl.BOX / "owner.json").read_text())["proof_id"] == "doomed-full"
+    holder.send_signal(signal.SIGKILL)
+    holder.wait(10)
+    assert (tmp_path / bl.BOX).exists(), "the corpse's locks are still on disk"
+    alerts, logs = [], []
+    small = bl.BoxLocks(tmp_path, "s", "small-after", log=logs.append, tier=bl.SLOT,
+                        alert=lambda k, t: alerts.append((k, t)))
+    ok, why = small.acquire(0, sleep=NOSLEEP)
+    assert ok, why
+    assert small.held == [bl.SLOTS[0]]
+    kinds = [k for k, _ in alerts]
+    assert kinds and set(kinds) == {"BOX_LOCK_REAPED"} and any("doomed-full" in t for _, t in alerts)
+    assert any(bl.BOX in t for _, t in alerts) and any(bl.SLOTS[0] in t for _, t in alerts)
+    assert not (tmp_path / bl.BOX).exists(), "box.lock.d reaped, not yielded to"
+    small.release()
+    assert held(tmp_path) == sorted([bl.SLOTS[1], bl.PORTAL]), "the corpse's other locks are reaped lazily by whoever needs them next"
