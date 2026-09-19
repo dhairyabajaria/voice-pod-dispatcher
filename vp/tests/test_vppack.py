@@ -571,9 +571,40 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     (wt / ".vp" / "PACKET.md").write_text("---\nitem: RJU\ncoverage_targets: [<union>, L99]\n---\nbody\n")
     (wt / ".vp" / "BENCHMARK.md").write_text("- B1 [evidence] [box] x — check: y\n")
     row = {"parameters": {"parent_contract_id": "L42", "covered_rows": ["L06", "L07"], "diff_or_scope": "union:RJU"}}
+    drv.run_root = wt.parent / "run"
+    (drv.run_root / "proofs").mkdir(parents=True)
+    drv._proof_index = lambda: LaneDriver._proof_index(drv)
+    drv._review_proofs = lambda *a: LaneDriver._review_proofs(drv, *a)
+    drv.PROOF_FIELDS = LaneDriver.PROOF_FIELDS
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, {"tasks": {}})
     assert plan["targets"] == ["L42", "L06", "L07", "L99"] and plan["subject"] == "union"
     assert "L06 ok" in plan["review_benchmark"] and "<union>" not in plan["review_benchmark"]
+    # D77 (§36 F.2): the head carries the PROOFS.json rule; with no records every entry is empty
+    assert "PASS when .vp/PROOFS.json records a PASS proof" in plan["review_benchmark"]
+    assert "do not FAIL the union on it" in plan["review_benchmark"]
+    assert [e["task"] for e in plan["proofs"]["entries"]] == ["L42", "L06", "L07", "L99"]
+    assert all(e["proof_id"] is None and e["output_sha"] is None for e in plan["proofs"]["entries"])
+    # with records: the newest PASS at the member's output sha wins over an older FAIL / a newer non-PASS
+    sha6, sha7 = "6" * 40, "7" * 40
+    for pid, sha, status, ts in (("proof-L06-1", sha6, "FAIL_INFRA", "2026-09-19T01:00:00.000Z"),
+                                 ("proof-L06-2", sha6, "PASS", "2026-09-19T02:00:00.000Z"),
+                                 ("proof-L06-3", sha6, "UNKNOWN", "2026-09-19T03:00:00.000Z"),
+                                 ("proof-L07-1", sha7, "FAIL_PRODUCT", "2026-09-19T02:00:00.000Z"),
+                                 ("proof-TIP-1", "c" * 40, "PASS", "2026-09-19T04:00:00.000Z")):
+        (drv.run_root / "proofs" / (pid + ".json")).write_text(json.dumps(
+            {"proof_id": pid, "sha": sha, "status": status, "ts": ts, "kind": "platform", "route": "box",
+             "paths": ["platform/tests/test_%s.py" % pid[6:9].lower()], "failed_nodes": ["x::y"] if "FAIL" in status else [],
+             "log": "/logs/%s.log" % pid}))
+    state = {"tasks": {"L06": {"output_sha": sha6}, "L07": {"output_sha": sha7}}}
+    union = {"union": "union-9", "members": [{"task": "L06", "output_sha": sha6}, {"task": "L07", "output_sha": sha7}]}
+    plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, state, union=union)
+    by = {e["task"]: e for e in plan["proofs"]["entries"]}
+    assert by["L06"]["proof_id"] == "proof-L06-2" and by["L06"]["status"] == "PASS" and by["L06"]["log"] == "/logs/proof-L06-2.log"
+    assert by["L07"]["proof_id"] == "proof-L07-1" and by["L07"]["failed_nodes"] == ["x::y"]
+    assert by["L42"]["proof_id"] is None and by["L99"]["proof_id"] is None
+    assert by["<union tip>"]["proof_id"] == "proof-TIP-1" and plan["proofs"]["union"] == "union-9"
+    assert "4 member record(s), 2 with a proof" in plan["review_benchmark"]
+    assert set(plan["proofs"]["entries"][0]) == {"task", "output_sha"} | set(LaneDriver.PROOF_FIELDS)
     # D73 (§33): the head names the registered candidate and says the records are bound to it
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40,
                                           {"tasks": {}, "candidate": {"sha": "5deac821" + "0" * 32}})
@@ -663,6 +694,12 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     assert (disp["candidate_sha"], disp["tree_sha"], disp["registered_candidate_sha"]) == (tip, utree, sha)
     con = json.loads((wt / ".vp" / "CONTRACT.json").read_text())["parameters"]
     assert (con["candidate_sha"], con["tree_sha"], con["registered_candidate_sha"], con["union"]) == (tip, utree, sha, uid)
+    # D77: the reviewer's worktree carries the members' proof records and the prompt points at them
+    proofs = json.loads((wt / ".vp" / "PROOFS.json").read_text())
+    assert proofs["union"] == uid and proofs["subject_sha"] == tip
+    assert {e["task"] for e in proofs["entries"]} >= {"P-FIX-A", "P-FIX-B"}
+    assert {e["output_sha"] for e in proofs["entries"] if e["task"] in have} == set(have.values())
+    assert ".vp/PROOFS.json" in lanedriver.REVIEW_PROMPT
     assert env.rows()["REVIEW-FIXSET"]["parameters"]["candidate_sha"] == sha, "the scheduler row is untouched"
     assert {"P-FIX-A", "P-FIX-B"} <= set(disp["union_members"])
     assert disp["owned_files"] == ["control/evidence/REVIEW-FIXSET/%s/verdict-packet.json" % uid]

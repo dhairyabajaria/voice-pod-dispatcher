@@ -79,8 +79,20 @@ REVIEW_PROMPT = (
     "evidence. Output ONLY the JSON object per .vp/REVIEW_SCHEMA.json, copying item, "
     "subject, base, candidate and reviewer from REVIEW_REQUEST.json verbatim. "
     "Verdict APPROVE only when every benchmark id is PASS with evidence and no "
-    "finding of severity medium or higher carries a reproduce command."
+    "finding of severity medium or higher carries a reproduce command. "
+    "Runtime criteria ([box]/[hosted]) are judged from .vp/PROOFS.json, the driver's "
+    "record of each member's proof at its output sha: cite the proof_id; UNKNOWN only "
+    "when no record exists for that member (D77)."
 )
+
+# D77 (§36 F.2, Architect 2026-09-19): the reviewer's worktree carried no proof
+# records, so every runtime criterion was an honest UNKNOWN
+PROOFS_RULE = ("Runtime criteria ([box]/[hosted]): PASS when .vp/PROOFS.json records a PASS proof at the "
+               "member's output sha whose paths cover the criterion's tests — cite the proof_id; UNKNOWN only "
+               "when no such record exists. Collection-baseline freshness: a union tip is pre-merge and its "
+               "baseline is expected to be stale; L35 Step 6 rebaselines it before the trunk merge. Record the "
+               "merge count from `scripts/ci_collection_floor.py freshness --branch vp/proof/review` "
+               "(informational mode) and do not FAIL the union on it.")
 
 BUILD_KINDS = ("builder", "control", "security_build", "integration")
 RED_OUTCOMES = ("REPAIR_REQUIRED", "INVALID_EVIDENCE", "BLOCKED")
@@ -4298,6 +4310,9 @@ class LaneDriver(object):
             # criteria over review_base..candidate), never the packet's benchmark
             # about the verdict file the driver has yet to write
             (wt / ".vp" / "BENCHMARK.md").write_text(rp["review_benchmark"], encoding="utf-8")
+            # D77: the proof records the reviewer judges runtime criteria from
+            (wt / ".vp" / "PROOFS.json").write_text(json.dumps(rp["proofs"], indent=2, sort_keys=True),
+                                                    encoding="utf-8")
         req = {"item": task, "subject": "item", "base": base, "candidate": cand,
                "reviewer": rcfg.get("model") or "reviewer",
                "benchmark_ids": self._benchmark_ids(wt), "unverified_ids": []}
@@ -4404,6 +4419,11 @@ class LaneDriver(object):
         except OSError:
             packet_benchmark = ""
         head = "# Review subject: %s..%s (%s)\n" % (rbase[:12], cand[:12], ", ".join(targets))
+        proofs = self._review_proofs(targets, state, union, cand)
+        mem = [e for e in proofs["entries"] if e["task"] != "<union tip>"]
+        head += "%s (.vp/PROOFS.json: %d member record(s), %d with a proof%s)\n" % (
+            PROOFS_RULE, len(mem), sum(1 for e in mem if e.get("proof_id")),
+            "; union tip proof present" if len(mem) != len(proofs["entries"]) else "")
         reg = (state.get("candidate") or {}).get("sha")
         if reg:
             # D73 (§33): REVIEW-JUNIOR-S3-F5-R2 failed 5 rows by reading the registered
@@ -4413,7 +4433,56 @@ class LaneDriver(object):
                     "records name.\n" % reg) + head
         return {"base": rbase, "targets": targets, "criteria": criteria, "subject": "union" if (union or "union" in
                 str((row.get("parameters") or {}).get("diff_or_scope") or "")) else "item",
-                "review_benchmark": head + "".join(lines), "packet_benchmark": packet_benchmark}
+                "review_benchmark": head + "".join(lines), "packet_benchmark": packet_benchmark,
+                "proofs": proofs}
+
+    PROOF_FIELDS = ("proof_id", "kind", "route", "status", "paths", "failed_nodes", "log")
+
+    def _proof_index(self):
+        """sha -> [proof records] from RUN_ROOT/proofs/proof-*.json (laneproof._write)"""
+        idx = {}
+        try:
+            files = sorted((self.run_root / "proofs").glob("proof-*.json"))
+        except OSError:
+            files = []
+        for f in files:
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if rec.get("sha"):
+                idx.setdefault(rec["sha"], []).append(rec)
+        return idx
+
+    def _review_proofs(self, targets, state, union, cand):
+        """D77: one entry per union member (and per coverage target), sourced from
+        the proof record of its VERIFIED attempt (the newest PASS at its output
+        sha, else the newest record), plus the union tip's own proof if any."""
+        idx = self._proof_index()
+        tasks = state.get("tasks") or {}
+        members = [str(m.get("task")) for m in ((union or {}).get("members") or []) if m.get("task")]
+        member_sha = {str(m.get("task")): m.get("output_sha") for m in ((union or {}).get("members") or [])}
+
+        def best(recs):
+            if not recs:
+                return None
+            ranked = sorted(recs, key=lambda r: (r.get("status") == "PASS", str(r.get("ts") or "")))
+            return ranked[-1]
+
+        entries = []
+        for t in list(dict.fromkeys(members + list(targets))):
+            sha = (tasks.get(t) or {}).get("output_sha") or member_sha.get(t)
+            rec = best(idx.get(sha)) if sha else None
+            e = {"task": t, "output_sha": sha}
+            e.update({k: (rec or {}).get(k) for k in self.PROOF_FIELDS})
+            entries.append(e)
+        tip = best(idx.get(cand)) if cand else None
+        if tip:
+            e = {"task": "<union tip>", "output_sha": cand}
+            e.update({k: tip.get(k) for k in self.PROOF_FIELDS})
+            entries.append(e)
+        return {"generated": utc_ms(), "subject_sha": cand, "union": (union or {}).get("union"),
+                "rule": PROOFS_RULE, "entries": entries}
 
     def _verdict_owned_path(self, task, p, row):
         """the packet's verdict-packet.json under owned_files, with <union>
