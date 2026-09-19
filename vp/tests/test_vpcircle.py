@@ -292,6 +292,47 @@ class PollTests(unittest.TestCase):
         self.assertEqual([t["name"] for t in result["failed_tests"][42]],
                          ["test_x", "test_w"])
 
+    def test_d82_poll_survives_transient_read_failures_and_gives_up_after_the_cap(self):
+        """D82 (2026-09-19 20:46Z/21:47Z): both canary polls died on one failed
+        read of a pipeline that was still running.  Up to POLL_TRANSIENT_MAX
+        consecutive failures are retried one interval apart; the deadline still
+        bounds the wait; a persistent failure is raised with the CLI's words."""
+        state = {"n": 0}
+        sleeps = []
+
+        def handler(account, path, argv):
+            if path == "api/v2/pipeline/pipe-1/workflow":
+                state["n"] += 1
+                if state["n"] <= 3:
+                    return 1, "", "GET /api/v2/...: 429 Too Many Requests"
+                return 0, json.dumps({"items": [{"id": "wf-1", "status": "success"}]}), ""
+            if path == "api/v2/workflow/wf-1/job":
+                return 0, json.dumps({"items": [{"id": "j", "name": "lint", "status": "success", "job_number": 1}]}), ""
+            raise AssertionError(path)
+
+        result = vc.poll("pipe-1", interval=60, deadline_s=5400, runner=vc.Runner(run=FakeRun(handler)),
+                         account="3", sleep=lambda s: sleeps.append(s), clock=lambda: 0.0)
+        self.assertEqual(state["n"], 4)
+        self.assertEqual(sleeps, [60, 60, 60], "one interval per failed read, then the answer")
+        self.assertEqual(result["jobs"][0]["name"], "lint")
+        # persistent: gives up after POLL_TRANSIENT_MAX + 1 reads, error text kept
+        state["n"] = -100
+        sleeps.clear()
+        with self.assertRaisesRegex(RuntimeError, "429 Too Many Requests"):
+            vc.poll("pipe-1", interval=60, deadline_s=5400, runner=vc.Runner(run=FakeRun(handler)),
+                    account="3", sleep=lambda s: sleeps.append(s), clock=lambda: 0.0)
+        self.assertEqual(len(sleeps), vc.POLL_TRANSIENT_MAX)
+        # the identity check's own failure carries the CLI's stderr (403 at 21:47Z)
+        forbidden = FakeRun(handler)
+        real = forbidden.__call__
+
+        def run(argv, **kw):
+            if _is_auth_me(list(argv)):
+                return subprocess.CompletedProcess(list(argv), 1, "", "GET /api/v3/users: 403 Forbidden\n")
+            return real(argv, **kw)
+        with self.assertRaisesRegex(RuntimeError, r"identity request failed; command was not run \(GET /api/v3/users: 403 Forbidden\)"):
+            c.verified_env("3", run=run, binary="/usr/bin/true")
+
     def test_poll_abort_raises_cancelled_before_the_next_sleep(self):
         sleeps = []
         flips = iter([False, True])

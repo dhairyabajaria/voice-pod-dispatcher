@@ -135,6 +135,9 @@ INFRA_JOB_STATUSES = {"infrastructure_fail", "timedout"}
 # FAIL_PRODUCT/FAIL_INFRA with reds, and never reusable (lanedriver D79).
 CANCELLED_JOB_STATUSES = {"canceled"}
 
+# D82: consecutive failed reads a poll tolerates before it gives up.
+POLL_TRANSIENT_MAX = 5
+
 # Job statuses that mean the job is done and will not change again.
 JOB_TERMINAL_STATUSES = {
     "success", "failed", "infrastructure_fail", "timedout", "canceled",
@@ -370,11 +373,27 @@ def poll(pipeline_id, interval=60, deadline_s=5400, runner=None, account=None,
     runner = runner or Runner()
     acct = account or DEFAULT_ROTATION[0]
     started = clock()
+    transient = 0
 
     while True:
-        workflows = _get_json(
-            runner, acct, f"api/v2/pipeline/{pipeline_id}/workflow"
-        ).get("items", [])
+        try:
+            workflows = _get_json(
+                runner, acct, f"api/v2/pipeline/{pipeline_id}/workflow"
+            ).get("items", [])
+        except RuntimeError as exc:
+            # D82: one failed read (identity check or API: rate limit, 5xx,
+            # network) must not end a 90-minute poll of a pipeline that is
+            # still running -- 20:46Z and 21:47Z both canary polls died on
+            # their FIRST read.  Retry up to POLL_TRANSIENT_MAX consecutive
+            # times, one interval apart; the deadline still bounds the wait.
+            transient += 1
+            if transient > POLL_TRANSIENT_MAX or clock() - started >= deadline_s:
+                raise
+            if abort is not None and abort():
+                raise Cancelled(f"poll: aborted by caller for pipeline {pipeline_id}") from exc
+            sleep(interval)
+            continue
+        transient = 0
         all_terminal = bool(workflows) and all(
             w.get("status") in WORKFLOW_TERMINAL for w in workflows
         )

@@ -44,7 +44,11 @@ def verified_env(account, *, base=None, run=subprocess.run, binary=None):
     identity = run(prefix + ["auth", "me", "--json"], env=env,
                    capture_output=True, text=True, timeout=30)
     if identity.returncode:
-        raise RuntimeError(f"Account {account}: identity request failed; command was not run")
+        # D82: carry the CLI's own words (rate limit, 5xx, network) -- 2026-09-19
+        # two canary polls died on this line and the log said nothing more
+        detail = ((identity.stderr or "") + " " + (identity.stdout or "")).strip().replace("\n", " ")[-200:]
+        raise RuntimeError(f"Account {account}: identity request failed; command was not run"
+                           + (f" ({detail})" if detail else ""))
     try:
         actual = json.loads(identity.stdout)["id"]
     except (ValueError, KeyError, TypeError):
