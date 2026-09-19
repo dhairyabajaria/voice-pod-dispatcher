@@ -703,6 +703,53 @@ def test_union_integrator_cuts_a_union_of_the_verified_fixes_and_the_review_runs
     assert sorted(d.name for d in (env.run_root / "unions").iterdir()) == before
 
 
+def test_union_re_review_on_a_later_tip_is_not_a_duplicate(tmp_path, monkeypatch):
+    """§26 (2026-09-19): a `<union>` review's scheduler key includes the union tip it
+    reviews, so the re-review owed after repairs land on union-N+1 is admitted while
+    the REPAIR_REQUIRED review of union-N stands; the same tip is still a duplicate."""
+    from test_lanedriver import register_candidate, CONTROL_DIR
+    import lanedriver
+    if "key_parts.append(parameters[\"union_sha\"])" not in (CONTROL_DIR / "orchestration_control.py").read_text():
+        pytest.skip("pinned scheduler predates §26 (review_key without union_sha)")
+    monkeypatch.setattr(lanedriver.LaneDriver, "_review_gate_check", lambda self, *a: (True, "PASS: fake gate"))
+    env, drv, codex = _union_env(tmp_path)
+    sha, tree = register_candidate(env)
+    settle(drv, 6)
+    integ = [json.loads(m.read_text()) for m in sorted((env.run_root / "unions").glob("*/members.json"),
+                                                       key=lambda q: int(q.parent.name))
+             if json.loads(m.read_text()).get("for") == ["INTEGRATION"]]
+    assert integ, (env.run_root / "driver.log").read_text()
+    # §26: a re-review of the same scope on a union tip is keyed by that tip -- not a
+    # duplicate of the finished review (REVIEW-JUNIOR-S3-F1..F5 were refused as
+    # "duplicate candidate/role/scope" on 2026-09-19 although their repairs had landed).
+    # The scheduler half (review_key += union_sha) lands with the owner's re-pin; until
+    # the pinned scheduler carries it these assertions are skipped, never faked.
+    if "key_parts.append(parameters[\"union_sha\"])" not in (CONTROL_DIR / "orchestration_control.py").read_text():
+        pytest.skip("pinned scheduler predates §26 (review_key without union_sha)")
+    orig = env.rows()["REVIEW-FIXSET"]
+    assert "union_sha" not in (orig["parameters"] or {}), "instantiated before any union existed: keyed as before"
+    drv.request_packet_retry("REVIEW-FIXSET", "re-review on the refreshed union (§26)")
+    settle(drv, 3)
+    rows = env.rows()
+    new = rows["REVIEW-FIXSET-R1"]
+    assert new["parameters"]["union_sha"] == integ[-1]["union_sha"] and new["parameters"]["union"] == integ[-1]["union"]
+    assert new["review_key"] != orig["review_key"], "keyed by the union tip"
+    assert new["parameters"]["candidate_sha"] == sha, "the registered candidate still binds the row"
+    assert "PACKET_INSTANTIATE_REFUSED REVIEW-FIXSET" not in (env.run_root / "driver.log").read_text()
+    # the scheduler's rule itself: the same scope on the SAME union tip is still a duplicate
+    # (the -R1 is PLANNED, not exempt); on another tip it is a new review
+    import lanedriver
+    pp = env.run_root / "packets" / "REVIEW-FIXSET-R1.params.json"
+    same = json.loads(pp.read_text())
+    dup = env.run_root / "packets" / "dup.params.json"
+    other = dict(same, union_sha="f" * 40, union="union-99")
+    dup.write_text(json.dumps(other))
+    drv.control.instantiate("JUNIOR_REVIEW", "REVIEW-FIXSET-OTHER", "L00", "B", dup, ["L00"])
+    assert env.rows()["REVIEW-FIXSET-OTHER"]["review_key"] not in (new["review_key"], orig["review_key"])
+    with pytest.raises(lanedriver.ControlError, match="duplicate candidate/role/scope"):
+        drv.control.instantiate("JUNIOR_REVIEW", "REVIEW-FIXSET-OTHER-2", "L00", "B", dup, ["L00"])
+
+
 def test_union_review_is_held_until_a_union_contains_all_its_depends_on_rows(tmp_path):
     """§9(5a): a members.json that lacks one of the packet's depends_on rows
     (or carries a member at a stale output sha) does not dispatch the review."""

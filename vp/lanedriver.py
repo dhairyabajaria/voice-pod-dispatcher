@@ -1195,7 +1195,10 @@ class LaneDriver(object):
     def _union_review_packet(self, task):
         """the packet when `task` is a `<union>` review with no review_base
         (its subject is a union tip the integrator builds), else None"""
-        p = self.packet_for(task)
+        return self._union_review(self.packet_for(task))
+
+    @staticmethod
+    def _union_review(p):
         if not p or p.get("v13_kind") != "review" or "<union>" not in (p.get("coverage_targets") or []):
             return None
         if p.get("review_base"):
@@ -1750,6 +1753,13 @@ class LaneDriver(object):
             return False
         covered = self._covered_rows(tasks) if template in vppack.REVIEW_TEMPLATES else None
         params = vppack.parameters_for(p, template, parent, candidate, covered)
+        if params is not None and template in vppack.REVIEW_TEMPLATES and self._union_review(p):
+            # §26: a `<union>` review is keyed by the union tip it will review, so a
+            # re-review on a later union (repairs carried) is not a duplicate of the
+            # REPAIR_REQUIRED one on the earlier union; no union yet = keyed as before
+            union, _missing = self._union_for(task, p, tasks)
+            if union and union.get("union_sha"):
+                params = dict(params, union_sha=union["union_sha"], union=union.get("union"))
         if params is None:
             if ("cand", pid) not in self._pack_logged:
                 self._pack_logged.add(("cand", pid))

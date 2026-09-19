@@ -1,0 +1,22 @@
+diff --git a/advisor-plans/outbound-launch/orchestration_control.py b/advisor-plans/outbound-launch/orchestration_control.py
+index c9f8bf26..bd477c6d 100644
+--- a/advisor-plans/outbound-launch/orchestration_control.py
++++ b/advisor-plans/outbound-launch/orchestration_control.py
+@@ -418,9 +418,14 @@ def cmd_instantiate(args) -> None:
+             if not candidate.get("sha") or parameters.get("candidate_sha") != candidate["sha"] or parameters.get("tree_sha") != candidate["tree"]:
+                 raise RuntimeError("review must bind the registered candidate SHA and tree")
+             scope = parameters.get("diff_or_scope", parameters.get("adversarial_scope"))
+-            review_key = hashlib.sha256(json.dumps(
+-                [args.template, candidate["sha"], candidate["tree"], scope], sort_keys=True
+-            ).encode()).hexdigest()
++            # §26: a union-keyed review (D30) is a review OF a union tip: the same scope
++            # on a later union (repairs landed, re-review owed) is a different review,
++            # not a duplicate.  final_review (§12 item 3) carries no union_sha and keeps
++            # the registered-candidate key unchanged.
++            key_parts = [args.template, candidate["sha"], candidate["tree"], scope]
++            if parameters.get("union_sha"):
++                key_parts.append(parameters["union_sha"])
++            review_key = hashlib.sha256(json.dumps(key_parts, sort_keys=True).encode()).hexdigest()
+             for existing in state["tasks"].values():
+                 if existing.get("review_key") == review_key and existing["state"] not in {"INVALID_EVIDENCE", "CANCELLED"}:
+                     raise RuntimeError(f"duplicate candidate/role/scope review: {existing['task_id']}")
