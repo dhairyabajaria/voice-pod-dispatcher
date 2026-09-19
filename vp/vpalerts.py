@@ -13,8 +13,9 @@ alert stream:
            still counts as one repeating failure);
   age      how long the same signature has been firing without a gap
            longer than `streak_gap_s` (an open, unresolved condition);
-  backlog  growth of an externally supplied backlog count (e.g. rows owed a
-           ruling, or READY rows nobody claims) across the window.
+  backlog  growth of an externally supplied backlog count (rows owed a
+           ruling) across the window -- applied to `backlog_kinds` only
+           (IDLE, DRAIN, OWED_RULINGS): idle while the pile grows is the page.
 
 A small `floor` set names kinds that are urgent on FIRST sight because the
 driver itself cannot proceed (budget, disk, scheduler down, authority
@@ -52,6 +53,9 @@ DEFAULTS = {
     # decisions panel, so its own repeats (one per restart) must not page
     "floor_routine": ["IDLE", "RELOAD", "PROMOTED", "PACKET_RETRIED", "DRAIN",
                       "RESTART", "PROFILE_CHANGED", "OWNER_GATE"],
+    # kinds for which backlog growth is a signal: nothing is being worked
+    # (IDLE/DRAIN) or rulings are owed, while the owed pile keeps growing
+    "backlog_kinds": ["IDLE", "DRAIN", "OWED_RULINGS"],
 }
 
 _SUFFIX_RE = re.compile(r"(?:-[RB]?\d+)+$")
@@ -64,6 +68,7 @@ def config(overrides=None):
             cfg[k] = v
     cfg["floor_urgent"] = set(cfg["floor_urgent"])
     cfg["floor_routine"] = set(cfg["floor_routine"])
+    cfg["backlog_kinds"] = set(cfg["backlog_kinds"])
     return cfg
 
 
@@ -183,12 +188,16 @@ def assess(alert, history, *, now=None, backlog=None, cfg=None):
     elif patterned and age_s >= cfg["age_attention_s"]:
         tier = max(tier, ATTENTION, key=TIERS.index)
         reasons.append("open %dm" % (age_s // 60))
-    if backlog_delta >= cfg["backlog_urgent"]:
+    # backlog growth is a signal for backlog_kinds only: "IDLE while the owed
+    # pile grows" is the page; a failure alert already carries its own
+    # repeat/age, and owed rows grow by design while dispatch is running
+    watches_backlog = kind in cfg["backlog_kinds"]
+    if watches_backlog and backlog_delta >= cfg["backlog_urgent"]:
         tier = URGENT
-        reasons.append("backlog +%d" % backlog_delta)
-    elif backlog_delta >= cfg["backlog_attention"]:
+        reasons.append("backlog +%d while %s" % (backlog_delta, kind))
+    elif watches_backlog and backlog_delta >= cfg["backlog_attention"]:
         tier = max(tier, ATTENTION, key=TIERS.index)
-        reasons.append("backlog +%d" % backlog_delta)
+        reasons.append("backlog +%d while %s" % (backlog_delta, kind))
     if kind in cfg["floor_urgent"]:
         tier = URGENT
         reasons.append("this kind stops the driver")
