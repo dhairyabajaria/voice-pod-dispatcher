@@ -278,7 +278,11 @@ class Dash(object):
                 per[acc]["proofs"][p.get("status") or "?"] += 1
                 if (p.get("ts") or "") > (per[acc]["last_proof_ts"] or ""):
                     per[acc]["last_proof_ts"], per[acc]["last_proof_status"] = p.get("ts"), p.get("status")
-        unattributed = Counter(p.get("status") for p in finished.values() if p.get("account") not in per)
+        # D65 refusals never had a pipeline or an account: they are not "unattributed"
+        refused = Counter(p.get("status") for p in finished.values()
+                          if p.get("status") in ("BLOCKED_GATE", "BLOCKED_CAP", "BLOCKED_OFF"))
+        unattributed = Counter(p.get("status") for p in finished.values()
+                               if p.get("account") not in per and p.get("status") not in refused)
         for a in per.values():
             a["proofs"] = dict(a["proofs"])
             # a pipeline older than the roster deadline with no proof record is not in flight, it is lost
@@ -295,6 +299,7 @@ class Dash(object):
             "in_flight_total": sum(len(a["in_flight"]) for a in per.values()),
             "accounts": list(per.values()),
             "proofs_unattributed": dict(unattributed),
+            "proofs_refused": dict(refused),
             "ledger_has_status_field": any("status" in r for r in j.pipeline_rows),
             "note": ("pipelines ledger records successful triggers only (no status field yet): refused/failed "
                      "triggers are invisible until the laneproof patch lands") if not any("status" in r for r in j.pipeline_rows) else None,
@@ -587,6 +592,7 @@ function renderCircle(){const c=SNAP.circleci||{};
  let h=`<div class="kpi"><div><div class="big">${c.triggered_today_total}</div><div class="l">pipelines today (UTC)</div></div><div><div class="big">${c.max_pipelines_per_day??'-'}</div><div class="l">max_pipelines_per_day (roster)</div></div><div><div class="big">${c.in_flight_total}</div><div class="l">in flight (no proof record yet)</div></div><div><div class="big">${c.max_pipelines_in_flight??'-'}</div><div class="l">max in flight (roster)</div></div><div><div class="big">${c.triggered_total}</div><div class="l">triggered, run total</div></div><div><div class="big ${c.gate_open?'s-VERIFIED':'s-BLOCKED'}">${c.gate_open?'OPEN':'CLOSED'}</div><div class="l">${esc(c.gate)} gate</div></div><div><div class="big">${esc(c.mode)}</div><div class="l">mode · primary ${esc(c.primary_account)} · spread ${(c.spread||[]).join(',')}</div></div></div>`;
  if(c.note)h+=`<div class="small" style="color:var(--warn)">${esc(c.note)}</div>`;
  h+='<table><tr><th>account</th><th>org / repo</th><th>today</th><th>total</th><th>in flight</th><th>lost</th><th>refused gate</th><th>refused cap</th><th>credits</th><th>failed</th><th>proof outcomes</th><th>last trigger</th><th>last proof</th></tr>'+(c.accounts||[]).map(a=>`<tr><td><b>${esc(a.account)}</b></td><td class="small">${esc(a.org||'')}<br><span class=mut>${esc(a.repo||'')}</span></td><td>${a.triggered_today}</td><td>${a.triggered_total}</td><td>${a.in_flight.length?a.in_flight.map(x=>`<code title="${esc(x.pipeline_id)}">${esc(x.proof_id.replace('proof-',''))}</code> ${age(x.age_s)}`).join('<br>'):'-'}</td><td>${a.lost.length||'-'}</td><td>${a.refused_gate||'-'}</td><td>${a.refused_cap||'-'}</td><td>${a.credits_blocked||'-'}</td><td>${a.trigger_failed||'-'}</td><td>${Object.entries(a.proofs).map(([k,v])=>st(k)+' '+v).join(' ')||'-'}</td><td class="small mut">${esc((a.last_trigger_ts||'-').slice(0,16))}</td><td class="small">${a.last_proof_ts?st(a.last_proof_status)+' <span class=mut>'+esc(a.last_proof_ts.slice(0,16))+'</span>':'-'}</td></tr>`).join('')+'</table>';
+ if(c.proofs_refused&&Object.keys(c.proofs_refused).length)h+=`<div class="small" style="color:var(--warn)">proofs refused at trigger time (no pipeline spent): ${Object.entries(c.proofs_refused).map(([k,v])=>st(k)+' '+v).join(' ')}</div>`;
  if(c.proofs_unattributed&&Object.keys(c.proofs_unattributed).length)h+=`<div class="mut small">${Object.values(c.proofs_unattributed).reduce((x,y)=>x+y,0)} circleci proof records carry no account field (pre-D44): ${esc(JSON.stringify(c.proofs_unattributed))}</div>`;
  $('#circle').innerHTML=h;}
 function renderDecisions(){const d=SNAP.decisions||{};let h=`<div class="kpi"><div><div class="big">${d.closed_gates_holding_work}</div><div class="l">closed gates holding work</div></div><div><div class="big">${d.rows_held_by_closed_gates}</div><div class="l">rows held</div></div><div><div class="big">${(d.open_rulings||[]).length}</div><div class="l">rulings not executed</div></div></div>`;

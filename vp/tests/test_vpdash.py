@@ -97,6 +97,13 @@ def test_circleci_panel_covers_every_account_and_the_failed_trigger_rows(tmp_pat
     assert accounts["3"]["triggered_total"] == 1 and len(accounts["3"]["lost"]) == 1   # triggered, no proof record, far past the deadline
     assert accounts["A2"]["refused_gate"] == 1 and accounts["A2"]["triggered_total"] == 0
     assert c["ledger_has_status_field"] is True and c["note"] is None
+    # a D65 refusal record (no account, no pipeline) is a refusal, not an unattributed proof
+    (d.run_root / "proofs" / "proof-P-FIX-HOSTED-R1-2.json").write_text(json.dumps(
+        {"proof_id": "proof-P-FIX-HOSTED-R1-2", "status": "BLOCKED_GATE", "route": "circleci", "account": None,
+         "pipeline_id": None, "ts": ts(12, 9), "reason": "circleci: owner gate DELIVERY-1 not open at trigger time"}))
+    d.refresh()
+    c = d.snapshot["circleci"]
+    assert c["proofs_refused"] == {"BLOCKED_GATE": 1} and c["proofs_unattributed"] == {}
 
 
 def test_decisions_panel_gate_age_from_snapshots_and_held_rows(tmp_path):
