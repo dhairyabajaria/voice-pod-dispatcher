@@ -338,7 +338,7 @@ class Journey(object):
             p = self._load_json(d / name)
             if isinstance(p, dict) and p.get("proof_id"):
                 self.proofs[p["proof_id"]] = {k: p.get(k) for k in
-                                              ("proof_id", "status", "route", "sha", "ts", "kind", "counts", "rc")}
+                                              ("proof_id", "status", "route", "sha", "ts", "kind", "counts", "rc", "account", "pipeline_id", "branch")}
 
     # -- identity ------------------------------------------------------------------
 
@@ -424,8 +424,9 @@ class Journey(object):
                 r["kind"] = "catalog"
         for rid, r in roots.items():
             def last_ts(t):
+                # never run-state updated_at: the scheduler touches it every tick
                 evs = ev_by.get(t) or []
-                return (evs[-1].get("created_at") if evs else None) or (self.tasks[t].get("updated_at") or "")
+                return (evs[-1].get("created_at") if evs else None) or ""
             rows = sorted(r["rows"], key=lambda t: (int(ev_by[t][0].get("sequence") or 0) if ev_by.get(t) else 0, t))
             r["rows"] = rows
             st = {t: self.tasks[t].get("state") for t in rows}
