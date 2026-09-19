@@ -36,6 +36,7 @@ import fcntl
 import hashlib
 import importlib
 import importlib.util
+import collections
 import json
 import os
 import re
@@ -57,6 +58,7 @@ import vppack     # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
 import vpverify   # noqa: E402
+import vpalerts   # noqa: E402
 from vpdriver import (BUILDER_PROMPT, JUNIOR_PROMPT, RESUME_PROMPT,  # noqa: E402
                       estimate_cost, findings_verdicts, sha256_text,
                       validate_findings_recomputed)
@@ -578,19 +580,64 @@ class LaneDriver(object):
 
     def alert(self, kind, text, task=None):
         ts = utc_ms()
-        self.log("ALERT %s %s" % (kind, text[:300]))
-        line = "- %s **%s**%s — %s\n" % (ts, kind, (" `%s`" % task) if task else "", text[:800])
+        entry = {"ts": ts, "kind": kind, "task": task, "text": text}
+        sev = self._alert_severity(entry)
+        entry.update({"severity": sev["severity"], "repeat": sev["repeat"],
+                      "repeat_family": sev["repeat_family"], "age_s": sev["age_s"],
+                      "reasons": sev["reasons"]})
+        tag = "" if sev["severity"] == vpalerts.ROUTINE else " [%s]" % sev["severity"].upper()
+        self.log("ALERT %s%s %s" % (kind, tag, text[:300]))
+        line = "- %s **%s**%s%s — %s\n" % (ts, kind, tag, (" `%s`" % task) if task else "", text[:800])
         try:
             with self._lock:
                 with open(self.alerts_md, "a", encoding="utf-8") as fh:
                     fh.write(line)
         except OSError:
             pass
-        _append_jsonl(self.alerts_jsonl, {"ts": ts, "kind": kind, "task": task, "text": text},
-                      self._lock)
+        _append_jsonl(self.alerts_jsonl, entry, self._lock)
         self.comms("lanedriver", "owner", text, kind="alert:%s" % kind, task=task)
-        if kind in ("STUCK", "QUOTA_WEEKLY", "QUOTA_ROLLING", "AUTH", "CONTROL_DOWN"):
-            self._notify(kind, text)
+        # pattern decides the page (D60): the legacy kind set is kept as a floor
+        if vpalerts.should_notify(sev) or kind in ("STUCK", "QUOTA_WEEKLY", "QUOTA_ROLLING", "AUTH", "CONTROL_DOWN"):
+            self._notify("%s %s" % (kind, sev["severity"]) if tag else kind, text)
+
+    def _alert_severity(self, entry):
+        """D60: severity from the alert stream's pattern, not from the kind.
+        History is the recent alerts.jsonl tail (seeded once per process, so a
+        restart mid-loop keeps the repeat count -- the 09-17 loop spanned one);
+        the backlog signal is the count of rows owed a human ruling
+        (REPAIR_REQUIRED + INVALID_EVIDENCE + BLOCKED), sampled here."""
+        with self._lock:  # alerts come from worker threads too: seed + snapshot under the lock
+            hist = self.__dict__.get("_alert_history")
+            if hist is None:
+                hist = collections.deque(maxlen=4000)
+                try:
+                    with open(self.alerts_jsonl, encoding="utf-8") as fh:
+                        for raw in fh.readlines()[-4000:]:
+                            try:
+                                hist.append(json.loads(raw))
+                            except ValueError:
+                                continue
+                except OSError:
+                    pass
+                self._alert_history = hist
+            samples = self.__dict__.setdefault("_backlog_samples", collections.deque(maxlen=500))
+            try:
+                tasks = (self.control.state_view().get("tasks") or {})
+                owed = sum(1 for r in tasks.values()
+                           if r.get("state") in ("REPAIR_REQUIRED", "INVALID_EVIDENCE", "BLOCKED"))
+                samples.append((entry["ts"], owed))
+            except Exception:
+                pass
+            hist_snap, samples_snap = list(hist), list(samples)
+        cfg = (self.alerts_cfg or {}).get("severity") if isinstance(self.alerts_cfg, dict) else None
+        try:
+            sev = vpalerts.assess(entry, hist_snap, backlog=samples_snap, cfg=cfg)
+        except Exception as exc:  # the alert itself must never be lost to its grading
+            sev = {"severity": vpalerts.ROUTINE, "repeat": 1, "repeat_family": 1, "age_s": 0,
+                   "reasons": ["severity failed: %s" % str(exc)[:80]]}
+        with self._lock:
+            hist.append(dict(entry, severity=sev["severity"]))
+        return sev
 
     def alert_once(self, key, kind, text, task=None):
         with self._lock:

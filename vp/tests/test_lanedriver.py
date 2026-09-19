@@ -1932,3 +1932,33 @@ def test_repair_row_without_a_packet_inherits_test_paths_and_stays_targeted(tmp_
     assert lanedriver.LaneDriver._pack_root("R-DOCS-MIGRANGE-V13-R1") == "R-DOCS-MIGRANGE"
     assert drv._pack_owns("L17-REPLY-WIRING-R1"), "a superseded retry of a packet is still the pack's"
     assert not drv._pack_owns("L99")
+
+
+def test_d60_alert_severity_is_pattern_based_and_survives_a_restart(tmp_path):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    pages = []
+    drv._notify = lambda kind, text: pages.append(kind)
+    # the 09-17 shape: one PROOF_UNKNOWN per re-instantiated repair row
+    for n in (1, 2, 3):
+        drv.alert("PROOF_UNKNOWN", "proof %d unknown" % n, task="R-L17-REPLY-WIRING-R1-B5-%d" % n)
+    drv.alert("IDLE", "idle for 30 min")
+    rows = [json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()]
+    mine = [r for r in rows if r["kind"] == "PROOF_UNKNOWN"]
+    assert [r["severity"] for r in mine] == ["attention", "attention", "urgent"]
+    assert [r["repeat_family"] for r in mine] == [1, 2, 3] and all(r["repeat"] == 1 for r in mine)
+    assert mine[-1]["reasons"] and "repeat=3" in mine[-1]["reasons"][0]
+    assert [r for r in rows if r["kind"] == "IDLE"][0]["severity"] == "routine"
+    assert pages == ["PROOF_UNKNOWN urgent"], "only the third cycle pages"
+    md = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "**PROOF_UNKNOWN** [URGENT]" in md and "**IDLE** [" not in md
+    # a fresh process (restart mid-loop) seeds its history from the file
+    drv2 = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    drv2._notify = lambda kind, text: pages.append(kind)
+    drv2.alert("PROOF_UNKNOWN", "proof 4 unknown", task="R-L17-REPLY-WIRING-R1-B5-4")
+    last = json.loads((env.run_root / "alerts.jsonl").read_text().splitlines()[-1])
+    assert last["repeat_family"] == 4 and last["severity"] == "urgent"
+    # the legacy kind floor still pages a first STUCK
+    drv2.alert("STUCK", "3 failures", task="OTHER")
+    assert pages[-1] == "STUCK attention"
