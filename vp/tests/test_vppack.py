@@ -1540,15 +1540,17 @@ def test_d71_canary_gate_holds_every_other_circleci_twin_until_the_canary_answer
     assert json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]["released_at"] is None
     # a real answer: pipeline_id + PASS -> released, recorded in the roster, the held twin claims
     time.sleep(0.05)
+    # D71a: the proof vocabulary is FAIL_PRODUCT; roster release_on says FAIL -- a real
+    # pipeline that failed the product IS an answer (2026-09-19 19:03Z: pipeline 722a0b89)
     (proofs / "proof-P-A-HOSTED-2.json").write_text(json.dumps(
-        {"proof_id": "proof-P-A-HOSTED-2", "status": "PASS", "pipeline_id": "pipe-123", "route": "circleci"}))
+        {"proof_id": "proof-P-A-HOSTED-2", "status": "FAIL_PRODUCT", "pipeline_id": "pipe-123", "route": "circleci"}))
     settle(drv, 8)
     rows = env.rows()
     assert rows["P-B-HOSTED"]["state"] == "VERIFIED", rows["P-B-HOSTED"]
     log = (env.run_root / "driver.log").read_text()
-    assert "CANARY_RELEASED P-A-HOSTED: pipeline pipe-123 -> PASS" in log
+    assert "CANARY_RELEASED P-A-HOSTED: pipeline pipe-123 -> FAIL_PRODUCT" in log
     rc = json.loads((env.run_root / "roster.json").read_text())["proof"]["circleci"]["canary"]
-    assert rc["released_at"] and rc["outcome"] == "PASS" and rc["pipeline_id"] == "pipe-123"
+    assert rc["released_at"] and rc["outcome"] == "FAIL_PRODUCT" and rc["pipeline_id"] == "pipe-123"
     assert (env.run_root / "alerts.jsonl").read_text().count("CANARY_RELEASED") == 1
     assert "ROSTER_REJECTED" not in log, "the driver's own roster write re-applies clean"
     # the lint rule

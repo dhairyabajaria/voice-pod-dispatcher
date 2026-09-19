@@ -1294,7 +1294,11 @@ class LaneDriver(object):
         status = str(rec.get("status") or "")
         pipeline = rec.get("pipeline_id")
         release_on = [str(x) for x in (c.get("release_on") or ["PASS", "FAIL"])]
-        if pipeline and status in release_on:
+        # D71a (2026-09-19 19:03Z): the proof vocabulary says FAIL_PRODUCT, the roster
+        # says FAIL -- pipeline 722a0b89 answered FAIL_PRODUCT (6 real reds, floor job
+        # green) and the literal match called it "not a real answer"
+        answers = set(release_on) | ({"FAIL_PRODUCT"} if "FAIL" in release_on else set())
+        if pipeline and status in answers:
             ts = utc_ms()
             try:
                 data = json.loads(self.roster_path.read_text(encoding="utf-8"))
