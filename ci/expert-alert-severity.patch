@@ -1,0 +1,126 @@
+diff --git a/vp/lanedriver.py b/vp/lanedriver.py
+index 6c3290f..b985728 100644
+--- a/vp/lanedriver.py
++++ b/vp/lanedriver.py
+@@ -36,6 +36,7 @@ import fcntl
+ import hashlib
+ import importlib
+ import importlib.util
++import collections
+ import json
+ import os
+ import re
+@@ -57,6 +58,7 @@ import vppack     # noqa: E402
+ import vprunners  # noqa: E402
+ import vpschema   # noqa: E402
+ import vpverify   # noqa: E402
++import vpalerts   # noqa: E402
+ from vpdriver import (BUILDER_PROMPT, JUNIOR_PROMPT, RESUME_PROMPT,  # noqa: E402
+                       estimate_cost, findings_verdicts, sha256_text,
+                       validate_findings_recomputed)
+@@ -578,19 +580,61 @@ class LaneDriver(object):
+ 
+     def alert(self, kind, text, task=None):
+         ts = utc_ms()
+-        self.log("ALERT %s %s" % (kind, text[:300]))
+-        line = "- %s **%s**%s — %s\n" % (ts, kind, (" `%s`" % task) if task else "", text[:800])
++        entry = {"ts": ts, "kind": kind, "task": task, "text": text}
++        sev = self._alert_severity(entry)
++        entry.update({"severity": sev["severity"], "repeat": sev["repeat"],
++                      "repeat_family": sev["repeat_family"], "age_s": sev["age_s"],
++                      "reasons": sev["reasons"]})
++        tag = "" if sev["severity"] == vpalerts.ROUTINE else " [%s]" % sev["severity"].upper()
++        self.log("ALERT %s%s %s" % (kind, tag, text[:300]))
++        line = "- %s **%s**%s%s — %s\n" % (ts, kind, tag, (" `%s`" % task) if task else "", text[:800])
+         try:
+             with self._lock:
+                 with open(self.alerts_md, "a", encoding="utf-8") as fh:
+                     fh.write(line)
+         except OSError:
+             pass
+-        _append_jsonl(self.alerts_jsonl, {"ts": ts, "kind": kind, "task": task, "text": text},
+-                      self._lock)
++        _append_jsonl(self.alerts_jsonl, entry, self._lock)
+         self.comms("lanedriver", "owner", text, kind="alert:%s" % kind, task=task)
+-        if kind in ("STUCK", "QUOTA_WEEKLY", "QUOTA_ROLLING", "AUTH", "CONTROL_DOWN"):
+-            self._notify(kind, text)
++        # pattern decides the page (D60): the legacy kind set is kept as a floor
++        if vpalerts.should_notify(sev) or kind in ("STUCK", "QUOTA_WEEKLY", "QUOTA_ROLLING", "AUTH", "CONTROL_DOWN"):
++            self._notify("%s %s" % (kind, sev["severity"]) if tag else kind, text)
++
++    def _alert_severity(self, entry):
++        """D60: severity from the alert stream's pattern, not from the kind.
++        History is the recent alerts.jsonl tail (seeded once per process, so a
++        restart mid-loop keeps the repeat count -- the 09-17 loop spanned one);
++        the backlog signal is the count of rows owed a human ruling
++        (REPAIR_REQUIRED + INVALID_EVIDENCE + BLOCKED), sampled here."""
++        hist = self.__dict__.get("_alert_history")
++        if hist is None:
++            hist = collections.deque(maxlen=4000)
++            try:
++                with open(self.alerts_jsonl, encoding="utf-8") as fh:
++                    for raw in fh.readlines()[-4000:]:
++                        try:
++                            hist.append(json.loads(raw))
++                        except ValueError:
++                            continue
++            except OSError:
++                pass
++            self._alert_history = hist
++        samples = self.__dict__.setdefault("_backlog_samples", collections.deque(maxlen=500))
++        try:
++            tasks = (self.control.state_view().get("tasks") or {})
++            owed = sum(1 for r in tasks.values()
++                       if r.get("state") in ("REPAIR_REQUIRED", "INVALID_EVIDENCE", "BLOCKED"))
++            samples.append((entry["ts"], owed))
++        except Exception:
++            pass
++        cfg = (self.alerts_cfg or {}).get("severity") if isinstance(self.alerts_cfg, dict) else None
++        try:
++            sev = vpalerts.assess(entry, list(hist), backlog=list(samples), cfg=cfg)
++        except Exception as exc:  # the alert itself must never be lost to its grading
++            sev = {"severity": vpalerts.ROUTINE, "repeat": 1, "repeat_family": 1, "age_s": 0,
++                   "reasons": ["severity failed: %s" % str(exc)[:80]]}
++        hist.append(dict(entry, severity=sev["severity"]))
++        return sev
+ 
+     def alert_once(self, key, kind, text, task=None):
+         with self._lock:
+diff --git a/vp/tests/test_lanedriver.py b/vp/tests/test_lanedriver.py
+index 6e3f8b8..af72e47 100644
+--- a/vp/tests/test_lanedriver.py
++++ b/vp/tests/test_lanedriver.py
+@@ -1932,3 +1932,33 @@ def test_repair_row_without_a_packet_inherits_test_paths_and_stays_targeted(tmp_
+     assert lanedriver.LaneDriver._pack_root("R-DOCS-MIGRANGE-V13-R1") == "R-DOCS-MIGRANGE"
+     assert drv._pack_owns("L17-REPLY-WIRING-R1"), "a superseded retry of a packet is still the pack's"
+     assert not drv._pack_owns("L99")
++
++
++def test_d60_alert_severity_is_pattern_based_and_survives_a_restart(tmp_path):
++    env = Env(tmp_path)
++    env.activate()
++    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
++    pages = []
++    drv._notify = lambda kind, text: pages.append(kind)
++    # the 09-17 shape: one PROOF_UNKNOWN per re-instantiated repair row
++    for n in (1, 2, 3):
++        drv.alert("PROOF_UNKNOWN", "proof %d unknown" % n, task="R-L17-REPLY-WIRING-R1-B5-%d" % n)
++    drv.alert("IDLE", "idle for 30 min")
++    rows = [json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()]
++    mine = [r for r in rows if r["kind"] == "PROOF_UNKNOWN"]
++    assert [r["severity"] for r in mine] == ["attention", "attention", "urgent"]
++    assert [r["repeat_family"] for r in mine] == [1, 2, 3] and all(r["repeat"] == 1 for r in mine)
++    assert mine[-1]["reasons"] and "repeat=3" in mine[-1]["reasons"][0]
++    assert [r for r in rows if r["kind"] == "IDLE"][0]["severity"] == "routine"
++    assert pages == ["PROOF_UNKNOWN urgent"], "only the third cycle pages"
++    md = (env.run_root / "OWNER-ALERTS.md").read_text()
++    assert "**PROOF_UNKNOWN** [URGENT]" in md and "**IDLE** [" not in md
++    # a fresh process (restart mid-loop) seeds its history from the file
++    drv2 = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
++    drv2._notify = lambda kind, text: pages.append(kind)
++    drv2.alert("PROOF_UNKNOWN", "proof 4 unknown", task="R-L17-REPLY-WIRING-R1-B5-4")
++    last = json.loads((env.run_root / "alerts.jsonl").read_text().splitlines()[-1])
++    assert last["repeat_family"] == 4 and last["severity"] == "urgent"
++    # the legacy kind floor still pages a first STUCK
++    drv2.alert("STUCK", "3 failures", task="OTHER")
++    assert pages[-1] == "STUCK attention"
