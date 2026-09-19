@@ -1149,16 +1149,21 @@ class LaneDriver(object):
         if not p or not vppack.is_hosted_twin(p):
             return
         ptask = next((t for t, pid in self.pack_by_task.items() if pid == p.get("twin_of")), None) or p.get("twin_of")
-        verdicts = {}
+        verdicts, source = {}, {}
         try:
             doc = json.loads(Path(fpath).read_text(encoding="utf-8")) if fpath and Path(fpath).exists() else {}
             for line in (doc.get("lines") or []):
                 if isinstance(line, dict) and str(line.get("id")) in (p.get("hosted_rows") or []):
                     verdicts[str(line["id"])] = str(line.get("verdict") or "UNKNOWN")
+                    source[str(line["id"])] = "findings"
         except (OSError, ValueError):
             pass
         for rid in p.get("hosted_rows") or []:
-            verdicts.setdefault(rid, "UNKNOWN" if outcome != "VERIFIED" else "PASS")
+            # D45: a row no grader ruled on is UNKNOWN whatever the twin's outcome -- the
+            # VERIFIED->PASS default put a PASS on L31/L34 B9 that the twin's own record
+            # called UNKNOWN (Architect, union-12 fact sheet)
+            verdicts.setdefault(rid, "UNKNOWN")
+            source.setdefault(rid, "default")
         hdir = self.run_root / "hosted"
         hdir.mkdir(parents=True, exist_ok=True)
         f = hdir / ("%s.json" % ptask)
@@ -1172,9 +1177,13 @@ class LaneDriver(object):
         twins[task] = {"gate": p.get("twin_gate"), "outcome": outcome, "attempt": attempt, "ts": utc_ms()}
         rows = rec.setdefault("hosted_rows", {})
         for rid, v in verdicts.items():
-            rows[rid] = {"verdict": v, "twin": task, "attempt": attempt, "ts": utc_ms()}
+            rows[rid] = {"verdict": v, "twin": task, "attempt": attempt, "ts": utc_ms(), "source": source[rid]}
         all_twins = [q["id"] for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")]
-        rec["box_only"] = not all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
+        # D45: box_only clears only when every twin is VERIFIED AND every hosted row is PASS
+        rec["box_only"] = not (all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
+                               and all(r.get("verdict") == "PASS" for r in rows.values())
+                               and set(rows) >= {rid for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")
+                                                 for rid in (q.get("hosted_rows") or [])})
         rec["twins_expected"] = sorted(all_twins)
         rec["ts"] = utc_ms()
         f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n", encoding="utf-8")

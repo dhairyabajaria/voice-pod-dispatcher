@@ -1180,5 +1180,17 @@ def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_ver
     log = (env.run_root / "driver.log").read_text()
     assert "PACK rewired L04.depends_on += P-PAR-HOSTED-CIRCLECI (hosted twin)" in log
     rec = json.loads((env.run_root / "hosted" / "P-PAR.json").read_text())
+    # D45: the EXTERNAL_PREP twin ran as a probe turn -- no grader, no FINDINGS.json -- so its
+    # rows are UNKNOWN (source "default"), never a PASS inferred from the VERIFIED outcome
+    # (L31/L34 B9, 2026-09-18); box_only clears only when every hosted row is PASS
+    assert {k: v["verdict"] for k, v in rec["hosted_rows"].items()} == {"B2": "PASS", "B3": "UNKNOWN", "B4": "UNKNOWN"}
+    assert {k: v["source"] for k, v in rec["hosted_rows"].items()} == {"B2": "findings", "B3": "default", "B4": "default"}
+    assert rec["box_only"] is True
+    # ... and a graded twin clears it
+    fpath = env.tmp / "graded" / "FINDINGS.json"
+    fpath.parent.mkdir()
+    fpath.write_text(json.dumps({"lines": [{"id": "B3", "verdict": "PASS"}, {"id": "B4", "verdict": "PASS"}]}))
+    drv._twin_record("P-PAR-HOSTED-DELIVERY-2A", "VERIFIED", fpath, "a-graded")
+    rec = json.loads((env.run_root / "hosted" / "P-PAR.json").read_text())
     assert {k: v["verdict"] for k, v in rec["hosted_rows"].items()} == {"B2": "PASS", "B3": "PASS", "B4": "PASS"}
     assert rec["box_only"] is False
