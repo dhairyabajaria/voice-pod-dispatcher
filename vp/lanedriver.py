@@ -2750,6 +2750,14 @@ class LaneDriver(object):
                      % (self._reload_pending["reason"] or "no reason given"))
             self.comms("lanedriver", "audit", "reload requested: %s" % self._reload_pending["reason"],
                        kind="lifecycle")
+        elif not self.reload_requested():
+            # D51: `reload --cancel` removed the marker while the quiesce was armed
+            # (2026-09-19 11:23Z: 7 READY rows waited ~1 h behind a reload that only
+            # a long builder attempt kept pending); claims resume this tick
+            self.log("RELOAD cancelled (%s): quiesce lifted, claims resume"
+                     % (self._reload_pending.get("reason") or "no reason given"))
+            self._reload_pending = None
+            return False
         self.join(timeout=0.0)
         self._threads = [t for t in self._threads if t.is_alive()]
         with self._lock:
@@ -4952,6 +4960,8 @@ def build_parser():
     rl = sub.add_parser("reload", help="D12: write RUN_ROOT/RELOAD; the running driver quiesces, "
                                        "reloads its code in place at active == 0, resumes")
     rl.add_argument("--reason", default="")
+    rl.add_argument("--cancel", action="store_true", help="D51: withdraw a pending reload; the quiesce lifts "
+                                                          "on the driver's next tick")
     rp = sub.add_parser("retry-packet", help="re-instantiate a packet whose task closed without a real "
                                              "verdict (e.g. RUNNER_CRASH -> INVALID_EVIDENCE) as <id>-R<n>")
     rp.add_argument("packet")
@@ -5073,6 +5083,18 @@ def cmd_verify(drv, args):
 
 def cmd_reload(drv, args):
     f = drv.run_root / RELOAD_FILE
+    if getattr(args, "cancel", False):
+        was = f.exists()
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        hb = read_heartbeat(drv.run_root)
+        print(json.dumps({"status": "CANCELLED" if was else "NOTHING_PENDING", "marker": str(f),
+                          "driver": {"pid": (hb or {}).get("pid"), "active": (hb or {}).get("active")},
+                          "note": "the driver lifts the quiesce on its next tick ('RELOAD cancelled' in driver.log)"},
+                         indent=2))
+        return 0
     f.write_text(json.dumps({"reason": args.reason, "requested_at": utc_ms(), "by": "cli"}) + "\n",
                  encoding="utf-8")
     hb = read_heartbeat(drv.run_root)

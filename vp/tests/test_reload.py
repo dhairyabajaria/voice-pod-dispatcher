@@ -129,6 +129,47 @@ def test_reload_failure_keeps_old_code_and_stops_new_claims(tmp_path):
     sys.modules.pop("vpextra_t", None)
 
 
+def test_reload_cancel_lifts_the_quiesce_and_claims_resume(tmp_path):
+    """D51 (2026-09-19 11:23Z: 7 READY rows waited behind a reload that a long
+    builder attempt kept pending): `reload --cancel` removes the marker; the armed
+    quiesce lifts on the next tick and new claims resume without a reload."""
+    env = Env(tmp_path)
+    env.activate()
+    oc = FakeRunner(default=slow_result(3.0))
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()}, interval=0.2)
+    drv.reload_modules = ()
+    drv._code_hashes = drv.code_hashes()
+    v0 = drv.code_version()
+    th = threading.Thread(target=drv.loop, daemon=True)
+    th.start()
+    wait_state(env, "L00", "RUNNING")
+    (env.run_root / "RELOAD").write_text(json.dumps({"reason": "held by a slow turn"}))
+    time.sleep(0.6)
+    hb = json.loads((env.run_root / "driver.heartbeat").read_text())
+    assert hb["reload_pending"] is True and hb["active"] == 1
+    assert all(r["state"] != "RUNNING" for t, r in env.rows().items() if t != "L00"), "quiesced: no new claims"
+    rc = lanedriver.main(["--roster", str(env.run_root / "roster.json"), "reload", "--cancel"])
+    assert rc == 0 and not (env.run_root / "RELOAD").exists()
+    deadline = time.time() + 10
+    while time.time() < deadline and "RELOAD cancelled" not in (env.run_root / "driver.log").read_text():
+        time.sleep(0.2)
+    log = (env.run_root / "driver.log").read_text()
+    assert "RELOAD cancelled (held by a slow turn): quiesce lifted, claims resume" in log
+    deadline = time.time() + 5
+    while time.time() < deadline and json.loads((env.run_root / "driver.heartbeat").read_text())["reload_pending"]:
+        time.sleep(0.2)
+    hb = json.loads((env.run_root / "driver.heartbeat").read_text())
+    assert hb["reload_pending"] is False and hb["reloads"] == 0 and drv.code_version() == v0, "no reload happened"
+    # L00 is still live (3 s turn) and the driver claims again: another row goes RUNNING while it runs
+    deadline = time.time() + 10
+    while time.time() < deadline and not any(r["state"] == "RUNNING" for t, r in env.rows().items() if t != "L00"):
+        time.sleep(0.2)
+    assert any(r["state"] == "RUNNING" for t, r in env.rows().items() if t != "L00"), env.rows()
+    assert not _reloads(env)
+    drv._stopping = True
+    th.join(timeout=15)
+
+
 def test_reload_cli_writes_the_marker(tmp_path):
     env = Env(tmp_path)
     env.activate()
