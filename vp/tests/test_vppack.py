@@ -574,6 +574,12 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, {"tasks": {}})
     assert plan["targets"] == ["L42", "L06", "L07", "L99"] and plan["subject"] == "union"
     assert "L06 ok" in plan["review_benchmark"] and "<union>" not in plan["review_benchmark"]
+    # D73 (§33): the head names the registered candidate and says the records are bound to it
+    plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40,
+                                          {"tasks": {}, "candidate": {"sha": "5deac821" + "0" * 32}})
+    first = plan["review_benchmark"].splitlines()[0]
+    assert first.startswith("Registered candidate: 5deac821") and "bound to it by design (D27)" in first
+    assert plan["review_benchmark"].splitlines()[1].startswith("# Review subject: bbbbbbbbbbbb..cccccccccccc")
 
 
 # -- D27 §9(5a)/(5b): the union integrator and the union-complete dispatch precondition ---------

@@ -4369,6 +4369,13 @@ class LaneDriver(object):
         except OSError:
             packet_benchmark = ""
         head = "# Review subject: %s..%s (%s)\n" % (rbase[:12], cand[:12], ", ".join(targets))
+        reg = (state.get("candidate") or {}).get("sha")
+        if reg:
+            # D73 (§33): REVIEW-JUNIOR-S3-F5-R2 failed 5 rows by reading the registered
+            # candidate as the union tip -- the records are bound to it by design (D27)
+            head = ("Registered candidate: %s — lane completion records (control/evidence/<lane>/v13/REGRADE.md) "
+                    "are bound to it by design (D27); the union tip is the subject of the diff, not the sha those "
+                    "records name.\n" % reg) + head
         return {"base": rbase, "targets": targets, "criteria": criteria, "subject": "union" if (union or "union" in
                 str((row.get("parameters") or {}).get("diff_or_scope") or "")) else "item",
                 "review_benchmark": head + "".join(lines), "packet_benchmark": packet_benchmark}
