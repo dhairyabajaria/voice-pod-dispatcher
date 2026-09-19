@@ -202,6 +202,8 @@ class Proof(object):
 
     CREDIT_BLOCK_S = 6 * 3600                 # an account CircleCI refused for credits is skipped this long
 
+    _spread_lock = threading.Lock()   # D49 round-robin counter guard (class-level: one per process)
+
     def _accounts(self, cc):
         """D44: the account order for one proof: roster circleci.account first,
         then circleci.rotation (default vpcircle.DEFAULT_ROTATION), minus the
@@ -209,6 +211,16 @@ class Proof(object):
         first = str(cc.get("account") or self.circle.ACCOUNTS[0])
         order = [first] + [str(a) for a in (cc.get("rotation") or getattr(self.circle, "DEFAULT_ROTATION", ()))
                            if str(a) != first]
+        spread = [str(a) for a in (cc.get("spread") or ())]
+        if spread:
+            # D49: proofs start on successive `spread` accounts (round-robin) so
+            # parallel pipelines land on A1/A2/A3 evenly instead of queueing on
+            # the first; the rest of the rotation follows as fallback
+            with self._spread_lock:
+                self._spread_n = getattr(self, "_spread_n", -1) + 1
+                k = self._spread_n % len(spread)
+            head = spread[k:] + spread[:k]
+            order = head + [a for a in order if a not in head]
         blocked = getattr(self, "_credit_blocked", {})
         now = time.monotonic()
         return [a for a in order if blocked.get(a, 0) <= now], [a for a in order if blocked.get(a, 0) > now]

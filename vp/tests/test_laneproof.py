@@ -365,6 +365,27 @@ def test_circleci_credit_refusal_after_the_trigger_is_blocked_credits_not_a_fail
     assert vpcircle.credit_block([{"status": "success", "job_number": 11}], R(), "3") is None
 
 
+def test_circleci_spread_starts_successive_proofs_on_successive_accounts(tmp_path):
+    """D49: roster circleci.spread = [A1, A2, A3] -> proof 1 starts on A1, proof 2 on
+    A2, proof 3 on A3, proof 4 on A1 again; the rest of the rotation follows each
+    as fallback.  Without `spread` the D44 order (account, then rotation) is unchanged."""
+    cfg = {"circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "rotation": ["A1", "A2", "A3", "2", "3", "1"], "spread": ["A1", "A2", "A3"]}}
+    p = make_proof(tmp_path, FakeCircle({}), FakeExec({}), cfg=cfg)
+    cc = p.circle_cfg()
+    starts = [p._accounts(cc)[0] for _ in range(4)]
+    assert starts == [["A1", "A2", "A3", "2", "3", "1"], ["A2", "A3", "A1", "2", "3", "1"],
+                      ["A3", "A1", "A2", "2", "3", "1"], ["A1", "A2", "A3", "2", "3", "1"]], starts
+    # a credits-blocked spread member is skipped, the round-robin still advances
+    p._block_account("A2", "no credits")
+    assert p._accounts(cc)[0] == ["A3", "A1", "2", "3", "1"]
+    # no spread: D44 order, stable across proofs
+    cfg2 = {"circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "3"}}
+    p2 = make_proof(tmp_path, FakeCircle({}), FakeExec({}), cfg=cfg2)
+    cc2 = p2.circle_cfg()
+    assert p2._accounts(cc2)[0] == p2._accounts(cc2)[0] == ["3", "1", "2", "A1", "A2", "A3"]
+
+
 def test_circleci_rotates_to_the_next_account_on_its_own_repo_when_one_is_out_of_credits(tmp_path):
     """D44: account 3 (Pareen Calling, dhairyabajaria/voice-pod-NEW) is refused for
     credits AFTER the trigger; the proof is re-pushed to account 1's own mirror
