@@ -1,11 +1,11 @@
 {
   "files": {
-    "CATALOG-AUTHORITY.json": "fc45cd6e467f12c23485a320e8a643a9cf9dd74ecda8c5886a650ac4cc23ee47",
-    "orchestration_control.py": "c2bfaac77d51993ac1c659b8b6ec7b6e0d8dad79a3ce2874bac18c0ead3f8078",
+    "CATALOG-AUTHORITY.json": "473ea77ae7870e8ccc41776d597cd29deae7e87b9696c6607b0a8e501a608118",
+    "orchestration_control.py": "7d9850db9cbd769e104c720d74b36be7ea555ea71dc5ab89bbd59a5ab5be7c61",
     "review_gate.py": "01168bad6bf3769f84809461e5d1f3b880f8f25764d928cea40ccd37fd626f16",
-    "v13-pack/roster-v13.json": "14ae42227938680f9fa8e6eac8e9d6ee614df0d193e3704348f77faebb087e11"
+    "v13-pack/roster-v13.json": "de1aaf4f97d89ecfadba2e419e8be156b5e05cd72e577e59427e90a86ea5d930"
   },
-  "pin_matches_review_gate": false,
+  "pin_matches_review_gate": true,
   "pin_matches_scheduler": true,
-  "taken_at": "2026-09-18T12:23:11Z"
+  "taken_at": "2026-09-19T11:18:46Z"
 }

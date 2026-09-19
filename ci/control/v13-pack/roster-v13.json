@@ -318,5 +318,15 @@
     "git_jsonl": true,
     "comms_jsonl": true,
     "costs_jsonl": true
+  },
+  "owner_gates": {
+    "DELIVERY-1": true,
+    "DELIVERY-2": false,
+    "DELIVERY-3": false,
+    "DELIVERY-4": false,
+    "DELIVERY-5": false,
+    "_comment": "Owner facts (00-SCOPE \u00a75, 09-OWNER-GATES). Only the owner via My assistant flips one to true; the Architect records it. D34: a gate holds the <ID>-HOSTED twins, never the base packet. 2026-09-19 01:30 IST: DELIVERY-2 split \u2014 2A (VPS host reachable: SSH/sudo/Docker, VPS_HANDOVER.md \u00a71-2, measured 2026-09-16) OPEN; 2B (public subdomain + ACME_EMAIL + 3 app API keys + OCI 80/443) closed; bare DELIVERY-2 = 2B.",
+    "DELIVERY-2A": true,
+    "DELIVERY-2B": false
   }
 }
