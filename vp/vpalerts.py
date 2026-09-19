@@ -165,7 +165,7 @@ def assess(alert, history, *, now=None, backlog=None, cfg=None):
         if len(inside) >= 2:
             backlog_delta = inside[-1][1] - inside[0][1]
 
-    reasons = []
+    reasons = []          # never embed `kind` here: alerts.jsonl readers count kind strings
     tier = ROUTINE
     strongest = max(repeat, repeat_family)
     # informational kinds (IDLE, RELOAD, ...) repeat by design; for them only
@@ -191,12 +191,12 @@ def assess(alert, history, *, now=None, backlog=None, cfg=None):
         reasons.append("backlog +%d" % backlog_delta)
     if kind in cfg["floor_urgent"]:
         tier = URGENT
-        reasons.append("kind %s stops the driver" % kind)
+        reasons.append("this kind stops the driver")
     elif kind not in cfg["floor_routine"] and tier == ROUTINE and repeat == 1:
         # a first, unrepeated failure-class alert is worth a look but not a page
         if kind not in ("PACKET_RETRIED",) and _looks_like_failure(kind):
             tier = ATTENTION
-            reasons.append("first %s" % kind)
+            reasons.append("first sighting")
     return {
         "severity": tier,
         "repeat": repeat,
