@@ -1271,6 +1271,50 @@ def test_hosted_twin_proves_the_integration_union_tip_once_the_required_repairs_
     assert seen["P-PAR-HOSTED-CIRCLECI"]["base"] == tip["union_sha"]
 
 
+def test_d59_twin_union_base_stacks_on_the_carried_retry_row_not_the_packet_name(tmp_path, monkeypatch):
+    """D59: 2026-09-19 14:36-14:42Z L09-SEED-FIX-HOSTED struck out 3/3 and
+    LINT-TYPECHECK-TRUNK-HOSTED 2/3 on `--stacked-on L09-SEED-FIX: not a row with
+    an output_sha`: twin_base.requires names the PACKET, the VERIFIED row was the
+    retry L09-SEED-FIX-R4, and D46 passed the packet name to the scheduler as a
+    stacked_on row.  The carried ROW goes to the claim."""
+    import lanedriver
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    pd = tmp_path / "pack"
+    packet(pd, "P-PAR", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="DELIVERY-2B",
+           body="parent for L00")
+    (pd / "P-PAR" / "BENCHMARK.md").write_text(BM_HOSTED.format(id="P-PAR"))
+    packet(pd, "P-FIX", "NEW:TEST_GAP", kind="repair", template="TEST_GAP", role="builder", gate="none",
+           body="the seed fix for L00")
+    env = Env(tmp_path, roster_extra={"alerts": {"frontier_every_s": 0, "idle_every_min": 30, "pack_every_s": 0},
+                                      "packet": {"twin_dependents": [],
+                                                 "twin_base": {"kind": "integration_union", "requires": ["P-FIX"]}},
+                                      "owner_gates": {"DELIVERY-1": True},
+                                      "proof": {"require_for_kinds": []}})
+    env.roster["run"]["pack_dir"] = str(pd)
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    env.activate()
+    crash = {"P-FIX": True}         # the first P-FIX row strikes out; its retry P-FIX-R1 is the one that lands
+
+    def builder(spec, ab):
+        if crash.get(spec.item):
+            return TurnOutcome("RUNNER_CRASH", "boom", runner="fake")
+        return _fix_builder(spec, ab)
+    oc = by_role({"builder": builder, "grader": findings("PASS"), "probe": builder})
+    drv = env.driver({"opencode": oc, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 10)
+    rows = env.rows()
+    assert rows["P-PAR"]["state"] == "VERIFIED" and rows["P-FIX"]["state"] == "INVALID_EVIDENCE", rows["P-FIX"]
+    drv.request_packet_retry("P-FIX", "crash was infra; retry")
+    settle(drv, 12)
+    rows = env.rows()
+    assert rows["P-FIX-R1"]["state"] == "VERIFIED", rows.get("P-FIX-R1")
+    cc = rows["P-PAR-HOSTED-CIRCLECI"]
+    assert cc["state"] == "VERIFIED", (cc, (env.run_root / "driver.log").read_text()[-3000:])
+    assert "P-FIX-R1" in cc["stacked_on"] and "P-FIX" not in cc["stacked_on"], cc["stacked_on"]
+    log = (env.run_root / "driver.log").read_text()
+    assert "not a row with an output_sha" not in log, "the packet name never reaches --stacked-on"
+
+
 def test_hosted_twin_runs_on_the_parents_verified_output_and_records_per_row_verdicts(tmp_path):
     """D37 driver half: the twin is instantiated once the parent has a VERIFIED
     output, cut from exactly that sha (§19(3)), its worktree carries the twin

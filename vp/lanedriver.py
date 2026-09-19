@@ -3087,9 +3087,14 @@ class LaneDriver(object):
             self.note_hold(task, self._ready_key(row), why, self.STACK_HOLD_S)
             return None, None
         base = latest["union_sha"]
+        # D59: `on` reaches the scheduler as --stacked-on, which wants ROWS with an
+        # output_sha -- the carried row of each require (L09-SEED-FIX-R4), never the
+        # packet name (2026-09-19 14:36-14:42Z: L09-SEED-FIX-HOSTED struck out 3/3 on
+        # "--stacked-on L09-SEED-FIX: not a row with an output_sha")
+        carried = [next(t for t in landed[r] if t in members) for r in req]
         return base, {"members": [{"task": t, "packet": self.pack_by_task.get(t) or t, "output_sha": sha, "depth": 0}
                                   for t, sha in sorted(members.items())],
-                      "on": [ptask] + req, "base": base,
+                      "on": [ptask] + carried, "base": base,
                       "why": "hosted twin of %s on the integration union %s (D46: requires %s)"
                              % (ptask, latest.get("union"), ",".join(req))}
 
