@@ -135,9 +135,9 @@ class Proof(object):
         cc = self.circle_cfg()
         listed = set(cc.get("kinds") or [])
         if not cc.get("enabled") or not ({kind, suite} & listed):
-            return "box", "circleci disabled or kind %s/%s not listed" % (kind, suite)
+            return "box", "%s disabled or kind %s/%s not listed" % (self.hosted_route(), kind, suite)
         if self.circle_off():
-            return "box", "circleci flipped off (%s)" % OFF_FILE
+            return "box", "%s flipped off (%s)" % (self.hosted_route(), OFF_FILE)
         cap = cc.get("max_pipelines_per_day")
         if cap is not None and int(cap) > 0 and self.pipelines_today() >= int(cap):
             self.alert("PIPELINE_CAP", "%d CircleCI pipelines today >= cap %d; proofs fall back "
@@ -145,7 +145,7 @@ class Proof(object):
             return "box", "daily cap"
         with self._lock:
             if self.circle_active >= int(cc.get("max_in_flight", 2)):
-                return "box", "circleci in flight %d/%d" % (self.circle_active, cc.get("max_in_flight", 2))
+                return "box", "%s in flight %d/%d" % (self.hosted_route(), self.circle_active, cc.get("max_in_flight", 2))
             mode = str(cc.get("mode", "overflow"))
             if mode in ("all", "swap"):
                 return self.hosted_route(), "mode all"
@@ -212,7 +212,7 @@ class Proof(object):
             if not open_:
                 return self.REFUSED_GATE, "owner gate DELIVERY-1 not open at trigger time"
         if self.circle_off():
-            return self.REFUSED_OFF, "circleci flipped off (%s) at trigger time" % OFF_FILE
+            return self.REFUSED_OFF, "%s flipped off (%s) at trigger time" % (self.hosted_route(), OFF_FILE)
         cap = cc.get("max_pipelines_per_day")
         if cap is not None and int(cap) > 0:
             n = self.pipelines_today()
@@ -362,8 +362,8 @@ class Proof(object):
                     # ("identity request failed") -> UNKNOWN -> the retry re-triggered
                     # a second pipeline for the same sha.  Re-poll the one we have.
                     pipeline_id, account = prior["pipeline_id"], prior.get("account")
-                    self.log("PROOF %s %s re-polls circleci pipeline %s (account %s) recorded by %s: "
-                             "no new trigger (D81)" % (task, pid, pipeline_id, account, prior.get("proof_id")))
+                    self.log("PROOF %s %s re-polls %s pipeline %s (account %s) recorded by %s: "
+                             "no new trigger (D81)" % (task, pid, self.hosted_route(), pipeline_id, account, prior.get("proof_id")))
                     self._note_pipeline(pid, pipeline_id, account, cand, status=self.REPOLLED,
                                         reason="D81: from %s" % prior.get("proof_id"))
                     res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
@@ -416,7 +416,7 @@ class Proof(object):
                         raise
                     pipeline_id, account = trig["pipeline_id"], trig["account"]
                     self._note_pipeline(pid, pipeline_id, account, cand)
-                    self.log("PROOF %s %s circleci pipeline %s (account %s, %s)" % (task, pid, pipeline_id, account,
+                    self.log("PROOF %s %s %s pipeline %s (account %s, %s)" % (task, pid, self.hosted_route(), pipeline_id, account,
                                                                                    tgt.get("repo") or remote))
                     res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
                                            deadline_s=int(cc.get("deadline_min", 90)) * 60,
@@ -431,8 +431,8 @@ class Proof(object):
                     refusals.append((acct, blocked[:200]))
                     self._block_account(acct, blocked)
                     self._note_pipeline(pid, pipeline_id, account, cand, status=self.CREDITS_BLOCKED, reason=blocked)
-                    self.log("PROOF %s %s circleci pipeline %s (account %s) blocked for credits -> next account"
-                             % (task, pid, pipeline_id, account))
+                    self.log("PROOF %s %s %s pipeline %s (account %s) blocked for credits -> next account"
+                             % (task, pid, self.hosted_route(), pipeline_id, account))
                     res, pipeline_id, account = None, None, None
                 if res is None and not prior:
                     raise self.AllBlocked("; ".join("account %s: %s" % r for r in refusals)
@@ -453,7 +453,7 @@ class Proof(object):
                           self.REFUSED_OFF: "BLOCKED_OFF", self.REFUSED_OVERLAY: "OVERLAY_DIRTY"}[exc.status]
                 rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                        "pipeline_id": None, "account": None, "branch": branch,
-                       "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
+                       "reason": "%s: %s" % (self.hosted_route(), str(exc)[:300]), "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> %s: %s" % (task, pid, status, str(exc)[:200]))
                 if status == "OVERLAY_DIRTY":
@@ -466,17 +466,17 @@ class Proof(object):
                 # the driver holds the attempt without a strike (PROOF_BLOCKED_CREDITS)
                 rec = {"status": "BLOCKED_CREDITS", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
                        "pipeline_id": pipeline_id, "account": account, "branch": branch,
-                       "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
+                       "reason": "%s: %s" % (self.hosted_route(), str(exc)[:300]), "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> BLOCKED_CREDITS: %s" % (task, pid, str(exc)[:200]))
                 return rec
             except Exception as exc:
                 rec = {"status": "UNKNOWN", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
-                       "reason": "circleci: %s: %s" % (type(exc).__name__, str(exc)[:300]),
+                       "reason": "%s: %s: %s" % (self.hosted_route(), type(exc).__name__, str(exc)[:300]),
                        "pipeline_id": pipeline_id, "account": account, "branch": branch,
                        "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
-                self.log("PROOF %s %s -> UNKNOWN (circleci: %s)" % (task, pid, str(exc)[:200]))
+                self.log("PROOF %s %s -> UNKNOWN (%s: %s)" % (task, pid, self.hosted_route(), str(exc)[:200]))
                 return rec
             try:
                 cls = self.circle.classify(res["jobs"], res["failed_tests"], workflows=res.get("workflows"))

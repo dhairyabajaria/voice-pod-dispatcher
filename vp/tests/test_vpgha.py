@@ -171,10 +171,15 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     # pytest legs: junit per leg, xunit1, continuation lines intact; shard leg -n SHARD_WORKERS
     # every pytest-running job asserts linger right after the junit prep (CircleCI Manager, logind RemoveIPC)
     for jid in ("platform", "platform-shards", "agent", "deploy-contracts"):
-        st = jobs[jid]["steps"][1]
+        st = jobs[jid]["steps"][2 if jid == "deploy-contracts" else 1]     # docker assert sits first there
         assert st["name"].startswith("Assert the runner user has linger"), jid
         assert 'loginctl show-user "$(id -un)" -p Linger --value' in st["run"] and "enable-linger" not in st["run"].split("::error::")[0], "assert only"
     assert not any("linger" in str(st.get("name", "")) for st in jobs["portal"]["steps"]), "no pytest, no linger step"
+    # §53: deploy-contracts asserts docker compose first (Oracle runners lack it; ubuntu-latest had it)
+    dc = jobs["deploy-contracts"]["steps"]
+    assert dc[1]["name"].startswith("Assert docker compose") and "docker compose version" in dc[1]["run"]
+    assert "install" not in dc[1]["run"].split("::error::")[0], "assert only"
+    assert not any("docker compose" in str(st.get("name", "")) for st in jobs["platform"]["steps"])
     plat = jobs["platform"]["steps"][5]["run"]
     assert ("uv run pytest -q --cov=core --junitxml=${{ runner.temp }}/junit/platform-1.xml -o junit_family=xunit1 \\\n"
             "  --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80\n") in plat

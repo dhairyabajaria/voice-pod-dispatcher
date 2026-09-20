@@ -83,6 +83,14 @@ SHARD_CLEANUP = {"name": "Remove this shard's pgdata dir (vp-proof)", "if": "alw
 # linger + RemoveIPC=no are the fix; this step only ASSERTS linger so a
 # regression (image rebuild, someone disabling it) is one loud red job.
 # It goes on every job that runs pytest (each one starts pgserver clusters).
+# Architect §53 (canary run 35483670689): deploy-contracts' three reds go through
+# the docker compose renderer, which ubuntu-latest preinstalls and the Oracle
+# runners lack; an absent renderer must name itself, not surface as BLOCKED.
+DOCKER_ASSERT = {"name": "Assert docker compose is available (vp-proof)",
+                 "run": 'set -euo pipefail\ndocker compose version || { echo "::error::docker compose is missing '
+                        'on this runner: the deploy-contracts renderer needs it; install it in the runner image, '
+                        'not here"; exit 1; }'}
+DOCKER_ASSERT_JOBS = ("deploy-contracts",)
 LINGER_ASSERT = {"name": "Assert the runner user has linger enabled (vp-proof)",
                  "run": 'set -euo pipefail\n'
                         'linger="$(loginctl show-user "$(id -un)" -p Linger --value)"\n'
@@ -189,6 +197,8 @@ def render_jobs(ci, floor_supports_branch=False):
             steps.append(dict(SHARD_CLEANUP))
         if legs[0] and any("pytest" in str(st.get("run", "")) for st in steps):
             steps.insert(1, dict(LINGER_ASSERT))
+        if job_id in DOCKER_ASSERT_JOBS:
+            steps.insert(1, dict(DOCKER_ASSERT))
         steps.append({
             "name": "Retain junit results (vp-proof)",
             "if": "always()",
