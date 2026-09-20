@@ -1274,14 +1274,31 @@ class LaneDriver(object):
         c = self._canary()
         return not (c and self._is_canary_row(task, c))
 
-    def _twin_scope_paths(self, task, p, tasks):
+    TEST_FILE_RE = re.compile(r"\b((?:platform|agent|portal)/[\w./-]*?tests?/[\w./-]+?\.(?:py|ts|tsx))(?=::|[`'\"\s,;)]|$)")
+
+    def _twin_scope_paths(self, task, p, tasks, wt=None):
         """the scoped twin's test files: the parent packet's test_paths, plus the
         parent_contract's own packet (<L-NN> of <L-NN>-V13) when twin_scope.
-        contract_from is parent_contract, plus twin_scope.extra_paths; sorted,
-        deduplicated, [] when nothing is known (the twin then runs full)"""
+        contract_from is parent_contract, plus every test file the twin's OWN
+        hosted rows name (hosted_lines / .vp/BENCHMARK.md: D04-HOSTED-R1's B9
+        asked for test_sequence_schema.py nodes its parent never listed, 17:12Z),
+        plus twin_scope.extra_paths; sorted, deduplicated, [] when nothing is
+        known (the twin then runs full)"""
         cfg = self._twin_scope_cfg()
         parent = self.pack.get(p.get("twin_of")) or {}
         paths = [str(x) for x in (parent.get("test_paths") or [])]
+        text = "\n".join(str(x) for x in (p.get("hosted_lines") or []))
+        if wt is not None:
+            try:
+                text += "\n" + (Path(wt) / ".vp" / "BENCHMARK.md").read_text(encoding="utf-8")
+            except OSError:
+                pass
+        named = self.TEST_FILE_RE.findall(text)
+        if wt is not None:
+            # a row may cite a file the candidate does not have (a typo, a moved
+            # test): pytest would error on it -> FAIL_INFRA; keep the tree's files
+            named = [x for x in named if (Path(wt) / x).exists()]
+        paths += named
         if str(cfg.get("contract_from") or "parent_contract") == "parent_contract":
             row = (tasks or {}).get(task) or {}
             cid = row.get("parent_contract_id") or parent.get("parent_contract")
@@ -1292,17 +1309,26 @@ class LaneDriver(object):
         paths += [str(x) for x in (cfg.get("extra_paths") or [])]
         return sorted(set(x for x in paths if x.strip()))
 
-    def _twin_scope_only(self, task, p, tasks=None):
+    def _twin_scope_only(self, task, p, tasks=None, wt=None):
         """-> "twin:<workers>:<p1,p2,...>" for a scoped twin, None otherwise"""
         if not self._scoped_twin(task, p):
             return None
         if tasks is None:
             tasks = self.control.state_view().get("tasks") or {}
-        paths = self._twin_scope_paths(task, p, tasks)
+        paths = self._twin_scope_paths(task, p, tasks, wt=wt)
         if not paths:
             self.alert_once("twin-scope:%s" % task, "TWIN_SCOPE_EMPTY",
                             "%s: no test paths from its parent %s or contract; runs the full pipeline"
                             % (task, p.get("twin_of")), task)
+            return None
+        foreign = [x for x in paths if not x.startswith("platform/")]
+        if foreign:
+            # the platform-twin job runs the platform suite only (working-directory
+            # platform, D106): a row asking for an agent/portal node (L-FAKE-CONTROLS
+            # -HOSTED B9, 17:16Z) needs the full pipeline until a per-suite twin
+            # job exists (D114)
+            self.log("PROOF %s scoped twin refused: %d non-platform test file(s) named (%s); full pipeline"
+                     % (task, len(foreign), ", ".join(foreign)[:200]))
             return None
         n = int(self._twin_scope_cfg().get("workers") or self.TWIN_SCOPE_WORKERS)
         return "twin:%d:%s" % (n, ",".join(paths))
@@ -4563,7 +4589,7 @@ class LaneDriver(object):
             # vp/platform-twin job over the parent's + its contract's test files;
             # the record carries `only`, answers this twin's ask only, and a
             # scoped PASS closes the twin VERIFIED.  The canary's own row stays full.
-            only = self._twin_scope_only(task, self.packet_for(task) or {})
+            only = self._twin_scope_only(task, self.packet_for(task) or {}, wt=wt)
             if only:
                 self.log("PROOF %s scoped twin: %d test path(s), -n %s (D113)"
                          % (task, only.count(",") + 1, only.split(":")[1]))

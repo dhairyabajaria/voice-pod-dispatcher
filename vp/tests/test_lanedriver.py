@@ -2678,6 +2678,28 @@ def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_cap
              "L06-HOSTED-R12": {"state": "READY"}, "R-B-HOSTED-R1": {"state": "READY"}}
     assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks) == \
         "twin:4:platform/tests/test_a.py,platform/tests/test_b.py,platform/tests/test_extra.py,platform/tests/test_l07.py"
+    # the twin's OWN rows name test files too (D04-HOSTED-R1 B9, 17:12Z): hosted_lines
+    # and the worktree's .vp/BENCHMARK.md, kept only when the tree has the file
+    twin["hosted_lines"] = ["B9 [hosted] the shard runs `platform/tests/test_rows.py::test_x` and "
+                            "platform/tests/test_missing.py::test_y green"]
+    wt = tmp_path / "wt-scope"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / "platform" / "tests").mkdir(parents=True)
+    for f in ("test_rows.py", "test_bench.py", "test_a.py", "test_b.py", "test_extra.py", "test_l07.py"):
+        (wt / "platform" / "tests" / f).write_text("")
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] platform/tests/test_bench.py::test_z green; "
+                                             "agent/tests/test_gone.py::test_q too\n")
+    got = drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt)
+    assert got == ("twin:4:platform/tests/test_a.py,platform/tests/test_b.py,platform/tests/test_bench.py,"
+                   "platform/tests/test_extra.py,platform/tests/test_l07.py,platform/tests/test_rows.py"), got
+    assert "test_missing" not in got and "test_gone" not in got, "files the tree lacks are dropped"
+    # a row naming an agent/portal test the platform-twin job cannot run -> full pipeline
+    (wt / "agent" / "tests").mkdir(parents=True)
+    (wt / "agent" / "tests" / "test_gone.py").write_text("")
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
+    assert "scoped twin refused: 1 non-platform test file(s) named (agent/tests/test_gone.py)" in \
+        (env.run_root / "driver.log").read_text()
+    twin.pop("hosted_lines")
     assert drv._twin_scope_only("L06-HOSTED-R12", canary, tasks) is None, "the canary's row stays the full pipeline"
     assert drv._twin_scope_only("R-B-HOSTED-R1", other, tasks) == "twin:4:platform/tests/test_extra.py"
     drv.proof_cfg["circleci"]["twin_scope"]["extra_paths"] = []
