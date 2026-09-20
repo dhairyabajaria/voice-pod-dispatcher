@@ -118,7 +118,9 @@ class Proof(object):
         if "max_pipelines_in_flight" in raw and "max_in_flight" not in raw:
             raw["max_in_flight"] = raw.pop("max_pipelines_in_flight")
         cc.update(raw)
-        cap = getattr(self.circle, "MAX_IN_FLIGHT", None)  # a provider may bound the in-flight count (gha: 1, rule 6)
+        cap = getattr(self.circle, "MAX_IN_FLIGHT", None)  # a provider may bound the in-flight count (gha: 3, D102)
+        if raw.get("max_full_in_flight") is not None:
+            cap = int(raw["max_full_in_flight"])            # D102: the roster knob wins over the provider constant
         if cap is not None:
             cc["max_in_flight"] = min(int(cc.get("max_in_flight", 2) or 2), int(cap))
         return cc

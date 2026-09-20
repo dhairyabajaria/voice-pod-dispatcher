@@ -2554,6 +2554,29 @@ def test_d101_an_amended_pack_reaches_the_next_round_and_keeps_the_migration_not
     assert (wt2 / ".vp" / "PACKET.md").read_text() == "twin text\n"
 
 
+def test_d104_a_cancelled_hosted_proof_closes_the_attempt_on_first_read_no_retrigger(tmp_path, monkeypatch):
+    """D104 (14:32-14:34Z): PROOF_CANCELLED used to strike 1/3, park, re-adopt and
+    TRIGGER a fresh full pipeline on the same tip each cycle (35516791190,
+    35516913030 on union-60).  Now the attempt closes INVALID_EVIDENCE on the
+    first CANCELLED read: one proof call, no second trigger, the packet is a
+    fresh retry."""
+    monkeypatch.setattr(lanedriver, "FAIL_BACKOFF_S", (0, 0, 0))
+    env = Env(tmp_path, roster_extra={"proof": {"require_for_kinds": ["builder"]}})
+    env.activate()
+    proof = FakeProof([{"status": "CANCELLED", "reason": "circleci pipeline 35513112276 cancelled: not an answer (D79b)"},
+                       {"status": "PASS"}])
+    drv = env.driver({"opencode": FakeRunner(default=routed_pass), "codex": FakeRunner(), "claude": FakeRunner()},
+                     proof=proof)
+    settle(drv, 4)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "INVALID_EVIDENCE", rows["L02"]
+    assert "cancelled" in rows["L02"]["blocker"].lower() and "D104" in rows["L02"]["blocker"]
+    assert len(proof.calls) == 1, "closed on the first CANCELLED read: never re-triggered"
+    log = (env.run_root / "driver.log").read_text()
+    assert "ALERT PROOF_CANCELLED" in log and "attempt closed (no re-trigger, D104)" in log
+    assert "FAIL L02 1/3 PROOF_CANCELLED" not in log
+
+
 def test_d96_the_driver_fills_a_missing_or_string_result_attempt_with_the_round(tmp_path):
     """D96 (§86/§91): `attempt` is the integer round number, a value the driver
     owns.  L-TRANSCRIPT-READ-AUDIT-TESTBENCH lost three builder turns to its

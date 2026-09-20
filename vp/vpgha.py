@@ -50,7 +50,12 @@ ACCOUNTS = (ACCOUNT,)
 DEFAULT_ROTATION = (ACCOUNT,)
 TARGETS = {ACCOUNT: {"repo": REPO, "push_remote": None, "org": "GitHub Actions (Oracle fleet)"}}
 FIND_RUN_TRIES, FIND_RUN_WAIT_S = 18, 5          # a dispatched run appears within seconds; allow 90 s
-MAX_IN_FLIGHT = 1                                # rule 6: one full proof in flight
+# D102 (owner order via the Architect, 2026-09-20 14:3xZ): the fleet is 12 runners
+# and one canary peaks at ~15 jobs, so 2 full pipelines run concurrently and a
+# 3rd mostly queues on runners (GitHub queues, no harm).  Rule 6's "one in
+# flight" is superseded; roster proof.circleci.max_full_in_flight overrides
+# without a code change (laneproof.circle_cfg), the only= cap stays separate.
+MAX_IN_FLIGHT = 3
 
 Cancelled = vpcircle.Cancelled
 classify = vpcircle.classify
@@ -191,13 +196,19 @@ def _json(res, what):
         raise RuntimeError("%s: invalid JSON: %s" % (what, exc)) from None
 
 
-def find_run(branch, runner, tries=FIND_RUN_TRIES, wait_s=FIND_RUN_WAIT_S, sleep=time.sleep):
-    """the newest vp-proof run whose run-name is `branch` (our proof_id input)"""
+def find_run(branch, runner, tries=FIND_RUN_TRIES, wait_s=FIND_RUN_WAIT_S, sleep=time.sleep, known=()):
+    """the newest vp-proof run whose run-name is `branch` (our proof_id input).
+    D103 (2026-09-20 14:32Z): a retried proof re-uses its branch name, so the
+    list also holds the EARLIER run of the same proof; the driver polled the
+    cancelled 35513112276 while its real re-trigger 35516791190 ran unobserved.
+    `known` (run ids listed before the trigger) and completed runs are skipped."""
+    known = set(str(k) for k in known)
     for i in range(tries):
         rows = _json(runner.gh(["run", "list", "-R", REPO, "--workflow", WORKFLOW, "--branch", branch,
                                 "--event", "workflow_dispatch", "--limit", "20",
                                 "--json", "databaseId,displayTitle,createdAt,status"]), "gh run list")
-        mine = [r for r in rows or [] if str(r.get("displayTitle")) == branch]
+        mine = [r for r in rows or [] if str(r.get("displayTitle")) == branch
+                and str(r.get("databaseId")) not in known and str(r.get("status")) != "completed"]
         if mine:
             mine.sort(key=lambda r: str(r.get("createdAt") or ""))
             return str(mine[-1]["databaseId"])
@@ -206,14 +217,25 @@ def find_run(branch, runner, tries=FIND_RUN_TRIES, wait_s=FIND_RUN_WAIT_S, sleep
     raise RuntimeError("gh workflow run: no vp-proof run named %s appeared within %ds" % (branch, tries * wait_s))
 
 
+def _runs_named(branch, runner):
+    try:
+        rows = _json(runner.gh(["run", "list", "-R", REPO, "--workflow", WORKFLOW, "--branch", branch,
+                                "--event", "workflow_dispatch", "--limit", "20", "--json", "databaseId,displayTitle"]),
+                     "gh run list")
+    except RuntimeError:
+        return []
+    return [str(r.get("databaseId")) for r in rows or [] if str(r.get("displayTitle")) == branch]
+
+
 def trigger(branch, parameters, runner=None, account=None, targets=None, rotate=False, sleep=time.sleep):
     """-> {"pipeline_id": <run id>, "account": "gha"}"""
     runner = runner or Runner()
+    known = _runs_named(branch, runner)              # D103: runs of an earlier attempt on this branch name
     args = ["workflow", "run", WORKFLOW, "-R", REPO, "--ref", branch, "-f", "proof_id=%s" % branch]
     for k, v in (parameters or {}).items():
         args += ["-f", "%s=%s" % (k, "true" if v is True else "false" if v is False else v)]
     _check(runner.gh(args), "gh workflow run")
-    return {"pipeline_id": find_run(branch, runner, sleep=sleep), "account": ACCOUNT}
+    return {"pipeline_id": find_run(branch, runner, sleep=sleep, known=known), "account": ACCOUNT}
 
 
 def runners(runner=None):

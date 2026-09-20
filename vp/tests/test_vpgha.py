@@ -383,9 +383,12 @@ def test_prepare_measured_adds_exactly_the_workflow_and_leaves_the_worktree_alon
 class FakeGh(object):
     """gh CLI answers by subcommand; records every argv"""
 
-    def __init__(self, run_rows=None, views=None, artifacts=None, downloads=None, dispatch_rc=0):
+    def __init__(self, run_rows=None, views=None, artifacts=None, downloads=None, dispatch_rc=0, rows_before=None):
         self.calls = []
         self.run_rows = run_rows or []
+        # D103: what `gh run list` shows BEFORE the dispatch (an earlier attempt's runs)
+        self.rows_before = rows_before
+        self.dispatched = False
         self.views = list(views or [])
         self.artifacts = artifacts or []
         self.downloads = downloads or {}
@@ -395,9 +398,11 @@ class FakeGh(object):
         self.calls.append(list(argv))
         a = argv[1:]
         if a[:2] == ["workflow", "run"]:
+            self.dispatched = not self.dispatch_rc
             return subprocess.CompletedProcess(argv, self.dispatch_rc, "", "" if not self.dispatch_rc else "HTTP 404")
         if a[:2] == ["run", "list"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.run_rows), "")
+            rows = self.run_rows if (self.dispatched or self.rows_before is None) else self.rows_before
+            return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
         if a[:2] == ["run", "view"]:
             v = self.views.pop(0) if len(self.views) > 1 else self.views[0]
             return subprocess.CompletedProcess(argv, 0, json.dumps(v), "")
@@ -429,6 +434,7 @@ JUNIT_RED = """<?xml version="1.0" encoding="utf-8"?>
 
 def test_trigger_finds_its_run_by_run_name_and_poll_reads_junit_into_reds(monkeypatch):
     gh = FakeGh(
+        rows_before=[{"databaseId": 111, "displayTitle": "vp/proof/other", "createdAt": "2026-09-19T20:00:00Z"}],
         run_rows=[{"databaseId": 111, "displayTitle": "vp/proof/other", "createdAt": "2026-09-19T20:00:00Z"},
                   {"databaseId": 222, "displayTitle": "vp/proof/proof-1-abc", "createdAt": "2026-09-19T20:01:00Z"},
                   {"databaseId": 223, "displayTitle": "vp/proof/proof-1-abc", "createdAt": "2026-09-19T20:02:00Z"}],
@@ -553,3 +559,38 @@ def test_shard_workers_and_pg_stagger_come_from_the_roster_and_touch_the_shard_j
     doc0 = yaml.safe_load(vpgha_overlay.render(MINI_CI, shard_stagger_s=0))
     run0 = next(st for st in doc0["jobs"]["platform-shards"]["steps"] if "uv run pytest" in str(st.get("run", "")))
     assert vpgha_overlay.STAGGER_ENV not in run0["env"], "0 = unset"
+
+
+def test_d103_a_retriggered_proof_never_adopts_its_earlier_attempts_run():
+    """D103 (14:32Z): L06-HOSTED-R9's retry re-used its branch name; `gh run list`
+    still held the cancelled 35513112276 and find_run returned it (newest by
+    createdAt at that instant) while the real re-trigger 35516791190 ran
+    unobserved -> a second PROOF_CANCELLED strike on a run that was never
+    polled.  Runs listed before the dispatch, and completed runs, are skipped;
+    the new run is waited for."""
+    old = {"databaseId": 35513112276, "displayTitle": "vp/proof/p-R9-4c72", "createdAt": "2026-09-20T13:18:29Z",
+           "status": "completed"}
+    new = {"databaseId": 35516791190, "displayTitle": "vp/proof/p-R9-4c72", "createdAt": "2026-09-20T14:32:20Z",
+           "status": "queued"}
+    gh = FakeGh(rows_before=[old], run_rows=[old, new])
+    runner = vpgha.Runner(run=gh, binary="gh")
+    trig = vpgha.trigger("vp/proof/p-R9-4c72", {"run_full_suite": True}, runner, sleep=lambda s: None)
+    assert trig["pipeline_id"] == "35516791190"
+    # the new run not yet visible: wait, never fall back to the old one
+    class Late(FakeGh):
+        n = 0
+        def __call__(self, argv, **kw):
+            if argv[1:3] == ["run", "list"] and self.dispatched:
+                Late.n += 1
+                if Late.n < 3:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([old]), "")
+            return FakeGh.__call__(self, argv, **kw)
+    gh = Late(rows_before=[old], run_rows=[old, new])
+    sleeps = []
+    trig = vpgha.trigger("vp/proof/p-R9-4c72", {"run_full_suite": True}, vpgha.Runner(run=gh, binary="gh"),
+                         sleep=sleeps.append)
+    assert trig["pipeline_id"] == "35516791190" and sleeps == [5, 5]
+    # a completed run of the same name is never the answer even when nothing else appears
+    gh = FakeGh(rows_before=[], run_rows=[old])
+    with pytest.raises(RuntimeError, match="no vp-proof run named"):
+        vpgha.trigger("vp/proof/p-R9-4c72", {}, vpgha.Runner(run=gh, binary="gh"), sleep=lambda s: None)

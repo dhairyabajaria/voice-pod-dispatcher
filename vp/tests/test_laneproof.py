@@ -706,7 +706,12 @@ def test_d83_the_gha_provider_is_chosen_by_the_roster_and_records_the_measured_c
     p = laneproof.Proof(tmp_path / "run", VP, tmp_path, git_fn, FakeExec({}), lambda m: None,
                         lambda k, t, task=None: None, cfg)
     assert p.provider() == "gha" and p.circle is vpgha and p.hosted_route() == "gha"
-    assert p.circle_cfg()["max_in_flight"] == 1, "rule 6: one full proof in flight on gha"
+    assert p.circle_cfg()["max_in_flight"] == 2, "D102: min(roster max_in_flight 2, gha MAX_IN_FLIGHT 3)"
+    p.cfg["circleci"]["max_in_flight"] = 12
+    assert p.circle_cfg()["max_in_flight"] == 3, "D102: the gha constant is 3 full pipelines"
+    p.cfg["circleci"]["max_full_in_flight"] = 5
+    assert p.circle_cfg()["max_in_flight"] == 5, "D102: roster max_full_in_flight overrides the constant"
+    del p.cfg["circleci"]["max_full_in_flight"], p.cfg["circleci"]["max_in_flight"]
     assert p._accounts(p.circle_cfg()) == (["gha"], []), "no rotation, no credits"
     assert p.route("platform") == ("gha", "mode all")
     p.cfg["hosted"] = {"provider": "circleci"}

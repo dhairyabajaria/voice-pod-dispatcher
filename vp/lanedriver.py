@@ -3963,6 +3963,18 @@ class LaneDriver(object):
                             "the gate/cap/off switch changes: %s" % outcome.detail[:300], task)
             self.note_hold(task, fkey, outcome.detail, GATE_HOLD_S)
             return
+        if outcome.status == "PROOF_CANCELLED":
+            # D104 (14:32-14:34Z): a cancelled hosted run is never an answer (D79b)
+            # and can never become one; striking its way out re-parked, re-adopted
+            # and TRIGGERED a fresh full pipeline on the same tip each cycle
+            # (35516791190, 35516913030 on union-60, D81/D87 broken).  The attempt
+            # closes on the first read; the packet re-enters as a fresh retry.
+            self.alert("PROOF_CANCELLED", "%s: hosted run cancelled -> attempt closed (no re-trigger, D104): %s"
+                       % (task, outcome.detail[:300]), task)
+            self._complete(task, attempt, "INVALID_EVIDENCE", tdir, evidence=[tdir / "record.json"],
+                           reason="hosted proof cancelled (not an answer, D79b; closed on first read, D104): %s"
+                                  % outcome.detail[:300])
+            return
         if result is None:
             count = self.note_failure(task, fkey, "%s: %s" % (outcome.status, outcome.detail),
                                       kind=outcome.status)
