@@ -1763,7 +1763,53 @@ class LaneDriver(object):
             self.log("WAIT %s: %d CIRCLECI twin(s) live >= cap %d" % (task, len(live), cap))
         return True
 
-    def unsound_grade(self, task, row_id, reason, evidence=None):
+    def restore_grade(self, task, row_id, reason):
+        """D126c: put back verbatim the verdict an `unsound-grade` withdrew.  The
+        withdrawal keeps the prior entry under `superseded` precisely so it is
+        recoverable, so a restore invents no evidence -- it copies that block back
+        and keeps the withdrawn entry under `restored_from`, so the record shows the
+        withdrawal AND its reversal rather than pretending neither happened.  Built
+        because 22:14Z withdrew two rows whose current verdict a newer twin (R2) had
+        legitimately recorded 25 seconds earlier; without this the only way back was
+        a hand edit of a sidecar the driver owns."""
+        p = self.packet_for(task)
+        if not p or not vppack.is_hosted_twin(p):
+            raise ValueError("%s is not a hosted twin" % task)
+        ptask = next((t for t, pid in self.pack_by_task.items() if pid == p.get("twin_of")), None) \
+            or p.get("twin_of")
+        f = self.run_root / "hosted" / ("%s.json" % ptask)
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("no hosted record for %s (%s)" % (ptask, exc))
+        rows = rec.get("hosted_rows") or {}
+        cur = rows.get(row_id)
+        if not cur:
+            raise ValueError("%s has no row %s in %s" % (ptask, row_id, f.name))
+        if cur.get("verdict") != "UNSOUND":
+            raise ValueError("%s row %s is %s, not UNSOUND -- nothing to restore"
+                             % (ptask, row_id, cur.get("verdict")))
+        prior = cur.get("superseded")
+        if not isinstance(prior, dict) or not prior.get("verdict"):
+            raise ValueError("%s row %s has no superseded verdict to restore" % (ptask, row_id))
+        rows[row_id] = dict(prior, restored_from=dict(cur), restore_reason=reason, restored_at=utc_ms())
+        all_twins = [q["id"] for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")]
+        twins = rec.get("twins") or {}
+        rec["box_only"] = not (all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
+                               and all(r.get("verdict") in ("PASS", "DEFERRED") for r in rows.values())
+                               and set(rows) >= {rid for q in self.pack.values()
+                                                 if q.get("twin_of") == p.get("twin_of")
+                                                 for rid in (q.get("hosted_rows") or [])})
+        rec["ts"] = utc_ms()
+        f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.alert("RESTORE_GRADE", "%s row %s restored to %s (withdrawal reversed): %s"
+                   % (task, row_id, prior.get("verdict"), reason), task)
+        self.log("RESTORE_GRADE %s %s UNSOUND -> %s (parent %s, box_only=%s): %s"
+                 % (task, row_id, prior.get("verdict"), ptask, rec["box_only"], reason))
+        return {"task": task, "parent": ptask, "row": row_id, "restored": prior.get("verdict"),
+                "box_only": rec["box_only"], "record": str(f)}
+
+    def unsound_grade(self, task, row_id, reason, evidence=None, force=False):
         """D126 (§152/§155): withdraw ONE hosted row verdict that the driver
         recorded correctly from inputs that were wrong -- a borrowed pipeline
         (§153), or a scope that stubbed the seam the row names (L17-HOSTED-R3 B9).
@@ -1792,6 +1838,17 @@ class LaneDriver(object):
             raise ValueError("%s has no row %s in %s" % (ptask, row_id, f.name))
         if cur.get("verdict") == "UNSOUND":
             raise ValueError("%s row %s is already UNSOUND" % (ptask, row_id))
+        if cur.get("twin") and cur["twin"] != task and not force:
+            # D126c: hosted_rows is keyed by row id and a newer twin OVERWRITES it, so
+            # evidence gathered minutes ago can name a verdict that no longer stands.
+            # 22:14Z: R-SUPPLY-AGENT-HOSTED-R2 recorded B7/B8 from its own pipeline at
+            # 22:14:10.890Z and the withdrawal landed 25 s later still naming R1 --
+            # the borrowed verdicts it was aimed at had already been superseded
+            # honestly.  Refuse and make the caller re-read, or pass --force.
+            raise ValueError("%s row %s now reads %s from %s, not from %s: a newer twin superseded the "
+                             "verdict your evidence read. Re-read the record, or pass --force to withdraw "
+                             "the newer one deliberately"
+                             % (ptask, row_id, cur.get("verdict"), cur["twin"], task))
         rows[row_id] = {"verdict": "UNSOUND", "twin": task, "attempt": cur.get("attempt"),
                         "ts": utc_ms(), "source": "unsound-grade", "reason": reason,
                         "evidence": str(evidence) if evidence else None,
@@ -2557,6 +2614,23 @@ class LaneDriver(object):
             t = rec.get("task")
             if t:
                 self.pack_by_task.setdefault(t, f.stem)
+        for f in sorted(pdir.glob("*.params.json")):
+            # D126b: a retry OVERWRITES the packet's binding record -- packets/
+            # R-SUPPLY-AGENT-HOSTED.json names the -R2 task, so the -R1 generation
+            # that actually supplied a row's verdict has no binding left.  Its own
+            # params sidecar survives, keyed by task in the filename and naming the
+            # packet inside, and that is what lets `unsound-grade` credit the
+            # withdrawal to the twin that recorded the row rather than to its successor.
+            task = f.name[:-len(".params.json")]
+            if task in self.pack_by_task:
+                continue
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            pid = rec.get("packet_id")
+            if pid in self.pack:
+                self.pack_by_task[task] = pid
         return self.pack_by_task
 
     def _pack_retry_requested(self, pid):
@@ -6412,6 +6486,14 @@ def build_parser():
     ug.add_argument("--row", required=True, help="the row id, e.g. B9")
     ug.add_argument("--reason", required=True, help="why the verdict is unsound, in one sentence")
     ug.add_argument("--evidence", help="path to the evidence file for this withdrawal")
+    ug.add_argument("--force", action="store_true",
+                    help="withdraw even when a NEWER twin recorded the row's current verdict (D126c)")
+    rg = sub.add_parser("restore-grade", help="D126c: reverse an `unsound-grade`, putting back the verdict it "
+                                              "kept under `superseded`; the withdrawal stays visible under "
+                                              "`restored_from`")
+    rg.add_argument("task", help="the hosted twin named by the withdrawal")
+    rg.add_argument("--row", required=True, help="the row id, e.g. B8")
+    rg.add_argument("--reason", required=True, help="why the withdrawal is being reversed")
     vf = sub.add_parser("verify", help="AUDIT-3: check every seal (chain, prefixes), replay the scheduler "
                                        "events against run-state/LEDGER.md, resolve every harvest sha; "
                                        "writes verify/verify-<ts>.json; exit 1 on any problem")
@@ -6456,10 +6538,24 @@ def cmd_retry_packet(drv, args):
     return 0
 
 
+def cmd_restore_grade(drv, args):
+    drv.pack_bindings_from_disk()          # D126a: a one-shot CLI has no pack bindings
+    try:
+        rec = drv.restore_grade(args.task, args.row, args.reason)
+    except ValueError as exc:
+        print(json.dumps({"status": "REFUSED", "error": str(exc)}))
+        return 2
+    print(json.dumps({"status": "RESTORED", "restore": rec,
+                      "note": "the withdrawn entry is kept under `restored_from`; box_only is recomputed"},
+                     indent=2))
+    return 0
+
+
 def cmd_unsound_grade(drv, args):
     drv.pack_bindings_from_disk()          # D126a: a one-shot CLI has no pack bindings
     try:
-        rec = drv.unsound_grade(args.task, args.row, args.reason, evidence=getattr(args, "evidence", None))
+        rec = drv.unsound_grade(args.task, args.row, args.reason, evidence=getattr(args, "evidence", None),
+                                force=getattr(args, "force", False))
     except ValueError as exc:
         print(json.dumps({"status": "REFUSED", "error": str(exc)}))
         return 2
@@ -6564,7 +6660,7 @@ def cmd_reload(drv, args):
     return 0
 
 
-SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
+SUBCOMMANDS = ("restore-grade", "run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
                "retry-packet", "reload", "contamination", "verify", "unsound-grade")
 
 
@@ -6614,6 +6710,8 @@ def main(argv=None):
         return cmd_retry_packet(drv, args)
     if args.cmd == "unsound-grade":
         return cmd_unsound_grade(drv, args)
+    if args.cmd == "restore-grade":
+        return cmd_restore_grade(drv, args)
     if args.cmd == "reload":
         return cmd_reload(drv, args)
     if args.cmd == "contamination":

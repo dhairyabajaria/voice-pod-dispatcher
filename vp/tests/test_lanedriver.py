@@ -2953,6 +2953,57 @@ def test_d128_a_packet_with_hosted_in_the_middle_of_its_id_is_not_a_twin(tmp_pat
     assert vppack.is_hosted_twin(drv.packet_for("R-PORTAL-HOSTED-TIMING-R1")) is False
 
 
+def test_d126c_a_newer_twins_verdict_is_refused_and_a_withdrawal_can_be_reversed(tmp_path):
+    """D126c, from a real error at 22:14Z: hosted_rows is keyed by row id and a newer
+    twin OVERWRITES it, so evidence gathered minutes earlier can name a verdict that
+    no longer stands.  R-SUPPLY-AGENT-HOSTED-R2 recorded B7/B8 from its own pipeline
+    at 22:14:10.890Z and the withdrawal landed 25 s later still naming R1 -- it
+    withdrew an honest verdict and credited it to the wrong twin.  Withdrawal now
+    refuses that case unless forced, and `restore-grade` puts the prior verdict back
+    from the `superseded` block the withdrawal kept for exactly this purpose."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    twin1 = {"id": "R-SUP-HOSTED-R1", "twin_of": "R-SUP", "twin_gate": "CIRCLECI", "hosted_rows": ["B7", "B8"]}
+    twin2 = {"id": "R-SUP-HOSTED-R2", "twin_of": "R-SUP", "twin_gate": "CIRCLECI", "hosted_rows": ["B7", "B8"]}
+    drv.pack.update({"R-SUP-HOSTED-R1": twin1, "R-SUP-HOSTED-R2": twin2, "R-SUP": {"id": "R-SUP"}})
+    drv.pack_by_task.update({"R-SUP-HOSTED-R1": "R-SUP-HOSTED-R1", "R-SUP-HOSTED-R2": "R-SUP-HOSTED-R2",
+                             "R-SUP-V13": "R-SUP"})
+    hdir = env.run_root / "hosted"
+    hdir.mkdir(parents=True, exist_ok=True)
+    (hdir / "R-SUP-V13.json").write_text(json.dumps({
+        "task": "R-SUP-V13", "packet": "R-SUP", "box_only": True,
+        "twins": {"R-SUP-HOSTED-R1": {"outcome": "REPAIR_REQUIRED", "attempt": "a1"},
+                  "R-SUP-HOSTED-R2": {"outcome": "REPAIR_REQUIRED", "attempt": "a2"}},
+        "hosted_rows": {"B7": {"verdict": "FAIL", "twin": "R-SUP-HOSTED-R2", "attempt": "a2", "source": "findings"},
+                        "B8": {"verdict": "PASS", "twin": "R-SUP-HOSTED-R1", "attempt": "a1", "source": "findings"}},
+    }))
+    with pytest.raises(ValueError, match="now reads FAIL from R-SUP-HOSTED-R2"):
+        drv.unsound_grade("R-SUP-HOSTED-R1", "B7", "borrowed pipeline")
+    rec = json.loads((hdir / "R-SUP-V13.json").read_text())
+    assert rec["hosted_rows"]["B7"]["verdict"] == "FAIL", "a refused withdrawal writes nothing"
+    # the row the named twin DID record still withdraws, and a FAIL withdraws like a PASS
+    out = drv.unsound_grade("R-SUP-HOSTED-R1", "B8", "borrowed pipeline 1234", evidence="e.md")
+    assert out["was"] == "PASS"
+    # --force is the deliberate path for the newer verdict
+    out = drv.unsound_grade("R-SUP-HOSTED-R1", "B7", "deliberate", force=True)
+    assert out["was"] == "FAIL", "a false RED withdraws too -- the verb is not green-only"
+    rec = json.loads((hdir / "R-SUP-V13.json").read_text())
+    assert rec["hosted_rows"]["B7"]["superseded"]["verdict"] == "FAIL"
+    # and the reversal: the prior entry comes back verbatim, the withdrawal stays visible
+    back = drv.restore_grade("R-SUP-HOSTED-R1", "B7", "MY ERROR: R2 had already superseded it honestly")
+    assert back["restored"] == "FAIL"
+    row = json.loads((hdir / "R-SUP-V13.json").read_text())["hosted_rows"]["B7"]
+    assert row["verdict"] == "FAIL" and row["twin"] == "R-SUP-HOSTED-R2" and row["source"] == "findings"
+    assert row["restored_from"]["verdict"] == "UNSOUND", "the withdrawal is not erased"
+    assert row["restore_reason"].startswith("MY ERROR") and row["restored_at"]
+    with pytest.raises(ValueError, match="not UNSOUND"):
+        drv.restore_grade("R-SUP-HOSTED-R1", "B7", "again")
+    with pytest.raises(ValueError, match="no row B4"):
+        drv.restore_grade("R-SUP-HOSTED-R1", "B4", "no such row")
+    assert "RESTORE_GRADE R-SUP-HOSTED-R1 B7 UNSOUND -> FAIL" in (env.run_root / "driver.log").read_text()
+
+
 def test_d126a_a_one_shot_cli_recovers_its_pack_bindings_from_the_dispatch_records(tmp_path):
     """D126a: _pack_restore needs the live `tasks` view and runs only inside the
     loop, so `unsound-grade` -- a one-shot process -- had an empty pack_by_task and
@@ -2971,16 +3022,29 @@ def test_d126a_a_one_shot_cli_recovers_its_pack_bindings_from_the_dispatch_recor
     pdir.mkdir(parents=True, exist_ok=True)
     (pdir / "L08-ADMIT-TG-HOSTED-R1.json").write_text(json.dumps({"task": "L08-ADMIT-TG-HOSTED-R1"}))
     (pdir / "L08-ADMIT-TG.json").write_text(json.dumps({"task": "L08-ADMIT-TG-R1"}))
-    (pdir / "L08-ADMIT-TG-HOSTED-R1.params.json").write_text(json.dumps({"task": "NOT-A-BINDING"}))
+    (pdir / "L08-ADMIT-TG-HOSTED-R1.params.json").write_text(json.dumps({"task": "NOT-A-BINDING",
+                                                                         "packet_id": "L08-ADMIT-TG-HOSTED-R1"}))
     assert drv.packet_for("L08-ADMIT-TG-HOSTED-R1") is None, "a fresh CLI process knows nothing"
     out = drv.pack_bindings_from_disk()
     assert out["L08-ADMIT-TG-HOSTED-R1"] == "L08-ADMIT-TG-HOSTED-R1"
     assert out["L08-ADMIT-TG-R1"] == "L08-ADMIT-TG", "the parent's task id comes back too"
-    assert "NOT-A-BINDING" not in out, "a .params.json sidecar is not a binding"
+    assert "NOT-A-BINDING" not in out, "a params sidecar's `task` field is not a binding; its FILENAME is"
     assert (drv.packet_for("L08-ADMIT-TG-HOSTED-R1") or {}).get("id") == "L08-ADMIT-TG-HOSTED-R1"
     drv.pack_by_task["L08-ADMIT-TG-HOSTED-R1"] = "SOMETHING-ELSE"
     drv.pack_bindings_from_disk()
     assert drv.pack_by_task["L08-ADMIT-TG-HOSTED-R1"] == "SOMETHING-ELSE", "never overwrites a live binding"
+    # D126b: a retry overwrites the packet's binding record, so the generation that
+    # actually recorded a row keeps no binding -- only its own params sidecar, whose
+    # FILENAME is the task and whose packet_id is the packet (R-SUPPLY-AGENT-HOSTED-R1,
+    # whose record had been rewritten to name -R2, 22:13Z)
+    drv.pack_by_task.clear()
+    (pdir / "L08-ADMIT-TG-HOSTED-R1.json").write_text(json.dumps({"task": "L08-ADMIT-TG-HOSTED-R2"}))
+    (pdir / "L08-ADMIT-TG-HOSTED-R1.params.json").write_text(
+        json.dumps({"packet_id": "L08-ADMIT-TG-HOSTED-R1", "runner_role": "probe"}))
+    out = drv.pack_bindings_from_disk()
+    assert out["L08-ADMIT-TG-HOSTED-R2"] == "L08-ADMIT-TG-HOSTED-R1", "the live generation still wins"
+    assert out["L08-ADMIT-TG-HOSTED-R1"] == "L08-ADMIT-TG-HOSTED-R1", "the superseded one comes back too"
+    assert (drv.packet_for("L08-ADMIT-TG-HOSTED-R1") or {}).get("id") == "L08-ADMIT-TG-HOSTED-R1"
 
 
 def test_d127_a_probe_twin_defers_its_owner_skipped_row_at_the_record_not_at_the_grader(tmp_path):
@@ -3072,8 +3136,9 @@ def test_d126_unsound_grade_withdraws_one_row_keeps_the_old_verdict_and_re_raise
     (hdir / "L17-V13.json").write_text(json.dumps({
         "task": "L17-V13", "packet": "L17", "box_only": False,
         "twins": {"L17-HOSTED": {"gate": "CIRCLECI", "outcome": "VERIFIED", "attempt": "a1"}},
-        "hosted_rows": {"B8": {"verdict": "PASS", "twin": "L17-HOSTED", "attempt": "a1", "source": "findings"},
-                        "B9": {"verdict": "PASS", "twin": "L17-HOSTED", "attempt": "a1", "source": "findings"}},
+        # the row's `twin` is the TASK that recorded it, which is what D126c compares against
+        "hosted_rows": {"B8": {"verdict": "PASS", "twin": "L17-HOSTED-R3", "attempt": "a1", "source": "findings"},
+                        "B9": {"verdict": "PASS", "twin": "L17-HOSTED-R3", "attempt": "a1", "source": "findings"}},
     }))
     out = drv.unsound_grade("L17-HOSTED-R3", "B9", "the scope stubs consent_grants.grant_is_live",
                             evidence="evidence/L17-B9.md")
@@ -3082,7 +3147,7 @@ def test_d126_unsound_grade_withdraws_one_row_keeps_the_old_verdict_and_re_raise
     b9 = rec["hosted_rows"]["B9"]
     assert b9["verdict"] == "UNSOUND" and b9["reason"].startswith("the scope stubs")
     assert b9["evidence"] == "evidence/L17-B9.md"
-    assert b9["superseded"] == {"verdict": "PASS", "twin": "L17-HOSTED", "attempt": "a1",
+    assert b9["superseded"] == {"verdict": "PASS", "twin": "L17-HOSTED-R3", "attempt": "a1",
                                 "source": "findings"}, "the old verdict is kept verbatim"
     assert rec["hosted_rows"]["B8"]["verdict"] == "PASS", "only the named row moves"
     assert rec["box_only"] is True, "D45 clears only on PASS/DEFERRED, so UNSOUND re-raises it"
