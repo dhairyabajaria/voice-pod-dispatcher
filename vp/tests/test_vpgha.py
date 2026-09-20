@@ -230,6 +230,46 @@ def test_overlay_refuses_a_ci_yml_missing_a_required_job():
         vpgha_overlay.render(MINI_CI.replace("  deploy-contracts:\n", "  deploy-contracts-x:\n"))
 
 
+ORDER_JOB = """
+  platform-order:
+    runs-on: ubuntu-latest
+    needs: [platform, deploy]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Order-dependence run
+        run: |
+          cd platform
+          uv run pytest tests -p randomly -q
+"""
+
+
+def test_overlay_renders_platform_order_only_when_present():
+    # §95 item 1 (R-CI-PLATFORM-ORDER-JOB): required-when-present -- the plain
+    # MINI_CI renders without it and without raising...
+    base = yaml.safe_load(vpgha_overlay.render(MINI_CI))
+    assert "platform-order" not in base["jobs"]
+    assert list(base["jobs"]) == list(vpgha_overlay.REQUIRED_JOBS)
+    # ...and a ci.yml carrying the job renders it after the required set, on the
+    # fleet, with its junit leg, and with `needs` pruned to rendered jobs only
+    # (a needs on the dropped `deploy` would make GitHub reject the workflow).
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB))
+    assert list(doc["jobs"]) == list(vpgha_overlay.REQUIRED_JOBS) + ["platform-order"]
+    job = doc["jobs"]["platform-order"]
+    assert job["name"] == "vp/platform-order" and job["runs-on"] == ["self-hosted", "voicepod"]
+    assert job["needs"] == ["platform"] and "if" not in job
+    assert job["timeout-minutes"] == vpgha_overlay.JOB_TIMEOUT_MIN
+    runs = [str(st.get("run", "")) for st in job["steps"]]
+    assert any("--junitxml=${{ runner.temp }}/junit/platform-order-1.xml" in r for r in runs)
+    assert job["steps"][-1]["with"]["name"] == "junit-platform-order"
+
+
+def test_overlay_drops_a_needs_that_only_named_dropped_jobs():
+    txt = MINI_CI + ORDER_JOB.replace("needs: [platform, deploy]", "needs: [deploy]")
+    doc = yaml.safe_load(vpgha_overlay.render(txt))
+    assert "needs" not in doc["jobs"]["platform-order"]
+
+
 def test_overlay_on_tmpfs_asserts_the_shm_size_and_never_remounts(monkeypatch):
     """Advisor 2026-09-20: the tmpfs size is the runner image's (/etc/fstab);
     the job only ASSERTS it (clear failure), never remounts; pgdata under

@@ -43,6 +43,11 @@ import yaml
 
 REQUIRED_JOBS = ("platform", "platform-shards", "platform-coverage", "agent",
                  "deploy-contracts", "portal", "supply-chain")
+# Required-when-present (§95 item 1, packet R-CI-PLATFORM-ORDER-JOB): rendered
+# when the candidate's ci.yml has the job, no raise when it does not.  Without
+# this a union carrying the packet would silently lose the serial order-
+# dependence run on the canary (it moved out of `platform`).
+OPTIONAL_JOBS = ("platform-order",)
 RUNS_ON = ["self-hosted", "voicepod"]
 # GitHub's default job timeout is 360 min; canary run 35483670689 hung disk-bound
 # with no junit for 10+ min and nothing would have ended it.  A job past this
@@ -177,9 +182,19 @@ def render_jobs(ci, floor_supports_branch=False):
     missing = [j for j in REQUIRED_JOBS if j not in src]
     if missing:
         raise ValueError("ci.yml lacks required job(s): %s" % ", ".join(missing))
+    selected = list(REQUIRED_JOBS) + [j for j in OPTIONAL_JOBS if j in src]
     out = {}
-    for job_id in REQUIRED_JOBS:
+    for job_id in selected:
         job = dict(src[job_id])
+        if job.get("needs"):
+            # a dependency on a dropped job (deploy, required-checks...) would make
+            # GitHub reject the whole workflow; keep only rendered jobs
+            needs = job["needs"] if isinstance(job["needs"], list) else [job["needs"]]
+            kept = [n for n in needs if n in selected]
+            if kept:
+                job["needs"] = kept
+            else:
+                job.pop("needs")
         suffix = matrix_suffix(job)
         job["name"] = "vp/%s%s" % (job_id, suffix)
         job["runs-on"] = list(RUNS_ON)
