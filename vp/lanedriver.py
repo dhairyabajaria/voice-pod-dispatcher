@@ -2659,6 +2659,45 @@ class LaneDriver(object):
             pass
         return rec
 
+    def _pack_dir_for(self, task):
+        """the packet directory a task was instantiated from (a twin's is its
+        parent's), or None"""
+        if not self.pack_dir:
+            return None
+        pid = self.pack_by_task.get(task, task)
+        p = self.pack.get(pid) if self.pack else None
+        d = Path(p["dir"]) if p and p.get("dir") else self.pack_dir / pid
+        return d if d.is_dir() else None
+
+    PACKET_TEXT = ("PACKET.md", "BENCHMARK.md")
+
+    def _copy_packet_extras(self, wt, task):
+        """D116 (§122): every non-.md file/dir of the packet directory (probe/,
+        SIMULATED-GREPS.txt, diff-*.txt, plant scripts) lands in <wt>/.vp/ so a
+        row's `<probe>` = .vp/probe/ resolves for the builder and the grader
+        (R-SWEEPS-RACE-THREE-FILES B2 round 1 graded UNKNOWN: the packet's
+        probe/ never reached the worktree).  Overwrites; returns the names."""
+        d = self._pack_dir_for(task)
+        if d is None:
+            return []
+        vp = Path(wt) / ".vp"
+        copied = []
+        for src in sorted(d.iterdir()):
+            if src.name.startswith(".") or src.name in self.PACKET_TEXT or src.suffix == ".md":
+                continue
+            dst = vp / src.name
+            try:
+                if src.is_dir():
+                    if dst.exists():
+                        shutil.rmtree(str(dst))
+                    shutil.copytree(str(src), str(dst))
+                else:
+                    shutil.copy2(str(src), str(dst))
+                copied.append(src.name + ("/" if src.is_dir() else ""))
+            except OSError as exc:
+                self.log("PACK extras %s: %s not copied: %s" % (task, src.name, exc))
+        return copied
+
     def _pack_paths(self, task):
         if not self.pack_dir:
             return None, None
@@ -2756,6 +2795,9 @@ class LaneDriver(object):
                                                                   proof_kind=pkind), encoding="utf-8")
             (vp / "BENCHMARK.md").write_text(bp.read_text(encoding="utf-8") if bp
                                              else self.render_benchmark(contract), encoding="utf-8")
+        extras = self._copy_packet_extras(wt, task)
+        if extras:
+            self.log("PACK extras %s -> .vp/: %s (D116)" % (task, ", ".join(extras)))
         for name, doc in (("RESULT_SCHEMA.json", vpschema.RESULT_SCHEMA_DOC),
                           ("FINDINGS_SCHEMA.json", vpschema.FINDINGS_SCHEMA_DOC),
                           ("REVIEW_SCHEMA.json", vpschema.REVIEW_SCHEMA_DOC)):
@@ -2798,6 +2840,9 @@ class LaneDriver(object):
             return False
         vp = Path(wt) / ".vp"
         changed = []
+        # D116: the packet's probe/, greps, diffs and plants ride along at every
+        # boundary too (an amended probe reaches the next round like the text)
+        self._copy_packet_extras(wt, task)
         try:
             for name, src in (("PACKET.md", pp), ("BENCHMARK.md", bp)):
                 if not src or not src.exists():

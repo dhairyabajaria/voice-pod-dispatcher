@@ -2765,3 +2765,45 @@ def test_d113_a_scoped_twin_record_answers_its_own_ask_and_a_full_hosted_pass_st
     (proofs / "proof-canary-003.json").unlink()
     rec("proof-box-004", route="box", pipeline_id=None, ts="2026-09-20T16:03:00.000Z")
     assert drv._reusable_proof(sha, "platform", [], only=ask) is None, "a box PASS never closes a hosted twin"
+
+
+def test_d116_a_packets_probe_greps_diffs_and_plants_ride_into_vp_at_instantiation_and_every_repack(tmp_path):
+    """D116 (§122): every non-.md file/dir of the packet directory is copied
+    into <wt>/.vp/ (so <probe> = .vp/probe/), overwritten at each repack; the
+    two .md texts keep the D101 path; a twin copies its PARENT's extras."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    pack = env.tmp / "pack"
+    d = pack / "R-P"
+    (d / "probe").mkdir(parents=True)
+    (d / "PACKET.md").write_text("---\nitem: R-P\ntitle: p\n---\nbody\n")
+    (d / "BENCHMARK.md").write_text("- B2 `<probe>/race.py` prints RACE\n")
+    (d / "NOTES.md").write_text("never copied\n")
+    (d / "probe" / "race.py").write_text("print('RACE v1')\n")
+    (d / "SIMULATED-GREPS.txt").write_text("g1\n")
+    (d / "diff-auth.txt").write_text("d\n")
+    (d / ".hidden").write_text("x")
+    drv.pack_dir = pack
+    drv.pack["R-P"] = {"id": "R-P", "dir": str(d), "test_paths": []}
+    drv.pack_by_task["R-P-a1"] = "R-P"
+    wt = env.tmp / "wt" / "R-P-a1"
+    (wt / ".vp").mkdir(parents=True)
+    assert drv._copy_packet_extras(wt, "R-P-a1") == ["SIMULATED-GREPS.txt", "diff-auth.txt", "probe/"]
+    assert (wt / ".vp" / "probe" / "race.py").read_text() == "print('RACE v1')\n"
+    assert not (wt / ".vp" / "NOTES.md").exists() and not (wt / ".vp" / ".hidden").exists()
+    # an amended probe reaches the next round through _repack, even with the .md texts unchanged
+    (wt / ".vp" / "PACKET.md").write_text("---\nitem: R-P\ntitle: p\n---\nbody\n")
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B2 `<probe>/race.py` prints RACE\n")
+    (d / "probe" / "race.py").write_text("print('RACE v2')\n")
+    (d / "probe" / "plant.sh").write_text("true\n")
+    assert drv._repack(wt, "R-P-a1", 2, "grade") is False, "texts unchanged"
+    assert (wt / ".vp" / "probe" / "race.py").read_text() == "print('RACE v2')\n"
+    assert (wt / ".vp" / "probe" / "plant.sh").exists()
+    # a twin takes its parent's directory
+    drv.pack["R-P-HOSTED"] = {"id": "R-P-HOSTED", "dir": str(d), "twin_of": "R-P", "twin_gate": "CIRCLECI"}
+    drv.pack_by_task["R-P-HOSTED-a1"] = "R-P-HOSTED"
+    wt2 = env.tmp / "wt" / "R-P-HOSTED-a1"
+    (wt2 / ".vp").mkdir(parents=True)
+    assert "probe/" in drv._copy_packet_extras(wt2, "R-P-HOSTED-a1")
+    assert drv._copy_packet_extras(wt2, "NO-SUCH-TASK") == []
