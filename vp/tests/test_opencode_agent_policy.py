@@ -119,3 +119,35 @@ def test_d90_the_grader_can_run_read_only_check_lines_and_nothing_else():
         assert decide(rules, cmd) == "allow", "grader read-only command denied: %s" % cmd
     for cmd in GRADER_MUST_DENY:
         assert decide(rules, cmd) == "deny", "grader run/write shape got through: %s" % cmd
+
+
+TRUNK = Path(__file__).resolve().parents[3] / "voice-pod" / "chief9-recovery"
+TRUNK_SHA = "5deac821"
+READ_ONLY_SHAPES = ("git show HEAD:%s", "cat %s", "git diff HEAD -- %s", "sed -n 1,40p %s",
+                    "git log --oneline -3 -- %s")
+
+
+@pytest.mark.skipif(not AGENTS.is_dir() or not TRUNK.is_dir(), reason="needs the agents dir and the trunk checkout")
+@pytest.mark.parametrize("name", FILES + ("vp-junior.md",))
+def test_d92_no_deny_pattern_fires_on_a_read_only_command_over_any_tracked_path(name):
+    """D92 class sweep (Advisor item d): every deny glob is run against every
+    tracked path at trunk inside the read-only shapes; a deny that fires on a
+    FILENAME (the D88 class: `*pytest*` denying `git diff -- test_pgserver…`)
+    is a defect of the pattern, whatever its intent."""
+    import subprocess
+    paths = subprocess.run(["git", "-C", str(TRUNK), "ls-files", "--with-tree", TRUNK_SHA],
+                           capture_output=True, text=True, check=True).stdout.split()
+    assert len(paths) > 100, "ls-files returned too little to be a sweep"
+    rules = _bash_rules((AGENTS / name).read_text())
+    denies = [pat for pat, action in rules if action == "deny"]
+    offenders = {}
+    for pat in denies:
+        for p in paths:
+            for shape in READ_ONLY_SHAPES:
+                cmd = shape % p
+                if fnmatch.fnmatchcase(cmd, pat) and decide(rules, cmd) == "deny":
+                    offenders.setdefault(pat, []).append(cmd)
+                    break
+            if pat in offenders:
+                break
+    assert not offenders, "deny patterns that fire on a tracked path in a read-only command: %r" % offenders
