@@ -1680,6 +1680,8 @@ def test_item8_probes_are_written_to_disk_and_ledger_renders_on_a_timer(tmp_path
     ledger = env.run_root / "LEDGER.md"
     text = ledger.read_text()
     assert text.startswith("# LEDGER") and "| L00 | " in text and "| L04 | WAITING_DEPENDENCY |" in text
+    header = text.split("| task |", 1)[0]
+    assert "legend: INTEGRATED = box-verified, reviewed and merged into the union; hosted evidence is the `<ID>-HOSTED` twin row" in header, "§48 legend in the header (D86)"
     first = drv._last_render_mono
     drv.tick()
     assert drv._last_render_mono == first, "3600 s timer has not elapsed"

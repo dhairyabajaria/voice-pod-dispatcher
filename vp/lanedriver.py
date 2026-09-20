@@ -352,6 +352,12 @@ DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
 # active == 0, reload these helper modules in dependency order, load a fresh copy
 # of lanedriver.py and rebind every live object's class to it, resume.
 RELOAD_FILE = "RELOAD"
+# §48: an outside audit read INTEGRATED lanes as "claimed hosted proof"; the
+# ledger says what the state means.  A lane's hosted evidence lives on its
+# `<ID>-HOSTED` twin row, never on the INTEGRATED row itself.
+LEDGER_LEGEND = ("legend: INTEGRATED = box-verified, reviewed and merged into the union; "
+                 "hosted evidence is the `<ID>-HOSTED` twin row")
+
 RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpgha_overlay", "vpgha", "vpdriver", "vp_box_lock", "vpproof", "vpmerge",
                 "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
@@ -2793,7 +2799,8 @@ class LaneDriver(object):
                  "generated: %s (tick %d, pid %d)" % (utc_ms(), self.tick_count, os.getpid()),
                  "spend: $%.2f  tokens: %s" % (usd, json.dumps(tokens, sort_keys=True)),
                  "live: %d  parked: %s" % (len(live), json.dumps(parked, sort_keys=True) if parked else "none"),
-                 "states: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())), "",
+                 "states: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())),
+                 LEDGER_LEGEND, "",
                  "| task | state | kind | attempt | unlocks | updated | note |",
                  "| --- | --- | --- | --- | --- | --- | --- |"]
         for tid in sorted(tasks):
