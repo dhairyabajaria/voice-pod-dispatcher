@@ -4043,14 +4043,43 @@ class LaneDriver(object):
             except OSError:
                 pass
 
+    def _archive_vp(self, task, tdir, wt):
+        """D107 (P3, disk analysis 2026-09-20): copy <wt>/.vp -> <tdir>/vp at
+        completion.  The worktree's .vp is git-excluded and was a terminal row's
+        ONLY copy of its RESULT/FINDINGS/PROOF, so no worktree could ever be
+        reaped without destroying evidence.  -> archive path or None."""
+        wt = Path(wt) if wt else self.worktree_path(task)
+        src = wt / ".vp"
+        if not src.is_dir():
+            return None
+        dst = Path(tdir) / "vp"
+        try:
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            n = sum(1 for _ in dst.rglob("*") if _.is_file())
+            size = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
+            self.log("ARCHIVE %s .vp -> %s (%d file(s), %d KB, D107)" % (task, dst.relative_to(self.run_root)
+                                                                       if str(dst).startswith(str(self.run_root))
+                                                                       else dst, n, size // 1024))
+            return dst
+        except OSError as exc:
+            self.alert("VP_ARCHIVE_FAILED", "%s: .vp not archived to %s: %s (the worktree stays the only copy)"
+                       % (task, dst, str(exc)[:200]), task)
+            return None
+
     def _complete(self, task, attempt, outcome, tdir, evidence=(), output_sha=None, tree_sha=None,
                   reason=None, verdict=None, fails=None, wt=None, kind=None, hosted_owed=None):
         ev = [str(p) for p in evidence if p and Path(p).exists()]
+        archive = self._archive_vp(task, tdir, wt)
+        if archive is not None:
+            # evidence that lived in the worktree's .vp is recorded at its archived path
+            vp_dir = str((Path(wt) if wt else self.worktree_path(task)) / ".vp")
+            ev = [str(archive / Path(p).relative_to(vp_dir)) if p.startswith(vp_dir + os.sep)
+                  and (archive / Path(p).relative_to(vp_dir)).exists() else p for p in ev]
         unlock = outcome == "VERIFIED" and bool(output_sha) and bool(ev)
         harvest = {"ts": utc_ms(), "task": task, "attempt": attempt, "outcome": outcome,
                    "output_sha": output_sha, "tree_sha": tree_sha, "evidence": ev,
                    "reason": reason, "fails": fails or [], "unlock_dependents": unlock,
-                   "hosted_owed": list(hosted_owed or [])}
+                   "hosted_owed": list(hosted_owed or []), "vp_archive": str(archive) if archive else None}
         try:
             (tdir / "harvest.json").write_text(json.dumps(harvest, indent=2, sort_keys=True),
                                                encoding="utf-8")

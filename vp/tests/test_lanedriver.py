@@ -330,7 +330,15 @@ def test_l00_verified_unlocks_l01_l04_and_all_complete(tmp_path):
     assert (tdir / "prompt.md").read_text() == lanedriver.BUILDER_PROMPT
     rec = json.loads((tdir / "record.json").read_text())
     assert rec["task"] == "L02" and rec["prompt_sha256"]
-    assert json.loads((tdir / "harvest.json").read_text())["outcome"] == "VERIFIED"
+    harvest = json.loads((tdir / "harvest.json").read_text())
+    assert harvest["outcome"] == "VERIFIED"
+    # D107 (P3): the worktree's .vp is archived into the turn dir at completion and
+    # evidence that lived in .vp is recorded at the archived path (the worktree
+    # can then be reaped without destroying evidence)
+    assert harvest["vp_archive"] == str(tdir / "vp") and (tdir / "vp" / "PACKET.md").exists()
+    wt_vp = str(env.tmp / "wt" / "L02" / ".vp")
+    assert not any(e.startswith(wt_vp) for e in harvest["evidence"]), harvest["evidence"]
+    assert "ARCHIVE L02 .vp -> " in (env.run_root / "driver.log").read_text()
     hb = json.loads((env.run_root / "driver.heartbeat").read_text())
     assert hb["tick"] == 2 and hb["sequence"] > 0
     assert len((env.run_root / "costs.jsonl").read_text().splitlines()) == 6  # 5 turns + grader
