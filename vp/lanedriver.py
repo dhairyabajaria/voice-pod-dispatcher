@@ -744,14 +744,21 @@ class LaneDriver(object):
     def _guards(self):
         gb = self.disk_gb()
         floor = float(self.night.get("pause_on_disk_gb", 25))
-        if gb is not None and gb < floor:
+        # D129: one threshold is not a gate, it is a coin flip at the boundary.  Free
+        # space sitting near `floor` paused and resumed on alternating ticks, with a
+        # DISK alert every time it crossed (reported as "flaps every minute").  Resume
+        # only above a HIGHER mark, so recovery has to be real: default floor + 10.
+        resume = max(float(self.night.get("resume_on_disk_gb", floor + 10)), floor)
+        if gb is None:
+            pass                              # unknown free space moves the gate neither way
+        elif gb < floor:
             if not self._disk_paused:
                 self._disk_paused = True
-                self.alert("DISK", "free disk %.1f GB < %.0f GB: no new worktrees or claims"
-                           % (gb, floor))
-        elif self._disk_paused:
+                self.alert("DISK", "free disk %.1f GB < %.0f GB: no new worktrees or claims "
+                           "(resumes at %.0f GB, D129)" % (gb, floor, resume))
+        elif self._disk_paused and gb >= resume:
             self._disk_paused = False
-            self.log("disk recovered: %.1f GB" % gb)
+            self.log("disk recovered: %.1f GB (>= resume %.0f GB, D129)" % (gb, resume))
         # D76: below memory_stop_below_pct (default 20) no new claims at all; between
         # that and proof.memory_hold_below_pct (30) only box proofs are held (laneproof)
         pct = self.memory_free_pct()

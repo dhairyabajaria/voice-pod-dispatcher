@@ -50,12 +50,22 @@ ACCOUNTS = (ACCOUNT,)
 DEFAULT_ROTATION = (ACCOUNT,)
 TARGETS = {ACCOUNT: {"repo": REPO, "push_remote": None, "org": "GitHub Actions (Oracle fleet)"}}
 FIND_RUN_TRIES, FIND_RUN_WAIT_S = 18, 5          # a dispatched run appears within seconds; allow 90 s
-# D102 (owner order via the Architect, 2026-09-20 14:3xZ): the fleet is 12 runners
-# and one canary peaks at ~15 jobs, so 2 full pipelines run concurrently and a
-# 3rd mostly queues on runners (GitHub queues, no harm).  Rule 6's "one in
-# flight" is superseded; roster proof.circleci.max_full_in_flight overrides
-# without a code change (laneproof.circle_cfg), the only= cap stays separate.
-MAX_IN_FLIGHT = 3
+# D102 (owner order via the Architect, 2026-09-20 14:3xZ), CORRECTED 2026-09-20 23:0xZ
+# with the CircleCI Manager's live runner counts: the original reasoned fleet-wide
+# ("the fleet is 12 runners") for what D112 later made a PER-BOX decision, so its
+# 3 was too high the moment full proofs were pinned.
+#
+# The fleet is 3 boxes / 36 runners, but a FULL pipeline pins to one of only two
+# (proof.circleci.hosts = voicepod-a, voicepod-c) at 12 runners each; voicepod-b
+# takes scoped/twin work only.  pick_host balances over those two, so by pigeonhole
+# ANY cap above 2 puts two full pipelines on one box -- the configuration the
+# -n3/-n6/-n9 runs measured at ~20% WORSE than serial.  2 is the only value that
+# guarantees one full pipeline per box, which is the ~15:12 (~1.25x) oversubscription
+# D102 accepted as no-harm; a doubled-up box is ~2.5x.
+#
+# Rule 6's "one in flight" is superseded; roster proof.circleci.max_full_in_flight
+# overrides without a code change (laneproof.circle_cfg), the only= cap stays separate.
+MAX_IN_FLIGHT = 2
 
 Cancelled = vpcircle.Cancelled
 classify = vpcircle.classify

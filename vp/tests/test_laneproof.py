@@ -708,9 +708,12 @@ def test_d83_the_gha_provider_is_chosen_by_the_roster_and_records_the_measured_c
     p = laneproof.Proof(tmp_path / "run", VP, tmp_path, git_fn, FakeExec({}), lambda m: None,
                         lambda k, t, task=None: None, cfg)
     assert p.provider() == "gha" and p.circle is vpgha and p.hosted_route() == "gha"
-    assert p.circle_cfg()["max_in_flight"] == 2, "D102: min(roster max_in_flight 2, gha MAX_IN_FLIGHT 3)"
+    assert p.circle_cfg()["max_in_flight"] == 2, "D102: min(roster max_in_flight 2, gha MAX_IN_FLIGHT 2)"
     p.cfg["circleci"]["max_in_flight"] = 12
-    assert p.circle_cfg()["max_in_flight"] == 3, "D102: the gha constant is 3 full pipelines"
+    assert p.circle_cfg()["max_in_flight"] == 2, \
+        ("D102 corrected 2026-09-20: the gha constant is 2, not 3. D112 pins a FULL proof to one of two "
+         "hosts, so by pigeonhole any cap above 2 puts two full pipelines on one 12-runner box -- the "
+         "configuration measured ~20% worse than serial")
     p.cfg["circleci"]["max_full_in_flight"] = 5
     assert p.circle_cfg()["max_in_flight"] == 5, "D102: roster max_full_in_flight overrides the constant"
     del p.cfg["circleci"]["max_full_in_flight"], p.cfg["circleci"]["max_in_flight"]

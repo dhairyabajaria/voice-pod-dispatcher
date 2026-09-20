@@ -3004,6 +3004,50 @@ def test_d126c_a_newer_twins_verdict_is_refused_and_a_withdrawal_can_be_reversed
     assert "RESTORE_GRADE R-SUP-HOSTED-R1 B7 UNSOUND -> FAIL" in (env.run_root / "driver.log").read_text()
 
 
+def test_d129_the_disk_gate_resumes_above_a_higher_mark_than_it_pauses_at(tmp_path):
+    """D129: the gate had ONE threshold, so free space sitting near it paused and
+    resumed on alternating ticks with a DISK alert each crossing ("flaps every
+    minute"). Resume now needs a higher mark than pause, so recovery has to be real.
+    Unknown free space moves the gate neither way."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv.night["pause_on_disk_gb"] = 25
+    seen = []
+    drv.disk_gb = lambda: seen[-1]
+    seen.append(90.0); drv._guards()
+    assert drv._disk_paused is False
+    seen.append(24.0); drv._guards()
+    assert drv._disk_paused is True, "below the floor pauses"
+    # the old bug: 25.1 GB is above the floor and would have resumed instantly
+    for gb in (25.1, 30.0, 34.9):
+        seen.append(gb); drv._guards()
+        assert drv._disk_paused is True, "%s GB is recovery on paper, not in fact" % gb
+    seen.append(35.0); drv._guards()
+    assert drv._disk_paused is False, "floor + 10 is the resume mark"
+    log = (env.run_root / "driver.log").read_text()
+    assert "resumes at 35 GB" in log and "disk recovered: 35.0 GB (>= resume 35 GB, D129)" in log
+    assert log.count("ALERT DISK") == 1, "one alert per real crossing, not one per tick"
+    # an explicit resume mark is honoured, and one below the floor is clamped to it
+    drv.night["resume_on_disk_gb"] = 60
+    seen.append(10.0); drv._guards()
+    seen.append(50.0); drv._guards()
+    assert drv._disk_paused is True
+    seen.append(60.0); drv._guards()
+    assert drv._disk_paused is False
+    drv.night["resume_on_disk_gb"] = 5
+    seen.append(10.0); drv._guards()
+    assert drv._disk_paused is True
+    seen.append(25.0); drv._guards()
+    assert drv._disk_paused is False, "a resume mark below the floor clamps to the floor"
+    # unknown free space leaves the gate exactly as it was
+    seen.append(10.0); drv._guards()
+    assert drv._disk_paused is True
+    drv.disk_gb = lambda: None
+    drv._guards()
+    assert drv._disk_paused is True, "unknown disk never silently resumes"
+
+
 def test_d126a_a_one_shot_cli_recovers_its_pack_bindings_from_the_dispatch_records(tmp_path):
     """D126a: _pack_restore needs the live `tasks` view and runs only inside the
     loop, so `unsound-grade` -- a one-shot process -- had an empty pack_by_task and
