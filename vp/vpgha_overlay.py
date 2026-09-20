@@ -56,12 +56,14 @@ DEFAULT_UPLOAD_ACTION = "actions/upload-artifact@v4"
 SHARD_JOB = "platform-shards"
 SHARD_WORKERS = 3
 # Where each shard's pgdata (TMPDIR) lives.  On tmpfs only once the product's
-# test fixture caps WAL (Advisor 2026-09-20: pg_wal grows to max_wal_size=1GB
+# test support caps WAL (Advisor 2026-09-20: pg_wal grows to max_wal_size=1GB
 # per cluster, 24 clusters = 24GB worst case, so /dev/shm overflowed in run
-# 35478392897 regardless of its size); until platform/tests/conftest.py
-# `_server` applies `ALTER SYSTEM SET max_wal_size='64MB' ...` the overlay
-# keeps pgdata on the runner disk.  Flip SHARD_TMP_ON_SHM once that lands.
-SHARD_TMP_ON_SHM = False
+# 35478392897 regardless of its size).  The cap landed: R-TEST-PG-WAL-CAP-R2
+# VERIFIED 04:27:02Z (platform/testsupport/postgres.py `temporary_postgres`
+# applies `ALTER SYSTEM SET max_wal_size='64MB' ...` to every disposable
+# cluster), so from union-43 on pgdata is on /dev/shm behind the run-time
+# size assert (SHARD_SHM_ASSERT); the disk path stays selectable here.
+SHARD_TMP_ON_SHM = True
 SHARD_SHM_MIN_GB = 6                                   # ~24 clusters x 150MB + headroom
 _SHARD_DIR_DISK = "${{ runner.temp }}/pgdata-${{ matrix.shard }}"
 _SHARD_DIR_SHM = "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"

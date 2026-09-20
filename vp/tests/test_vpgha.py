@@ -186,15 +186,17 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
             "  --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80\n") in plat
     assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][6]["run"]
     # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
-    prep = jobs["platform-shards"]["steps"][2]
-    assert prep["run"] == ('rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"\n'
-                           'mkdir -p "$RUNNER_TEMP/xdg" "${{ runner.temp }}/pgdata-${{ matrix.shard }}"'), "rm FIRST: a killed run leaks nothing"
+    # junit prep, linger assert, shm size assert, pgserver prep, checkout, run
+    assert jobs["platform-shards"]["steps"][2]["name"].startswith("Assert /dev/shm")
+    prep = jobs["platform-shards"]["steps"][3]
+    assert prep["run"] == ('rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"\n'
+                           'mkdir -p "$RUNNER_TEMP/xdg" "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"'), "rm FIRST: a killed run leaks nothing"
     assert jobs["platform-shards"]["steps"][-2] == {"name": "Remove this shard's pgdata dir (vp-proof)", "if": "always()",
-                                                    "run": 'rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"'}
-    assert not any("/dev/shm/pytest" in json.dumps(st) for st in jobs["platform-shards"]["steps"]), "tmpfs only once the WAL cap lands"
-    shard_step = jobs["platform-shards"]["steps"][4]     # junit prep, linger assert, pgserver prep, checkout, run
+                                                    "run": 'rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"'}
+    assert vpgha_overlay.SHARD_TMP_ON_SHM is True, "WAL cap landed (R-TEST-PG-WAL-CAP-R2 VERIFIED): shards on tmpfs"
+    shard_step = jobs["platform-shards"]["steps"][5]
     assert shard_step["env"]["XDG_RUNTIME_DIR"] == "${{ runner.temp }}/xdg"
-    assert shard_step["env"]["TMPDIR"] == "${{ runner.temp }}/pgdata-${{ matrix.shard }}", "on disk: /dev/shm filled in run 35478392897"
+    assert shard_step["env"]["TMPDIR"] == "/dev/shm/pytest-platform-shards-${{ matrix.shard }}", "tmpfs: WAL cap landed (R-TEST-PG-WAL-CAP-R2)"
     assert shard_step["env"]["COVERAGE_FILE"] == ".coverage.shard-${{ matrix.shard }}", "the candidate's own env kept"
     assert all("env" not in s or "XDG_RUNTIME_DIR" not in s["env"] for s in jobs["platform"]["steps"]), "only the shard job"
     shard = shard_step["run"]

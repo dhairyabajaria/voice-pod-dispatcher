@@ -89,3 +89,33 @@ def test_d88_read_only_commands_on_tool_named_files_are_allowed_and_runs_stay_de
     if name == "vp-builder.md":
         for cmd in MUST_ALLOW_STILL:
             assert decide(rules, cmd) == "allow", "%s: collection-only lost: %s" % (name, cmd)
+
+
+GRADER_DENIED = [   # turns/R-TEST-PG-WAL-CAP-R2/.../1-r1-grader-export.json (04:27Z)
+    "ls -la .vp",
+    'git grep -n "ALTER SYSTEM" HEAD -- platform',
+    'git grep -n "pg_reload_conf" HEAD -- platform',
+    'grep -n "SHOW" platform/tests/test_pgserver_lifecycle.py',
+    "sed -n 180,240p platform/testsupport/postgres.py",
+    "cat platform/testsupport/postgres.py",
+    "git diff --stat c6b3e08e..HEAD -- platform",
+]
+GRADER_MUST_DENY = [
+    "uv run pytest -q tests",
+    "python3 - <<'EOF'\nprint(1)\nEOF",
+    "cat x.py && rm -rf platform",
+    "ls | sh",
+    "cat a.py > b.py",
+    "pg_ctl start",
+]
+
+
+def test_d90_the_grader_can_run_read_only_check_lines_and_nothing_else():
+    path = AGENTS / "vp-junior.md"
+    if not path.is_file():
+        pytest.skip("vp-junior.md absent")
+    rules = _bash_rules(path.read_text(encoding="utf-8"))
+    for cmd in GRADER_DENIED:
+        assert decide(rules, cmd) == "allow", "grader read-only command denied: %s" % cmd
+    for cmd in GRADER_MUST_DENY:
+        assert decide(rules, cmd) == "deny", "grader run/write shape got through: %s" % cmd
