@@ -76,6 +76,20 @@ SHARD_SHM_ASSERT = {"name": "Assert /dev/shm is large enough for this shard (vp-
                            % (SHARD_SHM_MIN_GB * 1024 * 1024, SHARD_SHM_MIN_GB)}
 SHARD_CLEANUP = {"name": "Remove this shard's pgdata dir (vp-proof)", "if": "always()",
                  "run": 'rm -rf "%s"' % SHARD_DIR}
+# CircleCI Manager 2026-09-20 (host fix applied out of band on the Oracle box):
+# systemd-logind's RemoveIPC wipes a user's /dev/shm + POSIX shm when their
+# last login session ends, so an SSH logout mid-run killed every shard's
+# live Postgres ("Failed to remove POSIX shared memory directory ...").
+# linger + RemoveIPC=no are the fix; this step only ASSERTS linger so a
+# regression (image rebuild, someone disabling it) is one loud red job.
+# It goes on every job that runs pytest (each one starts pgserver clusters).
+LINGER_ASSERT = {"name": "Assert the runner user has linger enabled (vp-proof)",
+                 "run": 'set -euo pipefail\n'
+                        'linger="$(loginctl show-user "$(id -un)" -p Linger --value)"\n'
+                        'echo "Linger=$linger"\n'
+                        'test "$linger" = "yes" || { echo "::error::linger is off for $(id -un): '
+                        'logind RemoveIPC will wipe /dev/shm mid-run; fix on the host '
+                        '(loginctl enable-linger + RemoveIPC=no), not here"; exit 1; }'}
 
 PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run pytest\b[^\n]*?)(?P<cont>\s*\\)?$", re.M)
 FLOOR_RE = re.compile(r"ci_collection_floor\.py (floor|control|freshness)\b[^\n]*")
@@ -170,6 +184,8 @@ def render_jobs(ci, floor_supports_branch=False):
             steps.append(step)
         if job_id == SHARD_JOB:
             steps.append(dict(SHARD_CLEANUP))
+        if legs[0] and any("pytest" in str(st.get("run", "")) for st in steps):
+            steps.insert(1, dict(LINGER_ASSERT))
         steps.append({
             "name": "Retain junit results (vp-proof)",
             "if": "always()",

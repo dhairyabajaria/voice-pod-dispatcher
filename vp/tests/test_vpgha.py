@@ -167,18 +167,24 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     assert jobs["platform-shards"]["steps"][-1]["with"]["name"] == "junit-platform-shards-${{ matrix.shard }}"
     assert jobs["supply-chain"]["name"] == "vp/supply-chain-${{ matrix.component }}"
     # pytest legs: junit per leg, xunit1, continuation lines intact; shard leg -n SHARD_WORKERS
-    plat = jobs["platform"]["steps"][3]["run"]
+    # every pytest-running job asserts linger right after the junit prep (CircleCI Manager, logind RemoveIPC)
+    for jid in ("platform", "platform-shards", "agent", "deploy-contracts"):
+        st = jobs[jid]["steps"][1]
+        assert st["name"].startswith("Assert the runner user has linger"), jid
+        assert 'loginctl show-user "$(id -un)" -p Linger --value' in st["run"] and "enable-linger" not in st["run"].split("::error::")[0], "assert only"
+    assert not any("linger" in str(st.get("name", "")) for st in jobs["portal"]["steps"]), "no pytest, no linger step"
+    plat = jobs["platform"]["steps"][4]["run"]
     assert ("uv run pytest -q --cov=core --junitxml=${{ runner.temp }}/junit/platform-1.xml -o junit_family=xunit1 \\\n"
             "  --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80\n") in plat
-    assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][4]["run"]
+    assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][5]["run"]
     # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
-    prep = jobs["platform-shards"]["steps"][1]
+    prep = jobs["platform-shards"]["steps"][2]
     assert prep["run"] == ('rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"\n'
                            'mkdir -p "$RUNNER_TEMP/xdg" "${{ runner.temp }}/pgdata-${{ matrix.shard }}"'), "rm FIRST: a killed run leaks nothing"
     assert jobs["platform-shards"]["steps"][-2] == {"name": "Remove this shard's pgdata dir (vp-proof)", "if": "always()",
                                                     "run": 'rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"'}
-    assert not any("/dev/shm" in json.dumps(st) for st in jobs["platform-shards"]["steps"]), "tmpfs only once the WAL cap lands"
-    shard_step = jobs["platform-shards"]["steps"][3]     # junit prep, pgserver prep, checkout, run
+    assert not any("/dev/shm/pytest" in json.dumps(st) for st in jobs["platform-shards"]["steps"]), "tmpfs only once the WAL cap lands"
+    shard_step = jobs["platform-shards"]["steps"][4]     # junit prep, linger assert, pgserver prep, checkout, run
     assert shard_step["env"]["XDG_RUNTIME_DIR"] == "${{ runner.temp }}/xdg"
     assert shard_step["env"]["TMPDIR"] == "${{ runner.temp }}/pgdata-${{ matrix.shard }}", "on disk: /dev/shm filled in run 35478392897"
     assert shard_step["env"]["COVERAGE_FILE"] == ".coverage.shard-${{ matrix.shard }}", "the candidate's own env kept"
@@ -187,11 +193,11 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     assert "uv run pytest -q -n 3 --dist loadfile $files --junitxml=${{ runner.temp }}/junit/platform-shards-${{ matrix.shard }}-1.xml -o junit_family=xunit1 \\\n  --cov=core" in shard
     assert "<<'EOF'" in shard and "-n auto" not in shard
     agent = [s["run"] for s in jobs["agent"]["steps"] if s.get("run")]
-    assert agent[1].endswith("--junitxml=${{ runner.temp }}/junit/agent-1.xml -o junit_family=xunit1")
-    assert "--junitxml=${{ runner.temp }}/junit/agent-2.xml" in agent[2]
+    assert agent[2].endswith("--junitxml=${{ runner.temp }}/junit/agent-1.xml -o junit_family=xunit1")
+    assert "--junitxml=${{ runner.temp }}/junit/agent-2.xml" in agent[3]
     # rule 5: --branch on every floor call when the candidate's script takes it
-    assert jobs["platform"]["steps"][2]["run"].endswith('--baseline-file tests/collection_baseline.json --branch "$GITHUB_REF_NAME"')
-    assert agent[3].endswith('--branch "$GITHUB_REF_NAME"')
+    assert jobs["platform"]["steps"][3]["run"].endswith('--baseline-file tests/collection_baseline.json --branch "$GITHUB_REF_NAME"')
+    assert agent[4].endswith('--branch "$GITHUB_REF_NAME"')
     assert jobs["portal"]["steps"][2]["run"].endswith('--branch "$GITHUB_REF_NAME"')
     # vitest: junit reporter beside the json one
     assert ("npm run test -- --reporter=json --reporter=junit --outputFile.json=/tmp/portal-test-results.json "
@@ -222,11 +228,12 @@ def test_overlay_on_tmpfs_asserts_the_shm_size_and_never_remounts(monkeypatch):
     monkeypatch.setattr(vpgha_overlay, "SHARD_CLEANUP", {"name": "clean", "if": "always()", "run": 'rm -rf "%s"' % vpgha_overlay._SHARD_DIR_SHM})
     jobs = yaml.safe_load(vpgha_overlay.render(MINI_CI))["jobs"]
     steps = jobs["platform-shards"]["steps"]
-    assert steps[1]["name"].startswith("Assert /dev/shm")
-    assert "df -Pk /dev/shm" in steps[1]["run"] and "-ge %d" % (vpgha_overlay.SHARD_SHM_MIN_GB * 1024 * 1024) in steps[1]["run"]
-    assert "mount" not in steps[1]["run"], "assert, never mutate"
-    assert steps[2]["run"].startswith('rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"')
-    assert steps[4]["env"]["TMPDIR"] == "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"
+    assert steps[1]["name"].startswith("Assert the runner user has linger")
+    assert steps[2]["name"].startswith("Assert /dev/shm")
+    assert "df -Pk /dev/shm" in steps[2]["run"] and "-ge %d" % (vpgha_overlay.SHARD_SHM_MIN_GB * 1024 * 1024) in steps[2]["run"]
+    assert "mount" not in steps[2]["run"], "assert, never mutate"
+    assert steps[3]["run"].startswith('rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"')
+    assert steps[5]["env"]["TMPDIR"] == "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"
     assert steps[-2]["if"] == "always()" and steps[-2]["run"] == 'rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"'
     assert not any("Assert /dev/shm" in str(st.get("name")) for st in jobs["platform"]["steps"])
 
