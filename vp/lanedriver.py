@@ -4923,9 +4923,39 @@ class LaneDriver(object):
             return ""                             # cut from trunk / the packet base: nothing to explain
         return self.STACKED_BASE_NOTE % (base[:12], (pbase or trunk)[:12])
 
+    def _fill_attempt(self, path, rnd, task):
+        """D96 (§86/§91): `attempt` in RESULT.json is the integer round number --
+        a value the driver owns, not the builder.  L-TRANSCRIPT-READ-AUDIT-
+        TESTBENCH lost 3 turns to its absence and -R1 a 4th to a string copied
+        from DISPATCH.json.  When it is missing or not an integer (and the file
+        is otherwise a JSON object), fill it with the round and say so."""
+        try:
+            rec = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(rec, dict):
+            return
+        val = rec.get("attempt")
+        ok = (isinstance(val, int) and not isinstance(val, bool)) or (isinstance(val, str) and val.isdigit())
+        if ok:
+            return
+        rec["attempt"] = int(rnd)
+        try:
+            Path(path).write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            return
+        self.log("RESULT %s attempt %s -> %d filled by the driver (D96: the round number is ours)"
+                 % (task, "missing" if val is None else repr(val)[:40], int(rnd)))
+
     def _spec(self, role, task, wt, prompt, rcfg, runner, server, sid, out_path, validator,
               timeout_s, tdir, tag, expect_fence, rnd):
         prompt = prompt + self._base_note(role, wt)
+        if validator is vpschema.validate_result:
+            inner = validator
+
+            def validator(path, _inner=inner, _rnd=rnd, _task=task):
+                self._fill_attempt(path, _rnd, _task)
+                return _inner(path)
         base = dict(variant=rcfg.get("variant"), agent=rcfg.get("agent"), session_id=sid,
                     out_path=str(out_path), timeout_s=timeout_s, log_dir=str(tdir), tag=tag,
                     validator=validator, title="%s %s r%d" % (task, role, rnd),

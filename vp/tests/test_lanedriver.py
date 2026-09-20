@@ -2296,3 +2296,42 @@ def test_d94_a_hosted_full_suite_pass_is_adopted_by_a_twin_of_any_kind_on_the_sa
     assert drv._reusable_proof(sha, "agent", []) is None, "a box PASS proves one suite only"
     rec("proof-canary-004", kind="platform", paths=["t/a.py"], ts="2026-09-20T12:03:00.000Z")
     assert drv._reusable_proof(sha, "agent", []) is None, "a targeted hosted PASS is not the full suite"
+
+
+def test_d96_the_driver_fills_a_missing_or_string_result_attempt_with_the_round(tmp_path):
+    """D96 (§86/§91): `attempt` is the integer round number, a value the driver
+    owns.  L-TRANSCRIPT-READ-AUDIT-TESTBENCH lost three builder turns to its
+    absence and -R1 a fourth to a DISPATCH.json string.  The builder validator
+    now fills it (missing or non-integer) before validating; a correct value
+    is left alone; a broken file is left alone for the schema to name."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    wt = tmp_path / "wt-d96"
+    wt.mkdir()
+    out = wt / "RESULT.json"
+    tdir = tmp_path / "turns-d96"
+    tdir.mkdir()
+    rcfg = {"model": "m", "agent": "vp-builder"}
+    spec = drv._spec("builder", "L02", wt, "p", rcfg, "opencode", next(iter(drv.servers)), None, out,
+                     lanedriver.vpschema.validate_result, 60.0, tdir, "1-r2-builder", False, 2)
+    base = {"item": "L02", "commit": "a" * 40, "base": "b" * 40,
+            "diff_stat": {"files": 1, "insertions": 1, "deletions": 0},
+            "checks": [], "disputes": [], "blocked": None, "notes": ""}
+    out.write_text(json.dumps(base))                                   # no attempt at all
+    ok, errs = spec.validator(str(out))
+    assert ok, errs
+    assert json.loads(out.read_text())["attempt"] == 2
+    out.write_text(json.dumps(dict(base, attempt="L02-a20260920T125649106")))   # the DISPATCH string
+    ok, errs = spec.validator(str(out))
+    assert ok, errs
+    assert json.loads(out.read_text())["attempt"] == 2
+    out.write_text(json.dumps(dict(base, attempt=7)))                  # a correct value is kept
+    ok, _ = spec.validator(str(out))
+    assert ok and json.loads(out.read_text())["attempt"] == 7
+    out.write_text("{not json")                                        # a broken file is the schema's to name
+    ok, errs = spec.validator(str(out))
+    assert not ok
+    log = (env.run_root / "driver.log").read_text()
+    assert log.count("attempt missing -> 2 filled by the driver (D96") == 1
+    assert log.count("-> 2 filled by the driver") == 2
