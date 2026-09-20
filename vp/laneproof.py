@@ -539,13 +539,13 @@ class Proof(object):
                 # recorded as CANCELLED (the driver retries after the backoff, the
                 # canary does not release, D79 never reuses it), never as a
                 # PASS/FAIL_* that later rounds or the reuse check could trust
-                self.log("PROOF %s %s circleci pipeline %s was cancelled (%d job(s)/workflow(s)) -> CANCELLED"
-                         % (task, pid, pipeline_id, len(cls["reds"])))
+                self.log("PROOF %s %s %s pipeline %s was cancelled (%d job(s)/workflow(s)) -> CANCELLED"
+                         % (task, pid, self.hosted_route(), pipeline_id, len(cls["reds"])))
             if status == "FAIL_PRODUCT" and failed:
                 nodes = self.untouched_red_nodes(wt, base, cand, failed, cc)
                 if nodes:
-                    self.log("PROOF %s %s circleci %d reds in untouched files -> box re-run"
-                             % (task, pid, len(nodes)))
+                    self.log("PROOF %s %s %s %d reds in untouched files -> box re-run"
+                             % (task, pid, self.hosted_route(), len(nodes)))
                     st2, still = self.box_rerun(pid, cand, wt, nodes)
                     flake = {"nodes": nodes, "rerun": st2, "still_red": still}
                     if st2 == "PASS":
@@ -571,8 +571,8 @@ class Proof(object):
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
             self._write(pid, rec)
-            self.log("PROOF %s %s -> %s (circleci pipeline %s, %d reds)"
-                     % (task, pid, status, pipeline_id, len(cls["reds"])))
+            self.log("PROOF %s %s -> %s (%s pipeline %s, %d red job(s), %d red node(s))"
+                     % (task, pid, status, self.hosted_route(), pipeline_id, len(cls["reds"]), len(failed)))
             return rec
         finally:
             with self._lock:

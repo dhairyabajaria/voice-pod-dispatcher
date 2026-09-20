@@ -29,6 +29,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -163,6 +164,9 @@ OUTPUT_OF_ROLE = {"builder": "RESULT.json", "junior": "FINDINGS.json",
 PROMPT_OF_ROLE = {"builder": BUILDER_PROMPT, "junior": JUNIOR_PROMPT,
                   "infra": BUILDER_PROMPT, "senior": SENIOR_PROMPT,
                   "final": FINAL_PROMPT}
+_VITEST_FILE_RE = re.compile(r"\.(tsx?|jsx?|mjs|cjs)$")
+
+
 def circle_failed_nodes(failed_tests):
     """CircleCI `tests` items (junit xunit1 from pytest: file, classname,
     name, message) -> (sorted node ids, {node: message}).  `file` is the
@@ -176,6 +180,8 @@ def circle_failed_nodes(failed_tests):
             name = str(t.get("name") or "").strip()
             path = str(t.get("file") or "").strip()
             cls = str(t.get("classname") or "").strip()
+            if not path and cls and ("/" in cls or _VITEST_FILE_RE.search(cls)):
+                path = cls            # vitest junit: classname IS the file path (src/App.test.tsx)
             if not path and cls:
                 parts = cls.split(".")
                 mod = [x for x in parts if x[:1].islower() or x[:1] == "_"]
