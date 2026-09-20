@@ -3979,9 +3979,59 @@ class LaneDriver(object):
         return "ready:%s:%s:%s" % (row.get("state"), row.get("attempt_id"), row.get("claim_id"))
 
     def _base_for(self, row, state):
+        """the sha a row is built on: the candidate for a review, else trunk.  A
+        packet's declared base_sha stays ADVISORY -- it is reported, never obeyed.
+
+        D130 was going to make the pin binding when it ran ahead of trunk, because
+        three packets lost time tonight to a trunk the human fast-forward had not
+        reached.  Measured against the pack before building it, that was the wrong
+        change (Architect, 23:1xZ): of 163 packets declaring a base_sha, 135 pin a
+        commit trunk already contains (binding changes nothing), 28 pin a commit off
+        trunk's line -- building on one of those forks the lane: green, unmergeable,
+        and only discovered at integration -- and ZERO currently pin a commit ahead
+        of trunk, so the branch that motivated the change has no population at all.
+        The real mechanism for "this packet needs another packet's output in its
+        base" already exists and is depends_on + _unstacked_deps.
+
+        What survives is the half that costs nothing and cannot fork a lane: say so
+        when the pin does not describe the base we are about to build on.  A packet
+        carried a base_sha that was not a commit in this repo tonight -- it shared a
+        12-character prefix with trunk and differed after it -- and nothing noticed
+        until it was read by hand."""
         if row.get("review_key") or (row.get("kind") in REVIEW_KINDS):
             return (state.get("candidate") or {}).get("sha")
-        return self.trunk_sha()
+        trunk = self.trunk_sha()
+        self._check_base_pin(row, trunk)
+        return trunk
+
+    def _check_base_pin(self, row, base):
+        """D130 (diagnostic only): compare a packet's declared base_sha with the base
+        the row is actually claimed at, and report the three ways they disagree.
+        Never changes the base; never holds the row."""
+        pin = str((self.packet_for(row.get("task_id")) or {}).get("base_sha") or "").strip()
+        if not pin or not base or base.startswith(pin) or pin.startswith(base):
+            return
+        task = row.get("task_id") or "?"
+        if self.git(["-C", str(self.trunk), "cat-file", "-e", "%s^{commit}" % pin])[0] != 0:
+            self.alert_once("base-pin-missing:%s" % pin[:12], "BASE_PIN_UNKNOWN",
+                            "%s declares base_sha %s, which is not a commit in this repo; it is claimed at "
+                            "%s (D130)" % (task, pin[:12], base[:12]), task)
+            return
+        if self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", pin, base])[0] == 0:
+            return                                # the base carries the pin: nothing to say
+        key = ("base-pin", task, pin[:12])
+        if key in self._pack_logged:
+            return
+        self._pack_logged.add(key)
+        if self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", base, pin])[0] == 0:
+            self.log("BASE %s declares base_sha %s, which is AHEAD of the claim base %s: the fast-forward "
+                     "has not reached it, so anything that commit introduced is absent (D130)"
+                     % (task, pin[:12], base[:12]))
+        else:
+            self.alert_once("base-pin-diverged:%s" % pin[:12], "BASE_PIN_DIVERGED",
+                            "%s declares base_sha %s, which is neither an ancestor nor a descendant of the "
+                            "claim base %s; the pin does not describe what it builds on (D130)"
+                            % (task, pin[:12], base[:12]), task)
 
     STACK_HOLD_S = 600
 
@@ -4060,8 +4110,24 @@ class LaneDriver(object):
         landed = {r: [t for t in rows_of(r) if (tasks.get(t) or {}).get("state") in self.UNION_MEMBER_STATES]
                   for r in req}
         missing = [r for r in req if not landed[r]]
-        not_carried = [r for r in req if landed[r] and not any(t in members for t in landed[r])]
-        if ptask not in members or members.get(ptask) != out:
+        # D131: "carried" means the BASE contains the fix, and the integration union is
+        # only one way to get there -- a fast-forward is the other.  _integration_members
+        # drops every row trunk already carries, so the moment the orchestrator ff'd
+        # trunk to union-100 the union went to ZERO members and this gate could no
+        # longer be satisfied by anything: 32 wall-batch twins sat in a 600 s
+        # TWIN_BASE_WAIT loop asking for members of an empty union (23:13Z, 23:18Z).
+        # Trunk containing the output satisfies the requirement exactly as well.
+        trunk = self.trunk_sha()
+
+        def in_trunk(sha):
+            return bool(sha) and bool(trunk) and \
+                self.git(["-C", str(self.trunk), "merge-base", "--is-ancestor", sha, trunk])[0] == 0
+
+        def _carries(t):
+            return t in members or in_trunk((tasks.get(t) or {}).get("output_sha"))
+
+        not_carried = [r for r in req if landed[r] and not any(_carries(t) for t in landed[r])]
+        if (ptask not in members or members.get(ptask) != out) and not in_trunk(out):
             not_carried.append(ptask)
         if missing or not_carried or not latest:
             why = "TWIN_BASE_WAIT %s: requires not VERIFIED %s; not in the integration union %s" % (
@@ -4069,11 +4135,28 @@ class LaneDriver(object):
             self.note_hold(task, self._ready_key(row), why, self.STACK_HOLD_S)
             return None, None
         base = latest["union_sha"]
+        # D131: after a fast-forward the newest union can be an EMPTY cut sitting at the
+        # run's frozen base -- union-101 was 0 members at 5deac821, 1200+ commits behind
+        # trunk.  Building a full-suite twin there would be far worse than the stale base
+        # this gate exists to avoid, so when trunk already contains the union tip, trunk
+        # IS the tip plus everything the ff brought with it.
+        if base != trunk and in_trunk(base):
+            self.log("BASE %s: integration union %s is already in trunk; building on trunk %s (D131)"
+                     % (task, str(base)[:12], str(trunk)[:12]))
+            base = trunk
         # D59: `on` reaches the scheduler as --stacked-on, which wants ROWS with an
         # output_sha -- the carried row of each require (L09-SEED-FIX-R4), never the
         # packet name (2026-09-19 14:36-14:42Z: L09-SEED-FIX-HOSTED struck out 3/3 on
         # "--stacked-on L09-SEED-FIX: not a row with an output_sha")
-        carried = [next(t for t in landed[r] if t in members) for r in req]
+        # D131: prefer the union member (D59's case, unchanged); fall back to the row
+        # trunk carries.  This was a bare `next(...)` over `members` -- with the empty
+        # post-ff union it raises StopIteration inside the claim path, so the D131 gate
+        # above would have turned a permanent hold into a crash.
+        def _carrier(r):
+            return (next((t for t in landed[r] if t in members), None)
+                    or next((t for t in landed[r] if _carries(t)), None))
+
+        carried = [t for t in (_carrier(r) for r in req) if t]
         return base, {"members": [{"task": t, "packet": self.pack_by_task.get(t) or t, "output_sha": sha, "depth": 0}
                                   for t, sha in sorted(members.items())],
                       "on": [ptask] + carried, "base": base,

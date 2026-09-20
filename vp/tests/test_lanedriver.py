@@ -3004,6 +3004,57 @@ def test_d126c_a_newer_twins_verdict_is_refused_and_a_withdrawal_can_be_reversed
     assert "RESTORE_GRADE R-SUP-HOSTED-R1 B7 UNSOUND -> FAIL" in (env.run_root / "driver.log").read_text()
 
 
+def test_d130_a_declared_base_sha_is_reported_never_obeyed(tmp_path):
+    """D130: a packet's base_sha stays advisory -- the row is still claimed at trunk.
+    The diagnostic says so when the pin does not describe that base: not a commit at
+    all (one packet carried a sha sharing trunk's 12-char prefix and differing after
+    it), ahead of it (the fast-forward has not arrived), or off its line (28 of 163
+    packets pin one of those; building on one forks the lane)."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    TRUNK, AHEAD, SIDE, GHOST = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    drv.trunk_sha = lambda: TRUNK
+    calls = []
+
+    def fake_git(args, **kw):
+        calls.append(args)
+        if "cat-file" in args:
+            return (1 if GHOST in " ".join(args) else 0), "", ""
+        if "merge-base" in args:
+            pin, base = args[-2], args[-1]          # --is-ancestor <pin> <base>
+            return (0 if (pin, base) in {(TRUNK, AHEAD)} else 1), "", ""
+        return 0, "", ""
+    drv.git = fake_git
+    drv.pack.update({"P": {"id": "P"}})
+    drv.pack_by_task.update({"T": "P"})
+    row = {"task_id": "T", "kind": "integration"}
+
+    drv.pack["P"]["base_sha"] = TRUNK
+    assert drv._base_for(row, {}) == TRUNK
+    assert not calls, "a pin equal to the base asks git nothing"
+
+    drv.pack["P"]["base_sha"] = GHOST
+    assert drv._base_for(row, {}) == TRUNK, "an unknown pin never moves the base"
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "BASE_PIN_UNKNOWN" in alerts and "is not a commit in this repo" in alerts
+
+    drv.pack["P"]["base_sha"] = AHEAD
+    assert drv._base_for(row, {}) == TRUNK, "a pin AHEAD of trunk is still not obeyed"
+    log = (env.run_root / "driver.log").read_text()
+    assert "is AHEAD of the claim base" in log and "bbbbbbbbbbbb" in log
+
+    drv.pack["P"]["base_sha"] = SIDE
+    assert drv._base_for(row, {}) == TRUNK, "an off-line pin never forks the lane"
+    alerts = (env.run_root / "alerts.jsonl").read_text()
+    assert "BASE_PIN_DIVERGED" in alerts
+
+    # a review still takes the candidate, and no pin check runs on that path
+    calls.clear()
+    assert drv._base_for({"task_id": "T", "review_key": "k"}, {"candidate": {"sha": "f" * 40}}) == "f" * 40
+    assert not calls
+
+
 def test_d129_the_disk_gate_resumes_above_a_higher_mark_than_it_pauses_at(tmp_path):
     """D129: the gate had ONE threshold, so free space sitting near it paused and
     resumed on alternating ticks with a DISK alert each crossing ("flaps every
@@ -3204,3 +3255,60 @@ def test_d126_unsound_grade_withdraws_one_row_keeps_the_old_verdict_and_re_raise
         drv.unsound_grade("L17-HOSTED-R3", "B4", "no such row")
     with pytest.raises(ValueError, match="not a hosted twin"):
         drv.unsound_grade("L17-V13", "B9", "the parent is not a twin")
+
+
+def test_d131_a_fast_forward_empties_the_union_and_the_twin_still_builds_on_trunk(tmp_path):
+    """D131: 2026-09-20 23:13-23:18Z every wall-batch twin sat in a 600 s
+    TWIN_BASE_WAIT loop.  The orchestrator had fast-forwarded trunk to union-100,
+    so _integration_members -- which drops every row trunk already carries -- cut
+    union-101 with ZERO members at the run's frozen base.  _twin_union_base asked
+    for members of that empty map, a condition nothing could satisfy, and its
+    `base = latest["union_sha"]` would have put the twin 1200 commits behind trunk
+    had the gate passed.  Trunk containing the fix satisfies the requirement, and
+    a union tip trunk already contains is not the tip any more -- trunk is."""
+    env = Env(tmp_path)
+    (env.trunk / "platform" / "fix.py").write_text("seed = 1\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "P-FIX")
+    fix_sha = git(env.trunk, "rev-parse", "HEAD")
+    (env.trunk / "platform" / "par.py").write_text("par = 1\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "P-PAR")
+    par_sha = git(env.trunk, "rev-parse", "HEAD")      # trunk HEAD: the ff landed both
+
+    def union(n, sha, members):
+        d = env.run_root / "unions" / str(n)
+        d.mkdir(parents=True)
+        (d / "members.json").write_text(json.dumps(
+            {"n": n, "union": "union-%d" % n, "for": ["INTEGRATION"], "status": "BUILT",
+             "union_sha": sha,
+             "members": [{"task": t, "output_sha": s} for t, s in members]}))
+
+    union(100, par_sha, [("P-FIX-R4", fix_sha), ("P-PAR", par_sha)])
+    union(101, env.base, [])                            # cut after the ff: empty, at the frozen base
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+    drv.pack_by_task = {"P-FIX-R4": "P-FIX", "P-PAR": "P-PAR"}
+    tasks = {"P-FIX-R4": {"state": "VERIFIED", "output_sha": fix_sha},
+             "P-PAR": {"state": "VERIFIED", "output_sha": par_sha}}
+    row = {"state": "READY", "attempt_id": 1, "claim_id": None}
+    tb = {"kind": "integration_union", "requires": ["P-FIX"]}
+
+    base, plan = drv._twin_union_base("P-PAR-HOSTED", row, {}, "P-PAR", par_sha, tasks, tb)
+
+    log = (env.run_root / "driver.log").read_text()
+    assert "TWIN_BASE_WAIT" not in log, log[-2000:]
+    assert base == par_sha and base != env.base, (base, par_sha, env.base)
+    assert plan["base"] == par_sha
+    # D59 is unchanged: the CARRIED ROW reaches --stacked-on, never the packet name
+    assert plan["on"] == ["P-PAR", "P-FIX-R4"], plan["on"]
+    assert "integration union %s is already in trunk" % env.base[:12] in log
+
+    # and a union that is genuinely ahead of trunk is still the base it always was
+    (env.trunk / "platform" / "later.py").write_text("later = 1\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "ahead")
+    ahead = git(env.trunk, "rev-parse", "HEAD")
+    git(env.trunk, "reset", "-q", "--hard", par_sha)     # trunk back to the ff point
+    union(102, ahead, [("P-FIX-R4", fix_sha), ("P-PAR", par_sha)])
+    base2, plan2 = drv._twin_union_base("P-PAR-HOSTED", row, {}, "P-PAR", par_sha, tasks, tb)
+    assert base2 == ahead, (base2, ahead)
