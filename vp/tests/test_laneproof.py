@@ -663,3 +663,80 @@ def test_d81_a_retry_repolls_the_pipeline_whose_poll_died_instead_of_triggering_
     (tmp_path / "run" / "proofs" / "proof-x-pdead.json").write_text(json.dumps(
         {"sha": "deadbeef", "route": "circleci", "pipeline_id": "pipe-9", "status": "CANCELLED", "ts": "2026-09-19T20:00:00.000Z"}))
     assert p.triggered_pipeline("deadbeef") is None
+
+
+class FakeGha(FakeCircle):
+    """the gha provider surface: prepare_measured + OverlayDirty on top of FakeCircle"""
+    ACCOUNTS = ("gha",)
+    DEFAULT_ROTATION = ("gha",)
+    MAX_IN_FLIGHT = 1
+
+    class OverlayDirty(RuntimeError):
+        pass
+
+    def __init__(self, res, dirty=False):
+        FakeCircle.__init__(self, res)
+        self.dirty = dirty
+
+    def prepare_measured(self, wt, cand, runner=None):
+        self.calls.append(("prepare", cand))
+        if self.dirty:
+            raise self.OverlayDirty("measured differs by ['platform/a.py']")
+        # a real child commit of cand (same tree): the branch must point at something
+        rc, out, err = sh(["git", "-C", str(wt), "commit-tree", "%s^{tree}" % cand, "-p", cand, "-m", "overlay"])
+        assert rc == 0, err
+        self.measured = out.strip()
+        return self.measured
+
+    def trigger(self, branch, params, runner, account, targets=None, rotate=True):
+        self.calls.append(("trigger", branch, params, account))
+        return {"pipeline_id": "35470000001", "account": "gha"}
+
+
+def test_d83_the_gha_provider_is_chosen_by_the_roster_and_records_the_measured_commit(tmp_path):
+    """§46: proof.hosted.provider gha -> vpgha; one identity; in-flight 1; the
+    proof branch points at cand + the overlay; records carry route gha,
+    provider, measured_commit; D81's open-pipeline check reads the gha route."""
+    import vpgha
+    wt, base, cand = repo(tmp_path)
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "rotation": ["A1", "A2"], "max_in_flight": 2, "delete_branch_after": True}}
+    p = laneproof.Proof(tmp_path / "run", VP, tmp_path, git_fn, FakeExec({}), lambda m: None,
+                        lambda k, t, task=None: None, cfg)
+    assert p.provider() == "gha" and p.circle is vpgha and p.hosted_route() == "gha"
+    assert p.circle_cfg()["max_in_flight"] == 1, "rule 6: one full proof in flight on gha"
+    assert p._accounts(p.circle_cfg()) == (["gha"], []), "no rotation, no credits"
+    assert p.route("platform") == ("gha", "mode all")
+    p.cfg["hosted"] = {"provider": "circleci"}
+    assert p.circle is vpcircle and p.hosted_route() == "circleci" and p.circle_cfg()["max_in_flight"] == 2
+    # end to end with a fake provider that has the gha surface
+    green = {"jobs": [{"id": "j2", "name": "vp/agent", "status": "success", "job_number": 342}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    logs, alerts = [], []
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg={"hosted": {"provider": "gha"},
+                                                     "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"],
+                                                                  "account": "A1", "delete_branch_after": True}},
+                   alerts=alerts, logs=logs)
+    rec = p.run("L06", "proof-g1", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS" and rec["route"] == "gha" and rec["provider"] == "gha"
+    assert rec["pipeline_id"] == "35470000001" and rec["account"] == "gha"
+    assert rec["sha"] == cand and rec["measured_commit"] == gha.measured and gha.measured != cand
+    assert ("prepare", cand) in gha.calls
+    assert any("measured commit %s = %s + vp-proof overlay (D83)" % (gha.measured[:12], cand[:12]) in m for m in logs)
+    assert rec["record"] == "proofs/proof-g1-p35470000.json"
+    assert ("trigger", "vp/proof/proof-g1-%s" % cand[:12], {"run_full_suite": True}, "gha") in gha.calls
+    # rule 2: a dirty overlay is refused before any push or trigger, with an alert
+    dirty = FakeGha(green, dirty=True)
+    p = make_proof(tmp_path, dirty, FakeExec({}), cfg={"hosted": {"provider": "gha"},
+                                                       "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"]}},
+                   alerts=alerts, logs=logs)
+    rec = p.run("L06", "proof-g2", wt, base, cand, "platform", [])
+    assert rec["status"] == "OVERLAY_DIRTY" and rec["pipeline_id"] is None and "platform/a.py" in rec["reason"]
+    assert not [c for c in dirty.calls if c[0] in ("push", "trigger")]
+    assert [a[0] for a in alerts] == ["PROOF_OVERLAY_DIRTY"]
+    # D81 sees an open gha pipeline too
+    (tmp_path / "run" / "proofs" / "proof-g3-p1.json").write_text(json.dumps(
+        {"sha": "abc", "route": "gha", "pipeline_id": "35470000009", "status": "UNKNOWN", "ts": "2026-09-20T00:00:00.000Z"}))
+    assert p.triggered_pipeline("abc")["pipeline_id"] == "35470000009"

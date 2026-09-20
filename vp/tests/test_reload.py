@@ -259,6 +259,13 @@ def test_d59_a_successful_reload_lifts_stuck_strikes(tmp_path):
     assert "RELOAD lifted STUCK strikes for ['L00']" in (env.run_root / "driver.log").read_text()
 
 
+def test_d83_vpgha_and_its_overlay_are_reload_targets_before_laneproof():
+    import lanedriver
+    order = list(lanedriver.RELOAD_ORDER)
+    assert order.index("vpgha_overlay") < order.index("vpgha") < order.index("laneproof")
+    assert order.index("vpcircle") < order.index("vpgha"), "vpgha reuses vpcircle's classify/record"
+
+
 def test_d74_circleaccount_is_a_reload_target(tmp_path):
     """D74: circleaccount.py (dispatcher/, imported by vpcircle) holds the
     CircleCI account allow-list; the live driver kept the pre-be57344 copy

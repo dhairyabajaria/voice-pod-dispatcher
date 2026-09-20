@@ -1,0 +1,405 @@
+"""D83 (§46): the GitHub Actions hosted-proof provider and its overlay workflow."""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+HERE = Path(__file__).resolve().parent
+VP = HERE.parent
+sys.path.insert(0, str(VP))
+
+import vpcircle  # noqa: E402
+import vpgha  # noqa: E402
+import vpgha_overlay  # noqa: E402
+
+CI_YML = Path(__file__).resolve().parents[3] / "voice-pod" / "chief9-recovery" / ".github" / "workflows" / "ci.yml"
+
+MINI_CI = """
+name: ci
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: x
+permissions:
+  contents: read
+jobs:
+  kb-real-provider-eval:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - run: echo skip
+  platform:
+    name: required / platform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@abc
+      - name: Enforce platform collected-test floor
+        working-directory: platform
+        run: uv run python ../scripts/ci_collection_floor.py floor --suite platform --baseline-file tests/collection_baseline.json
+      - name: Run platform tests with coverage
+        working-directory: platform
+        run: |
+          uv run pytest -q --cov=core \\
+            --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80
+          uv run python ../deploy/check_module_coverage.py /tmp/platform-coverage.json
+      - name: Rotating order
+        working-directory: platform
+        run: uv run python -m tests.shuffled_runner -q
+  platform-shards:
+    name: required / platform (shard ${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@abc
+      - name: Run this shard with coverage
+        working-directory: platform
+        env:
+          COVERAGE_FILE: .coverage.shard-${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          files="$(SHARD='${{ matrix.shard }}' python3 - <<'EOF'
+          print('tests/test_a.py')
+          EOF
+          )"
+          uv run pytest -q -n auto --dist loadfile $files \\
+            --cov=core --cov-report=
+      - name: Upload shard coverage data
+        uses: actions/upload-artifact@deadbeef
+        with:
+          name: platform-coverage-shard-${{ matrix.shard }}
+          path: platform/.coverage.shard-${{ matrix.shard }}
+  platform-coverage:
+    name: required / platform-coverage
+    runs-on: ubuntu-latest
+    needs: [platform-shards]
+    steps:
+      - run: echo combine
+  agent:
+    name: required / agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: trap battery
+        working-directory: agent
+        run: uv run pytest ../evals/test_trap_battery.py -q
+      - name: agent tests
+        working-directory: agent
+        run: uv run pytest -q tests --cov=. --cov-fail-under=80
+      - name: floor
+        working-directory: agent
+        run: uv run python ../scripts/ci_collection_floor.py control --suite agent --baseline-file ../platform/tests/collection_baseline.json
+  deploy-contracts:
+    name: required / deploy-contracts
+    runs-on: ubuntu-latest
+    steps:
+      - working-directory: platform
+        run: uv run pytest ../deploy/tests -q
+  portal:
+    name: required / portal
+    runs-on: ubuntu-latest
+    steps:
+      - name: Typecheck, unit tests and build
+        working-directory: portal
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run test -- --reporter=json --outputFile=/tmp/portal-test-results.json
+          npm run build
+      - name: floor
+        working-directory: portal
+        run: python3 ../scripts/ci_collection_floor.py floor --suite portal --baseline-file ../platform/tests/collection_baseline.json
+  supply-chain:
+    name: required / supply-chain / ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - component: platform
+            path: platform
+          - component: portal
+            path: portal
+    steps:
+      - run: echo audit
+  deploy:
+    name: required / deploy
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker build .
+  required-checks:
+    name: required / integration
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [platform, deploy]
+    steps:
+      - run: echo gate
+"""
+
+
+def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
+    text = vpgha_overlay.render(MINI_CI, floor_supports_branch=True)
+    doc = yaml.safe_load(text)
+    assert doc["name"] == "vp-proof" and doc["run-name"] == "${{ inputs.proof_id || github.ref_name }}"
+    on = doc[True]                                       # PyYAML reads `on:` as True
+    assert list(on) == ["workflow_dispatch"]
+    assert on["workflow_dispatch"]["inputs"]["proof_id"] == {"type": "string", "default": ""}
+    assert on["workflow_dispatch"]["inputs"]["run_full_suite"] == {"type": "boolean", "default": True}
+    assert doc["concurrency"]["cancel-in-progress"] is False and doc["permissions"] == {"contents": "read"}
+    jobs = doc["jobs"]
+    assert list(jobs) == list(vpgha_overlay.REQUIRED_JOBS), "only the required jobs, in order; deploy/gate/eval dropped"
+    for jid, job in jobs.items():
+        assert job["runs-on"] == ["self-hosted", "voicepod"], jid
+        assert "if" not in job
+        assert job["steps"][0]["run"] == 'mkdir -p "$RUNNER_TEMP/junit"'
+        last = job["steps"][-1]
+        assert last["if"] == "always()" and last["uses"] == "actions/upload-artifact@deadbeef", "ci.yml's own pin"
+        assert last["with"]["path"] == "${{ runner.temp }}/junit/*.xml" and last["with"]["if-no-files-found"] == "ignore"
+    assert jobs["platform"]["name"] == "vp/platform" and jobs["platform"]["steps"][-1]["with"]["name"] == "junit-platform"
+    assert jobs["platform-shards"]["name"] == "vp/platform-shards-${{ matrix.shard }}"
+    assert jobs["platform-shards"]["steps"][-1]["with"]["name"] == "junit-platform-shards-${{ matrix.shard }}"
+    assert jobs["supply-chain"]["name"] == "vp/supply-chain-${{ matrix.component }}"
+    # pytest legs: junit per leg, xunit1, continuation lines intact; shard leg -n SHARD_WORKERS
+    plat = jobs["platform"]["steps"][3]["run"]
+    assert ("uv run pytest -q --cov=core --junitxml=${{ runner.temp }}/junit/platform-1.xml -o junit_family=xunit1 \\\n"
+            "  --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80\n") in plat
+    assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][4]["run"]
+    # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
+    prep = jobs["platform-shards"]["steps"][1]
+    assert prep["run"] == 'mkdir -p "$RUNNER_TEMP/xdg" "/dev/shm/pytest-${GITHUB_JOB}-${{ matrix.shard }}"'
+    shard_step = jobs["platform-shards"]["steps"][3]     # junit prep, pgserver prep, checkout, run
+    assert shard_step["env"]["XDG_RUNTIME_DIR"] == "${{ runner.temp }}/xdg"
+    assert shard_step["env"]["TMPDIR"] == "/dev/shm/pytest-${{ github.job }}-${{ matrix.shard }}"
+    assert shard_step["env"]["COVERAGE_FILE"] == ".coverage.shard-${{ matrix.shard }}", "the candidate's own env kept"
+    assert all("env" not in s or "XDG_RUNTIME_DIR" not in s["env"] for s in jobs["platform"]["steps"]), "only the shard job"
+    shard = shard_step["run"]
+    assert "uv run pytest -q -n 3 --dist loadfile $files --junitxml=${{ runner.temp }}/junit/platform-shards-${{ matrix.shard }}-1.xml -o junit_family=xunit1 \\\n  --cov=core" in shard
+    assert "<<'EOF'" in shard and "-n auto" not in shard
+    agent = [s["run"] for s in jobs["agent"]["steps"] if s.get("run")]
+    assert agent[1].endswith("--junitxml=${{ runner.temp }}/junit/agent-1.xml -o junit_family=xunit1")
+    assert "--junitxml=${{ runner.temp }}/junit/agent-2.xml" in agent[2]
+    # rule 5: --branch on every floor call when the candidate's script takes it
+    assert jobs["platform"]["steps"][2]["run"].endswith('--baseline-file tests/collection_baseline.json --branch "$GITHUB_REF_NAME"')
+    assert agent[3].endswith('--branch "$GITHUB_REF_NAME"')
+    assert jobs["portal"]["steps"][2]["run"].endswith('--branch "$GITHUB_REF_NAME"')
+    # vitest: junit reporter beside the json one
+    assert ("npm run test -- --reporter=json --reporter=junit --outputFile.json=/tmp/portal-test-results.json "
+            "--outputFile.junit=${{ runner.temp }}/junit/portal-1.xml") in jobs["portal"]["steps"][1]["run"]
+    # matrix and needs survive
+    assert jobs["platform-shards"]["strategy"]["matrix"]["shard"] == [0, 1]
+    assert jobs["platform-coverage"]["needs"] == ["platform-shards"]
+    # without --branch support nothing is appended
+    text2 = vpgha_overlay.render(MINI_CI, floor_supports_branch=False)
+    assert "--branch" not in text2
+    assert vpgha_overlay.floor_supports_branch('p.add_argument("--branch", default=None)') is True
+    assert vpgha_overlay.floor_supports_branch("no such flag") is False
+
+
+def test_overlay_refuses_a_ci_yml_missing_a_required_job():
+    with pytest.raises(ValueError, match="deploy-contracts"):
+        vpgha_overlay.render(MINI_CI.replace("  deploy-contracts:\n", "  deploy-contracts-x:\n"))
+
+
+@pytest.mark.skipif(not CI_YML.exists(), reason="trunk ci.yml not checked out")
+def test_overlay_renders_from_the_real_trunk_ci_yml():
+    text = vpgha_overlay.render(CI_YML.read_text(encoding="utf-8"), floor_supports_branch=False)
+    doc = yaml.safe_load(text)
+    assert set(doc["jobs"]) == set(vpgha_overlay.REQUIRED_JOBS)
+    assert text.count("--junitxml=") == 5, "platform, shards, agent x2, deploy-contracts"
+    assert text.count("--outputFile.junit=") == 1, "portal's vitest junit"
+    assert text.count("-n 3 --dist loadfile") == 1 and "-n auto" not in text
+    assert text.count("XDG_RUNTIME_DIR: ${{ runner.temp }}/xdg") == 1
+
+
+def _repo(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    sh = lambda *a: subprocess.run(["git", "-C", str(r)] + list(a), check=True, capture_output=True, text=True)  # noqa: E731
+    sh("init", "-q", "-b", "main")
+    sh("config", "user.email", "t@t")
+    sh("config", "user.name", "t")
+    (r / ".github" / "workflows").mkdir(parents=True)
+    (r / ".github" / "workflows" / "ci.yml").write_text(MINI_CI)
+    (r / "scripts").mkdir()
+    (r / "scripts" / "ci_collection_floor.py").write_text('p.add_argument("--branch")\n')
+    (r / "platform").mkdir()
+    (r / "platform" / "a.py").write_text("x = 1\n")
+    sh("add", "-A")
+    sh("commit", "-q", "-m", "cand")
+    cand = sh("rev-parse", "HEAD").stdout.strip()
+    (r / "platform" / "a.py").write_text("x = 2\n")            # dirty worktree file: must stay untouched
+    return r, cand, sh
+
+
+def test_prepare_measured_adds_exactly_the_workflow_and_leaves_the_worktree_alone(tmp_path):
+    r, cand, sh = _repo(tmp_path)
+    runner = vpgha.Runner()
+    measured = vpgha.prepare_measured(r, cand, runner)
+    assert measured != cand and len(measured) == 40
+    assert sh("diff", "--name-only", cand, measured).stdout.split() == [".github/workflows/vp-proof.yml"]
+    assert sh("rev-parse", "HEAD").stdout.strip() == cand, "HEAD untouched"
+    assert (r / "platform" / "a.py").read_text() == "x = 2\n", "working file untouched"
+    assert sh("status", "--porcelain").stdout.strip() == "M platform/a.py", "index untouched"
+    text = sh("show", "%s:.github/workflows/vp-proof.yml" % measured).stdout
+    assert "--branch \"$GITHUB_REF_NAME\"" in text, "rendered from the candidate's own script (accepts --branch)"
+    assert yaml.safe_load(text)["jobs"]["platform"]["runs-on"] == ["self-hosted", "voicepod"]
+    # idempotent per content: the same candidate yields the same tree
+    again = vpgha.prepare_measured(r, cand, runner)
+    assert sh("rev-parse", "%s^{tree}" % again).stdout == sh("rev-parse", "%s^{tree}" % measured).stdout
+    # rule 2: a measured commit that differs by anything else is refused (no trigger)
+    real = runner.git
+
+    def lying_git(args, cwd=None, env=None):
+        res = real(args, cwd=cwd, env=env)
+        if args[:2] == ["diff", "--name-only"]:
+            res.stdout = res.stdout + "platform/a.py\n"
+        return res
+    runner.git = lying_git
+    with pytest.raises(vpgha.OverlayDirty, match="platform/a.py"):
+        vpgha.prepare_measured(r, cand, runner)
+
+
+class FakeGh(object):
+    """gh CLI answers by subcommand; records every argv"""
+
+    def __init__(self, run_rows=None, views=None, artifacts=None, downloads=None, dispatch_rc=0):
+        self.calls = []
+        self.run_rows = run_rows or []
+        self.views = list(views or [])
+        self.artifacts = artifacts or []
+        self.downloads = downloads or {}
+        self.dispatch_rc = dispatch_rc
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv))
+        a = argv[1:]
+        if a[:2] == ["workflow", "run"]:
+            return subprocess.CompletedProcess(argv, self.dispatch_rc, "", "" if not self.dispatch_rc else "HTTP 404")
+        if a[:2] == ["run", "list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.run_rows), "")
+        if a[:2] == ["run", "view"]:
+            v = self.views.pop(0) if len(self.views) > 1 else self.views[0]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(v), "")
+        if a[0] == "api" and "artifacts" in a[2]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.artifacts), "")
+        if a[:2] == ["run", "download"]:
+            name = a[a.index("-n") + 1]
+            dest = Path(a[a.index("-D") + 1])
+            dest.mkdir(parents=True, exist_ok=True)
+            for fn, text in (self.downloads.get(name) or {}).items():
+                (dest / fn).write_text(text)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if a[:2] == ["run", "cancel"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if a[0] == "api" and "workflows" in a[1]:
+            return subprocess.CompletedProcess(argv, 0, "active\n", "")
+        raise AssertionError("unexpected gh %s" % a)
+
+
+JUNIT_RED = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="3" failures="1" errors="1">
+<testcase classname="tests.test_x" file="tests/test_x.py" line="3" name="test_a[p1]" time="0.1">
+  <failure message="AssertionError: boom">trace</failure></testcase>
+<testcase classname="tests.test_x" file="tests/test_x.py" line="9" name="test_b" time="0.1">
+  <error message="fixture blew up">trace</error></testcase>
+<testcase classname="tests.test_x" file="tests/test_x.py" line="12" name="test_c" time="0.1"/>
+</testsuite></testsuites>"""
+
+
+def test_trigger_finds_its_run_by_run_name_and_poll_reads_junit_into_reds(monkeypatch):
+    gh = FakeGh(
+        run_rows=[{"databaseId": 111, "displayTitle": "vp/proof/other", "createdAt": "2026-09-19T20:00:00Z"},
+                  {"databaseId": 222, "displayTitle": "vp/proof/proof-1-abc", "createdAt": "2026-09-19T20:01:00Z"},
+                  {"databaseId": 223, "displayTitle": "vp/proof/proof-1-abc", "createdAt": "2026-09-19T20:02:00Z"}],
+        views=[{"status": "in_progress", "conclusion": None, "jobs": []},
+               {"status": "completed", "conclusion": "failure", "headSha": "abc", "url": "u", "jobs": [
+                   {"databaseId": 1, "name": "vp/platform", "status": "completed", "conclusion": "failure"},
+                   {"databaseId": 2, "name": "vp/platform-shards-3", "status": "completed", "conclusion": "failure"},
+                   {"databaseId": 3, "name": "vp/agent", "status": "completed", "conclusion": "success"},
+                   {"databaseId": 4, "name": "vp/portal", "status": "completed", "conclusion": "skipped"}]}],
+        artifacts=[{"name": "junit-platform", "id": 9, "expired": False},
+                   {"name": "junit-platform-shards-3", "id": 10, "expired": False}],
+        downloads={"junit-platform": {"platform-1.xml": JUNIT_RED},
+                   "junit-platform-shards-3": {"platform-shards-3-1.xml": JUNIT_RED.replace("failures=\"1\" errors=\"1\"", "failures=\"0\" errors=\"0\"").replace("<failure", "<skipped").replace("</failure>", "</skipped>").replace("<error", "<skipped").replace("</error>", "</skipped>")}},
+    )
+    runner = vpgha.Runner(run=gh, binary="gh")
+    sleeps = []
+    trig = vpgha.trigger("vp/proof/proof-1-abc", {"run_full_suite": True}, runner, sleep=sleeps.append)
+    assert trig == {"pipeline_id": "223", "account": "gha"}, "the newest run named after the branch"
+    dispatch = next(c for c in gh.calls if c[1:3] == ["workflow", "run"])
+    assert dispatch[3:] == ["vp-proof.yml", "-R", vpgha.REPO, "--ref", "vp/proof/proof-1-abc",
+                            "-f", "proof_id=vp/proof/proof-1-abc", "-f", "run_full_suite=true"]
+    assert sleeps == []
+    res = vpgha.poll("223", interval=60, deadline_s=5400, runner=runner, sleep=sleeps.append, clock=lambda: 0.0)
+    assert sleeps == [60]
+    assert res["pipeline_id"] == "223" and res["workflows"][0]["status"] == "failed"
+    by = {j["name"]: j for j in res["jobs"]}
+    assert by["vp/platform"]["status"] == "failed" and by["vp/agent"]["status"] == "success"
+    assert by["vp/portal"]["status"] == "infrastructure_fail", "GHA 'skipped' = a needs failed; never green"
+    assert sorted(res["failed_tests"]) == [1, 2], "junit fetched for the non-success jobs only"
+    reds = res["failed_tests"][1]
+    assert [(t["name"], t["result"], t["file"]) for t in reds] == [("test_a[p1]", "failure", "tests/test_x.py"),
+                                                                     ("test_b", "error", "tests/test_x.py")]
+    assert res["failed_tests"][2] == [], "a failed job whose junit has no reds"
+    downloads = [c for c in gh.calls if c[1:3] == ["run", "download"]]
+    assert sorted(c[c.index("-n") + 1] for c in downloads) == ["junit-platform", "junit-platform-shards-3"]
+    # the CircleCI classifier reads the mapped shape: reds -> FAIL_PRODUCT with nodes
+    cls = vpcircle.classify(res["jobs"], res["failed_tests"], workflows=res["workflows"])
+    assert cls["status"] == "FAIL_PRODUCT"
+    kinds = {r["job"]: r["kind"] for r in cls["reds"]}
+    assert kinds == {"vp/platform": "product", "vp/platform-shards-3": "infra", "vp/portal": "infra"}, \
+        "failed with junit but zero reds = infra (rule 3), never PASS"
+
+
+def test_a_missing_junit_artifact_makes_a_failed_job_infra_and_a_cancelled_run_is_cancelled():
+    view_failed = {"status": "completed", "conclusion": "failure", "jobs": [
+        {"databaseId": 1, "name": "vp/platform", "status": "completed", "conclusion": "failure"}]}
+    gh = FakeGh(views=[view_failed], artifacts=[], downloads={})
+    res = vpgha.poll("5", runner=vpgha.Runner(run=gh, binary="gh"), sleep=lambda s: None, clock=lambda: 0.0)
+    assert res["failed_tests"] == {} and not [c for c in gh.calls if c[1:3] == ["run", "download"]]
+    assert vpcircle.classify(res["jobs"], res["failed_tests"], workflows=res["workflows"])["status"] == "FAIL_INFRA"
+    view_cancelled = {"status": "completed", "conclusion": "cancelled", "jobs": [
+        {"databaseId": 1, "name": "vp/platform", "status": "completed", "conclusion": "cancelled"},
+        {"databaseId": 2, "name": "vp/agent", "status": "completed", "conclusion": "success"}]}
+    gh = FakeGh(views=[view_cancelled], artifacts=[], downloads={})
+    res = vpgha.poll("6", runner=vpgha.Runner(run=gh, binary="gh"), sleep=lambda s: None, clock=lambda: 0.0)
+    assert vpcircle.classify(res["jobs"], res["failed_tests"], workflows=res["workflows"])["status"] == "CANCELLED"
+    view_green = {"status": "completed", "conclusion": "success", "jobs": [
+        {"databaseId": 1, "name": "vp/platform", "status": "completed", "conclusion": "success"}]}
+    gh = FakeGh(views=[view_green])
+    res = vpgha.poll("7", runner=vpgha.Runner(run=gh, binary="gh"), sleep=lambda s: None, clock=lambda: 0.0)
+    assert vpcircle.classify(res["jobs"], res["failed_tests"], workflows=res["workflows"])["status"] == "PASS"
+    assert vpgha.cancel_pipeline("7", vpgha.Runner(run=gh, binary="gh")) == ["7"]
+
+
+def test_trigger_failures_and_poll_transients_surface_or_retry():
+    gh = FakeGh(dispatch_rc=1)
+    with pytest.raises(RuntimeError, match="gh workflow run failed"):
+        vpgha.trigger("vp/proof/x", {}, vpgha.Runner(run=gh, binary="gh"), sleep=lambda s: None)
+    gh = FakeGh(run_rows=[])
+    with pytest.raises(RuntimeError, match="no vp-proof run named vp/proof/x appeared"):
+        vpgha.find_run("vp/proof/x", vpgha.Runner(run=gh, binary="gh"), tries=3, wait_s=1, sleep=lambda s: None)
+    assert len([c for c in gh.calls if c[1:3] == ["run", "list"]]) == 3
+    # a transient `gh run view` failure is retried (vpcircle.POLL_TRANSIENT_MAX), then answered
+    n = {"i": 0}
+
+    def flaky(argv, **kw):
+        if argv[1:3] == ["run", "view"]:
+            n["i"] += 1
+            if n["i"] <= 2:
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"status": "completed", "conclusion": "success", "jobs": []}), "")
+        return subprocess.CompletedProcess(argv, 0, "[]", "")
+    sleeps = []
+    res = vpgha.poll("9", interval=30, runner=vpgha.Runner(run=flaky, binary="gh"), sleep=sleeps.append,
+                     clock=lambda: 0.0)
+    assert res["workflows"][0]["status"] == "success" and sleeps == [30, 30]
+    assert vpgha.project_visible(vpgha.Runner(run=FakeGh(), binary="gh")) == (True, "gha")

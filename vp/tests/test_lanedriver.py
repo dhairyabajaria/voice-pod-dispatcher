@@ -2137,6 +2137,11 @@ def test_d79_reusable_proof_picks_a_real_answer_for_the_same_sha_kind_and_paths(
     assert drv._reusable_proof("b" * 40, "platform", ["t/a.py"]) is None
     rec("proof-X-9", route="box", pipeline_id=None, ts="2026-09-19T19:20:00.000Z")            # a completed box run counts
     assert drv._reusable_proof(sha, "platform", ["t/a.py"])["proof_id"] == "proof-X-9"
+    # D83: a GitHub Actions record is a hosted answer exactly like a CircleCI one
+    rec("proof-X-10", route="gha", pipeline_id="35470000001", ts="2026-09-19T19:30:00.000Z")
+    assert drv._reusable_proof(sha, "platform", ["t/a.py"])["proof_id"] == "proof-X-10"
+    rec("proof-X-11", route="gha", pipeline_id=None, ts="2026-09-19T19:31:00.000Z")           # gha without a run id
+    assert drv._reusable_proof(sha, "platform", ["t/a.py"])["proof_id"] == "proof-X-10"
 
 
 def test_d79_a_recorded_answer_is_reused_instead_of_re_proving_the_same_head(tmp_path, monkeypatch):

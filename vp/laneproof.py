@@ -28,10 +28,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import vpcircle   # noqa: E402
+import vpcircle
+import vpgha   # noqa: E402
 from vpdriver import circle_failed_nodes  # noqa: E402
 
 RERUN_KINDS = {"platform": "platform/", "deploy": "deploy/", "agent": "agent/"}
+HOSTED_ROUTES = ("circleci", "gha")      # D83: the `route` values a hosted record may carry
+
 DEFAULT_CIRCLE = {"enabled": False, "mode": "overflow", "kinds": ["full"], "param": "run_full_suite",
                   "branch_prefix": "vp/proof/", "account": "3", "poll_interval_s": 60,
                   "deadline_min": 90, "delete_branch_after": True, "flake_rerun_max": 10,
@@ -75,7 +78,7 @@ class Proof(object):
         self.log = log
         self.alert = alert
         self.cfg = dict(proof_cfg or {})
-        self.circle = circle or vpcircle
+        self._circle_override = circle              # tests inject a fake provider
         self.circle_runner = circle_runner
         self.python = python or sys.executable
         # D65: callable() -> bool read at TRIGGER time (the driver passes a lambda over
@@ -87,6 +90,26 @@ class Proof(object):
 
     # -- config ----------------------------------------------------------------------------
 
+    def provider(self):
+        """D83 (§46 rule 8): roster proof.hosted.provider = "circleci" (default) | "gha";
+        the CircleCI block (proof.circleci.*) keeps the shared knobs (enabled,
+        kinds, mode, branch_prefix, poll/deadline, caps) whichever provider runs."""
+        return str((self.cfg.get("hosted") or {}).get("provider") or "circleci")
+
+    @property
+    def circle(self):
+        if getattr(self, "_circle_override", None) is not None:
+            return self._circle_override
+        return vpgha if self.provider() == "gha" else vpcircle
+
+    @circle.setter
+    def circle(self, value):
+        self._circle_override = value
+
+    def hosted_route(self):
+        """the `route` a hosted record carries: "gha" or "circleci" (HOSTED_ROUTES)"""
+        return "gha" if self.provider() == "gha" else "circleci"
+
     def circle_cfg(self):
         cc = dict(DEFAULT_CIRCLE)
         raw = dict(self.cfg.get("circleci") or {})
@@ -94,6 +117,9 @@ class Proof(object):
         if "max_pipelines_in_flight" in raw and "max_in_flight" not in raw:
             raw["max_in_flight"] = raw.pop("max_pipelines_in_flight")
         cc.update(raw)
+        cap = getattr(self.circle, "MAX_IN_FLIGHT", None)  # a provider may bound the in-flight count (gha: 1, rule 6)
+        if cap is not None:
+            cc["max_in_flight"] = min(int(cc.get("max_in_flight", 2) or 2), int(cap))
         return cc
 
     def circle_off(self):
@@ -122,17 +148,18 @@ class Proof(object):
                 return "box", "circleci in flight %d/%d" % (self.circle_active, cc.get("max_in_flight", 2))
             mode = str(cc.get("mode", "overflow"))
             if mode in ("all", "swap"):
-                return "circleci", "mode all"
+                return self.hosted_route(), "mode all"
             if suite == "full" and "full" in listed:
-                return "circleci", "full suite is never run on the box (06-ROUTING §5)"
+                return self.hosted_route(), "full suite is never run on the box (06-ROUTING §5)"
             slots = int(self.cfg.get("box_slots", 1))
             if self.box_active < slots:
                 return "box", "overflow: box free (%d/%d)" % (self.box_active, slots)
-            return "circleci", "overflow: box busy (%d/%d)" % (self.box_active, slots)
+            return self.hosted_route(), "overflow: box busy (%d/%d)" % (self.box_active, slots)
 
     TRIGGERED = "triggered"
     # D65: every trigger attempt leaves a ledger row; only TRIGGERED rows spend a pipeline
     REFUSED_GATE, REFUSED_CAP, REFUSED_OFF = "refused_gate", "refused_cap", "refused_off"
+    REFUSED_OVERLAY = "refused_overlay"            # D83 rule 2: the measured commit is not cand + the workflow
     CREDITS_BLOCKED, TRIGGER_FAILED = "credits_blocked", "trigger_failed"
     REPOLLED = "repolled"                          # D81: an open pipeline polled again, not a trigger
 
@@ -209,7 +236,7 @@ class Proof(object):
         suite = "targeted" if paths else "full"
         route, why = self.route(kind, suite)
         self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
-        if route == "circleci":
+        if route in HOSTED_ROUTES:
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort)
         held = self.memory_hold()
         if held:
@@ -291,6 +318,8 @@ class Proof(object):
         """D44: the account order for one proof: roster circleci.account first,
         then circleci.rotation (default vpcircle.DEFAULT_ROTATION), minus the
         accounts CircleCI refused for credits within CREDIT_BLOCK_S"""
+        if self.provider() == "gha":
+            return [vpgha.ACCOUNT], []            # one identity (gh's), no rotation, no credits
         first = str(cc.get("account") or self.circle.ACCOUNTS[0])
         order = [first] + [str(a) for a in (cc.get("rotation") or getattr(self.circle, "DEFAULT_ROTATION", ()))
                            if str(a) != first]
@@ -321,6 +350,7 @@ class Proof(object):
         param = cc.get("param") or "run_full_suite"
         targets = cc.get("accounts") or None
         pipeline_id, account = None, None
+        measured = cand                               # D83: the commit the run measures (cand + overlay on gha)
         pushed = {}                                   # account -> remote the branch was pushed to
         prior = self.triggered_pipeline(cand)
         with self._lock:
@@ -342,7 +372,18 @@ class Proof(object):
                                            abort=lambda: bool((abort and abort()) or self.circle_off()))
                     accounts = []
                 else:
-                    rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, cand])
+                    prepare = getattr(self.circle, "prepare_measured", None)
+                    if prepare is not None:
+                        # D83 §46 rule 2: the measured commit = candidate + exactly one
+                        # overlay commit (.github/workflows/vp-proof.yml); anything else
+                        # in the diff is OVERLAY_DIRTY and nothing is triggered
+                        try:
+                            measured = prepare(wt, cand, runner)
+                        except getattr(self.circle, "OverlayDirty", ()) as exc:
+                            raise self.Refused(self.REFUSED_OVERLAY, str(exc)[:300])
+                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83)"
+                                 % (task, pid, measured[:12], cand[:12]))
+                    rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, measured])
                     if rc != 0:
                         raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
                     accounts, skipped = self._accounts(cc)
@@ -398,7 +439,7 @@ class Proof(object):
                                           or "every CircleCI account is blocked for credits: %s" % skipped)
             except self.circle.Cancelled:
                 done = self.circle.cancel_pipeline(pipeline_id, runner, account)
-                rec = {"status": "CANCELLED", "route": "circleci", "proof_id": pid, "sha": cand,
+                rec = {"status": "CANCELLED", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
                        "pipeline_id": pipeline_id, "cancelled_workflows": done, "ts": utc_ms()}
                 self._write(pid, rec)
                 return rec
@@ -409,24 +450,28 @@ class Proof(object):
                     self.log("PROOF %s %s circleci refused (%s) -> box" % (task, pid, exc))
                     return self.run_box(task, pid, wt, cand, kind, paths)
                 status = {self.REFUSED_GATE: "BLOCKED_GATE", self.REFUSED_CAP: "BLOCKED_CAP",
-                          self.REFUSED_OFF: "BLOCKED_OFF"}[exc.status]
-                rec = {"status": status, "route": "circleci", "proof_id": pid, "sha": cand, "kind": kind,
+                          self.REFUSED_OFF: "BLOCKED_OFF", self.REFUSED_OVERLAY: "OVERLAY_DIRTY"}[exc.status]
+                rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                        "pipeline_id": None, "account": None, "branch": branch,
                        "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> %s: %s" % (task, pid, status, str(exc)[:200]))
+                if status == "OVERLAY_DIRTY":
+                    self.alert("PROOF_OVERLAY_DIRTY", "%s %s: the measured commit is not the candidate + "
+                               "vp-proof.yml alone (D83 rule 2); no run triggered: %s" % (task, pid, str(exc)[:300]),
+                               task)
                 return rec
             except self.AllBlocked as exc:
                 # a plan/credit refusal is the account's condition, never the candidate's:
                 # the driver holds the attempt without a strike (PROOF_BLOCKED_CREDITS)
-                rec = {"status": "BLOCKED_CREDITS", "route": "circleci", "proof_id": pid, "sha": cand,
+                rec = {"status": "BLOCKED_CREDITS", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
                        "pipeline_id": pipeline_id, "account": account, "branch": branch,
                        "reason": "circleci: %s" % str(exc)[:300], "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> BLOCKED_CREDITS: %s" % (task, pid, str(exc)[:200]))
                 return rec
             except Exception as exc:
-                rec = {"status": "UNKNOWN", "route": "circleci", "proof_id": pid, "sha": cand,
+                rec = {"status": "UNKNOWN", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
                        "reason": "circleci: %s: %s" % (type(exc).__name__, str(exc)[:300]),
                        "pipeline_id": pipeline_id, "account": account, "branch": branch,
                        "failed_nodes": [], "ts": utc_ms()}
@@ -467,10 +512,11 @@ class Proof(object):
                                              res["jobs"], res["failed_tests"], cls)
             except Exception as exc:
                 out_dir = "record failed: %s" % exc
-            rec = {"status": status, "route": "circleci", "proof_id": pid, "sha": cand, "kind": kind,
+            rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                    "paths": paths, "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
                    "flake_suspect": flake, "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
+                   "provider": self.provider(), "measured_commit": measured,
                    "reason": ("circleci pipeline %s cancelled: not an answer (D79b)" % pipeline_id
                               if status == "CANCELLED" else None),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
@@ -564,7 +610,7 @@ class Proof(object):
                 rec = json.loads(f.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if (rec.get("sha") == cand and rec.get("route") == "circleci" and rec.get("pipeline_id")
+            if (rec.get("sha") == cand and rec.get("route") in HOSTED_ROUTES and rec.get("pipeline_id")
                     and rec.get("status") in self.OPEN_STATUSES):
                 if best is None or str(rec.get("ts") or "") > str(best.get("ts") or ""):
                     best = rec

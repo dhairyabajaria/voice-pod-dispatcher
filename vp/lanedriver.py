@@ -352,7 +352,7 @@ DEFAULT_PROOF_KINDS = ["builder", "integrator", "infra"]
 # active == 0, reload these helper modules in dependency order, load a fresh copy
 # of lanedriver.py and rebind every live object's class to it, resume.
 RELOAD_FILE = "RELOAD"
-RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpdriver", "vp_box_lock", "vpproof", "vpmerge",
+RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpgha_overlay", "vpgha", "vpdriver", "vp_box_lock", "vpproof", "vpmerge",
                 "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
 
@@ -4627,9 +4627,9 @@ class LaneDriver(object):
             if rec.get("status") not in self.REUSABLE_STATUSES:
                 continue
             route = rec.get("route")
-            if route == "circleci" and not rec.get("pipeline_id"):
+            if route in laneproof.HOSTED_ROUTES and not rec.get("pipeline_id"):
                 continue
-            if route not in ("circleci", "box"):
+            if route not in laneproof.HOSTED_ROUTES + ("box",):
                 continue
             found.append(rec)
         return max(found, key=lambda r: str(r.get("ts") or "")) if found else None

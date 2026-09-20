@@ -508,6 +508,10 @@ def lint_roster_v13(r):
     if proof.get("box_slots") != 1 or proof.get("shm_reap") is not True:
         out.append("ERROR roster: proof.box_slots 1 and proof.shm_reap true required")
     cc = proof.get("circleci") or {}
+    # D83 (§46 rule 8): the hosted provider is a roster field
+    prov = (proof.get("hosted") or {}).get("provider", "circleci")
+    if prov not in ("circleci", "gha"):
+        out.append("ERROR roster: proof.hosted.provider must be circleci or gha; got %r" % (prov,))
     # §29: the account vocabulary lives in vpcircle.TARGETS only (no literal here)
     try:
         import vpcircle

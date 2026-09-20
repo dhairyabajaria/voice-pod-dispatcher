@@ -252,7 +252,7 @@ class Dash(object):
                         "proofs": Counter(), "in_flight": [], "last_proof_ts": None, "last_proof_status": None}
         finished = {}   # proof_id -> proof record
         for pid, p in j.proofs.items():
-            if p.get("route") == "circleci":
+            if p.get("route") in ("circleci", "gha"):
                 finished[pid] = p
         for row in j.pipeline_rows:
             acc = row.get("account")
