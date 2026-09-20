@@ -2927,6 +2927,32 @@ def test_d115_a_skipped_owner_gate_defers_its_rows_and_releases_its_twin_never_a
     assert drv._deferred_rows(wt) == {}
 
 
+def test_d128_a_packet_with_hosted_in_the_middle_of_its_id_is_not_a_twin(tmp_path):
+    """D128: is_hosted_twin tested "-HOSTED" as a SUBSTRING, so
+    R-PORTAL-HOSTED-TIMING -- an ordinary portal repair packet with no twin_of --
+    was handed D79's twin rule max_rounds=1: its R1 went REPAIR_REQUIRED after one
+    round (08:26:03Z) and the work needed a second packet task (R2, 08:31:24Z), and
+    it filed an empty hosted/None.json under a parent named None.  The id test is a
+    suffix now; twin_of still decides on its own, whatever the id."""
+    import vppack
+    for tid in ("L17-HOSTED", "L17-HOSTED-R3", "L18-HOSTED-CIRCLECI", "L18-HOSTED-CIRCLECI-R1",
+                "L34-HOSTED-DELIVERY-4", "L34-HOSTED-DELIVERY-4-R2", "WA-03-DP11R-HOSTED"):
+        assert vppack.is_hosted_twin({"id": tid}) is True, tid
+    for pid in ("R-PORTAL-HOSTED-TIMING", "R-PORTAL-HOSTED-TIMING-R1", "R-PORTAL-HOSTED-TIMING-R2",
+                "R-SUPPLY-HOSTED-DEPS", "L19-LAUNCH-ADMISSION"):
+        assert vppack.is_hosted_twin({"id": pid}) is False, pid
+    assert vppack.is_hosted_twin({"id": "R-PORTAL-HOSTED-TIMING", "twin_of": "L19"}) is True, \
+        "an explicit twin_of still decides, whatever the id looks like"
+    # the twin rule that misfired: a twin gets one round, a plain repair packet gets its repairs
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv.pack.update({"R-PORTAL-HOSTED-TIMING": {"id": "R-PORTAL-HOSTED-TIMING",
+                                                "owned_files": ["portal/src/test/setup.ts"]}})
+    drv.pack_by_task.update({"R-PORTAL-HOSTED-TIMING-R1": "R-PORTAL-HOSTED-TIMING"})
+    assert vppack.is_hosted_twin(drv.packet_for("R-PORTAL-HOSTED-TIMING-R1")) is False
+
+
 def test_d127_a_probe_twin_defers_its_owner_skipped_row_at_the_record_not_at_the_grader(tmp_path):
     """D127 (§123, Architect option (b)): D115 defers on FINDINGS.json after a grader
     turn, so a probe-kind twin -- no grader, no FINDINGS.json -- left its

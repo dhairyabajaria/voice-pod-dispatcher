@@ -315,10 +315,21 @@ GATE_TEMPLATE = {"CIRCLECI": "TEST_GAP"}        # §19(2): product proof via Cir
 TWIN_KIND = "hosted"
 
 
+HOSTED_TWIN_ID_RE = re.compile(r"-HOSTED(?:-(?:DELIVERY-[1-5][AB]?|O[1-9]|CIRCLECI))?(?:-R\d+)?$")
+
+
 def is_hosted_twin(packet):
-    """the <ID>-HOSTED[-<GATE>] twin that owes the hosted evidence (00-SCOPE §5,
-    PACKET-FORMAT §2/§6); the base packet goes VERIFIED_LOCAL on its [box] rows"""
-    return bool(packet.get("twin_of")) or HOSTED_TWIN_SUFFIX in str(packet.get("id") or "")
+    """the <ID>-HOSTED[-<GATE>][-R<n>] twin that owes the hosted evidence (00-SCOPE §5,
+    PACKET-FORMAT §2/§6); the base packet goes VERIFIED_LOCAL on its [box] rows.
+
+    D128: the id test is a SUFFIX, never a substring.  R-PORTAL-HOSTED-TIMING is an
+    ordinary portal repair packet with no twin_of, and the substring match handed it
+    D79's twin rule max_rounds=1 -- so its R1 went REPAIR_REQUIRED after a single
+    round (08:26:03Z) and the work needed a whole second packet task (R2, 08:31:24Z).
+    It also filed an empty hosted/None.json sidecar under a parent named None.
+    Measured before the change: of the 169 twin ids this run recorded, the suffix
+    rule reclassifies those 3 (R-PORTAL-HOSTED-TIMING, -R1, -R2) and nothing else."""
+    return bool(packet.get("twin_of")) or bool(HOSTED_TWIN_ID_RE.search(str(packet.get("id") or "")))
 
 
 def hosted_row_gates(text):

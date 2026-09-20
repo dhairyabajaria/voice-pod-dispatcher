@@ -1322,7 +1322,12 @@ class LaneDriver(object):
         r"revoked consent|consent (?:fence|revocation|withdrawn)": ("grant_is_live", "consent_grants"),
         r"STOP suppression|suppression fence": ("suppression_active", "is_suppressed"),
         r"erasure hold": ("erasure_hold", "erasure_state"),
-        r"knowledge pack|asset binding": ("resolve_published", "asset_binding"),
+        # D125a (Architect, 2026-09-20 21:57Z): a revoked knowledge pack sets no fence
+        # flag of its own -- it moves published_ready/readiness_reason through
+        # resolve_published's pack join and surfaces as the existing
+        # held.release_withdrawn.  resolve_published IS the seam; `asset_binding`
+        # matched nothing under platform/ and is dropped rather than left looking covered.
+        r"knowledge pack|asset binding": ("resolve_published",),
         r"RLS|tenant role": ("tenant_session",),
     }
     STUB_RE = "(?:monkeypatch\\.setattr|setattr)\\([^)]*%s"
