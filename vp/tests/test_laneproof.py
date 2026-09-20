@@ -678,8 +678,9 @@ class FakeGha(FakeCircle):
         FakeCircle.__init__(self, res)
         self.dirty = dirty
 
-    def prepare_measured(self, wt, cand, runner=None, only=None):
-        self.calls.append(("prepare", cand) + ((only,) if only else ()))
+    def prepare_measured(self, wt, cand, runner=None, only=None, order=False, shard=None):
+        self.calls.append(("prepare", cand) + ((only,) if only else ()) + (("order",) if order else ())
+                          + ((shard,) if shard else ()))
         if self.dirty:
             raise self.OverlayDirty("measured differs by ['platform/a.py']")
         # a real child commit of cand (same tree): the branch must point at something
@@ -843,3 +844,68 @@ def test_d98_only_never_runs_on_the_box_and_needs_a_rendering_provider(tmp_path)
     rec = p.run("R-X", "proof-R-X-3", wt, base, cand, "platform", [], only="portal")
     assert rec["status"] == "UNKNOWN" and "only=portal needs a provider that renders" in rec["reason"]
     assert not [c for c in circle.calls if c[0] == "trigger"] and not ex.calls
+
+
+def test_fleet1_only_runs_have_their_own_in_flight_cap(tmp_path):
+    """Fleet-1 (§98): only= proofs count against max_only_in_flight (default 3),
+    never against the full-pipeline cap; at the cap they hold (BLOCKED_CAP, no
+    strike) instead of running."""
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/portal", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    seen = {}
+    real_poll = gha.poll
+    def poll(*a, **k):
+        seen["only_active"], seen["circle_active"] = p.only_active, p.circle_active
+        return real_poll(*a, **k)
+    gha.poll = poll
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "delete_branch_after": True}}
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg)
+    assert p.only_cap() == 3
+    rec = p.run("R-X", "proof-R-X-1", wt, base, cand, "platform", [], only="portal")
+    assert rec["status"] == "PASS" and seen == {"only_active": 1, "circle_active": 0}
+    assert p.only_active == 0 and p.circle_active == 0
+    p.only_active = 3
+    rec = p.run("R-X", "proof-R-X-2", wt, base, cand, "platform", [], only="portal")
+    assert rec["status"] == "BLOCKED_CAP" and "3 only= proofs in flight >= max_only_in_flight 3" in rec["reason"]
+    assert len([c for c in gha.calls if c[0] == "trigger"]) == 1, "the held one triggered nothing"
+    p.cfg["circleci"]["max_only_in_flight"] = 4
+    rec = p.run("R-X", "proof-R-X-3", wt, base, cand, "platform", [], only="portal")
+    assert rec["status"] == "PASS"
+
+
+def test_d100_a_final_canary_renders_the_order_job_and_records_it(tmp_path):
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/platform-order", "status": "success", "job_number": 9}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    logs = []
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "delete_branch_after": True}}
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg, logs=logs)
+    rec = p.run("L06", "proof-L06-1", wt, base, cand, "platform", [], order=True)
+    assert rec["status"] == "PASS" and rec["order"] is True and rec["only"] is None
+    assert ("prepare", cand, "order") in gha.calls
+    assert any("order=final (platform-order rendered, D100)" in m for m in logs)
+    rec = p.run("L06", "proof-L06-2", wt, base, cand, "platform", [])
+    assert rec["order"] is False and ("prepare", cand) in gha.calls
+
+
+def test_roster_shard_workers_and_stagger_reach_the_overlay(tmp_path):
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/agent", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "delete_branch_after": True, "shard_workers": 6, "shard_stagger_s": 1.25}}
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg)
+    p.run("L06", "proof-L06-1", wt, base, cand, "platform", [])
+    assert ("prepare", cand, {"workers": 6, "stagger_s": 1.25}) in gha.calls
+    del p.cfg["circleci"]["shard_workers"], p.cfg["circleci"]["shard_stagger_s"]
+    p.run("L06", "proof-L06-2", wt, base, cand, "platform", [])
+    assert ("prepare", cand) in gha.calls, "no roster keys -> the plain call"

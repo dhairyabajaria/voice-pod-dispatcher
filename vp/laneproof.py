@@ -87,6 +87,7 @@ class Proof(object):
         self._lock = threading.Lock()
         self.box_active = 0
         self.circle_active = 0
+        self.only_active = 0          # Fleet-1: only= runs in flight (own cap)
 
     # -- config ----------------------------------------------------------------------------
 
@@ -224,7 +225,14 @@ class Proof(object):
 
     NO_RUN_KINDS = ("docs",)
 
-    def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None, only=None):
+    ONLY_IN_FLIGHT_DEFAULT = 3
+
+    def only_cap(self):
+        """Fleet-1 (§98): only= proofs have their own in-flight cap (default 3),
+        beside the full-pipeline cap (max_in_flight, 1 on gha)"""
+        return int(self.circle_cfg().get("max_only_in_flight", self.ONLY_IN_FLIGHT_DEFAULT) or 0)
+
+    def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None, only=None, order=False):
         if only:
             # §95 item 2: `only=<job|shard>` is a targeted HOSTED proof of one
             # workflow job / matrix leg (the overlay carries that job alone).  It
@@ -240,6 +248,17 @@ class Proof(object):
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> BLOCKED_OFF: only=%s needs the hosted route" % (task, pid, only))
                 return rec
+            with self._lock:
+                only_active = getattr(self, "only_active", 0)
+            if only_active >= self.only_cap():
+                rec = {"status": "BLOCKED_CAP", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
+                       "kind": kind, "paths": paths, "only": only, "pipeline_id": None, "account": None,
+                       "reason": "only=%s held: %d only= proofs in flight >= max_only_in_flight %d (Fleet-1)"
+                                 % (only, only_active, self.only_cap()),
+                       "failed_nodes": [], "ts": utc_ms()}
+                self._write(pid, rec)
+                self.log("PROOF %s %s -> BLOCKED_CAP: %s" % (task, pid, rec["reason"]))
+                return rec
             self.log("PROOF %s %s route=%s (only=%s: one job/leg, targeted, %s)" % (task, pid, self.hosted_route(), only, kind))
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort, only=only)
         if kind in self.NO_RUN_KINDS:
@@ -254,7 +273,7 @@ class Proof(object):
         route, why = self.route(kind, suite)
         self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
         if route in HOSTED_ROUTES:
-            return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort)
+            return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort, order=order)
         held_off = self.full_suite_held(suite, why)
         if held_off:
             # D87: a hosted-eligible FULL suite refused by the off switch / cap /
@@ -409,7 +428,7 @@ class Proof(object):
         self.log("PROOF circleci account %s blocked for credits for %dh: %s"
                  % (acct, self.CREDIT_BLOCK_S // 3600, why[:160]))
 
-    def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None):
+    def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None, order=False):
         cc = self.circle_cfg()
         runner = self.circle_runner or self.circle.Runner()
         branch = "%s%s-%s" % (cc.get("branch_prefix", "vp/proof/"), pid, cand[:12])
@@ -420,7 +439,11 @@ class Proof(object):
         pushed = {}                                   # account -> remote the branch was pushed to
         prior = self.triggered_pipeline(cand)
         with self._lock:
-            self.circle_active += 1
+            # Fleet-1: only= runs count against their own cap, never the full-pipeline one
+            if only:
+                self.only_active = getattr(self, "only_active", 0) + 1
+            else:
+                self.circle_active += 1
         try:
             try:
                 if prior:
@@ -447,11 +470,21 @@ class Proof(object):
                         # overlay commit (.github/workflows/vp-proof.yml); anything else
                         # in the diff is OVERLAY_DIRTY and nothing is triggered
                         try:
-                            measured = prepare(wt, cand, runner, only=only) if only else prepare(wt, cand, runner)
+                            kw = {}
+                            if only:
+                                kw["only"] = only
+                            if order:
+                                kw["order"] = True
+                            shard = {k: cc[v] for k, v in (("workers", "shard_workers"), ("stagger_s", "shard_stagger_s"))
+                                     if cc.get(v) is not None}
+                            if shard:
+                                kw["shard"] = shard          # roster proof.circleci.shard_workers / shard_stagger_s
+                            measured = prepare(wt, cand, runner, **kw) if kw else prepare(wt, cand, runner)
                         except getattr(self.circle, "OverlayDirty", ()) as exc:
                             raise self.Refused(self.REFUSED_OVERLAY, str(exc)[:300])
-                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83%s)"
-                                 % (task, pid, measured[:12], cand[:12], ", only=%s" % only if only else ""))
+                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83%s%s)"
+                                 % (task, pid, measured[:12], cand[:12], ", only=%s" % only if only else "",
+                                    ", order=final (platform-order rendered, D100)" if order else ""))
                     rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, measured])
                     if rc != 0:
                         raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
@@ -583,7 +616,8 @@ class Proof(object):
             except Exception as exc:
                 out_dir = "record failed: %s" % exc
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
-                   "paths": paths, "only": only, "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
+                   "paths": paths, "only": only, "order": bool(order),
+                   "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
                    "flake_suspect": flake, "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
                    "provider": self.provider(), "measured_commit": measured,
@@ -598,7 +632,10 @@ class Proof(object):
             return rec
         finally:
             with self._lock:
-                self.circle_active = max(0, self.circle_active - 1)
+                if only:
+                    self.only_active = max(0, getattr(self, "only_active", 0) - 1)
+                else:
+                    self.circle_active = max(0, self.circle_active - 1)
             if cc.get("delete_branch_after", True):
                 for acct, remote in (pushed or {"": cc.get("push_remote")}).items():
                     try:

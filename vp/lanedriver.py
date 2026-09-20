@@ -1272,6 +1272,180 @@ class LaneDriver(object):
             self.log("HOLD: CANARY_PENDING %s holds %s (no claim, no strike, no pipeline)" % (c["task"], task))
         return True
 
+    # -- Fleet-3 (§98): FLEET_IDLE ---------------------------------------------------------
+
+    FLEET_POLL_S = 300
+    FLEET_IDLE_MIN_S = 600
+    FLEET_IDLE_MIN_RUNNERS = 3
+
+    def _fleet_cfg(self):
+        f = (self.proof_cfg.get("circleci") or {}).get("fleet")
+        return f if isinstance(f, dict) else {}
+
+    def _fleet_waiting(self, state):
+        """hosted work that could use an idle runner: READY CIRCLECI twins and
+        twins held by the canary (§21.2)"""
+        tasks = (state or {}).get("tasks") or {}
+        waiting = set(t for k, t in [k for k in self._pack_logged if isinstance(k, tuple) and k[0] == "canary-hold"])
+        for t, row in tasks.items():
+            if (row or {}).get("state") != "READY":
+                continue
+            p = self.packet_for(t)
+            if p and vppack.is_hosted_twin(p) and p.get("twin_gate") == "CIRCLECI":
+                waiting.add(t)
+        return sorted(waiting)
+
+    def _fleet_step(self, state, now=None):
+        """Fleet-3: ALERT FLEET_IDLE (once per idle episode) when >= N self-hosted
+        runners have sat idle > 10 min while hosted work waits.  Reads the
+        runner API every FLEET_POLL_S; writes fleet.json for the board.  Only on
+        the gha provider; disabled by proof.circleci.fleet.enabled false."""
+        cfg = self._fleet_cfg()
+        if self.proof.provider() != "gha" or cfg.get("enabled") is False:
+            return
+        now = time.monotonic() if now is None else now
+        last = getattr(self, "_fleet_last_mono", None)
+        if last is not None and now - last < float(cfg.get("poll_s", self.FLEET_POLL_S)):
+            return
+        self._fleet_last_mono = now
+        rows = self.proof.circle.runners(self.proof.circle_runner)
+        since = getattr(self, "_fleet_idle_since", None) or {}
+        for r in rows:
+            if r["status"] == "online" and not r["busy"]:
+                since.setdefault(r["name"], now)
+            else:
+                since.pop(r["name"], None)
+        for name in list(since):
+            if name not in [r["name"] for r in rows]:
+                since.pop(name)
+        self._fleet_idle_since = since
+        floor = float(cfg.get("idle_min_s", self.FLEET_IDLE_MIN_S))
+        idle_long = sorted(n for n, t0 in since.items() if now - t0 >= floor)
+        waiting = self._fleet_waiting(state)
+        snap = {"ts": utc_ms(), "runners": len(rows), "online": sum(1 for r in rows if r["status"] == "online"),
+                "busy": sum(1 for r in rows if r["busy"]), "idle": len(since), "idle_over_floor": idle_long,
+                "waiting": waiting}
+        try:
+            (self.run_root / "fleet.json").write_text(json.dumps(snap, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        n = int(cfg.get("idle_min_runners", self.FLEET_IDLE_MIN_RUNNERS))
+        if len(idle_long) >= n and waiting:
+            episode = min(since[x] for x in idle_long)
+            self.alert_once("fleet-idle:%d" % int(episode), "FLEET_IDLE",
+                            "%d of %d runners idle > %d min (%s) while hosted work waits: %s -- a proof_only "
+                            "twin (twin_proof_only) or the next canary could use them (Fleet-3)"
+                            % (len(idle_long), len(rows), int(floor // 60), ", ".join(idle_long)[:200],
+                               ", ".join(waiting)[:200]))
+
+    # -- Fleet-2 (§98): preflight ---------------------------------------------------------
+
+    PREFLIGHT_MAX = 1
+
+    def _preflight_tip(self, twin, p, tasks):
+        """-> (sha, paths, why): the newest BUILT integration union when it carries the
+        parent's output, else the parent's own VERIFIED output; None when the
+        parent has no output or no test paths"""
+        parent = p.get("twin_of")
+        row = tasks.get(parent) or {}
+        out = row.get("output_sha")
+        pp = self.pack.get(parent) or {}
+        paths = [str(x) for x in (pp.get("test_paths") or [])]
+        if not out or not paths:
+            return None
+        docs = [d for d in self._integration_docs() if d.get("status") == "BUILT"]
+        latest = docs[-1] if docs else None
+        members = {m.get("task"): m.get("output_sha") for m in (latest or {}).get("members") or []}
+        if latest and members.get(parent) == out:
+            return latest["union_sha"], paths, "integration union %s" % latest.get("union")
+        return out, paths, "parent %s output" % parent
+
+    def _preflight_done(self, twin, tip):
+        for rec in self._proof_index().get(tip) or []:
+            if str(rec.get("proof_id") or "").startswith("proof-preflight-%s-" % twin) \
+                    and rec.get("status") in ("PASS", "FAIL_PRODUCT"):
+                return rec
+        return None
+
+    def _preflight_step(self, state, now=None):
+        """Fleet-2: lowest-priority use of idle runners -- ONE hosted run of a
+        held twin's parent test files (`only=preflight:<paths>`) at the tip the
+        twin will get.  A signal, never a verdict: the record carries `only`, so
+        D79/D94 never adopt it, the canary never releases on it and the twin's
+        state does not move.  Cancelled when the tip changes.  Launched only
+        when an idle runner exists (fleet.json) and the only= cap keeps a free
+        slot for real only= twins."""
+        cfg = self._fleet_cfg()
+        if self.proof.provider() != "gha" or cfg.get("enabled") is False or cfg.get("preflight") is False:
+            return
+        tasks = (state or {}).get("tasks") or {}
+        live = getattr(self, "_preflight", None)
+        if live is None:
+            live = self._preflight = {}
+        # cancel on tip change / reap finished
+        for twin in list(live):
+            ent = live[twin]
+            if not ent["thread"].is_alive():
+                live.pop(twin)
+                continue
+            p = self.packet_for(twin) or {}
+            cur = self._preflight_tip(twin, p, tasks)
+            if cur and cur[0] != ent["tip"] and not ent.get("cancelled"):
+                ent["cancelled"] = True
+                prior = self.proof.triggered_pipeline(ent["tip"])
+                if prior and prior.get("pipeline_id"):
+                    try:
+                        self.proof.circle.cancel_pipeline(prior["pipeline_id"], self.proof.circle_runner,
+                                                          prior.get("account"))
+                        self.log("PREFLIGHT %s tip moved %s -> %s: cancelled run %s (Fleet-2)"
+                                 % (twin, ent["tip"][:12], cur[0][:12], prior["pipeline_id"]))
+                    except Exception as exc:  # noqa: BLE001
+                        self.log("PREFLIGHT %s cancel of run %s failed: %s" % (twin, prior["pipeline_id"], exc))
+        if len(live) >= int(cfg.get("preflight_max", self.PREFLIGHT_MAX)):
+            return
+        idle = getattr(self, "_fleet_idle_since", None) or {}
+        if not idle:
+            return
+        if getattr(self.proof, "only_active", 0) + 1 >= self.proof.only_cap():
+            return                                   # keep a slot for a real only= twin
+        for twin in self._fleet_waiting(state):
+            if twin in live:
+                continue
+            p = self.packet_for(twin) or {}
+            got = self._preflight_tip(twin, p, tasks)
+            if not got:
+                continue
+            tip, paths, why = got
+            if self._preflight_done(twin, tip):
+                continue
+            # proof-<...> so RUN_ROOT/proofs/proof-*.json (the proof index) sees it
+            pid = "proof-preflight-%s-%s" % (twin, utc_ms().replace(":", "").replace("-", "").replace(".", "")[:15])
+            kind = str(p.get("proof_kind") or "platform")
+            self.log("PREFLIGHT %s: %d test path(s) of %s at %s (%s) on an idle runner (Fleet-2, %s)"
+                     % (twin, len(paths), p.get("twin_of"), tip[:12], why, pid))
+            th = threading.Thread(target=self._preflight_run, args=(twin, pid, tip, kind, paths), daemon=True,
+                                  name="preflight-%s" % twin)
+            live[twin] = {"tip": tip, "pid": pid, "thread": th, "ts": utc_ms()}
+            th.start()
+            return                                   # one launch per step
+
+    def _preflight_run(self, twin, pid, tip, kind, paths):
+        try:
+            wt = self.ensure_worktree("PREFLIGHT-%s" % twin, tip)
+            rec = self.proof.run(twin, pid, wt, tip, tip, kind, [], abort=lambda: self._abort.is_set(),
+                                 only="preflight:%s" % ",".join(paths))
+        except Exception as exc:  # noqa: BLE001
+            self.log("PREFLIGHT %s %s failed: %s: %s" % (twin, pid, type(exc).__name__, exc))
+            return
+        status = rec.get("status")
+        reds = [str(n) for n in rec.get("failed_nodes") or []]
+        self.log("PREFLIGHT %s %s at %s -> %s (%d red node(s)%s): a signal, not a verdict"
+                 % (twin, pid, tip[:12], status, len(reds), ", pipeline %s" % rec.get("pipeline_id")
+                    if rec.get("pipeline_id") else ""))
+        if status == "FAIL_PRODUCT":
+            self.alert("PREFLIGHT_RED", "%s: %d of its parent's test nodes are red at %s (pipeline %s): %s"
+                       % (twin, len(reds), tip[:12], rec.get("pipeline_id"), ", ".join(reds)[:400]), twin)
+
     def _canary_proof(self, c, tasks):
         """the newest proof record of the canary's rows (proofs/proof-<row>-*.json), or None"""
         rows = [t for t in tasks if self._is_canary_row(t, c)]
@@ -1899,6 +2073,14 @@ class LaneDriver(object):
             self._canary_step(self.control.state_view() or {})
         except Exception as exc:  # noqa: BLE001
             self.log("CANARY step failed: %s: %s" % (type(exc).__name__, exc))
+        try:
+            self._fleet_step(self.control.state_view() or {})
+        except Exception as exc:  # noqa: BLE001
+            self.log("FLEET step failed: %s: %s" % (type(exc).__name__, exc))
+        try:
+            self._preflight_step(self.control.state_view() or {})
+        except Exception as exc:  # noqa: BLE001
+            self.log("PREFLIGHT step failed: %s: %s" % (type(exc).__name__, exc))
         if self.pack:
             try:
                 state = self.control.state_view() or {}
@@ -2476,6 +2658,51 @@ class LaneDriver(object):
         except OSError:
             pass
 
+    MIGRATION_NOTE_RE = re.compile(r"(?m)^> MIGRATION NUMBERS[^\n]*\n\n?")
+
+    def _repack(self, wt, task, rnd, stage):
+        """D101 (Architect 2026-09-20): at EVERY round boundary -- before the
+        builder's turn and before the grader's -- re-copy PACKET.md /
+        BENCHMARK.md from the pack when the pack copy differs from the .vp copy,
+        so an amendment reaches the next round instead of only a claim or a
+        resume (R-W2-PIN-TEXT-ESCALATE round 2 graded stale B4/B7 literals).
+        The D80 migration note is kept; prompts stay byte-identical (the
+        payload lives in .vp, rule 7).  Twins keep their derived text."""
+        try:
+            pp, bp = self._pack_paths(task)
+        except Exception:  # noqa: BLE001
+            return False
+        twin = self.packet_for(task)
+        if not pp or (twin and vppack.is_hosted_twin(twin)):
+            return False
+        vp = Path(wt) / ".vp"
+        changed = []
+        try:
+            for name, src in (("PACKET.md", pp), ("BENCHMARK.md", bp)):
+                if not src or not src.exists():
+                    continue
+                new = src.read_text(encoding="utf-8")
+                dst = vp / name
+                cur = dst.read_text(encoding="utf-8") if dst.exists() else ""
+                note = self.MIGRATION_NOTE_RE.search(cur) if name == "PACKET.md" else None
+                out = new
+                if note:
+                    # the D80 note goes back exactly where _allocate_migrations puts it
+                    m = re.match(r"(?s)\A---\n.*?\n---\n", new)
+                    cut = m.end() if m else 0
+                    out = new[:cut] + ("\n" if cut else "") + note.group(0) + new[cut:].lstrip("\n")
+                if cur == out:
+                    continue
+                dst.write_text(out, encoding="utf-8")
+                changed.append("%s %s->%s" % (name, hashlib.sha256(cur.encode("utf-8")).hexdigest()[:8],
+                                              hashlib.sha256(out.encode("utf-8")).hexdigest()[:8]))
+        except OSError as exc:
+            self.log("REPACK %s round %d %s failed: %s" % (task, rnd, stage, exc))
+            return False
+        if changed:
+            self.log("REPACK %s round %d %s (%s; the pack was amended -- D101)" % (task, rnd, stage, ", ".join(changed)))
+        return bool(changed)
+
     MIGRATION_PLACEHOLDER = re.compile(r"(?:^|/)migrations/NNN_([a-z0-9_]+)\.sql$")
 
     def _allocate_migrations(self, wt, task):
@@ -2548,7 +2775,7 @@ class LaneDriver(object):
             # opening `---` it broke parse_front_matter, _proof_step read no
             # test_paths and sent a FULL suite to CircleCI (eb3f3dc9, 20:45Z)
             cur = pk.read_text(encoding="utf-8")
-            cur = re.sub(r"(?m)^> MIGRATION NUMBERS[^\n]*\n\n?", "", cur)
+            cur = self.MIGRATION_NOTE_RE.sub("", cur)
             m = re.match(r"(?s)\A---\n.*?\n---\n", cur)
             cut = m.end() if m else 0
             pk.write_text(cur[:cut] + ("\n" if cut else "") + head + cur[cut:].lstrip("\n"), encoding="utf-8")
@@ -4010,6 +4237,7 @@ class LaneDriver(object):
                 if fpath.exists():
                     _doc, fails, unknown = findings_verdicts(fpath)
         for rnd in range(start, max_rounds + 1):
+            self._repack(wt, task, rnd, "build")
             if skip_build:
                 skip_build = False
                 self.log("BUILD %s round %d already on %s (build skipped)" % (task, rnd, rst["head"][:12]))
@@ -4054,6 +4282,7 @@ class LaneDriver(object):
                 fpath.unlink()
             except OSError:
                 pass
+            self._repack(wt, task, rnd, "grade")
             gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
                               JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, rnd,
                               expect_fence=True)
@@ -4217,14 +4446,19 @@ class LaneDriver(object):
         # "portal").  A targeted proof of that packet's own claim: its record
         # carries `only` and is never adopted as a twin's full-suite PASS.
         only = str(hdr.get("proof_only") or "").strip() or None
+        # D100 (§98 item 3): the ~80-min platform-order job runs only on the FINAL
+        # canary (roster canary.final true, armed by the Architect) or a packet
+        # that asks for it (`proof_order: true`); intermediate canaries omit it
+        order = self._order_wanted(task, hdr)
         pending = {"sha": cand, "base": base, "kind": pkind, "paths": paths, "workers": workers, "only": only,
-                   "ts": utc_ms()}
+                   "order": order, "ts": utc_ms()}
         (tdir / "proof-pending.json").write_text(json.dumps(pending, indent=2), encoding="utf-8")
         pid = "proof-%s-%s" % (task, attempt[-15:])
-        if hdr.get("proof_paths") or workers or only:
-            self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s%s"
-                     % (task, len(paths), workers, ", only=%s (one hosted job/leg, D98)" % only if only else ""))
-        prior = self._reusable_proof(cand, pkind, paths, exclude=pid, only=only)
+        if hdr.get("proof_paths") or workers or only or order:
+            self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s%s%s"
+                     % (task, len(paths), workers, ", only=%s (one hosted job/leg, D98)" % only if only else "",
+                        ", order=final (platform-order rendered, D100)" if order else ""))
+        prior = self._reusable_proof(cand, pkind, paths, exclude=pid, only=only, order=order)
         if prior is not None:
             # D79: the same sha + kind + paths already has a real answer (a CircleCI
             # pipeline or a completed box run, PASS/FAIL_PRODUCT): reuse it, never
@@ -4238,8 +4472,13 @@ class LaneDriver(object):
         else:
             # `only` is passed only when set: a pre-D98 Proof (a fake, or a live
             # instance across the hot reload) keeps its signature
+            kw = {}
+            if only:
+                kw["only"] = only
+            if order:
+                kw["order"] = True
             rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set(),
-                                 workers=workers, **({"only": only} if only else {}))
+                                 workers=workers, **kw)
         status = rec.get("status")
         self._copy_proof_into_worktree(wt, pid, rec)
         outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")
@@ -4634,7 +4873,31 @@ class LaneDriver(object):
 
     REUSABLE_STATUSES = ("PASS", "FAIL_PRODUCT")
 
-    def _reusable_proof(self, sha, kind, paths, exclude=None, only=None):
+    def _order_wanted(self, task, hdr):
+        """D100: True when this proof must carry the platform-order job -- the
+        packet says so (proof_order: true) or it is the canary's row and the
+        roster canary block is armed `final: true`."""
+        if str(hdr.get("proof_order") or "").strip().lower() in ("true", "yes", "1"):
+            return True
+        c = self._canary()
+        return bool(c and c.get("final") and self._is_canary_row(task, c))
+
+    def order_proof(self, sha):
+        """D100 ship gate: the newest hosted PASS record for `sha` whose jobs
+        include vp/platform-order (the final canary's answer), else None.
+        An intermediate canary PASS (no order job) never satisfies it."""
+        found = []
+        for rec in self._proof_index().get(sha) or []:
+            if rec.get("status") != "PASS" or rec.get("route") not in laneproof.HOSTED_ROUTES:
+                continue
+            if rec.get("only") or not rec.get("pipeline_id"):
+                continue
+            names = [str(j.get("name") or "") for j in rec.get("jobs") or []]
+            if any(n == "vp/platform-order" or n.startswith("vp/platform-order-") for n in names):
+                found.append(rec)
+        return max(found, key=lambda r: str(r.get("ts") or "")) if found else None
+
+    def _reusable_proof(self, sha, kind, paths, exclude=None, only=None, order=False):
         """D79: the newest real answer already recorded for sha + kind + paths --
         a circleci record with a pipeline_id, or a box record -- with status
         PASS/FAIL_PRODUCT; None otherwise (FAIL_INFRA/UNKNOWN/CANCELLED/BLOCKED_*
@@ -4649,6 +4912,10 @@ class LaneDriver(object):
                 continue
             route = rec.get("route")
             if (rec.get("only") or None) != (only or None):
+                continue
+            if order and not rec.get("order"):
+                # D100: a final canary needs the order job; an intermediate PASS
+                # (no platform-order) is not its answer.  The reverse adopts.
                 continue
             if rec.get("kind") != kind:
                 # D94 (§77): a hosted FULL-SUITE PASS ran every suite the workflow

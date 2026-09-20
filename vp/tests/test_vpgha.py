@@ -256,7 +256,10 @@ def test_overlay_renders_platform_order_only_when_present():
     # ...and a ci.yml carrying the job renders it after the required set, on the
     # fleet, with its junit leg, and with `needs` pruned to rendered jobs only
     # (a needs on the dropped `deploy` would make GitHub reject the workflow).
-    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB))
+    # D100: even when present it is rendered only for a FINAL canary (order=True) or only=
+    inter = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB))
+    assert "platform-order" not in inter["jobs"], "an intermediate canary omits the ~80-min order job"
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB, order=True))
     assert list(doc["jobs"]) == list(vpgha_overlay.REQUIRED_JOBS) + ["platform-order"]
     job = doc["jobs"]["platform-order"]
     assert job["name"] == "vp/platform-order" and job["runs-on"] == ["self-hosted", "voicepod"]
@@ -269,7 +272,7 @@ def test_overlay_renders_platform_order_only_when_present():
 
 def test_overlay_drops_a_needs_that_only_named_dropped_jobs():
     txt = MINI_CI + ORDER_JOB.replace("needs: [platform, deploy]", "needs: [deploy]")
-    doc = yaml.safe_load(vpgha_overlay.render(txt))
+    doc = yaml.safe_load(vpgha_overlay.render(txt, order=True))
     assert "needs" not in doc["jobs"]["platform-order"]
 
 
@@ -514,3 +517,39 @@ def test_trigger_failures_and_poll_transients_surface_or_retry():
                      clock=lambda: 0.0)
     assert res["workflows"][0]["status"] == "success" and sleeps == [30, 30]
     assert vpgha.project_visible(vpgha.Runner(run=FakeGh(), binary="gh")) == (True, "gha")
+
+
+def test_fleet2_preflight_renders_the_platform_job_with_one_pytest_of_the_lanes_files():
+    """Fleet-2 (§98): only=preflight:<paths> renders `platform-preflight` alone:
+    the platform job's setup kept, floor/coverage/shuffled/suite steps replaced
+    by one serial `uv run pytest -q <paths>` with its junit leg."""
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="preflight:tests/test_a.py,tests/test_b.py"))
+    assert list(doc["jobs"]) == ["platform-preflight"]
+    job = doc["jobs"]["platform-preflight"]
+    assert job["name"] == "vp/platform-preflight" and "strategy" not in job
+    runs = [str(st.get("run", "")) for st in job["steps"]]
+    assert sum("uv run pytest" in r for r in runs) == 1
+    assert any(r.startswith("uv run pytest -q tests/test_a.py tests/test_b.py --junitxml=${{ runner.temp }}/junit/platform-preflight-1.xml")
+               for r in runs)
+    assert not any("ci_collection_floor" in r or "shuffled_runner" in r or "check_module_coverage" in r for r in runs)
+    assert job["steps"][-1]["with"]["name"] == "junit-platform-preflight"
+    with pytest.raises(ValueError, match="names no test paths"):
+        vpgha_overlay.render(MINI_CI, only="preflight:")
+
+
+def test_shard_workers_and_pg_stagger_come_from_the_roster_and_touch_the_shard_job_only():
+    """R-TEST-PG-STAGGER pre-stage: roster proof.circleci.shard_workers rewrites the
+    shard leg's -n; shard_stagger_s sets VOICEPOD_PG_START_STAGGER_SECONDS on the
+    shard pytest step only (unset by default: local and other jobs untouched)."""
+    base = yaml.safe_load(vpgha_overlay.render(MINI_CI))
+    shard_steps = base["jobs"]["platform-shards"]["steps"]
+    run = next(st for st in shard_steps if "uv run pytest" in str(st.get("run", "")))
+    assert "-n 3 --dist loadfile" in run["run"] and vpgha_overlay.STAGGER_ENV not in run["env"]
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, shard_workers=6, shard_stagger_s=1.25))
+    run = next(st for st in doc["jobs"]["platform-shards"]["steps"] if "uv run pytest" in str(st.get("run", "")))
+    assert "-n 6 --dist loadfile" in run["run"] and run["env"][vpgha_overlay.STAGGER_ENV] == "1.25"
+    text = vpgha_overlay.render(MINI_CI, shard_workers=6, shard_stagger_s=1.25)
+    assert text.count(vpgha_overlay.STAGGER_ENV) == 1, "the shard job only"
+    doc0 = yaml.safe_load(vpgha_overlay.render(MINI_CI, shard_stagger_s=0))
+    run0 = next(st for st in doc0["jobs"]["platform-shards"]["steps"] if "uv run pytest" in str(st.get("run", "")))
+    assert vpgha_overlay.STAGGER_ENV not in run0["env"], "0 = unset"

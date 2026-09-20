@@ -1636,3 +1636,27 @@ def test_d98_a_twin_header_never_carries_proof_only():
     head, rest = vppack.twin_front_matter(packet, "a" * 40)
     assert "proof_only" not in head and "proof_paths" not in head and "proof_workers" not in head
     assert "proof_kind: platform" in head and rest == "body\n"
+
+
+def test_a_twin_never_carries_proof_only_even_when_the_parent_names_one_for_it():
+    """04-REVIEW-POLICY (owner, 2026-09-20): VERIFIED hosted only through the full
+    canary-gated run.  Neither the parent's proof_only nor a twin_proof_only
+    line reaches the CIRCLECI twin; the twin's own proof_only is empty."""
+    body = ("---\nitem: R-X\ntitle: x\nproof_kind: platform\nproof_only: portal\n"
+            "twin_proof_only: platform-shards-3\n---\nbody\n")
+    packet = {"body": body, "id": "R-X-HOSTED", "title": "x", "twin_gate": "CIRCLECI", "max_rounds": 1,
+              "twin_of": "R-X", "depends_on": [], "test_paths": [], "hosted_rows": [], "proof_only": ""}
+    head, _ = vppack.twin_front_matter(packet, "a" * 40)
+    assert "proof_only" not in head
+
+
+def test_load_pack_gives_the_circleci_twin_no_proof_only(tmp_path):
+    d = tmp_path / "R-X"
+    d.mkdir()
+    (d / "PACKET.md").write_text("---\nitem: R-X\ntitle: x\nrunner_role: builder\nowned_files:\n  - platform/a.py\n"
+                                 "test_paths:\n  - platform/tests/test_a.py\nproof_only: portal\n"
+                                 "twin_proof_only: platform-shards-3\n---\nbody\n")
+    (d / "BENCHMARK.md").write_text("- B1 the hosted row [hosted] (gate: CIRCLECI)\n")
+    pack, lint = vppack.load_pack(tmp_path)[:2]
+    assert pack["R-X"]["proof_only"] == "portal" and pack["R-X-HOSTED"]["proof_only"] == ""
+    assert "proof_only" not in vppack.twin_packet_text(pack["R-X-HOSTED"], "a" * 40)

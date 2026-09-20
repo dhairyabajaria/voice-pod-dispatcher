@@ -44,9 +44,10 @@ import yaml
 REQUIRED_JOBS = ("platform", "platform-shards", "platform-coverage", "agent",
                  "deploy-contracts", "portal", "supply-chain")
 # Required-when-present (§95 item 1, packet R-CI-PLATFORM-ORDER-JOB): rendered
-# when the candidate's ci.yml has the job, no raise when it does not.  Without
-# this a union carrying the packet would silently lose the serial order-
-# dependence run on the canary (it moved out of `platform`).
+# when the candidate's ci.yml has the job, no raise when it does not.  D100
+# (§98 item 3): the order job is ~80 min and bounds every canary, so it is
+# rendered only for a FINAL canary (`order=True`: the Architect arms which) or
+# when `only=` names it; intermediate canaries run without it (~40 min).
 OPTIONAL_JOBS = ("platform-order",)
 RUNS_ON = ["self-hosted", "voicepod"]
 # GitHub's default job timeout is 360 min; canary run 35483670689 hung disk-bound
@@ -74,6 +75,11 @@ _SHARD_DIR_DISK = "${{ runner.temp }}/pgdata-${{ matrix.shard }}"
 _SHARD_DIR_SHM = "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"
 SHARD_DIR = _SHARD_DIR_SHM if SHARD_TMP_ON_SHM else _SHARD_DIR_DISK
 SHARD_ENV = {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg", "TMPDIR": SHARD_DIR}
+# R-TEST-PG-STAGGER (Architect 2026-09-20): worker gwN sleeps N x this before the
+# pgserver lock acquire; unset = no sleep (local untouched).  The overlay sets it
+# on the shard job only, from roster proof.circleci.shard_stagger_s (no product
+# default); roster proof.circleci.shard_workers lifts -n 3 -> 6 once it is live.
+STAGGER_ENV = "VOICEPOD_PG_START_STAGGER_SECONDS"
 # rm -rf FIRST (not only as cleanup): a cancelled / OOM-killed run must not
 # leak its pgdata (RAM, on tmpfs) until the box reboots
 SHARD_PREP = {"name": "Prepare per-job pgserver lock dir and pgdata dir (vp-proof)",
@@ -156,13 +162,13 @@ def matrix_suffix(job):
     return ("-${{ matrix.%s }}" % key) if key else ""
 
 
-def _rewrite_run(script, job_id, suffix, floor_supports_branch, legs):
-    """pytest legs get junit; shard leg -n 1; floor calls --branch; vitest junit"""
+def _rewrite_run(script, job_id, suffix, floor_supports_branch, legs, shard_workers=None):
+    """pytest legs get junit; shard leg -n SHARD_WORKERS; floor calls --branch; vitest junit"""
     def pytest_sub(m):
         legs[0] += 1
         cmd = m.group("cmd")
         if job_id == SHARD_JOB:
-            cmd = re.sub(r"-n\s+\S+", "-n %d" % SHARD_WORKERS, cmd, count=1)
+            cmd = re.sub(r"-n\s+\S+", "-n %d" % int(shard_workers or SHARD_WORKERS), cmd, count=1)
         cmd += " --junitxml=%s/%s%s-%d.xml -o junit_family=xunit1" % (JUNIT_DIR, job_id, suffix, legs[0])
         return "%s%s%s" % (m.group("indent"), cmd, m.group("cont") or "")
     out = PYTEST_RE.sub(pytest_sub, script)
@@ -223,16 +229,51 @@ def select_only(src, selected, only):
     raise ValueError("only=%s names no rendered job or matrix leg (jobs: %s)" % (only, ", ".join(selected)))
 
 
-def render_jobs(ci, floor_supports_branch=False, only=None):
+PREFLIGHT_JOB = "platform-preflight"
+PREFLIGHT_PREFIX = "preflight:"
+PREFLIGHT_DROP_RE = re.compile(r"ci_collection_floor\.py|check_module_coverage\.py|tests\.shuffled_runner|uv run pytest\b")
+
+
+def preflight_job(src, paths):
+    """Fleet-2 (§98): the `platform` job with its suite steps replaced by ONE
+    serial `uv run pytest -q <paths>` (the held lane's own test files); setup,
+    lint and typecheck steps are kept.  A signal about the lane, never a verdict."""
+    job = dict(src["platform"])
+    steps, done = [], False
+    for st in job.get("steps") or []:
+        run = str(st.get("run") or "")
+        if run and PREFLIGHT_DROP_RE.search(run):
+            if not done:
+                done = True
+                steps.append({"name": "Preflight: the lane's own test files (vp-proof, Fleet-2)",
+                              "working-directory": st.get("working-directory") or "platform",
+                              "run": "uv run pytest -q %s" % " ".join(paths)})
+            continue
+        steps.append(st)
+    if not done:
+        raise ValueError("preflight: the platform job has no pytest step to replace")
+    job["steps"] = steps
+    job.pop("strategy", None)
+    return job
+
+
+def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_workers=None, shard_stagger_s=None):
     """{job_id: job} for the overlay, derived from a parsed ci.yml; `only`
-    narrows it to one job / matrix leg (select_only)"""
+    narrows it to one job / matrix leg (select_only); `order` adds the
+    optional order-dependence job when the ci.yml has it (D100);
+    `shard_workers` / `shard_stagger_s` tune the shard job (R-TEST-PG-STAGGER)"""
     upload = _upload_action(ci)
     src = ci.get("jobs") or {}
     missing = [j for j in REQUIRED_JOBS if j not in src]
     if missing:
         raise ValueError("ci.yml lacks required job(s): %s" % ", ".join(missing))
-    selected = list(REQUIRED_JOBS) + [j for j in OPTIONAL_JOBS if j in src]
-    if only:
+    selected = list(REQUIRED_JOBS) + [j for j in OPTIONAL_JOBS if j in src and (order or only)]
+    if only and str(only).startswith(PREFLIGHT_PREFIX):
+        paths = [x for x in str(only)[len(PREFLIGHT_PREFIX):].split(",") if x.strip()]
+        if not paths:
+            raise ValueError("only=%s names no test paths" % only)
+        selected, src = [PREFLIGHT_JOB], {PREFLIGHT_JOB: preflight_job(src, paths)}
+    elif only:
         selected, src = select_only(src, selected, only)
     out = {}
     for job_id in selected:
@@ -260,11 +301,14 @@ def render_jobs(ci, floor_supports_branch=False, only=None):
         for step in job.get("steps") or []:
             step = dict(step)
             if step.get("run"):
-                new = _rewrite_run(str(step["run"]), job_id, suffix, floor_supports_branch, legs)
+                new = _rewrite_run(str(step["run"]), job_id, suffix, floor_supports_branch, legs,
+                                   shard_workers=shard_workers)
                 step["run"] = _Literal(new) if "\n" in new else new
                 if job_id == SHARD_JOB and "pytest" in new:
                     env = dict(step.get("env") or {})
                     env.update(SHARD_ENV)
+                    if shard_stagger_s is not None and float(shard_stagger_s) > 0:
+                        env[STAGGER_ENV] = "%.2f" % float(shard_stagger_s)
                     step["env"] = env
             steps.append(step)
         if job_id == SHARD_JOB:
@@ -307,9 +351,11 @@ permissions:
 """ % {"name": WORKFLOW_NAME}
 
 
-def render(ci_yml_text, floor_supports_branch=False, only=None):
+def render(ci_yml_text, floor_supports_branch=False, only=None, order=False, shard_workers=None,
+           shard_stagger_s=None):
     ci = yaml.safe_load(ci_yml_text)
-    jobs = render_jobs(ci, floor_supports_branch, only=only)
+    jobs = render_jobs(ci, floor_supports_branch, only=only, order=order, shard_workers=shard_workers,
+                       shard_stagger_s=shard_stagger_s)
     body = yaml.dump({"jobs": jobs}, Dumper=_Dumper, sort_keys=False, width=200, allow_unicode=True,
                      default_flow_style=False)
     return HEAD + body

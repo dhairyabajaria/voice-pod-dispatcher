@@ -106,6 +106,9 @@ def load_pack(pack_dir):
             # D17/D21 review subject keys (the driver's _review_packet_plan)
             "review_base": str(fm.get("review_base") or "").strip(),
             "coverage_targets": [str(t).strip() for t in _as_list(fm.get("coverage_targets"))],
+            # D98: one hosted job/leg for this packet's OWN proof (empty = full suite);
+            # never inherited by a twin (04-REVIEW-POLICY: VERIFIED hosted = the full run)
+            "proof_only": str(fm.get("proof_only") or "").strip(),
         }
         if st.startswith("NEW:"):
             tpl = st[4:]
@@ -377,6 +380,7 @@ def hosted_twins(packet, benchmark_path, lint=None):
             "parent_contract": packet.get("parent_contract"), "group": packet.get("group"), "body": packet["body"],
             "review_base": "", "coverage_targets": [],
             "twin_of": packet["id"], "twin_gate": gate, "hosted_rows": rids, "hosted_lines": lines,
+            "proof_only": "",     # a twin is the full canary-gated run, never one job (04-REVIEW-POLICY)
         })
     return twins
 
@@ -456,7 +460,9 @@ def twin_front_matter(packet, base):
         end = lines.index("---", 1)
     except ValueError:
         return None, body
-    drop = set(TWIN_HEADER_OVERRIDES) | {"proof_only"}   # D98: a twin is the full suite, never one job/leg
+    # D98: a twin is the full suite, never one job/leg -- the parent's proof_only never
+    # reaches it (04-REVIEW-POLICY: VERIFIED hosted only through the full canary-gated run)
+    drop = set(TWIN_HEADER_OVERRIDES) | {"proof_only", "twin_proof_only"}
     if not packet["test_paths"]:
         drop |= {"proof_paths", "proof_workers"}   # a full-suite twin keeps no box narrowing (F-B)
     kept, skip = [], False

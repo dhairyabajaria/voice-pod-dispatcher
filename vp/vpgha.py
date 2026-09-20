@@ -135,25 +135,28 @@ def _git(runner, args, cwd, what, env=None):
     return (res.stdout or "").strip()
 
 
-def render_overlay(wt, cand, runner, only=None):
+def render_overlay(wt, cand, runner, only=None, order=False, shard=None):
     """vp-proof.yml text for this candidate, from ITS ci.yml and floor script;
-    `only` (§95 item 2) narrows the workflow to one job / matrix leg"""
+    `only` (§95 item 2) narrows the workflow to one job / matrix leg; `order`
+    (D100) adds the platform-order job for a final canary"""
     ci_text = _git(runner, ["show", "%s:.github/workflows/ci.yml" % cand], wt, "overlay")
     try:
         floor = _git(runner, ["show", "%s:scripts/ci_collection_floor.py" % cand], wt, "overlay")
     except RuntimeError:
         floor = ""
-    return vpgha_overlay.render(ci_text, vpgha_overlay.floor_supports_branch(floor), only=only)
+    shard = shard or {}
+    return vpgha_overlay.render(ci_text, vpgha_overlay.floor_supports_branch(floor), only=only, order=order,
+                                shard_workers=shard.get("workers"), shard_stagger_s=shard.get("stagger_s"))
 
 
-def prepare_measured(wt, cand, runner=None, text=None, only=None):
+def prepare_measured(wt, cand, runner=None, text=None, only=None, order=False, shard=None):
     """-> measured commit sha: `cand` + one commit that adds/replaces
     .github/workflows/vp-proof.yml, built through a temporary index so the
     worktree's HEAD, index and files are untouched.  Asserts (rule 2) that
     `git diff --name-only cand measured` is exactly that path."""
     runner = runner or Runner()
     wt = str(wt)
-    text = text if text is not None else render_overlay(wt, cand, runner, only=only)
+    text = text if text is not None else render_overlay(wt, cand, runner, only=only, order=order, shard=shard)
     with tempfile.TemporaryDirectory(prefix="vp-overlay-") as tmp:
         blob_path = Path(tmp) / "vp-proof.yml"
         blob_path.write_text(text, encoding="utf-8")
@@ -166,8 +169,9 @@ def prepare_measured(wt, cand, runner=None, text=None, only=None):
         tree = _git(runner, ["write-tree"], wt, "overlay", env=env)
         measured = _git(runner, ["-c", "user.name=vp-lanedriver", "-c", "user.email=lanedriver@voicepod.local",
                                  "commit-tree", tree, "-p", cand, "-m",
-                                 "vp-proof overlay (D83 §46): %s on %s%s"
-                                 % (vpgha_overlay.WORKFLOW_PATH, cand[:12], " only=%s" % only if only else "")],
+                                 "vp-proof overlay (D83 §46): %s on %s%s%s"
+                                 % (vpgha_overlay.WORKFLOW_PATH, cand[:12], " only=%s" % only if only else "",
+                                    " order=final" if order else "")],
                         wt, "overlay")
     changed = [l for l in _git(runner, ["diff", "--name-only", cand, measured], wt, "overlay").splitlines()
                if l.strip()]
@@ -210,6 +214,18 @@ def trigger(branch, parameters, runner=None, account=None, targets=None, rotate=
         args += ["-f", "%s=%s" % (k, "true" if v is True else "false" if v is False else v)]
     _check(runner.gh(args), "gh workflow run")
     return {"pipeline_id": find_run(branch, runner, sleep=sleep), "account": ACCOUNT}
+
+
+def runners(runner=None):
+    """Fleet-3: [{name, status, busy}] for the repo's self-hosted runners (read-only)"""
+    runner = runner or Runner()
+    data = _json(runner.gh(["api", "--paginate", "repos/%s/actions/runners" % REPO,
+                            "--jq", "[.runners[] | {name, status, busy}]"]), "gh api runners")
+    rows = []
+    for chunk in (data if isinstance(data, list) else [data]):
+        rows.extend(chunk if isinstance(chunk, list) else [chunk])
+    return [{"name": str(r.get("name")), "status": str(r.get("status")), "busy": bool(r.get("busy"))}
+            for r in rows if isinstance(r, dict) and r.get("name")]
 
 
 def _map_job(j, run_id):

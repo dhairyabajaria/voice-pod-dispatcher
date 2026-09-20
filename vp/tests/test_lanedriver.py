@@ -2334,6 +2334,226 @@ def test_d98_an_only_record_is_never_adopted_as_a_full_suite_answer(tmp_path):
     assert "CANARY_NOT_ANSWERED" in log and "only=platform-shards-3 run (one job/leg)" in log
 
 
+def test_d100_order_is_wanted_for_a_final_canary_and_the_ship_gate_needs_the_order_job(tmp_path):
+    """D100 (§98 item 3): platform-order renders only when the canary block is
+    armed final (or a packet says proof_order: true); an intermediate PASS is
+    adopted by twins as today but never answers a final ask nor the ship gate."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    assert drv._order_wanted("L06-HOSTED-R10", {}) is False
+    assert drv._order_wanted("R-X", {"proof_order": "true"}) is True
+    drv.proof_cfg["circleci"] = {"canary": {"task": "L06-HOSTED", "release_on": ["PASS"]}}
+    assert drv._order_wanted("L06-HOSTED-R10", {}) is False, "armed but not final"
+    drv.proof_cfg["circleci"]["canary"]["final"] = True
+    assert drv._order_wanted("L06-HOSTED-R10", {}) is True
+    assert drv._order_wanted("R-OTHER", {}) is False, "only the canary's row"
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "e" * 40
+    def rec(pid, **kw):
+        d = {"proof_id": pid, "sha": sha, "kind": "platform", "paths": [], "route": "gha",
+             "pipeline_id": "357" + pid[-3:], "status": "PASS", "ts": "2026-09-20T14:00:00.000Z",
+             "jobs": [{"name": "vp/platform", "status": "success"}, {"name": "vp/portal", "status": "success"}]}
+        d.update(kw)
+        (proofs / (pid + ".json")).write_text(json.dumps(d))
+    rec("proof-inter-001")
+    assert drv._reusable_proof(sha, "agent", [])["proof_id"] == "proof-inter-001", "twins adopt an intermediate PASS"
+    assert drv._reusable_proof(sha, "platform", [], order=True) is None, "a final ask needs the order job"
+    assert drv.order_proof(sha) is None, "ship gate: no record carries platform-order"
+    rec("proof-final-002", order=True, ts="2026-09-20T14:01:00.000Z",
+        jobs=[{"name": "vp/platform", "status": "success"}, {"name": "vp/platform-order", "status": "success"}])
+    assert drv._reusable_proof(sha, "platform", [], order=True)["proof_id"] == "proof-final-002"
+    assert drv._reusable_proof(sha, "platform", [])["proof_id"] == "proof-final-002", "a final PASS answers a plain ask too"
+    assert drv.order_proof(sha)["proof_id"] == "proof-final-002"
+    rec("proof-only-003", only="platform-order", ts="2026-09-20T14:02:00.000Z",
+        jobs=[{"name": "vp/platform-order", "status": "success"}])
+    assert drv.order_proof(sha)["proof_id"] == "proof-final-002", "an only=platform-order run is not the ship gate"
+
+
+def test_every_circleci_twin_is_held_by_the_canary_whatever_its_header_says(tmp_path, monkeypatch):
+    """04-REVIEW-POLICY: a twin is VERIFIED hosted only through the full canary-
+    gated run -- a proof_only on a twin (there is none by construction) buys no
+    exemption from the §21.2 hold."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv.proof_cfg["circleci"] = {"canary": {"task": "L06-HOSTED", "release_on": ["PASS"]}}
+    full = {"id": "R-A-HOSTED", "twin_of": "R-A", "twin_gate": "CIRCLECI", "proof_only": ""}
+    one = {"id": "R-B-HOSTED", "twin_of": "R-B", "twin_gate": "CIRCLECI", "proof_only": "platform-shards-3"}
+    monkeypatch.setattr(drv, "packet_for", lambda task: {"R-A-HOSTED": full, "R-B-HOSTED": one}.get(task))
+    assert drv._canary_hold("R-A-HOSTED") is True and drv._canary_hold("R-B-HOSTED") is True
+
+
+def test_fleet3_idle_runners_with_waiting_hosted_work_alert_once_per_episode(tmp_path, monkeypatch):
+    """Fleet-3 (§98): >= 3 runners idle > 10 min while a READY CIRCLECI twin or a
+    canary-held twin exists -> ALERT FLEET_IDLE once per idle episode; fleet.json
+    on the run root for the board; nothing when no work waits."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    fleet = [{"name": "r%d" % i, "status": "online", "busy": False} for i in range(1, 5)]
+    fleet[0]["busy"] = True
+    class Circle(object):
+        calls = 0
+        @staticmethod
+        def runners(runner=None):
+            Circle.calls += 1
+            return list(fleet)
+    drv.proof.circle = Circle
+    monkeypatch.setattr(drv.proof, "provider", lambda: "gha")
+    twin = {"id": "R-A-HOSTED", "twin_of": "R-A", "twin_gate": "CIRCLECI", "proof_only": ""}
+    monkeypatch.setattr(drv, "packet_for", lambda task: twin if task == "R-A-HOSTED" else None)
+    state = {"tasks": {"R-A-HOSTED": {"state": "READY"}, "R-B": {"state": "READY"}}}
+    drv._fleet_step(state, now=1000.0)                      # first sight: idle clocks start
+    drv._fleet_step(state, now=1100.0)                      # inside poll_s: no API call
+    assert Circle.calls == 1
+    drv._fleet_step(state, now=1400.0)                      # 400 s idle: under the 10-min floor
+    lp = env.run_root / "driver.log"
+    assert "FLEET_IDLE" not in (lp.read_text() if lp.exists() else "")
+    drv._fleet_step(state, now=1700.0)                      # 700 s idle, 3 runners, work waits
+    log = (env.run_root / "driver.log").read_text()
+    assert "ALERT FLEET_IDLE" in log and "3 of 4 runners idle > 10 min (r2, r3, r4)" in log and "R-A-HOSTED" in log
+    snap = json.loads((env.run_root / "fleet.json").read_text())
+    assert snap["idle_over_floor"] == ["r2", "r3", "r4"] and snap["waiting"] == ["R-A-HOSTED"] and snap["busy"] == 1
+    drv._fleet_step(state, now=2100.0)                      # same episode: no second alert
+    assert (env.run_root / "driver.log").read_text().count("ALERT FLEET_IDLE") == 1
+    # no waiting work -> no alert even with idle runners (a new episode)
+    fleet[1]["busy"] = True
+    drv._fleet_step(state, now=2500.0)
+    fleet[1]["busy"] = False
+    drv._fleet_step({"tasks": {}}, now=2900.0)
+    drv._fleet_step({"tasks": {}}, now=3600.0)
+    assert (env.run_root / "driver.log").read_text().count("ALERT FLEET_IDLE") == 1
+    assert drv._fleet_waiting({"tasks": {}}) == []
+
+
+def test_fleet2_preflight_runs_a_held_twins_parent_files_once_per_tip_and_cancels_on_tip_change(tmp_path, monkeypatch):
+    """Fleet-2 (§98): with an idle runner and a slot under the only= cap, the
+    driver runs ONE hosted preflight (only=preflight:<paths>) of a held twin's
+    parent test files at the tip the twin will get; the record is a signal
+    (only= -> never adopted); a moved tip cancels the running one; the same
+    (twin, tip) is never launched twice."""
+    import threading
+    env = Env(tmp_path)
+    env.activate()
+    gate = threading.Event()
+    class Proof(FakeProof):
+        only_active = 0
+        class circle(object):
+            cancelled = []
+            @staticmethod
+            def cancel_pipeline(run_id, runner=None, account=None):
+                Proof.circle.cancelled.append(run_id)
+                return ["w1"]
+        circle_runner = None
+        def provider(self):
+            return "gha"
+        def only_cap(self):
+            return 3
+        def triggered_pipeline(self, sha):
+            return {"pipeline_id": "run-" + sha[:4], "account": "gha"}
+        def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None, only=None, order=False):
+            self.calls.append((task, pid, cand, kind, paths, only))
+            gate.wait(10)
+            rec = {"status": "FAIL_PRODUCT", "proof_id": pid, "sha": cand, "route": "gha", "only": only,
+                   "pipeline_id": "run-" + cand[:4], "failed_nodes": ["tests/test_a.py::test_x"], "ts": "2026-09-20T14:30:00.000Z"}
+            d = env.run_root / "proofs"
+            d.mkdir(exist_ok=True)
+            (d / (pid + ".json")).write_text(json.dumps(rec))
+            return rec
+    proof = Proof([])
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()}, proof=proof)
+    monkeypatch.setattr(drv, "ensure_worktree", lambda task, base: env.tmp / "wt" / task)
+    twin = {"id": "R-A-HOSTED", "twin_of": "R-A", "twin_gate": "CIRCLECI", "proof_only": "", "proof_kind": "platform"}
+    monkeypatch.setattr(drv, "packet_for", lambda task: twin if task == "R-A-HOSTED" else None)
+    drv.pack["R-A"] = {"id": "R-A", "test_paths": ["tests/test_a.py", "tests/test_b.py"]}
+    monkeypatch.setattr(drv, "_integration_docs", lambda: [])
+    out1, out2 = "1" * 40, "2" * 40
+    state = {"tasks": {"R-A-HOSTED": {"state": "READY"}, "R-A": {"state": "VERIFIED", "output_sha": out1}}}
+    drv._preflight_step(state)
+    assert proof.calls == [], "no idle runner known yet -> nothing launched"
+    drv._fleet_idle_since = {"r2": 1.0}
+    proof.only_active = 2
+    drv._preflight_step(state)
+    assert proof.calls == [], "the last only= slot is kept for a real only= twin"
+    proof.only_active = 0
+    drv._preflight_step(state)
+    for _ in range(50):
+        if proof.calls:
+            break
+        time.sleep(0.05)
+    assert len(proof.calls) == 1
+    task, pid, cand, kind, paths, only = proof.calls[0]
+    assert task == "R-A-HOSTED" and pid.startswith("proof-preflight-R-A-HOSTED-") and cand == out1
+    assert paths == [] and only == "preflight:tests/test_a.py,tests/test_b.py"
+    drv._preflight_step(state)
+    assert len(proof.calls) == 1, "one in flight: no second launch"
+    # the parent re-verifies -> tip moves -> the running preflight is cancelled
+    state["tasks"]["R-A"]["output_sha"] = out2
+    drv._preflight_step(state)
+    assert Proof.circle.cancelled == ["run-1111"]
+    gate.set()
+    drv._preflight[("R-A-HOSTED")]["thread"].join(5)
+    log = (env.run_root / "driver.log").read_text()
+    assert "PREFLIGHT R-A-HOSTED tip moved 111111111111 -> 222222222222: cancelled run run-1111" in log
+    assert "-> FAIL_PRODUCT (1 red node(s), pipeline run-1111): a signal, not a verdict" in log
+    assert "ALERT PREFLIGHT_RED" in log
+    # the record is never an answer for the twin's full-suite ask
+    assert drv._reusable_proof(out1, "platform", []) is None
+    # a new tip launches once; the same (twin, tip) never twice
+    drv._preflight_step(state)
+    for _ in range(50):
+        if len(proof.calls) == 2:
+            break
+        time.sleep(0.05)
+    assert len(proof.calls) == 2 and proof.calls[1][2] == out2
+    drv._preflight["R-A-HOSTED"]["thread"].join(5)
+    drv._preflight_step(state)
+    drv._preflight_step(state)
+    assert len(proof.calls) == 2, "a done (twin, tip) is not preflighted again"
+
+
+def test_d101_an_amended_pack_reaches_the_next_round_and_keeps_the_migration_note(tmp_path):
+    """D101: at every round boundary the driver re-copies PACKET.md/BENCHMARK.md
+    from the pack when they differ from the .vp copy (REPACK logged); the D80
+    migration note survives; an unchanged pack is a no-op; twins are left alone."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    pack = env.tmp / "pack"
+    (pack / "R-X").mkdir(parents=True)
+    (pack / "R-X" / "PACKET.md").write_text("---\nitem: R-X\ntitle: x\n---\nbody v1\n")
+    (pack / "R-X" / "BENCHMARK.md").write_text("- B4 grep -c phrase prints 1\n")
+    drv.pack_dir = pack
+    drv.pack_by_task["R-X-a1"] = "R-X"
+    wt = env.tmp / "wt" / "R-X-a1"
+    (wt / ".vp").mkdir(parents=True)
+    note = "> MIGRATION NUMBERS (allocated by the driver at claim time, F13/D80): x -> 302_x.sql. Details: .vp/MIGRATION.json\n\n"
+    (wt / ".vp" / "PACKET.md").write_text("---\nitem: R-X\ntitle: x\n---\n\n" + note + "body v1\n")
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B4 grep -c phrase prints 1\n")
+    assert drv._repack(wt, "R-X-a1", 2, "grade") is False, "unchanged pack: no rewrite"
+    (pack / "R-X" / "BENCHMARK.md").write_text("- B4 grep -cE '^\\s*x$' prints 1\n")
+    (pack / "R-X" / "PACKET.md").write_text("---\nitem: R-X\ntitle: x\n---\nbody v2\n")
+    assert drv._repack(wt, "R-X-a1", 2, "grade") is True
+    assert (wt / ".vp" / "BENCHMARK.md").read_text() == "- B4 grep -cE '^\\s*x$' prints 1\n"
+    assert (wt / ".vp" / "PACKET.md").read_text() == "---\nitem: R-X\ntitle: x\n---\n\n" + note + "body v2\n", \
+        "the D80 note sits after the front matter, as _allocate_migrations writes it"
+    log = (env.run_root / "driver.log").read_text()
+    assert "REPACK R-X-a1 round 2 grade (PACKET.md " in log and "BENCHMARK.md " in log and "D101" in log
+    assert drv._repack(wt, "R-X-a1", 3, "build") is False, "now equal again"
+    # a twin keeps its derived text
+    drv.pack["R-X-HOSTED"] = {"id": "R-X-HOSTED", "twin_of": "R-X", "twin_gate": "CIRCLECI"}
+    drv.pack_by_task["R-X-HOSTED-a1"] = "R-X-HOSTED"
+    (pack / "R-X-HOSTED").mkdir()
+    (pack / "R-X-HOSTED" / "PACKET.md").write_text("x\n")
+    wt2 = env.tmp / "wt" / "R-X-HOSTED-a1"
+    (wt2 / ".vp").mkdir(parents=True)
+    (wt2 / ".vp" / "PACKET.md").write_text("twin text\n")
+    assert drv._repack(wt2, "R-X-HOSTED-a1", 1, "build") is False
+    assert (wt2 / ".vp" / "PACKET.md").read_text() == "twin text\n"
+
+
 def test_d96_the_driver_fills_a_missing_or_string_result_attempt_with_the_round(tmp_path):
     """D96 (§86/§91): `attempt` is the integer round number, a value the driver
     owns.  L-TRANSCRIPT-READ-AUDIT-TESTBENCH lost three builder turns to its
