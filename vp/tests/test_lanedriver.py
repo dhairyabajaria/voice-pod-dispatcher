@@ -2264,3 +2264,35 @@ def test_d80_migration_numbers_are_allocated_by_the_driver_at_claim_time(tmp_pat
     assert drv._allocate_migrations(wt2, "L02") is None
     log = (env.run_root / "driver.log").read_text()
     assert "MIGRATION NO-SUCH-TASK allocate failed" in log and "MIGRATION_ALLOC_FAILED" in log
+
+
+def test_d94_a_hosted_full_suite_pass_is_adopted_by_a_twin_of_any_kind_on_the_same_base(tmp_path):
+    """D94 (§77): ~110 full-suite twins release after the first canary PASS; each
+    one's proof sha IS the union base (a twin's head never changes), so D79
+    reuse already covers platform-kind twins.  A hosted full-suite PASS ran
+    every suite, so agent/portal/deploy twins on that base adopt it too.  A
+    FAIL_PRODUCT never crosses kinds; a targeted PASS never crosses kinds."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "c" * 40
+    def rec(pid, **kw):
+        d = {"proof_id": pid, "sha": sha, "kind": "platform", "paths": [], "route": "gha",
+             "pipeline_id": "355" + pid[-3:], "status": "PASS", "ts": "2026-09-20T12:00:00.000Z"}
+        d.update(kw)
+        (proofs / (pid + ".json")).write_text(json.dumps(d))
+    rec("proof-canary-001")
+    for kind in ("platform", "agent", "portal", "deploy"):
+        assert drv._reusable_proof(sha, kind, [])["proof_id"] == "proof-canary-001", kind
+    assert drv._reusable_proof(sha, "agent", ["t/x.py"]) is None, "targeted paths never adopt a full-suite record"
+    (proofs / "proof-canary-001.json").unlink()
+    rec("proof-canary-002", status="FAIL_PRODUCT", ts="2026-09-20T12:01:00.000Z")
+    assert drv._reusable_proof(sha, "platform", [])["proof_id"] == "proof-canary-002"
+    assert drv._reusable_proof(sha, "agent", []) is None, "a red answer stays kind-strict"
+    (proofs / "proof-canary-002.json").unlink()
+    rec("proof-box-003", route="box", pipeline_id=None, ts="2026-09-20T12:02:00.000Z")
+    assert drv._reusable_proof(sha, "agent", []) is None, "a box PASS proves one suite only"
+    rec("proof-canary-004", kind="platform", paths=["t/a.py"], ts="2026-09-20T12:03:00.000Z")
+    assert drv._reusable_proof(sha, "agent", []) is None, "a targeted hosted PASS is not the full suite"

@@ -4627,13 +4627,21 @@ class LaneDriver(object):
         want = [str(x) for x in (paths or [])]
         found = []
         for rec in self._proof_index().get(sha) or []:
-            if rec.get("proof_id") == exclude or rec.get("kind") != kind:
+            if rec.get("proof_id") == exclude:
                 continue
+            route = rec.get("route")
+            if rec.get("kind") != kind:
+                # D94 (§77): a hosted FULL-SUITE PASS ran every suite the workflow
+                # has (platform shards + serial, agent, portal, deploy-contracts) on
+                # this exact tree, so a twin of any kind on the same base adopts it;
+                # a FAIL_PRODUCT stays kind-strict (its reds belong to one suite)
+                if not (rec.get("status") == "PASS" and route in laneproof.HOSTED_ROUTES
+                        and not want and not rec.get("paths")):
+                    continue
             if [str(x) for x in (rec.get("paths") or [])] != want:
                 continue
             if rec.get("status") not in self.REUSABLE_STATUSES:
                 continue
-            route = rec.get("route")
             if route in laneproof.HOSTED_ROUTES and not rec.get("pipeline_id"):
                 continue
             if route not in laneproof.HOSTED_ROUTES + ("box",):
