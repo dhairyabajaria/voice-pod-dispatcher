@@ -173,7 +173,11 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][4]["run"]
     # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
     prep = jobs["platform-shards"]["steps"][1]
-    assert prep["run"] == 'mkdir -p "$RUNNER_TEMP/xdg" "$RUNNER_TEMP/pgdata-${{ matrix.shard }}"'
+    assert prep["run"] == ('rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"\n'
+                           'mkdir -p "$RUNNER_TEMP/xdg" "${{ runner.temp }}/pgdata-${{ matrix.shard }}"'), "rm FIRST: a killed run leaks nothing"
+    assert jobs["platform-shards"]["steps"][-2] == {"name": "Remove this shard's pgdata dir (vp-proof)", "if": "always()",
+                                                    "run": 'rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"'}
+    assert not any("/dev/shm" in json.dumps(st) for st in jobs["platform-shards"]["steps"]), "tmpfs only once the WAL cap lands"
     shard_step = jobs["platform-shards"]["steps"][3]     # junit prep, pgserver prep, checkout, run
     assert shard_step["env"]["XDG_RUNTIME_DIR"] == "${{ runner.temp }}/xdg"
     assert shard_step["env"]["TMPDIR"] == "${{ runner.temp }}/pgdata-${{ matrix.shard }}", "on disk: /dev/shm filled in run 35478392897"
@@ -205,6 +209,26 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
 def test_overlay_refuses_a_ci_yml_missing_a_required_job():
     with pytest.raises(ValueError, match="deploy-contracts"):
         vpgha_overlay.render(MINI_CI.replace("  deploy-contracts:\n", "  deploy-contracts-x:\n"))
+
+
+def test_overlay_on_tmpfs_asserts_the_shm_size_and_never_remounts(monkeypatch):
+    """Advisor 2026-09-20: the tmpfs size is the runner image's (/etc/fstab);
+    the job only ASSERTS it (clear failure), never remounts; pgdata under
+    /dev/shm/pytest-platform-shards-<N> is rm -rf'd first and last."""
+    monkeypatch.setattr(vpgha_overlay, "SHARD_TMP_ON_SHM", True)
+    monkeypatch.setattr(vpgha_overlay, "SHARD_DIR", vpgha_overlay._SHARD_DIR_SHM)
+    monkeypatch.setattr(vpgha_overlay, "SHARD_ENV", {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg", "TMPDIR": vpgha_overlay._SHARD_DIR_SHM})
+    monkeypatch.setattr(vpgha_overlay, "SHARD_PREP", {"name": "prep", "run": 'rm -rf "%s"\nmkdir -p "$RUNNER_TEMP/xdg" "%s"' % ((vpgha_overlay._SHARD_DIR_SHM,) * 2)})
+    monkeypatch.setattr(vpgha_overlay, "SHARD_CLEANUP", {"name": "clean", "if": "always()", "run": 'rm -rf "%s"' % vpgha_overlay._SHARD_DIR_SHM})
+    jobs = yaml.safe_load(vpgha_overlay.render(MINI_CI))["jobs"]
+    steps = jobs["platform-shards"]["steps"]
+    assert steps[1]["name"].startswith("Assert /dev/shm")
+    assert "df -Pk /dev/shm" in steps[1]["run"] and "-ge %d" % (vpgha_overlay.SHARD_SHM_MIN_GB * 1024 * 1024) in steps[1]["run"]
+    assert "mount" not in steps[1]["run"], "assert, never mutate"
+    assert steps[2]["run"].startswith('rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"')
+    assert steps[4]["env"]["TMPDIR"] == "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"
+    assert steps[-2]["if"] == "always()" and steps[-2]["run"] == 'rm -rf "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"'
+    assert not any("Assert /dev/shm" in str(st.get("name")) for st in jobs["platform"]["steps"])
 
 
 @pytest.mark.skipif(not CI_YML.exists(), reason="trunk ci.yml not checked out")

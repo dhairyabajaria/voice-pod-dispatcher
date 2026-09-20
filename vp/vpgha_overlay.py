@@ -50,10 +50,32 @@ JUNIT_DIR = "${{ runner.temp }}/junit"
 DEFAULT_UPLOAD_ACTION = "actions/upload-artifact@v4"
 SHARD_JOB = "platform-shards"
 SHARD_WORKERS = 3
-SHARD_ENV = {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg",
-             "TMPDIR": "${{ runner.temp }}/pgdata-${{ matrix.shard }}"}
+# Where each shard's pgdata (TMPDIR) lives.  On tmpfs only once the product's
+# test fixture caps WAL (Advisor 2026-09-20: pg_wal grows to max_wal_size=1GB
+# per cluster, 24 clusters = 24GB worst case, so /dev/shm overflowed in run
+# 35478392897 regardless of its size); until platform/tests/conftest.py
+# `_server` applies `ALTER SYSTEM SET max_wal_size='64MB' ...` the overlay
+# keeps pgdata on the runner disk.  Flip SHARD_TMP_ON_SHM once that lands.
+SHARD_TMP_ON_SHM = False
+SHARD_SHM_MIN_GB = 6                                   # ~24 clusters x 150MB + headroom
+_SHARD_DIR_DISK = "${{ runner.temp }}/pgdata-${{ matrix.shard }}"
+_SHARD_DIR_SHM = "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"
+SHARD_DIR = _SHARD_DIR_SHM if SHARD_TMP_ON_SHM else _SHARD_DIR_DISK
+SHARD_ENV = {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg", "TMPDIR": SHARD_DIR}
+# rm -rf FIRST (not only as cleanup): a cancelled / OOM-killed run must not
+# leak its pgdata (RAM, on tmpfs) until the box reboots
 SHARD_PREP = {"name": "Prepare per-job pgserver lock dir and pgdata dir (vp-proof)",
-              "run": 'mkdir -p "$RUNNER_TEMP/xdg" "$RUNNER_TEMP/pgdata-${{ matrix.shard }}"'}
+              "run": 'rm -rf "%s"\nmkdir -p "$RUNNER_TEMP/xdg" "%s"' % (SHARD_DIR, SHARD_DIR)}
+# assert, never mutate: the tmpfs size is the runner image's (/etc/fstab) job;
+# a too-small mount fails here with a clear line instead of a DiskFull wall
+SHARD_SHM_ASSERT = {"name": "Assert /dev/shm is large enough for this shard (vp-proof)",
+                    "run": 'size_kb=$(df -Pk /dev/shm | awk \'NR==2{print $2}\')\n'
+                           'echo "/dev/shm size: ${size_kb} kB"\n'
+                           'test "$size_kb" -ge %d || { echo "::error::/dev/shm is smaller than %dG; '
+                           'resize it in the runner image (/etc/fstab), not here"; exit 1; }'
+                           % (SHARD_SHM_MIN_GB * 1024 * 1024, SHARD_SHM_MIN_GB)}
+SHARD_CLEANUP = {"name": "Remove this shard's pgdata dir (vp-proof)", "if": "always()",
+                 "run": 'rm -rf "%s"' % SHARD_DIR}
 
 PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run pytest\b[^\n]*?)(?P<cont>\s*\\)?$", re.M)
 FLOOR_RE = re.compile(r"ci_collection_floor\.py (floor|control|freshness)\b[^\n]*")
@@ -133,6 +155,8 @@ def render_jobs(ci, floor_supports_branch=False):
         legs = [0]
         steps = [{"name": "Prepare junit dir (vp-proof)", "run": 'mkdir -p "$RUNNER_TEMP/junit"'}]
         if job_id == SHARD_JOB:
+            if SHARD_TMP_ON_SHM:
+                steps.append(dict(SHARD_SHM_ASSERT))
             steps.append(dict(SHARD_PREP))
         for step in job.get("steps") or []:
             step = dict(step)
@@ -144,6 +168,8 @@ def render_jobs(ci, floor_supports_branch=False):
                     env.update(SHARD_ENV)
                     step["env"] = env
             steps.append(step)
+        if job_id == SHARD_JOB:
+            steps.append(dict(SHARD_CLEANUP))
         steps.append({
             "name": "Retain junit results (vp-proof)",
             "if": "always()",
