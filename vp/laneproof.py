@@ -663,6 +663,44 @@ class Proof(object):
                     and rec.get("status") in self.OPEN_STATUSES):
                 if best is None or str(rec.get("ts") or "") > str(best.get("ts") or ""):
                     best = rec
+        if best is None:
+            best = self.ledger_open_pipeline(cand)
+        return best
+
+    def ledger_open_pipeline(self, cand):
+        """D93: the driver died mid-poll (the 10:53Z reboot) -> no proof-*.json
+        was ever written for the trigger, so D81 saw nothing and the restart
+        re-triggered a second run for the same sha (the 04:41Z precedent).
+        The trigger itself IS on record: circleci-pipelines.jsonl gets a
+        `triggered` row the moment the pipeline exists.  A triggered row for
+        this sha with no proof record naming its pipeline_id is open."""
+        ledger = self.run_root / "proofs" / "circleci-pipelines.jsonl"
+        try:
+            rows = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
+        except (OSError, ValueError):
+            return None
+        answered = set()
+        try:
+            for f in (self.run_root / "proofs").glob("proof-*.json"):
+                try:
+                    rec = json.loads(f.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if rec.get("pipeline_id"):
+                    answered.add(str(rec["pipeline_id"]))
+        except OSError:
+            pass
+        # a later ledger row that names the pipeline with any status other than
+        # triggered/repolled (credits_blocked after the trigger, 21:12Z) closes it too
+        for row in rows:
+            if row.get("pipeline_id") and row.get("status") not in (self.TRIGGERED, self.REPOLLED):
+                answered.add(str(row["pipeline_id"]))
+        best = None
+        for row in rows:
+            if (row.get("sha") == cand and row.get("pipeline_id") and row.get("status") == self.TRIGGERED
+                    and str(row["pipeline_id"]) not in answered):
+                if best is None or str(row.get("ts") or "") > str(best.get("ts") or ""):
+                    best = row
         return best
 
     def _write(self, pid, rec):

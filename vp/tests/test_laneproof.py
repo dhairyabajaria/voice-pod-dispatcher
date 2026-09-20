@@ -775,3 +775,29 @@ def test_d87_a_hosted_full_suite_refused_by_the_off_switch_or_cap_is_held_not_ru
     p.circle_active = 0
     rec = p.run("L06-HOSTED", "proof-box", wt, base, cand, "platform", [])
     assert rec["route"] == "box" and len(boxed) == 2
+
+
+def test_d93_a_triggered_ledger_row_without_a_proof_record_is_an_open_pipeline(tmp_path):
+    """D93: the driver died mid-poll (reboot) before writing any proof record;
+    the trigger is on the pipelines ledger.  D81 must re-poll that run, never
+    trigger a second one for the same sha.  Once any proof record names the
+    pipeline, the row is answered and closed."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle({"jobs": [{"id": "j2", "name": "lint", "status": "success", "job_number": 1}],
+                         "failed_tests": {}, "workflows": [{"id": "w1", "status": "success"}]})
+    logs = []
+    p = make_proof(tmp_path, circle, FakeExec({}), logs=logs)
+    ledger = tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"ts": "2026-09-20T09:38:41.652Z", "proof_id": "proof-L06-HOSTED-R7-x",
+                                  "pipeline_id": "35502871574", "account": "gha", "sha": cand,
+                                  "status": "triggered"}) + "\n")
+    assert p.triggered_pipeline(cand)["pipeline_id"] == "35502871574"
+    assert p.triggered_pipeline("other-sha") is None
+    rec = p.run("L06", "proof-L06-HOSTED-R7-x", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS" and rec["pipeline_id"] == "35502871574"
+    assert not [c for c in circle.calls if c[0] == "trigger"], "re-polled, never re-triggered"
+    assert [c[:2] for c in circle.calls if c[0] == "poll"] == [("poll", "35502871574")]
+    assert any("re-polls circleci pipeline 35502871574" in m and "D81" in m for m in logs)
+    # answered now: the proof record names the pipeline, so the ledger row is closed
+    assert p.triggered_pipeline(cand) is None
