@@ -385,13 +385,34 @@ def hosted_twins(packet, benchmark_path, lint=None):
     return twins
 
 
+GATE_SKIPPED = "skipped"
+
+
+def gate_state(gate, roster):
+    """-> "open" (roster.owner_gates.<gate> is JSON true), "skipped" (the exact
+    string "skipped": the owner skipped it for launch, D115 §123), else
+    "closed" -- no map = all closed (D34); any other truthy value, e.g. a bare
+    string, is CLOSED (a truthy read would release a twin on nothing).
+    CIRCLECI rows open with DELIVERY-1 (00-SCOPE §5)."""
+    gates = roster.get("owner_gates")
+    if not isinstance(gates, dict):
+        return "closed"
+    v = gates.get(GATE_ROSTER_KEY.get(gate, gate))
+    if v is True:
+        return "open"
+    if isinstance(v, str) and v.strip().lower() == GATE_SKIPPED:
+        return "skipped"
+    return "closed"
+
+
 def gate_open(gate, roster):
     """an owner gate is open only when roster.owner_gates names it true; no map
     = all closed (D34).  CIRCLECI rows open with DELIVERY-1 (00-SCOPE §5)."""
-    gates = roster.get("owner_gates")
-    if not isinstance(gates, dict):
-        return False
-    return bool(gates.get(GATE_ROSTER_KEY.get(gate, gate)))
+    return gate_state(gate, roster) == "open"
+
+
+def gate_skipped(gate, roster):
+    return gate_state(gate, roster) == "skipped"
 
 
 def twin_gate(packet):
@@ -409,7 +430,8 @@ def owner_gate_open(packet, roster):
     gate = twin_gate(packet)
     if gate == "none":
         return True
-    return gate_open(gate, roster)
+    # D115: a skipped gate releases the twin; its rows grade DEFERRED (lanedriver)
+    return gate_state(gate, roster) in ("open", "skipped")
 
 
 def twin_benchmark(packet):

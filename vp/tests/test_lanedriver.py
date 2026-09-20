@@ -2807,3 +2807,56 @@ def test_d116_a_packets_probe_greps_diffs_and_plants_ride_into_vp_at_instantiati
     (wt2 / ".vp").mkdir(parents=True)
     assert "probe/" in drv._copy_packet_extras(wt2, "R-P-HOSTED-a1")
     assert drv._copy_packet_extras(wt2, "NO-SUCH-TASK") == []
+
+
+def test_d115_a_skipped_owner_gate_defers_its_rows_and_releases_its_twin_never_a_bare_string(tmp_path):
+    """D115 (§123, owner skipped DELIVERY-4 for launch): roster owner_gates.X ==
+    "skipped" (exact string) -> every row tagged (gate: X) grades DEFERRED
+    (not UNKNOWN/FAIL) with the ruling note, is excluded from all_pass and never
+    blocks; a twin behind a skipped gate is released; any OTHER string (or a
+    bare truthy) is CLOSED, never open."""
+    from vpdriver import findings_verdicts
+    import vppack
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv.roster["owner_gates"] = {"DELIVERY-1": True, "DELIVERY-4": "skipped", "DELIVERY-5": "yes", "DELIVERY-3": False,
+                                 "DELIVERY-4_skipped_on": "2026-09-20"}
+    assert vppack.gate_state("DELIVERY-1", drv.roster) == "open"
+    assert vppack.gate_state("DELIVERY-4", drv.roster) == "skipped" and vppack.gate_skipped("DELIVERY-4", drv.roster)
+    assert vppack.gate_state("DELIVERY-5", drv.roster) == "closed", "a bare string never opens a gate"
+    assert vppack.gate_state("CIRCLECI", drv.roster) == "open" and not vppack.gate_open("DELIVERY-4", drv.roster)
+    twin4 = {"id": "L34-HOSTED", "twin_of": "L34", "twin_gate": "DELIVERY-4"}
+    twin5 = {"id": "L43-HOSTED", "twin_of": "L43", "twin_gate": "DELIVERY-5"}
+    assert vppack.owner_gate_open(twin4, drv.roster) is True, "a skipped gate releases its twin"
+    assert vppack.owner_gate_open(twin5, drv.roster) is False
+    wt = env.tmp / "wt" / "L34-HOSTED-R1"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / ".vp" / "BENCHMARK.md").write_text(
+        "- B7 [invariant] plain row\n"
+        "- B8 [invariant] [hosted] Live drill with the receiver (gate: DELIVERY-4)\n"
+        "- B9 [invariant] [hosted] CI shard green (gate: CIRCLECI)\n")
+    assert drv._deferred_rows(wt) == {"B8": "DELIVERY-4"}
+    f = wt / ".vp" / "FINDINGS.json"
+    f.write_text(json.dumps({"item": "L34-HOSTED", "attempt": 1, "commit": "a" * 40, "all_pass": False, "lines": [
+        {"id": "B7", "kind": "invariant", "verdict": "PASS", "evidence": "x", "note": ""},
+        {"id": "B8", "kind": "invariant", "verdict": "UNKNOWN", "evidence": "no receiver", "note": ""},
+        {"id": "B9", "kind": "invariant", "verdict": "PASS", "evidence": "y", "note": ""}]}))
+    assert drv._defer_rows("L34-HOSTED-R1", f, wt) == ["B8"]
+    doc, fails, unknown = findings_verdicts(f)
+    assert fails == [] and unknown == [] and doc["all_pass"] is True
+    b8 = next(l for l in doc["lines"] if l["id"] == "B8")
+    assert b8["verdict"] == "DEFERRED" and b8["deferred_from"] == "UNKNOWN"
+    assert b8["note"] == "B8 DEFERRED -- DELIVERY-4 skipped for launch (owner 2026-09-20)"
+    assert drv._defer_rows("L34-HOSTED-R1", f, wt) == [], "idempotent"
+    assert "DEFER L34-HOSTED-R1 rows B8: gate skipped by the owner (D115)" in (env.run_root / "driver.log").read_text()
+    # a FAIL on a deferred row is deferred too (never stubbed, never red); a red elsewhere still blocks
+    f.write_text(json.dumps({"item": "L34-HOSTED", "attempt": 1, "commit": "a" * 40, "all_pass": False, "lines": [
+        {"id": "B8", "kind": "invariant", "verdict": "FAIL", "evidence": "x", "note": ""},
+        {"id": "B9", "kind": "invariant", "verdict": "FAIL", "evidence": "y", "note": ""}]}))
+    drv._defer_rows("L34-HOSTED-R1", f, wt)
+    doc, fails, unknown = findings_verdicts(f)
+    assert fails == ["B9"] and doc["all_pass"] is False
+    # gate closed (false) -> nothing deferred
+    drv.roster["owner_gates"]["DELIVERY-4"] = False
+    assert drv._deferred_rows(wt) == {}

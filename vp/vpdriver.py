@@ -213,7 +213,9 @@ def findings_verdicts(path):
     fails = [str(l.get("id")) for l in lines if isinstance(l, dict) and l.get("verdict") == "FAIL"]
     unknown = [str(l.get("id")) for l in lines
                if isinstance(l, dict) and l.get("verdict") == "UNKNOWN"]
-    computed = all(isinstance(l, dict) and l.get("verdict") == "PASS" for l in lines)
+    # D115: a DEFERRED line (its gate skipped by the owner) is neither red nor
+    # unknown and does not count against all_pass
+    computed = all(isinstance(l, dict) and l.get("verdict") in ("PASS", "DEFERRED") for l in lines)
     if doc.get("all_pass") is not computed:
         doc["all_pass"] = computed
         path.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")

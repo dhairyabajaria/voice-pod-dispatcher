@@ -1698,7 +1698,7 @@ class LaneDriver(object):
         all_twins = [q["id"] for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")]
         # D45: box_only clears only when every twin is VERIFIED AND every hosted row is PASS
         rec["box_only"] = not (all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
-                               and all(r.get("verdict") == "PASS" for r in rows.values())
+                               and all(r.get("verdict") in ("PASS", "DEFERRED") for r in rows.values())
                                and set(rows) >= {rid for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")
                                                  for rid in (q.get("hosted_rows") or [])})
         rec["twins_expected"] = sorted(all_twins)
@@ -4496,6 +4496,7 @@ class LaneDriver(object):
             if gout.status != STATUS_DONE:
                 return gout, None
             self._merge_proof_findings(fpath, prec)
+            self._defer_rows(task, fpath, wt)
             _doc, fails, unknown = findings_verdicts(fpath)
             hosted = self._exempt_rows(task, wt)
             owed = [u for u in unknown if u in hosted]
@@ -4514,6 +4515,7 @@ class LaneDriver(object):
                 if gout.status != STATUS_DONE:
                     return gout, None
                 self._merge_proof_findings(fpath, prec)
+                self._defer_rows(task, fpath, wt)
                 _doc, fails, unknown = findings_verdicts(fpath)
                 owed = [u for u in unknown if u in hosted]
                 blocking = [u for u in unknown if u not in hosted]
@@ -4579,6 +4581,55 @@ class LaneDriver(object):
         ev = [out_path, fpath, tdir / "record.json"] + self._proof_evidence(prec)
         return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                          "evidence": ev, "hosted_owed": owed}
+
+    ROW_LINE_RE = re.compile(r"^-\s*(B\d+)\b(.*)$", re.M)
+
+    def _deferred_rows(self, wt):
+        """D115 (§123): {row id: gate} for every benchmark row whose `(gate: X)`
+        names a gate the owner SKIPPED (roster owner_gates.X == "skipped")"""
+        try:
+            text = (Path(wt) / ".vp" / "BENCHMARK.md").read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        out = {}
+        for m in self.ROW_LINE_RE.finditer(text):
+            g = vppack.ROW_GATE_RE.search(m.group(2))
+            if g and vppack.gate_skipped(g.group(1), self.roster):
+                out[m.group(1)] = g.group(1)
+        return out
+
+    def _defer_rows(self, task, fpath, wt):
+        """D115: rewrite the grader's verdict on every skipped-gate row to
+        DEFERRED (never UNKNOWN, never FAIL), note "B<n> DEFERRED -- <gate>
+        skipped for launch (owner <date>)"; DEFER, never stub.  Returns the ids."""
+        rows = self._deferred_rows(wt)
+        if not rows:
+            return []
+        try:
+            doc = json.loads(Path(fpath).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        lines = doc.get("lines") if isinstance(doc, dict) else None
+        if not isinstance(lines, list):
+            return []
+        gates = self.roster.get("owner_gates") or {}
+        done = []
+        for ln in lines:
+            rid = str((ln or {}).get("id")) if isinstance(ln, dict) else None
+            if rid not in rows or ln.get("verdict") == "DEFERRED":
+                continue
+            gate = rows[rid]
+            when = str(gates.get("%s_skipped_on" % gate) or gates.get("skipped_on") or utc_ms()[:10])
+            ln["deferred_from"] = ln.get("verdict")
+            ln["verdict"] = "DEFERRED"
+            ln["note"] = "%s DEFERRED -- %s skipped for launch (owner %s)" % (rid, gate, when)
+            done.append(rid)
+        if done:
+            doc["all_pass"] = all(isinstance(l, dict) and l.get("verdict") in ("PASS", "DEFERRED") for l in lines)
+            Path(fpath).write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+            self.log("DEFER %s rows %s: gate skipped by the owner (D115); excluded from all_pass"
+                     % (task, ",".join(done)))
+        return done
 
     def _exempt_rows(self, task, wt):
         """rows that may stay UNKNOWN without blocking: every [hosted] row of a
@@ -5235,6 +5286,7 @@ class LaneDriver(object):
                           JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, 1, expect_fence=True)
         if gout.status != STATUS_DONE:
             return gout, None
+        self._defer_rows(task, fpath, wt)
         _doc, fails, unknown = findings_verdicts(fpath)
         hosted = self._exempt_rows(task, wt)
         blocking = [u for u in unknown if u not in hosted]
