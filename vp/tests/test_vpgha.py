@@ -173,10 +173,10 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][4]["run"]
     # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
     prep = jobs["platform-shards"]["steps"][1]
-    assert prep["run"] == 'mkdir -p "$RUNNER_TEMP/xdg" "/dev/shm/pytest-${GITHUB_JOB}-${{ matrix.shard }}"'
+    assert prep["run"] == 'mkdir -p "$RUNNER_TEMP/xdg" "$RUNNER_TEMP/pgdata-${{ matrix.shard }}"'
     shard_step = jobs["platform-shards"]["steps"][3]     # junit prep, pgserver prep, checkout, run
     assert shard_step["env"]["XDG_RUNTIME_DIR"] == "${{ runner.temp }}/xdg"
-    assert shard_step["env"]["TMPDIR"] == "/dev/shm/pytest-${{ github.job }}-${{ matrix.shard }}"
+    assert shard_step["env"]["TMPDIR"] == "${{ runner.temp }}/pgdata-${{ matrix.shard }}", "on disk: /dev/shm filled in run 35478392897"
     assert shard_step["env"]["COVERAGE_FILE"] == ".coverage.shard-${{ matrix.shard }}", "the candidate's own env kept"
     assert all("env" not in s or "XDG_RUNTIME_DIR" not in s["env"] for s in jobs["platform"]["steps"]), "only the shard job"
     shard = shard_step["run"]

@@ -19,9 +19,11 @@ the jobs the candidate ships (rule 3: every required ci.yml job), with:
   * the shard job gets its own pgserver lockfile and tmpfs pgdata
     (Advisor, 2026-09-20: pgserver's lockfile is per Unix user, so 8 shard
     jobs on one box queued behind ONE lock and blew its 10 s start timeout):
-    `XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg`, `TMPDIR=/dev/shm/pytest-<job>-<shard>`
-    (both mkdir'd first) and `-n SHARD_WORKERS` on the shard leg, mirroring
-    voice-pod 894cdeec on ci/self-hosted-runner-trial-2;
+    `XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg`, `TMPDIR=$RUNNER_TEMP/pgdata-<shard>`
+    (both mkdir'd first) and `-n SHARD_WORKERS` on the shard leg.  894cdeec on
+    ci/self-hosted-runner-trial-2 put TMPDIR on /dev/shm and run 35478392897
+    filled it (psycopg DiskFull / ENOSPC on every shard, 00:20Z), so the
+    overlay keeps pgdata on the runner's disk;
   * `--branch "$GITHUB_REF_NAME"` on every ci_collection_floor.py call
     when the candidate's script accepts it (rule 5; $CIRCLE_BRANCH is
     absent on GHA).
@@ -49,9 +51,9 @@ DEFAULT_UPLOAD_ACTION = "actions/upload-artifact@v4"
 SHARD_JOB = "platform-shards"
 SHARD_WORKERS = 3
 SHARD_ENV = {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg",
-             "TMPDIR": "/dev/shm/pytest-${{ github.job }}-${{ matrix.shard }}"}
-SHARD_PREP = {"name": "Prepare per-job pgserver lock dir and tmpfs pgdata dir (vp-proof)",
-              "run": 'mkdir -p "$RUNNER_TEMP/xdg" "/dev/shm/pytest-${GITHUB_JOB}-${{ matrix.shard }}"'}
+             "TMPDIR": "${{ runner.temp }}/pgdata-${{ matrix.shard }}"}
+SHARD_PREP = {"name": "Prepare per-job pgserver lock dir and pgdata dir (vp-proof)",
+              "run": 'mkdir -p "$RUNNER_TEMP/xdg" "$RUNNER_TEMP/pgdata-${{ matrix.shard }}"'}
 
 PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run pytest\b[^\n]*?)(?P<cont>\s*\\)?$", re.M)
 FLOOR_RE = re.compile(r"ci_collection_floor\.py (floor|control|freshness)\b[^\n]*")
