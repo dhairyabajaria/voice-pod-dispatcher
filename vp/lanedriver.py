@@ -1309,9 +1309,33 @@ class LaneDriver(object):
         paths += [str(x) for x in (cfg.get("extra_paths") or [])]
         return sorted(set(x for x in paths if x.strip()))
 
-    def _twin_scope_only(self, task, p, tasks=None, wt=None):
-        """-> "twin:<workers>:<p1,p2,...>" for a scoped twin, None otherwise"""
+    # a hosted row that asks for a CI JOB or STEP (the collection floor, the order
+    # job, coverage, a suite job) is not a test-file ask: the scoped twin cannot
+    # answer it (L04-BASELINE-REASON-HOSTED B7 asked for collected-test-floor, 17:17Z)
+    JOB_ASK_RE = re.compile(r"collect(?:ion|ed)[- _]?(?:test[- _])?floor|ci_collection_floor|platform-order|"
+                            r"shuffled[_ -]?runner|order[- ]dependence|module[_ -]coverage|platform-coverage|"
+                            r"deploy-contracts|supply-chain|vp/(?:platform|agent|portal|deploy)\b|"
+                            r"\b(?:agent|portal) (?:job|suite)\b", re.I)
+
+    def _twin_scope_only(self, task, p, tasks=None, wt=None, hdr=None):
+        """-> "twin:<workers>:<p1,p2,...>" for a scoped twin, None otherwise
+        (twin_scope off, the canary row, header `twin_scope: full`, a row that
+        asks for a CI job/step, a non-platform test file, or no paths)"""
         if not self._scoped_twin(task, p):
+            return None
+        if str((hdr or {}).get("twin_scope") or "").strip().lower() == "full":
+            self.log("PROOF %s scoped twin refused: header twin_scope: full" % task)
+            return None
+        text = "\n".join(str(x) for x in (p.get("hosted_lines") or []))
+        if wt is not None:
+            try:
+                text += "\n" + (Path(wt) / ".vp" / "BENCHMARK.md").read_text(encoding="utf-8")
+            except OSError:
+                pass
+        m = self.JOB_ASK_RE.search(text)
+        if m:
+            self.log("PROOF %s scoped twin refused: a hosted row asks for a CI job/step (%r); full pipeline"
+                     % (task, m.group(0)))
             return None
         if tasks is None:
             tasks = self.control.state_view().get("tasks") or {}
@@ -4589,7 +4613,7 @@ class LaneDriver(object):
             # vp/platform-twin job over the parent's + its contract's test files;
             # the record carries `only`, answers this twin's ask only, and a
             # scoped PASS closes the twin VERIFIED.  The canary's own row stays full.
-            only = self._twin_scope_only(task, self.packet_for(task) or {}, wt=wt)
+            only = self._twin_scope_only(task, self.packet_for(task) or {}, wt=wt, hdr=hdr)
             if only:
                 self.log("PROOF %s scoped twin: %d test path(s), -n %s (D113)"
                          % (task, only.count(",") + 1, only.split(":")[1]))

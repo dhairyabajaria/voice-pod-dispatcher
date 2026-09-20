@@ -2699,7 +2699,14 @@ def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_cap
     assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
     assert "scoped twin refused: 1 non-platform test file(s) named (agent/tests/test_gone.py)" in \
         (env.run_root / "driver.log").read_text()
+    # a row asking for a CI job/step, or a header twin_scope: full -> full pipeline
+    twin["hosted_lines"] = ["B7 [hosted] the exact-sha collected-test-floor job is green"]
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
+    assert "scoped twin refused: a hosted row asks for a CI job/step ('collected-test-floor')" in \
+        (env.run_root / "driver.log").read_text()
     twin.pop("hosted_lines")
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, hdr={"twin_scope": "full"}) is None
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, hdr={"twin_scope": "scoped"}).startswith("twin:4:")
     assert drv._twin_scope_only("L06-HOSTED-R12", canary, tasks) is None, "the canary's row stays the full pipeline"
     assert drv._twin_scope_only("R-B-HOSTED-R1", other, tasks) == "twin:4:platform/tests/test_extra.py"
     drv.proof_cfg["circleci"]["twin_scope"]["extra_paths"] = []
