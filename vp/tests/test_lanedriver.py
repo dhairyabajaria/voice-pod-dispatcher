@@ -2953,6 +2953,36 @@ def test_d128_a_packet_with_hosted_in_the_middle_of_its_id_is_not_a_twin(tmp_pat
     assert vppack.is_hosted_twin(drv.packet_for("R-PORTAL-HOSTED-TIMING-R1")) is False
 
 
+def test_d126a_a_one_shot_cli_recovers_its_pack_bindings_from_the_dispatch_records(tmp_path):
+    """D126a: _pack_restore needs the live `tasks` view and runs only inside the
+    loop, so `unsound-grade` -- a one-shot process -- had an empty pack_by_task and
+    refused every withdrawal with "is not a hosted twin" (all 8 of the Architect's
+    §136 rows, 22:05Z).  packets/<pid>.json is the binding's durable form; read it."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    pack = env.tmp / "pack"
+    for pid in ("L08-ADMIT-TG-HOSTED-R1", "L08-ADMIT-TG"):
+        (pack / pid).mkdir(parents=True)
+        (pack / pid / "PACKET.md").write_text("---\nitem: %s\ntitle: t\n---\nbody\n" % pid)
+        (pack / pid / "BENCHMARK.md").write_text("- B7 [invariant] [hosted] a row\n")
+    drv.pack_dir = pack
+    pdir = env.run_root / "packets"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "L08-ADMIT-TG-HOSTED-R1.json").write_text(json.dumps({"task": "L08-ADMIT-TG-HOSTED-R1"}))
+    (pdir / "L08-ADMIT-TG.json").write_text(json.dumps({"task": "L08-ADMIT-TG-R1"}))
+    (pdir / "L08-ADMIT-TG-HOSTED-R1.params.json").write_text(json.dumps({"task": "NOT-A-BINDING"}))
+    assert drv.packet_for("L08-ADMIT-TG-HOSTED-R1") is None, "a fresh CLI process knows nothing"
+    out = drv.pack_bindings_from_disk()
+    assert out["L08-ADMIT-TG-HOSTED-R1"] == "L08-ADMIT-TG-HOSTED-R1"
+    assert out["L08-ADMIT-TG-R1"] == "L08-ADMIT-TG", "the parent's task id comes back too"
+    assert "NOT-A-BINDING" not in out, "a .params.json sidecar is not a binding"
+    assert (drv.packet_for("L08-ADMIT-TG-HOSTED-R1") or {}).get("id") == "L08-ADMIT-TG-HOSTED-R1"
+    drv.pack_by_task["L08-ADMIT-TG-HOSTED-R1"] = "SOMETHING-ELSE"
+    drv.pack_bindings_from_disk()
+    assert drv.pack_by_task["L08-ADMIT-TG-HOSTED-R1"] == "SOMETHING-ELSE", "never overwrites a live binding"
+
+
 def test_d127_a_probe_twin_defers_its_owner_skipped_row_at_the_record_not_at_the_grader(tmp_path):
     """D127 (§123, Architect option (b)): D115 defers on FINDINGS.json after a grader
     turn, so a probe-kind twin -- no grader, no FINDINGS.json -- left its

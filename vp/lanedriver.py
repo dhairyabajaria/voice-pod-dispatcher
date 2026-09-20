@@ -2536,6 +2536,29 @@ class LaneDriver(object):
             if t in tasks and t not in self.pack_by_task:
                 self.pack_by_task[t] = pid
 
+    def pack_bindings_from_disk(self):
+        """D126a: packets/<pid>.json is the binding's durable form, so a CLI verb can
+        recover task -> packet without the scheduler.  _pack_restore needs the live
+        `tasks` view and runs only inside the loop; `unsound-grade` is a one-shot
+        process whose pack and pack_by_task are both empty, which made every
+        withdrawal refuse with "is not a hosted twin".  Never overwrites a binding
+        the loop already holds."""
+        self._load_pack()
+        pdir = self.run_root / "packets"
+        if not pdir.is_dir():
+            return self.pack_by_task
+        for f in sorted(pdir.glob("*.json")):
+            if f.name.endswith(".params.json") or f.stem not in self.pack:
+                continue
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            t = rec.get("task")
+            if t:
+                self.pack_by_task.setdefault(t, f.stem)
+        return self.pack_by_task
+
     def _pack_retry_requested(self, pid):
         f = self.run_root / "packets" / (self.RETRY_MARKER % pid)
         if not f.exists():
@@ -6434,6 +6457,7 @@ def cmd_retry_packet(drv, args):
 
 
 def cmd_unsound_grade(drv, args):
+    drv.pack_bindings_from_disk()          # D126a: a one-shot CLI has no pack bindings
     try:
         rec = drv.unsound_grade(args.task, args.row, args.reason, evidence=getattr(args, "evidence", None))
     except ValueError as exc:
