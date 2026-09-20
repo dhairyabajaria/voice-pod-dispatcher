@@ -238,6 +238,22 @@ class Proof(object):
         self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
         if route in HOSTED_ROUTES:
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort)
+        held_off = self.full_suite_held(suite, why)
+        if held_off:
+            # D87: a hosted-eligible FULL suite refused by the off switch / cap /
+            # in-flight limit is never dropped onto the box (06-ROUTING §5) --
+            # 02:52Z the CIRCLECI-OFF kill switch sent L06-HOSTED-R5's whole
+            # platform suite to the box.  Held without a strike (BLOCKED_*), the
+            # driver re-asks each tick, exactly like a refused trigger.
+            status = "BLOCKED_OFF" if self.circle_off() else "BLOCKED_CAP"
+            rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
+                   "paths": paths, "pipeline_id": None, "account": None,
+                   "reason": "%s: full suite held, never run on the box (06-ROUTING §5, D87): %s"
+                             % (self.hosted_route(), why),
+                   "failed_nodes": [], "ts": utc_ms()}
+            self._write(pid, rec)
+            self.log("PROOF %s %s -> %s: full suite held off the box (%s)" % (task, pid, status, why))
+            return rec
         held = self.memory_hold()
         if held:
             # D76: the box is short of memory (a proof spins up 4 Postgres + 4 pytest
@@ -249,6 +265,18 @@ class Proof(object):
             self.log("PROOF %s %s -> BLOCKED_MEMORY: %s" % (task, pid, held))
             return rec
         return self.run_box(task, pid, wt, cand, kind, paths, workers=workers)
+
+    def full_suite_held(self, suite, why):
+        """D87: True when a full suite that the roster routes hosted (`kinds`
+        lists "full") was refused by the hosted gate rather than by policy --
+        it must wait, not run on the box.  A roster that does not list "full"
+        keeps its box behaviour."""
+        if suite != "full":
+            return False
+        cc = self.circle_cfg()
+        if not cc.get("enabled") or "full" not in set(cc.get("kinds") or []):
+            return False
+        return True
 
     def memory_hold(self):
         """D76: -> reason when free memory is below proof.memory_hold_below_pct

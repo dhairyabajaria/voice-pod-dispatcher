@@ -740,3 +740,38 @@ def test_d83_the_gha_provider_is_chosen_by_the_roster_and_records_the_measured_c
     (tmp_path / "run" / "proofs" / "proof-g3-p1.json").write_text(json.dumps(
         {"sha": "abc", "route": "gha", "pipeline_id": "35470000009", "status": "UNKNOWN", "ts": "2026-09-20T00:00:00.000Z"}))
     assert p.triggered_pipeline("abc")["pipeline_id"] == "35470000009"
+
+
+def test_d87_a_hosted_full_suite_refused_by_the_off_switch_or_cap_is_held_not_run_on_the_box(tmp_path):
+    """02:52Z 2026-09-20: the CIRCLECI-OFF kill switch cancelled the canary and the
+    retry's route() fell through to the BOX for the whole platform suite
+    (06-ROUTING §5 forbids it).  Now: held as BLOCKED_OFF / BLOCKED_CAP (no
+    strike, re-asked each tick); a targeted suite still uses the box."""
+    wt, base, cand = repo(tmp_path)
+    ex = FakeExec({})
+    logs = []
+    p = make_proof(tmp_path, FakeCircle({}), ex, logs=logs,
+                   cfg={"circleci": {"enabled": True, "mode": "overflow", "kinds": ["full"],
+                                     "flip_off_watcher": True}, "box_slots": 1, "memory_hold_below_pct": 0})
+    boxed = []
+    p.run_box = lambda *a, **k: boxed.append(a) or {"status": "PASS", "route": "box"}
+    (tmp_path / "run").mkdir(exist_ok=True)
+    (tmp_path / "run" / "CIRCLECI-OFF").write_text("stop\n")
+    rec = p.run("L06-HOSTED", "proof-off", wt, base, cand, "platform", [])
+    assert rec["status"] == "BLOCKED_OFF" and rec["route"] == "circleci" and rec["pipeline_id"] is None
+    assert "never run on the box" in rec["reason"] and boxed == [], "the full suite did not touch the box"
+    assert any("full suite held off the box" in m for m in logs)
+    # a targeted suite is still the box's while the switch is off
+    rec = p.run("L06", "proof-off-t", wt, base, cand, "platform", ["platform/tests/test_a.py"])
+    assert rec["route"] == "box" and len(boxed) == 1
+    # the in-flight cap holds a full suite the same way (BLOCKED_CAP)
+    (tmp_path / "run" / "CIRCLECI-OFF").unlink()
+    p.circle_active = 2
+    rec = p.run("L06-HOSTED", "proof-cap", wt, base, cand, "platform", [])
+    assert rec["status"] == "BLOCKED_CAP" and len(boxed) == 1
+    # a roster that never routes "full" hosted keeps its box behaviour
+    p.cfg = {"circleci": {"enabled": True, "mode": "overflow", "kinds": ["targeted"]}, "box_slots": 1,
+             "memory_hold_below_pct": 0}
+    p.circle_active = 0
+    rec = p.run("L06-HOSTED", "proof-box", wt, base, cand, "platform", [])
+    assert rec["route"] == "box" and len(boxed) == 2
