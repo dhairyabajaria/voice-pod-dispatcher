@@ -251,9 +251,12 @@ def preflight_job(src, paths):
         if run and PREFLIGHT_DROP_RE.search(run):
             if not done:
                 done = True
+                wd = st.get("working-directory") or "platform"
+                # D106: test_paths are repo-relative (platform/tests/x.py); the step runs
+                # in the platform dir (run 35518327671: "file or directory not found")
+                rel = [x[len(wd) + 1:] if x.startswith(wd + "/") else x for x in paths]
                 steps.append({"name": "Preflight: the lane's own test files (vp-proof, Fleet-2)",
-                              "working-directory": st.get("working-directory") or "platform",
-                              "run": "uv run pytest -q %s" % " ".join(paths)})
+                              "working-directory": wd, "run": "uv run pytest -q %s" % " ".join(rel)})
             continue
         steps.append(st)
     if not done:

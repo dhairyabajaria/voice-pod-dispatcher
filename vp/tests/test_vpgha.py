@@ -530,14 +530,16 @@ def test_fleet2_preflight_renders_the_platform_job_with_one_pytest_of_the_lanes_
     """Fleet-2 (§98): only=preflight:<paths> renders `platform-preflight` alone:
     the platform job's setup kept, floor/coverage/shuffled/suite steps replaced
     by one serial `uv run pytest -q <paths>` with its junit leg."""
-    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="preflight:tests/test_a.py,tests/test_b.py"))
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="preflight:platform/tests/test_a.py,tests/test_b.py"))
     assert list(doc["jobs"]) == ["platform-preflight"]
     job = doc["jobs"]["platform-preflight"]
     assert job["name"] == "vp/platform-preflight" and "strategy" not in job
     runs = [str(st.get("run", "")) for st in job["steps"]]
     assert sum("uv run pytest" in r for r in runs) == 1
     assert any(r.startswith("uv run pytest -q tests/test_a.py tests/test_b.py --junitxml=${{ runner.temp }}/junit/platform-preflight-1.xml")
-               for r in runs)
+               for r in runs), "D106: repo-relative platform/tests/... becomes tests/... in the platform working dir"
+    step = next(st for st in job["steps"] if "uv run pytest" in str(st.get("run", "")))
+    assert step["working-directory"] == "platform" and "platform/tests/" not in step["run"]
     assert not any("ci_collection_floor" in r or "shuffled_runner" in r or "check_module_coverage" in r for r in runs)
     assert job["steps"][-1]["with"]["name"] == "junit-platform-preflight"
     with pytest.raises(ValueError, match="names no test paths"):
