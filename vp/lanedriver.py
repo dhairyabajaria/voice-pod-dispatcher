@@ -1347,23 +1347,29 @@ class LaneDriver(object):
         parent's output, else the parent's own VERIFIED output; None when the
         parent has no output or no test paths"""
         parent = p.get("twin_of")
-        row = tasks.get(parent) or {}
-        out = row.get("output_sha")
+        # D109: the parent's ROW is the packet's bound row (D04 -> D04-V13), never
+        # the catalog row of the same name (D04's INTEGRATED 3cf31286 is a 09-16
+        # ancestor of trunk: the first D04 preflight ran an old tree's lint reds)
+        ptask, out = self._twin_parent_output(p, tasks)
         pp = self.pack.get(parent) or {}
         paths = [str(x) for x in (pp.get("test_paths") or [])]
-        if not out or not paths:
+        if not ptask or not out or not paths:
             return None
         docs = [d for d in self._integration_docs() if d.get("status") == "BUILT"]
         latest = docs[-1] if docs else None
         members = {m.get("task"): m.get("output_sha") for m in (latest or {}).get("members") or []}
-        if latest and members.get(parent) == out:
+        if latest and members.get(ptask) == out:
             return latest["union_sha"], paths, "integration union %s" % latest.get("union")
-        return out, paths, "parent %s output" % parent
+        return out, paths, "parent %s output" % ptask
 
     def _preflight_done(self, twin, tip):
+        """any preflight record of (twin, tip) that came from a real run -- PASS,
+        FAIL_PRODUCT or FAIL_INFRA (D110: a FAIL_INFRA at the same tip, e.g. a
+        lint-gate red, recurs identically; re-firing it every tick burned a
+        runner per 5 min on D04-HOSTED-R1).  CANCELLED/UNKNOWN/BLOCKED_* retry."""
         for rec in self._proof_index().get(tip) or []:
             if str(rec.get("proof_id") or "").startswith("proof-preflight-%s-" % twin) \
-                    and rec.get("status") in ("PASS", "FAIL_PRODUCT"):
+                    and rec.get("status") in ("PASS", "FAIL_PRODUCT", "FAIL_INFRA") and rec.get("pipeline_id"):
                 return rec
         return None
 

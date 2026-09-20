@@ -2476,9 +2476,11 @@ def test_fleet2_preflight_runs_a_held_twins_parent_files_once_per_tip_and_cancel
     twin = {"id": "R-A-HOSTED", "twin_of": "R-A", "twin_gate": "CIRCLECI", "proof_only": "", "proof_kind": "platform"}
     monkeypatch.setattr(drv, "packet_for", lambda task: twin if task == "R-A-HOSTED" else None)
     drv.pack["R-A"] = {"id": "R-A", "test_paths": ["tests/test_a.py", "tests/test_b.py"]}
+    drv.pack_by_task["R-A-V13"] = "R-A"                       # D109: the packet's BOUND row is the parent
     monkeypatch.setattr(drv, "_integration_docs", lambda: [])
     out1, out2 = "1" * 40, "2" * 40
-    state = {"tasks": {"R-A-HOSTED": {"state": "READY"}, "R-A": {"state": "VERIFIED", "output_sha": out1}}}
+    state = {"tasks": {"R-A-HOSTED": {"state": "READY"}, "R-A-V13": {"state": "VERIFIED", "output_sha": out1},
+                       "R-A": {"state": "INTEGRATED", "output_sha": "0" * 40}}}   # a stale catalog row of the same name
     drv._preflight_step(state)
     assert proof.calls == [], "no idle runner known yet -> nothing launched"
     drv._fleet_idle_since = {"r2": 1.0}
@@ -2498,7 +2500,7 @@ def test_fleet2_preflight_runs_a_held_twins_parent_files_once_per_tip_and_cancel
     drv._preflight_step(state)
     assert len(proof.calls) == 1, "one in flight: no second launch"
     # the parent re-verifies -> tip moves -> the running preflight is cancelled
-    state["tasks"]["R-A"]["output_sha"] = out2
+    state["tasks"]["R-A-V13"]["output_sha"] = out2
     drv._preflight_step(state)
     assert Proof.circle.cancelled == ["run-1111"]
     gate.set()
@@ -2520,6 +2522,25 @@ def test_fleet2_preflight_runs_a_held_twins_parent_files_once_per_tip_and_cancel
     drv._preflight_step(state)
     drv._preflight_step(state)
     assert len(proof.calls) == 2, "a done (twin, tip) is not preflighted again"
+    # D110: a FAIL_INFRA record with a real run id counts as done too; a CANCELLED one does not
+    d = env.run_root / "proofs"
+    out3 = "3" * 40
+    state["tasks"]["R-A-V13"]["output_sha"] = out3
+    (d / "proof-preflight-R-A-HOSTED-x.json").write_text(json.dumps(
+        {"proof_id": "proof-preflight-R-A-HOSTED-x", "sha": out3, "status": "FAIL_INFRA", "pipeline_id": "run-3333",
+         "route": "gha", "only": "preflight:tests/test_a.py"}))
+    drv._preflight_step(state)
+    assert len(proof.calls) == 2, "FAIL_INFRA at the same tip recurs identically: not re-fired"
+    (d / "proof-preflight-R-A-HOSTED-x.json").write_text(json.dumps(
+        {"proof_id": "proof-preflight-R-A-HOSTED-x", "sha": out3, "status": "CANCELLED", "pipeline_id": "run-3333",
+         "route": "gha", "only": "preflight:tests/test_a.py"}))
+    drv._preflight_step(state)
+    for _ in range(50):
+        if len(proof.calls) == 3:
+            break
+        time.sleep(0.05)
+    assert len(proof.calls) == 3 and proof.calls[2][2] == out3
+    drv._preflight["R-A-HOSTED"]["thread"].join(5)
 
 
 def test_d101_an_amended_pack_reaches_the_next_round_and_keeps_the_migration_note(tmp_path):
