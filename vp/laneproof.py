@@ -278,6 +278,19 @@ class Proof(object):
             return False
         return True
 
+    BOX_STOP_SLACK_S = 120.0
+
+    def box_deadlines(self, paths):
+        """D89 -> (vpproof's own --timeout-min, the exec's outer timeout_s).
+        The outer bound leaves room for the box-lock wait (proof_wait_max_min,
+        90 by default) and vpproof's SIGINT/SIGTERM grace, so the wrapper is
+        never killed while it still owns a live pytest."""
+        cfg = self.cfg
+        inner = int(cfg.get("targeted_timeout_min", 40) if paths else cfg.get("full_box_timeout_min", 90))
+        wait = float(cfg.get("proof_wait_max_min", 90))
+        grace = float(cfg.get("kill_grace_int_s", 60)) + float(cfg.get("kill_grace_term_s", 30))
+        return inner, inner * 60.0 + wait * 60.0 + grace + self.BOX_STOP_SLACK_S
+
     def memory_hold(self):
         """D76: -> reason when free memory is below proof.memory_hold_below_pct
         (default 30, the audit runner's launch gate), else None.  A pre-D76
@@ -309,11 +322,19 @@ class Proof(object):
             argv += ["--workers", str(workers)]
         if no_record:
             argv.append("--no-record")
+        # D89: vpproof owns the deadline.  Before, the exec here timed out at
+        # targeted_timeout_min (40) even for a FULL run whose own limit is
+        # full_box_timeout_min (90) -- and the box-lock wait counted inside it --
+        # so subprocess.run killed the wrapper alone and pytest + its clusters
+        # ran on orphaned (L06-HOSTED-R5, 03:32Z, pid 11825).  Now the inner
+        # limit is passed explicitly and the outer one is inner + the lock wait
+        # + vpproof's INT/TERM grace, so stop_group + reap always run first.
+        inner_min, outer_s = self.box_deadlines(paths)
+        argv += ["--timeout-min", str(inner_min)]
         with self._lock:
             self.box_active += 1
         try:
-            rc, out, err = self.exec.run(argv, cwd=str(self.here),
-                                         timeout_s=float(self.cfg.get("targeted_timeout_min", 40)) * 60)
+            rc, out, err = self.exec.run(argv, cwd=str(self.here), timeout_s=outer_s)
         finally:
             with self._lock:
                 self.box_active = max(0, self.box_active - 1)

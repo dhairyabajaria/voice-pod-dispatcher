@@ -277,19 +277,96 @@ class Exec(object):
                 time.sleep(0.1)
 
     def run(self, argv, env=None, cwd=None, timeout_s=120):
-        """Blocking helper for short commands (git, export)."""
+        """Blocking helper for short commands (git, export) and the box proof.
+
+        D89: on timeout the WHOLE process tree dies, not just the child.
+        `subprocess.run(timeout=)` SIGKILLs the direct child only; vpproof's
+        pytest sits in its own session (start_new_session), so it and its
+        Postgres clusters ran on orphaned (L06-HOSTED-R5, 03:32Z, pid 11825).
+        Descendants are walked via `ps` before anything is signalled, then
+        SIGINT -> SIGTERM -> SIGKILL, deepest first, with short graces."""
         if env is None:
             env = self.env_for()
         try:
-            cp = subprocess.run(list(argv), env=env, cwd=cwd, timeout=timeout_s,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, universal_newlines=True,
-                                start_new_session=True)
-            return cp.returncode, cp.stdout or "", cp.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            return 124, exc.stdout or "", "timeout after %ss" % timeout_s
+            proc = subprocess.Popen(list(argv), env=env, cwd=cwd,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, universal_newlines=True,
+                                    start_new_session=True)
         except OSError as exc:
             return 127, "", "%s" % exc
+        try:
+            out, err = proc.communicate(timeout=timeout_s)
+            return proc.returncode, out or "", err or ""
+        except subprocess.TimeoutExpired:
+            killed = kill_tree(proc.pid)
+            try:
+                out, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            return 124, out or "", "timeout after %ss; killed tree %s" % (timeout_s, killed)
+
+
+def descendants(pid):
+    """every live descendant pid of `pid`, deepest last (stdlib: one `ps`)"""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid="], stdout=subprocess.PIPE,
+                             universal_newlines=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    kids = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            kids.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, frontier = [], [int(pid)]
+    while frontier:
+        nxt = []
+        for p in frontier:
+            for c in kids.get(p, []):
+                if c not in found:
+                    found.append(c)
+                    nxt.append(c)
+        frontier = nxt
+    return found
+
+
+def kill_tree(pid, grace_int_s=5.0, grace_term_s=3.0, sleep=time.sleep):
+    """SIGINT -> SIGTERM -> SIGKILL to `pid` and every descendant (deepest
+    first); returns the pids signalled.  A descendant in its own session
+    (pytest under vpproof) is reached by pid, which killpg never was."""
+    targets = list(reversed(descendants(pid))) + [int(pid)]
+    signalled = list(targets)
+    for sig, grace in ((signal.SIGINT, grace_int_s), (signal.SIGTERM, grace_term_s), (signal.SIGKILL, None)):
+        alive = []
+        for p in targets:
+            try:
+                os.kill(p, sig)
+                alive.append(p)
+            except OSError:
+                pass
+        if not alive:
+            break
+        if grace is None:
+            break
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if not any(_alive(p) for p in alive):
+                break
+            sleep(0.1)
+        targets = [p for p in alive if _alive(p)]
+        if not targets:
+            break
+    return sorted(set(signalled))
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
 
     def run_to_file(self, argv, path, env=None, cwd=None, timeout_s=300):
         """K-04: stdout straight to a file (a pipe truncates at 65,536 bytes)."""
