@@ -119,6 +119,12 @@ jobs:
       - name: floor
         working-directory: portal
         run: python3 ../scripts/ci_collection_floor.py floor --suite portal --baseline-file ../platform/tests/collection_baseline.json
+      - name: Enforce portal line-coverage floor
+        working-directory: portal
+        run: npm run test -- --coverage.enabled --coverage.reporter=json-summary
+      - name: e2e
+        working-directory: portal
+        run: npm run test:e2e
   supply-chain:
     name: required / supply-chain / ${{ matrix.component }}
     runs-on: ubuntu-latest
@@ -219,6 +225,12 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     # vitest: junit reporter beside the json one
     assert ("npm run test -- --reporter=json --reporter=junit --outputFile.json=/tmp/portal-test-results.json "
             "--outputFile.junit=${{ runner.temp }}/junit/portal-1.xml") in jobs["portal"]["steps"][1]["run"]
+    # D108: the coverage-floor vitest run gets its own junit leg; test:e2e is untouched
+    assert jobs["portal"]["steps"][3]["run"] == ("npm run test -- --coverage.enabled --coverage.reporter=json-summary "
+                                                 "--reporter=default --reporter=junit "
+                                                 "--outputFile.junit=${{ runner.temp }}/junit/portal-2.xml")
+    assert jobs["portal"]["steps"][4]["run"] == "npm run test:e2e"
+    assert text.count("--outputFile.junit=") == 2
     # matrix and needs survive
     assert jobs["platform-shards"]["strategy"]["matrix"]["shard"] == [0, 1]
     assert jobs["platform-coverage"]["needs"] == ["platform-shards"]
@@ -328,7 +340,7 @@ def test_overlay_renders_from_the_real_trunk_ci_yml():
     doc = yaml.safe_load(text)
     assert set(doc["jobs"]) == set(vpgha_overlay.REQUIRED_JOBS)
     assert text.count("--junitxml=") == 6, "platform x2 (coverage + shuffled, D99), shards, agent x2, deploy-contracts"
-    assert text.count("--outputFile.junit=") == 1, "portal's vitest junit"
+    assert text.count("--outputFile.junit=") == 2, "portal's vitest junit: unit run + coverage run (D108)"
     assert text.count("-n 3 --dist loadfile") == 1 and "-n auto" not in text
     assert text.count("XDG_RUNTIME_DIR: ${{ runner.temp }}/xdg") == 1
 

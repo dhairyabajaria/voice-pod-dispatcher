@@ -134,6 +134,12 @@ PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run (?:pytest|python -m test
 # "unrecognized arguments" -- canary run 35483670689's vp/platform job (D83d)
 FLOOR_RE = re.compile(r"ci_collection_floor\.py freshness\b[^\n]*")
 VITEST_RE = re.compile(r"npm run test -- --reporter=json --outputFile=(?P<json>\S+)")
+# D108 (-R10 portal, 2026-09-20): the coverage-floor vitest run had no junit leg,
+# so its one red (Settings.test.tsx timeout under instrumentation) read "failed
+# with zero failed tests" = FAIL_INFRA.  Any other `npm run test -- ...` line
+# (not test:e2e) gets a junit reporter beside its own flags.
+VITEST_OTHER_RE = re.compile(r"^(?P<indent>\s*)npm run test -- (?P<flags>(?!--reporter=json --outputFile=)[^\n]*?)"
+                             r"(?P<cont>\s*\\)?$", re.M)
 
 
 class _Literal(str):
@@ -186,6 +192,14 @@ def _rewrite_run(script, job_id, suffix, floor_supports_branch, legs, shard_work
         return ("npm run test -- --reporter=json --reporter=junit --outputFile.json=%s "
                 "--outputFile.junit=%s/%s%s-%d.xml" % (m.group("json"), JUNIT_DIR, job_id, suffix, legs[0]))
     out = VITEST_RE.sub(vitest_sub, out)
+
+    def vitest_other_sub(m):
+        if "--outputFile.junit=" in m.group("flags"):
+            return m.group(0)
+        legs[0] += 1
+        return "%snpm run test -- %s --reporter=default --reporter=junit --outputFile.junit=%s/%s%s-%d.xml%s" % (
+            m.group("indent"), m.group("flags").rstrip(), JUNIT_DIR, job_id, suffix, legs[0], m.group("cont") or "")
+    out = VITEST_OTHER_RE.sub(vitest_other_sub, out)
     return out
 
 
