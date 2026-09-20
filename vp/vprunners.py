@@ -402,7 +402,11 @@ def extract_json_fence(text):
         if not chunk.startswith("{"):
             continue
         try:
-            obj = json.loads(chunk)
+            # D95: strict=False accepts raw control characters inside string
+            # values -- a grader that quotes `git diff --numstat` output writes
+            # literal TABs into its check log, and strict JSON refused the whole
+            # record four times in 50 s (L-FAKE-CONTROLS-SOURCES r3, 12:55Z)
+            obj = json.loads(chunk, strict=False)
         except ValueError:
             continue
         if isinstance(obj, dict):
@@ -411,7 +415,7 @@ def extract_json_fence(text):
     stripped = (text or "").strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
-            obj = json.loads(stripped)
+            obj = json.loads(stripped, strict=False)
             if isinstance(obj, dict):
                 return obj
         except ValueError:
