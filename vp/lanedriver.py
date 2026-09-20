@@ -941,6 +941,61 @@ class LaneDriver(object):
             pass
         return ok
 
+    def _http_json(self, url, timeout=10.0):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 -- a catalog we cannot read simply skips the check
+            return None
+
+    def _check_role_variants(self):
+        """D132: 2026-09-20 roster.roles.infra asked deepseek-v4.1-flash for variant
+        "xhigh".  That model declares low/high/max and nothing else -- the string was
+        copied from the muse roles, where it is valid.  NEITHER END VALIDATES:
+        vprunners.py:929 puts spec.variant straight into the prompt_async body, and the
+        server accepts any string at all with HTTP 204 and echoes it back (measured
+        live with "definitely-not-a-variant").  A misrouted role therefore produces no
+        error, no red and no log line -- it just quietly runs on something else.  The
+        provider catalog is the only place the mismatch is visible, so the check lives
+        here, at startup, and alerts rather than refuses: a catalog we cannot read must
+        never stop the run."""
+        if self.fake_runners:
+            return
+        cat = None
+        for srv in self.servers.values():
+            if srv.get("parked"):
+                continue
+            cat = self._http_json(str(srv["url"]).rstrip("/") + "/config/providers")
+            if cat:
+                break
+        provs = (cat.get("providers") if isinstance(cat, dict) else cat) or []
+        declared = {}
+        for prov in provs:
+            for mid, m in ((prov or {}).get("models") or {}).items():
+                # the catalog's own order, not sorted: low/high/max reads as a scale
+                names = list((m.get("variants") or {}).keys())
+                declared["%s/%s" % (prov.get("id"), mid)] = names
+                declared.setdefault(mid, names)
+        if not declared:
+            return
+        # normalize_roster aliases every kind onto its role, so the same
+        # misconfiguration appears under several names: report the PAIR once
+        offenders = {}
+        for role, cfg in sorted((self.roster.get("roles") or {}).items()):
+            if not isinstance(cfg, dict) or cfg.get("runner") != "opencode":
+                continue
+            variant, model = cfg.get("variant"), str(cfg.get("model") or "")
+            if not variant or model not in declared or variant in declared[model]:
+                continue
+            offenders.setdefault((model, variant), []).append(role)
+        for (model, variant), roles in sorted(offenders.items()):
+            self.alert_once("variant:%s:%s" % (model, variant), "ROLE_VARIANT_UNDECLARED",
+                            "%s asks %s for variant %r, which it does not declare (%s). "
+                            "Nothing rejects it -- the server accepts any string with 204 -- "
+                            "so the role runs on an unintended config silently (D132)"
+                            % (", ".join(roles), model, variant,
+                               ", ".join(declared[model]) or "none"))
+
     def _http_ok(self, url, timeout=5.0):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -3714,6 +3769,7 @@ class LaneDriver(object):
             for name, srv in self.servers.items():
                 if not srv.get("parked"):
                     self.probe(name, srv["url"] + "/session", "startup")
+            self._check_role_variants()          # D132
         self._seal_step()
         self._render_step()
         if self._stopping:

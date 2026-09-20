@@ -3312,3 +3312,42 @@ def test_d131_a_fast_forward_empties_the_union_and_the_twin_still_builds_on_trun
     union(102, ahead, [("P-FIX-R4", fix_sha), ("P-PAR", par_sha)])
     base2, plan2 = drv._twin_union_base("P-PAR-HOSTED", row, {}, "P-PAR", par_sha, tasks, tb)
     assert base2 == ahead, (base2, ahead)
+
+
+def test_d132_a_role_asking_for_a_variant_its_model_does_not_declare_is_alerted(tmp_path, monkeypatch):
+    """D132: 2026-09-20 roster.roles.infra asked deepseek-v4.1-flash for variant
+    "xhigh", copied from the muse roles where it is valid; that model declares
+    low/high/max.  Nothing rejected it -- vprunners puts the string straight into
+    the prompt_async body and the live server answers 204 to ANY string, echoing
+    it back (measured with "definitely-not-a-variant").  The provider catalog is
+    the only place it is visible.  The alert names the pair once, not once per
+    kind alias, and an unreadable catalog never stops the run."""
+    env = Env(tmp_path, roster_extra={
+        "roles": {"builder": {"runner": "opencode", "model": "opencode-go/muse-1", "variant": "xhigh"},
+                  "infra": {"runner": "opencode", "model": "opencode-go/ds-flash", "variant": "xhigh"},
+                  "operations": {"runner": "opencode", "model": "opencode-go/ds-flash", "variant": "xhigh"},
+                  "grader": {"runner": "opencode", "model": "opencode-go/ds-flash", "variant": "high"},
+                  "junior": {"runner": "codex", "model": "gpt-x", "variant": "nonsense"}}})
+    (env.run_root / "roster.json").write_text(json.dumps(env.roster, indent=2))
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+    drv.fake_runners = False
+    catalog = {"providers": [{"id": "opencode-go", "models": {
+        "ds-flash": {"variants": {"low": {}, "high": {}, "max": {}}},
+        "muse-1": {"variants": {"low": {}, "high": {}, "xhigh": {}}}}}]}
+    monkeypatch.setattr(type(drv), "_http_json", lambda self, url, timeout=10.0: catalog)
+    drv._check_role_variants()
+    alerts = [json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()]
+    undeclared = [a for a in alerts if a.get("kind") == "ROLE_VARIANT_UNDECLARED"]
+    assert len(undeclared) == 1, undeclared          # the PAIR once, not once per kind alias
+    text = undeclared[0]["text"]
+    assert "ds-flash" in text and "'xhigh'" in text and "low, high, max" in text
+    assert "infra" in text and "operations" in text and "provider" in text  # every alias, one alert
+    assert "muse-1" not in text                      # xhigh is valid there
+    assert "gpt-x" not in text                       # codex roles are not opencode variants
+
+    # an unreadable catalog skips the check rather than stopping the run
+    drv._alerted.clear()
+    (env.run_root / "alerts.jsonl").write_text("")
+    monkeypatch.setattr(type(drv), "_http_json", lambda self, url, timeout=10.0: None)
+    drv._check_role_variants()
+    assert (env.run_root / "alerts.jsonl").read_text().strip() == ""
