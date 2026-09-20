@@ -283,6 +283,41 @@ def preflight_job(src, paths):
     return job
 
 
+TWIN_JOB = "platform-twin"
+TWIN_PREFIX = "twin:"
+TWIN_WORKERS = 3
+
+
+def twin_job(src, paths, workers=None):
+    """D113 (§114): a released lane's SCOPED twin -- the `platform` job with its
+    suite steps replaced by ONE `uv run pytest -q -n <workers> <paths>` over the
+    parent's test files plus its contract's; junit as every pytest leg, NO --cov
+    (class I, the cross-host coverage combine, cannot touch it), per-worker
+    Postgres like a shard leg.  Its record answers the twin's own ask only."""
+    job = preflight_job(src, paths)
+    n = int(workers or TWIN_WORKERS)
+    for st in job.get("steps") or []:
+        run = str(st.get("run") or "")
+        if run.startswith("uv run pytest -q "):
+            st["name"] = "Twin: the lane's and its contract's test files (vp-proof, D113)"
+            st["run"] = "uv run pytest -q -n %d %s" % (n, run[len("uv run pytest -q "):])
+    return job
+
+
+def _subst_steps(steps, old, new):
+    def sub(v):
+        if isinstance(v, _Literal):
+            return _Literal(str(v).replace(old, new))
+        if isinstance(v, str):
+            return v.replace(old, new)
+        if isinstance(v, dict):
+            return {k: sub(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [sub(x) for x in v]
+        return v
+    return [sub(st) for st in steps]
+
+
 def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_workers=None, shard_stagger_s=None,
                 host=None):
     """{job_id: job} for the overlay, derived from a parsed ci.yml; `only`
@@ -300,6 +335,14 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
         if not paths:
             raise ValueError("only=%s names no test paths" % only)
         selected, src = [PREFLIGHT_JOB], {PREFLIGHT_JOB: preflight_job(src, paths)}
+    elif only and str(only).startswith(TWIN_PREFIX):
+        # D113: "twin:<workers>:<p1,p2,...>" -- one scoped job, any host
+        spec = str(only)[len(TWIN_PREFIX):]
+        workers, _, rest = spec.partition(":")
+        paths = [x for x in rest.split(",") if x.strip()]
+        if not workers.isdigit() or not paths:
+            raise ValueError("only=%s: expected twin:<workers>:<path,...>" % only)
+        selected, src = [TWIN_JOB], {TWIN_JOB: twin_job(src, paths, int(workers))}
     elif only:
         selected, src = select_only(src, selected, only)
     out = {}
@@ -321,7 +364,7 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
         job.pop("if", None)
         legs = [0]
         steps = [{"name": "Prepare junit dir (vp-proof)", "run": 'mkdir -p "$RUNNER_TEMP/junit"'}]
-        if job_id == SHARD_JOB:
+        if job_id in (SHARD_JOB, TWIN_JOB):
             if SHARD_TMP_ON_SHM:
                 steps.append(dict(SHARD_SHM_ASSERT))
             steps.append(dict(SHARD_PREP))
@@ -331,15 +374,19 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
                 new = _rewrite_run(str(step["run"]), job_id, suffix, floor_supports_branch, legs,
                                    shard_workers=shard_workers)
                 step["run"] = _Literal(new) if "\n" in new else new
-                if job_id == SHARD_JOB and "pytest" in new:
+                if job_id in (SHARD_JOB, TWIN_JOB) and "pytest" in new:
                     env = dict(step.get("env") or {})
                     env.update(SHARD_ENV)
                     if shard_stagger_s is not None and float(shard_stagger_s) > 0:
                         env[STAGGER_ENV] = "%.2f" % float(shard_stagger_s)
                     step["env"] = env
             steps.append(step)
-        if job_id == SHARD_JOB:
+        if job_id in (SHARD_JOB, TWIN_JOB):
             steps.append(dict(SHARD_CLEANUP))
+        if job_id == TWIN_JOB:
+            # no matrix: the shard dir/lock-log names key on the run id instead, so
+            # several twin jobs on one host never share (or remove) one /dev/shm dir
+            steps = _subst_steps(steps, "${{ matrix.shard }}", "twin-${{ github.run_id }}")
         if legs[0] and any("pytest" in str(st.get("run", "")) for st in steps):
             steps.insert(1, dict(LINGER_ASSERT))
         if job_id in DOCKER_ASSERT_JOBS:
@@ -349,7 +396,7 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
             "if": "always()",
             "uses": upload,
             "with": {"name": "junit-%s%s" % (job_id, suffix),
-                     "path": "%s/*.xml%s" % (JUNIT_DIR, "\n%s/*.log" % JUNIT_DIR if job_id == SHARD_JOB else ""),
+                     "path": "%s/*.xml%s" % (JUNIT_DIR, "\n%s/*.log" % JUNIT_DIR if job_id in (SHARD_JOB, TWIN_JOB) else ""),
                      "if-no-files-found": "ignore", "retention-days": 7},
         })
         job["steps"] = steps

@@ -1253,6 +1253,60 @@ class LaneDriver(object):
     def _is_canary_row(self, task, c):
         return task == c["task"] or self._pack_root(task) == c["task"] or self.pack_by_task.get(task) == c["task"]
 
+    # -- D113 (§114): scoped twins ------------------------------------------------------
+
+    TWIN_SCOPE_WORKERS = 3
+
+    def _twin_scope_cfg(self):
+        """roster proof.circleci.twin_scope {enabled, contract_from, extra_paths,
+        workers}; {} when absent or disabled (twins stay the full canary-gated run)"""
+        t = (self.proof_cfg.get("circleci") or {}).get("twin_scope")
+        return t if isinstance(t, dict) and t.get("enabled") else {}
+
+    def _scoped_twin(self, task, p=None):
+        """a CIRCLECI twin that runs SCOPED (D113): twin_scope enabled and the
+        twin is not the canary's own row (the canary stays the full pipeline)"""
+        if not self._twin_scope_cfg():
+            return False
+        p = p if p is not None else self.packet_for(task)
+        if not p or not vppack.is_hosted_twin(p) or p.get("twin_gate") != "CIRCLECI":
+            return False
+        c = self._canary()
+        return not (c and self._is_canary_row(task, c))
+
+    def _twin_scope_paths(self, task, p, tasks):
+        """the scoped twin's test files: the parent packet's test_paths, plus the
+        parent_contract's own packet (<L-NN> of <L-NN>-V13) when twin_scope.
+        contract_from is parent_contract, plus twin_scope.extra_paths; sorted,
+        deduplicated, [] when nothing is known (the twin then runs full)"""
+        cfg = self._twin_scope_cfg()
+        parent = self.pack.get(p.get("twin_of")) or {}
+        paths = [str(x) for x in (parent.get("test_paths") or [])]
+        if str(cfg.get("contract_from") or "parent_contract") == "parent_contract":
+            row = (tasks or {}).get(task) or {}
+            cid = row.get("parent_contract_id") or parent.get("parent_contract")
+            cpk = next((self.pack.get(q) for t, q in self.pack_by_task.items() if t == cid), None)
+            if cpk is None and cid and str(cid).endswith("-V13"):
+                cpk = self.pack.get(str(cid)[:-4])
+            paths += [str(x) for x in ((cpk or {}).get("test_paths") or [])]
+        paths += [str(x) for x in (cfg.get("extra_paths") or [])]
+        return sorted(set(x for x in paths if x.strip()))
+
+    def _twin_scope_only(self, task, p, tasks=None):
+        """-> "twin:<workers>:<p1,p2,...>" for a scoped twin, None otherwise"""
+        if not self._scoped_twin(task, p):
+            return None
+        if tasks is None:
+            tasks = self.control.state_view().get("tasks") or {}
+        paths = self._twin_scope_paths(task, p, tasks)
+        if not paths:
+            self.alert_once("twin-scope:%s" % task, "TWIN_SCOPE_EMPTY",
+                            "%s: no test paths from its parent %s or contract; runs the full pipeline"
+                            % (task, p.get("twin_of")), task)
+            return None
+        n = int(self._twin_scope_cfg().get("workers") or self.TWIN_SCOPE_WORKERS)
+        return "twin:%d:%s" % (n, ",".join(paths))
+
     def _canary_hold(self, task):
         """§21.2 (Architect, 2026-09-19): while the canary is armed (task set,
         released_at null) only the canary's own CIRCLECI twin may claim; every
@@ -1267,6 +1321,8 @@ class LaneDriver(object):
             return False
         if self._is_canary_row(task, c):
             return False
+        if self._scoped_twin(task, p):
+            return False                             # D113: a scoped twin never waits on the canary
         if ("canary-hold", task) not in self._pack_logged:
             self._pack_logged.add(("canary-hold", task))
             self.log("HOLD: CANARY_PENDING %s holds %s (no claim, no strike, no pipeline)" % (c["task"], task))
@@ -1384,6 +1440,8 @@ class LaneDriver(object):
         cfg = self._fleet_cfg()
         if self.proof.provider() != "gha" or cfg.get("enabled") is False or cfg.get("preflight") is False:
             return
+        if self._twin_scope_cfg():
+            return                                   # D113: scoped twins retire Fleet-2 preflight
         tasks = (state or {}).get("tasks") or {}
         live = getattr(self, "_preflight", None)
         if live is None:
@@ -1532,9 +1590,16 @@ class LaneDriver(object):
         p = self.packet_for(task)
         if not p or not vppack.is_hosted_twin(p) or p.get("twin_gate") != "CIRCLECI":
             return False
-        cap = int(self.proof.circle_cfg().get("max_in_flight", 2) or 2)   # roster max_pipelines_in_flight
+        scoped = self._scoped_twin(task, p)
+        if scoped:
+            # D113: a scoped twin is one only= job, capped by max_only_in_flight
+            # (laneproof.only_cap), never by the full-pipeline slot
+            cap = self.proof.only_cap()
+        else:
+            cap = int(self.proof.circle_cfg().get("max_in_flight", 2) or 2)   # roster max_pipelines_in_flight
         with self._lock:
-            live = [t for t in self._live if (self.packet_for(t) or {}).get("twin_gate") == "CIRCLECI"]
+            live = [t for t in self._live if (self.packet_for(t) or {}).get("twin_gate") == "CIRCLECI"
+                    and self._scoped_twin(t) == scoped]
         if len(live) < cap:
             return False
         if ("twin-slot", task) not in self._pack_logged:
@@ -4493,6 +4558,15 @@ class LaneDriver(object):
         # "portal").  A targeted proof of that packet's own claim: its record
         # carries `only` and is never adopted as a twin's full-suite PASS.
         only = str(hdr.get("proof_only") or "").strip() or None
+        if not only:
+            # D113 (§114): a released lane's CIRCLECI twin runs SCOPED -- one
+            # vp/platform-twin job over the parent's + its contract's test files;
+            # the record carries `only`, answers this twin's ask only, and a
+            # scoped PASS closes the twin VERIFIED.  The canary's own row stays full.
+            only = self._twin_scope_only(task, self.packet_for(task) or {})
+            if only:
+                self.log("PROOF %s scoped twin: %d test path(s), -n %s (D113)"
+                         % (task, only.count(",") + 1, only.split(":")[1]))
         # D100 (§98 item 3): the ~80-min platform-order job runs only on the FINAL
         # canary (roster canary.final true, armed by the Architect) or a packet
         # that asks for it (`proof_order: true`); intermediate canaries omit it
@@ -4959,7 +5033,13 @@ class LaneDriver(object):
                 continue
             route = rec.get("route")
             if (rec.get("only") or None) != (only or None):
-                continue
+                # D113: a full hosted PASS on this tree (no only, no paths) still
+                # closes a scoped twin -- it ran the twin's files and every other
+                # suite; nothing else crosses the only= line (D98)
+                if not (only and str(only).startswith("twin:") and not rec.get("only")
+                        and rec.get("status") == "PASS" and route in laneproof.HOSTED_ROUTES
+                        and not rec.get("paths")):
+                    continue
             if order and not rec.get("order"):
                 # D100: a final canary needs the order job; an intermediate PASS
                 # (no platform-order) is not its answer.  The reverse adopts.

@@ -2643,3 +2643,96 @@ def test_d96_the_driver_fills_a_missing_or_string_result_attempt_with_the_round(
     log = (env.run_root / "driver.log").read_text()
     assert log.count("attempt missing -> 2 filled by the driver (D96") == 1
     assert log.count("-> 2 filled by the driver") == 2
+
+
+def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_capped_as_a_full_pipeline(tmp_path, monkeypatch):
+    """D113 (§114, owner reversal of 04-REVIEW-POLICY): with roster
+    proof.circleci.twin_scope enabled a CIRCLECI twin asks only=twin:<n>:<paths>
+    (parent test_paths ∪ the parent_contract's <L-NN> packet test_paths ∪
+    extra_paths, sorted, deduplicated); the canary's own row stays the full
+    pipeline; scoped twins are not held by the canary, count against the only=
+    cap (not the full-pipeline slot), and Fleet-2 preflight is retired."""
+    env = Env(tmp_path)
+    env.activate()
+    proof = FakeProof([])
+    proof.only_active = 0
+    proof.only_cap = lambda: 2
+    proof.circle_cfg = lambda: {"max_in_flight": 1}
+    proof.provider = lambda: "gha"
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()}, proof=proof)
+    drv.proof_cfg["circleci"] = {"canary": {"task": "L06-HOSTED", "release_on": ["PASS"]},
+                                 "max_in_flight": 1,
+                                 "twin_scope": {"enabled": True, "contract_from": "parent_contract",
+                                                "extra_paths": ["platform/tests/test_extra.py"], "workers": 4}}
+    twin = {"id": "R-A-HOSTED", "twin_of": "R-A", "twin_gate": "CIRCLECI", "proof_only": "", "proof_kind": "platform"}
+    canary = {"id": "L06-HOSTED", "twin_of": "L06", "twin_gate": "CIRCLECI", "proof_only": ""}
+    other = {"id": "R-B-HOSTED", "twin_of": "R-B", "twin_gate": "CIRCLECI", "proof_only": ""}
+    drv.pack.update({"R-A-HOSTED": twin, "L06-HOSTED": canary, "R-B-HOSTED": other,
+                     "R-A": {"id": "R-A", "test_paths": ["platform/tests/test_b.py", "platform/tests/test_a.py"],
+                             "parent_contract": "L07-V13"},
+                     "L07": {"id": "L07", "test_paths": ["platform/tests/test_a.py", "platform/tests/test_l07.py"]},
+                     "R-B": {"id": "R-B", "test_paths": []}})
+    drv.pack_by_task.update({"R-A-HOSTED-R1": "R-A-HOSTED", "L06-HOSTED-R12": "L06-HOSTED",
+                             "R-B-HOSTED-R1": "R-B-HOSTED", "L07-V13": "L07"})
+    tasks = {"R-A-HOSTED-R1": {"state": "READY", "parent_contract_id": "L07-V13"},
+             "L06-HOSTED-R12": {"state": "READY"}, "R-B-HOSTED-R1": {"state": "READY"}}
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks) == \
+        "twin:4:platform/tests/test_a.py,platform/tests/test_b.py,platform/tests/test_extra.py,platform/tests/test_l07.py"
+    assert drv._twin_scope_only("L06-HOSTED-R12", canary, tasks) is None, "the canary's row stays the full pipeline"
+    assert drv._twin_scope_only("R-B-HOSTED-R1", other, tasks) == "twin:4:platform/tests/test_extra.py"
+    drv.proof_cfg["circleci"]["twin_scope"]["extra_paths"] = []
+    assert drv._twin_scope_only("R-B-HOSTED-R1", other, tasks) is None, "no paths known -> full run"
+    assert "ALERT TWIN_SCOPE_EMPTY" in (env.run_root / "driver.log").read_text()
+    # canary hold: scoped twins pass; the canary itself is not held; a full twin is
+    assert drv._canary_hold("R-A-HOSTED-R1") is False and drv._canary_hold("L06-HOSTED-R12") is False
+    drv.proof_cfg["circleci"]["twin_scope"]["enabled"] = False
+    assert drv._canary_hold("R-A-HOSTED-R1") is True, "twin_scope off: the §21.2 hold as before"
+    drv.proof_cfg["circleci"]["twin_scope"]["enabled"] = True
+    # slot: scoped twins are capped by only_cap (2), full pipelines by max_in_flight (1)
+    drv._live = {"R-B-HOSTED-R1": object()}
+    assert drv._twin_slot_full("R-A-HOSTED-R1") is False, "1 scoped live < only cap 2"
+    assert drv._twin_slot_full("L06-HOSTED-R12") is False, "no FULL twin live: the canary claims"
+    drv._live = {"R-B-HOSTED-R1": object(), "R-C-HOSTED-R1": object()}
+    drv.pack["R-C-HOSTED"] = {"id": "R-C-HOSTED", "twin_of": "R-C", "twin_gate": "CIRCLECI"}
+    drv.pack_by_task["R-C-HOSTED-R1"] = "R-C-HOSTED"
+    assert drv._twin_slot_full("R-A-HOSTED-R1") is True, "2 scoped live >= only cap 2"
+    assert drv._twin_slot_full("L06-HOSTED-R12") is False, "scoped twins never fill the full-pipeline slot"
+    # preflight retired
+    drv._fleet_idle_since = {"r1": 1.0}
+    drv._preflight_step({"tasks": tasks})
+    assert not getattr(drv, "_preflight", None)
+
+
+def test_d113_a_scoped_twin_record_answers_its_own_ask_and_a_full_hosted_pass_still_closes_it(tmp_path):
+    """D113: a twin: record is never a full-suite or other-only answer (D98 kept);
+    a full hosted PASS on the same tree (no only, no paths) is adopted by a
+    scoped twin's ask (the canary closes twins as before); a FAIL_PRODUCT or a
+    box PASS is not."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "e" * 40
+    ask = "twin:3:platform/tests/test_a.py"
+    def rec(pid, **kw):
+        d = {"proof_id": pid, "sha": sha, "kind": "platform", "paths": [], "route": "gha",
+             "pipeline_id": "357" + pid[-3:], "status": "PASS", "ts": "2026-09-20T16:00:00.000Z"}
+        d.update(kw)
+        (proofs / (pid + ".json")).write_text(json.dumps(d))
+    rec("proof-twin-001", only=ask)
+    assert drv._reusable_proof(sha, "platform", []) is None, "a scoped twin is not the full suite"
+    assert drv._reusable_proof(sha, "platform", [], only="platform-shards-3") is None
+    assert drv._reusable_proof(sha, "platform", [], only="twin:3:platform/tests/test_b.py") is None, "a different scope"
+    assert drv._reusable_proof(sha, "platform", [], only=ask)["proof_id"] == "proof-twin-001"
+    (proofs / "proof-twin-001.json").unlink()
+    rec("proof-canary-002", ts="2026-09-20T16:01:00.000Z")
+    assert drv._reusable_proof(sha, "platform", [], only=ask)["proof_id"] == "proof-canary-002"
+    assert drv._reusable_proof(sha, "agent", [], only=ask)["proof_id"] == "proof-canary-002", "D94 across kinds"
+    assert drv._reusable_proof(sha, "platform", [], only="portal") is None, "D98: a full record never answers a job ask"
+    (proofs / "proof-canary-002.json").unlink()
+    rec("proof-canary-003", status="FAIL_PRODUCT", ts="2026-09-20T16:02:00.000Z")
+    assert drv._reusable_proof(sha, "platform", [], only=ask) is None, "a full red is not the twin's answer"
+    (proofs / "proof-canary-003.json").unlink()
+    rec("proof-box-004", route="box", pipeline_id=None, ts="2026-09-20T16:03:00.000Z")
+    assert drv._reusable_proof(sha, "platform", [], only=ask) is None, "a box PASS never closes a hosted twin"

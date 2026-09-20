@@ -630,3 +630,34 @@ def test_d112_host_pins_every_job_of_a_full_overlay_but_never_an_only_run():
     assert doc["jobs"]["portal"]["runs-on"] == ["self-hosted", "voicepod"]
     doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, host="voicepod-b", only="preflight:tests/test_a.py"))
     assert doc["jobs"]["platform-preflight"]["runs-on"] == ["self-hosted", "voicepod"]
+
+
+def test_d113_a_scoped_twin_renders_one_platform_twin_job_with_xdist_junit_and_no_cov():
+    """D113 (§114): only=twin:<n>:<paths> renders `platform-twin` alone: the
+    platform job's setup kept, the suite steps replaced by one
+    `uv run pytest -q -n <n> <paths>` with junit, no --cov (class I cannot touch
+    it), a per-worker Postgres dir keyed on the run id (no matrix), the shared
+    runner label (any host: only full pipelines are D112-pinned)."""
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="twin:3:platform/tests/test_a.py,tests/test_b.py",
+                                              host="voicepod-b"))
+    assert list(doc["jobs"]) == ["platform-twin"]
+    job = doc["jobs"]["platform-twin"]
+    assert job["name"] == "vp/platform-twin" and "strategy" not in job
+    assert job["runs-on"] == ["self-hosted", "voicepod"], "a scoped twin may land on any host"
+    runs = [str(st.get("run", "")) for st in job["steps"]]
+    assert sum("uv run pytest" in r for r in runs) == 1
+    step = next(st for st in job["steps"] if "uv run pytest" in str(st.get("run", "")))
+    assert step["run"].startswith("uv run pytest -q -n 3 tests/test_a.py tests/test_b.py "
+                                  "--junitxml=${{ runner.temp }}/junit/platform-twin-1.xml")
+    assert "--cov" not in step["run"] and step["working-directory"] == "platform"
+    assert step["env"]["TMPDIR"] == "/dev/shm/pytest-platform-shards-twin-${{ github.run_id }}"
+    assert step["env"][vpgha_overlay.LOCK_LOG_ENV].endswith("pgserver-lock-twin-${{ github.run_id }}.log")
+    assert "matrix.shard" not in vpgha_overlay.render(MINI_CI, only="twin:3:tests/test_a.py")
+    assert any("/dev/shm/pytest-platform-shards-twin-${{ github.run_id }}" in r and r.startswith("rm -rf") for r in runs)
+    assert not any("ci_collection_floor" in r or "shuffled_runner" in r or "check_module_coverage" in r for r in runs)
+    up = job["steps"][-1]["with"]
+    assert up["name"] == "junit-platform-twin" and "*.log" in up["path"]
+    with pytest.raises(ValueError, match="twin:<workers>"):
+        vpgha_overlay.render(MINI_CI, only="twin:tests/test_a.py")
+    with pytest.raises(ValueError, match="twin:<workers>"):
+        vpgha_overlay.render(MINI_CI, only="twin:3:")
