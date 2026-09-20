@@ -184,7 +184,10 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     plat = jobs["platform"]["steps"][5]["run"]
     assert ("uv run pytest -q --cov=core --junitxml=${{ runner.temp }}/junit/platform-1.xml -o junit_family=xunit1 \\\n"
             "  --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80\n") in plat
-    assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][6]["run"]
+    assert "check_module_coverage.py" in plat
+    # D99: the shuffled (order-dependence) run is pytest.main(argv) -> its own junit leg, no -n rewrite
+    assert jobs["platform"]["steps"][6]["run"] == ("uv run python -m tests.shuffled_runner -q "
+                                                   "--junitxml=${{ runner.temp }}/junit/platform-2.xml -o junit_family=xunit1")
     # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
     # junit prep, linger assert, shm size assert, pgserver prep, checkout, run
     assert jobs["platform-shards"]["steps"][2]["name"].startswith("Assert /dev/shm")
@@ -240,7 +243,7 @@ ORDER_JOB = """
       - name: Order-dependence run
         run: |
           cd platform
-          uv run pytest tests -p randomly -q
+          uv run python -m tests.shuffled_runner -q
 """
 
 
@@ -320,7 +323,7 @@ def test_overlay_renders_from_the_real_trunk_ci_yml():
     text = vpgha_overlay.render(CI_YML.read_text(encoding="utf-8"), floor_supports_branch=False)
     doc = yaml.safe_load(text)
     assert set(doc["jobs"]) == set(vpgha_overlay.REQUIRED_JOBS)
-    assert text.count("--junitxml=") == 5, "platform, shards, agent x2, deploy-contracts"
+    assert text.count("--junitxml=") == 6, "platform x2 (coverage + shuffled, D99), shards, agent x2, deploy-contracts"
     assert text.count("--outputFile.junit=") == 1, "portal's vitest junit"
     assert text.count("-n 3 --dist loadfile") == 1 and "-n auto" not in text
     assert text.count("XDG_RUNTIME_DIR: ${{ runner.temp }}/xdg") == 1

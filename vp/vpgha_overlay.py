@@ -111,7 +111,12 @@ LINGER_ASSERT = {"name": "Assert the runner user has linger enabled (vp-proof)",
                         'logind RemoveIPC will wipe /dev/shm mid-run; fix on the host '
                         '(loginctl enable-linger + RemoveIPC=no), not here"; exit 1; }'}
 
-PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run pytest\b[^\n]*?)(?P<cont>\s*\\)?$", re.M)
+# D99 (Architect 2026-09-20): `uv run python -m tests.shuffled_runner` is
+# pytest.main(argv) with a seed plugin (platform/tests/shuffled_runner.py), so
+# it takes --junitxml unchanged; before this it was the one pytest leg without
+# junit (the order-dependence step of vp/platform, soon vp/platform-order)
+PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run (?:pytest|python -m tests\.shuffled_runner)\b[^\n]*?)"
+                       r"(?P<cont>\s*\\)?$", re.M)
 # only the `freshness` subcommand takes --branch (L04-FLOOR-PROOF-BRANCH adds it
 # under `elif mode == "freshness":`); `floor` / `control` refuse it with
 # "unrecognized arguments" -- canary run 35483670689's vp/platform job (D83d)
