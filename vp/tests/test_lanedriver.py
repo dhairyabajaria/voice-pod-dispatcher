@@ -2459,7 +2459,7 @@ def test_fleet2_preflight_runs_a_held_twins_parent_files_once_per_tip_and_cancel
             return "gha"
         def only_cap(self):
             return 3
-        def triggered_pipeline(self, sha):
+        def triggered_pipeline(self, sha, only=None):
             return {"pipeline_id": "run-" + sha[:4], "account": "gha"}
         def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None, only=None, order=False):
             self.calls.append((task, pid, cand, kind, paths, only))
