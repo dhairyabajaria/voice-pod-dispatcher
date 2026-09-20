@@ -1506,7 +1506,7 @@ class LaneDriver(object):
             cur = self._preflight_tip(twin, p, tasks)
             if cur and cur[0] != ent["tip"] and not ent.get("cancelled"):
                 ent["cancelled"] = True
-                prior = self.proof.triggered_pipeline(ent["tip"])
+                prior = self.proof.triggered_pipeline(ent["tip"], only=ent.get("only"))
                 if prior and prior.get("pipeline_id"):
                     try:
                         self.proof.circle.cancel_pipeline(prior["pipeline_id"], self.proof.circle_runner,
@@ -1539,7 +1539,8 @@ class LaneDriver(object):
                      % (twin, len(paths), p.get("twin_of"), tip[:12], why, pid))
             th = threading.Thread(target=self._preflight_run, args=(twin, pid, tip, kind, paths), daemon=True,
                                   name="preflight-%s" % twin)
-            live[twin] = {"tip": tip, "pid": pid, "thread": th, "ts": utc_ms()}
+            live[twin] = {"tip": tip, "pid": pid, "thread": th, "ts": utc_ms(),
+                          "only": "preflight:%s" % ",".join(paths)}
             th.start()
             return                                   # one launch per step
 

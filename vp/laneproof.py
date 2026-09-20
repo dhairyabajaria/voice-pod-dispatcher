@@ -189,11 +189,11 @@ class Proof(object):
             pass
         return n
 
-    def _note_pipeline(self, pid, pipeline_id, account, cand, status=TRIGGERED, reason=None):
+    def _note_pipeline(self, pid, pipeline_id, account, cand, status=TRIGGERED, reason=None, only=None):
         ledger = self.run_root / "proofs" / "circleci-pipelines.jsonl"
         ledger.parent.mkdir(parents=True, exist_ok=True)
         row = {"ts": utc_ms(), "proof_id": pid, "pipeline_id": pipeline_id, "account": account, "sha": cand,
-               "status": status}
+               "status": status, "only": only}
         if reason:
             row["reason"] = str(reason)[:300]
         with open(ledger, "a", encoding="utf-8") as fh:
@@ -548,7 +548,7 @@ class Proof(object):
         pipeline_id, account = None, None
         measured = cand                               # D83: the commit the run measures (cand + overlay on gha)
         pushed = {}                                   # account -> remote the branch was pushed to
-        prior = self.triggered_pipeline(cand)
+        prior = self.triggered_pipeline(cand, only=only)
         with self._lock:
             # Fleet-1: only= runs count against their own cap, never the full-pipeline one
             if only:
@@ -567,7 +567,7 @@ class Proof(object):
                     pipeline_id, account = prior["pipeline_id"], prior.get("account")
                     self.log("PROOF %s %s re-polls %s pipeline %s (account %s) recorded by %s: "
                              "no new trigger (D81)" % (task, pid, self.hosted_route(), pipeline_id, account, prior.get("proof_id")))
-                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.REPOLLED,
+                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.REPOLLED, only=only,
                                         reason="D81: from %s" % prior.get("proof_id"))
                     res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
                                            deadline_s=int(cc.get("deadline_min", 90)) * 60,
@@ -612,7 +612,7 @@ class Proof(object):
                 for acct in accounts:
                     refusal = self._trigger_refusal(cc)
                     if refusal:
-                        self._note_pipeline(pid, None, acct, cand, status=refusal[0], reason=refusal[1])
+                        self._note_pipeline(pid, None, acct, cand, status=refusal[0], reason=refusal[1], only=only)
                         raise self.Refused(*refusal)
                     # D44: each account triggers its own project on its own GitHub repo --
                     # push there first, and prove the branch is there (D38)
@@ -627,14 +627,14 @@ class Proof(object):
                         trig = self.circle.trigger(branch, {param: True}, runner, acct, targets=targets, rotate=False)
                     except RuntimeError as exc:
                         if self.circle._looks_like_credit_error(str(exc)):
-                            self._note_pipeline(pid, None, acct, cand, status=self.CREDITS_BLOCKED, reason=str(exc))
+                            self._note_pipeline(pid, None, acct, cand, status=self.CREDITS_BLOCKED, reason=str(exc), only=only)
                             refusals.append((acct, str(exc)[:200]))
                             self._block_account(acct, str(exc))
                             continue
-                        self._note_pipeline(pid, None, acct, cand, status=self.TRIGGER_FAILED, reason=str(exc))
+                        self._note_pipeline(pid, None, acct, cand, status=self.TRIGGER_FAILED, reason=str(exc), only=only)
                         raise
                     pipeline_id, account = trig["pipeline_id"], trig["account"]
-                    self._note_pipeline(pid, pipeline_id, account, cand)
+                    self._note_pipeline(pid, pipeline_id, account, cand, only=only)
                     self.log("PROOF %s %s %s pipeline %s (account %s, %s)" % (task, pid, self.hosted_route(), pipeline_id, account,
                                                                                    tgt.get("repo") or remote))
                     res = self.circle.poll(pipeline_id, interval=int(cc.get("poll_interval_s", 60)),
@@ -649,7 +649,7 @@ class Proof(object):
                     # account is out; the next one gets the same branch on its own repo
                     refusals.append((acct, blocked[:200]))
                     self._block_account(acct, blocked)
-                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.CREDITS_BLOCKED, reason=blocked)
+                    self._note_pipeline(pid, pipeline_id, account, cand, status=self.CREDITS_BLOCKED, reason=blocked, only=only)
                     self.log("PROOF %s %s %s pipeline %s (account %s) blocked for credits -> next account"
                              % (task, pid, self.hosted_route(), pipeline_id, account))
                     res, pipeline_id, account = None, None, None
@@ -705,6 +705,23 @@ class Proof(object):
             status = cls["status"]
             failed, errors = circle_failed_nodes(res["failed_tests"])
             flake = None
+            collected = None
+            if only and vpgha_overlay.scoped_spec(only) and status == "PASS":
+                # D118b (§137): a scoped job that collected nothing is no answer
+                # (the twin job rendered `uv run pytest` over portal .test.tsx files:
+                # "failed with zero failed tests" / a green empty run) -> FAIL_INFRA
+                totals = getattr(self.circle, "junit_totals", None)
+                if totals is not None:
+                    try:
+                        scoped_jobs = [j for j in res["jobs"] if str(j.get("name") or "").startswith("vp/platform-t")]
+                        got = totals(pipeline_id, scoped_jobs, runner)
+                        collected = sum(got.values()) if got else None
+                    except Exception as exc:  # noqa: BLE001
+                        self.log("PROOF %s %s junit totals unreadable: %s" % (task, pid, exc))
+                    if collected == 0:
+                        status = "FAIL_INFRA"
+                        self.log("PROOF %s %s scoped job collected 0 tests (%s) -> FAIL_INFRA, no answer (D118b)"
+                                 % (task, pid, only[:80]))
             if status == "CANCELLED":
                 # D79b: a cancelled workflow/job is no answer about the candidate --
                 # recorded as CANCELLED (the driver retries after the backoff, the
@@ -735,11 +752,13 @@ class Proof(object):
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                    "paths": paths, "only": only, "order": bool(order), "host": host,
                    "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
-                   "flake_suspect": flake, "pipeline_id": pipeline_id, "account": account,
+                   "flake_suspect": flake, "tests_collected": collected,
+                   "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
                    "provider": self.provider(), "measured_commit": measured,
                    "reason": ("circleci pipeline %s cancelled: not an answer (D79b)" % pipeline_id
-                              if status == "CANCELLED" else None),
+                              if status == "CANCELLED" else
+                              "scoped job collected 0 tests: not an answer (D118b)" if collected == 0 else None),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
             self._write(pid, rec)
@@ -822,11 +841,30 @@ class Proof(object):
 
     OPEN_STATUSES = ("UNKNOWN",)
 
-    def triggered_pipeline(self, cand):
+    @staticmethod
+    def open_answers(rec_only, only):
+        """D117 (§136): an open pipeline may be re-polled for an ask only when it
+        ran the SAME thing -- equal `only` (a full for a full, one scoped set for
+        the identical set); a twin ask may also adopt an open FULL run (the D113
+        twin_adopts_full shape).  Never one scoped set for another: under D113
+        every twin on one union base shares the sha, and the first twin's
+        pipeline (one twin step = ITS files) was adopted by 5 siblings today."""
+        rec_only, only = rec_only or None, only or None
+        if rec_only == only:
+            return True
+        return bool(only and str(only).startswith("twin:") and not rec_only)
+
+    @staticmethod
+    def _open_rank(rec, only):
+        """an exact `only` match beats a twin's adoption of a full run; newest next"""
+        return (1 if (rec.get("only") or None) == (only or None) else 0, str(rec.get("ts") or ""))
+
+    def triggered_pipeline(self, cand, only=None):
         """D81: the newest CircleCI record for this sha whose pipeline was really
         triggered but whose answer never came back (status UNKNOWN: the poll
         died, the pipeline did not) -> {pipeline_id, account, proof_id}, else None.
-        A PASS/FAIL_* is D79's business (reuse), CANCELLED/BLOCKED_* are closed."""
+        A PASS/FAIL_* is D79's business (reuse), CANCELLED/BLOCKED_* are closed.
+        D117: only a record that ran the same `only` (open_answers)."""
         d = self.run_root / "proofs"
         best = None
         try:
@@ -839,14 +877,14 @@ class Proof(object):
             except (OSError, ValueError):
                 continue
             if (rec.get("sha") == cand and rec.get("route") in HOSTED_ROUTES and rec.get("pipeline_id")
-                    and rec.get("status") in self.OPEN_STATUSES):
-                if best is None or str(rec.get("ts") or "") > str(best.get("ts") or ""):
+                    and rec.get("status") in self.OPEN_STATUSES and self.open_answers(rec.get("only"), only)):
+                if best is None or self._open_rank(rec, only) > self._open_rank(best, only):
                     best = rec
         if best is None:
-            best = self.ledger_open_pipeline(cand)
+            best = self.ledger_open_pipeline(cand, only=only)
         return best
 
-    def ledger_open_pipeline(self, cand):
+    def ledger_open_pipeline(self, cand, only=None):
         """D93: the driver died mid-poll (the 10:53Z reboot) -> no proof-*.json
         was ever written for the trigger, so D81 saw nothing and the restart
         re-triggered a second run for the same sha (the 04:41Z precedent).
@@ -877,8 +915,8 @@ class Proof(object):
         best = None
         for row in rows:
             if (row.get("sha") == cand and row.get("pipeline_id") and row.get("status") == self.TRIGGERED
-                    and str(row["pipeline_id"]) not in answered):
-                if best is None or str(row.get("ts") or "") > str(best.get("ts") or ""):
+                    and str(row["pipeline_id"]) not in answered and self.open_answers(row.get("only"), only)):
+                if best is None or self._open_rank(row, only) > self._open_rank(best, only):
                     best = row
         return best
 

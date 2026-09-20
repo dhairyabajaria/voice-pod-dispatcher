@@ -287,6 +287,39 @@ def _artifacts(run_id, runner):
     return {r["name"]: r for r in rows if isinstance(r, dict) and r.get("name")}
 
 
+def junit_case_count(text):
+    """the number of <testcase> elements (collected and run: passed, failed, skipped)"""
+    return sum(1 for _ in ET.fromstring(text).iter("testcase"))
+
+
+def junit_totals(run_id, jobs, runner, download_dir=None):
+    """D118b: {job_number: testcase count} from each job's junit artifact, green
+    jobs included; a job without an artifact gets no key.  A SCOPED job that
+    collected nothing (0 cases) is no answer -- laneproof classifies it FAIL_INFRA."""
+    have = _artifacts(run_id, runner)
+    out = {}
+    tmp = download_dir or tempfile.mkdtemp(prefix="vp-junit-")
+    for j in jobs:
+        key = vpgha_overlay.job_key_from_name(j.get("name"))
+        if not key:
+            continue
+        name = "junit-%s" % key
+        if name not in have or have[name].get("expired"):
+            continue
+        dest = Path(tmp) / name
+        res = runner.gh(["run", "download", str(run_id), "-R", REPO, "-n", name, "-D", str(dest)], timeout_s=300)
+        if res.returncode != 0:
+            continue
+        n = 0
+        for f in sorted(dest.rglob("*.xml")):
+            try:
+                n += junit_case_count(f.read_text(encoding="utf-8"))
+            except (OSError, ET.ParseError):
+                continue
+        out[j["job_number"]] = n
+    return out
+
+
 def junit_by_job(run_id, jobs, runner, download_dir=None):
     """{job_number: [red test items]} from the junit-<job> artifacts; a job
     whose artifact is missing or empty gets NO key (classify -> FAIL_INFRA

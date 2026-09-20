@@ -674,3 +674,11 @@ def test_d114_targeted_renders_the_twin_shaped_job_under_its_own_name():
     assert vpgha_overlay.scoped_spec("portal") is None
     with pytest.raises(ValueError, match="targeted:<workers>"):
         vpgha_overlay.render(MINI_CI, only="targeted:x:tests/a.py")
+
+
+def test_d118b_junit_case_count_counts_every_testcase():
+    xml = ('<testsuites><testsuite tests="3"><testcase classname="a" name="t1" file="tests/a.py"/>'
+           '<testcase classname="a" name="t2" file="tests/a.py"><failure message="x"/></testcase>'
+           '<testcase classname="a" name="t3" file="tests/a.py"><skipped/></testcase></testsuite></testsuites>')
+    assert vpgha.junit_case_count(xml) == 3
+    assert vpgha.junit_case_count("<testsuite/>") == 0

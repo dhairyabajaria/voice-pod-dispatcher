@@ -75,7 +75,10 @@ JUNIOR_PROMPT = (
     "a SCOPED hosted run: it answers a row whenever the row's test nodes are inside "
     "that paths list and failed_nodes has none of them; the job name (vp/platform-twin, "
     "vp/platform-targeted) and measured_commit differing from sha are never grounds to "
-    "fail or UNKNOWN a row (06-ROUTING rule 11). "
+    "fail or UNKNOWN a row (06-ROUTING rule 11). One check IS required for a scoped record: "
+    "its `only` paths must equal the pytest paths of the twin step in "
+    "`git show <measured_commit>:.github/workflows/vp-proof.yml`; if they differ the "
+    "record is not this twin's run -- FAIL the proof row and say so. "
     "If the write is refused, print the complete "
     "FINDINGS JSON in a single ```json fence as your final message and stop."
 )

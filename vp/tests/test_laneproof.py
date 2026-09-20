@@ -1047,3 +1047,77 @@ def test_d114_a_targeted_platform_proof_overflows_to_one_hosted_platform_targete
     rec = p.run("R-X", "proof-R-X-7", wt, base, cand, "platform", paths)
     assert rec["route"] == "box" and rec["status"] == "PASS"
     assert any("hosted targeted job FAIL_INFRA" in m and "the box answers (§125)" in m for m in logs)
+
+
+def test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set(tmp_path):
+    """D117 (§136): D81/D93 re-poll matched by sha alone, so under D113 a twin
+    adopted a sibling twin's open pipeline that never ran its files (5 VERIFIED
+    on borrowed answers).  Now: equal `only` only (full for full, one scoped set
+    for the identical set); a twin ask may adopt an open FULL run; a scoped set
+    never answers another scoped set or a full ask.  Ledger rows carry `only`."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle({"jobs": [{"id": "j2", "name": "lint", "status": "success", "job_number": 1}],
+                         "failed_tests": {}, "workflows": [{"id": "w1", "status": "success"}]})
+    p = make_proof(tmp_path, circle, FakeExec({}))
+    ledger = tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    a = "twin:3:platform/tests/test_a.py"
+    b = "twin:3:platform/tests/test_b.py"
+    rows = [{"ts": "2026-09-20T17:11:00.000Z", "proof_id": "proof-A-HOSTED-1", "pipeline_id": "1001", "account": "gha",
+             "sha": cand, "status": "triggered", "only": a},
+            {"ts": "2026-09-20T17:12:00.000Z", "proof_id": "proof-FULL-1", "pipeline_id": "1002", "account": "gha",
+             "sha": cand, "status": "triggered", "only": None}]
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert p.triggered_pipeline(cand, only=a)["pipeline_id"] == "1001"
+    got = p.triggered_pipeline(cand, only=b)
+    assert got["pipeline_id"] == "1002", "a sibling's scoped run is never adopted; the open FULL run is"
+    assert p.triggered_pipeline(cand)["pipeline_id"] == "1002", "a full ask takes the full run only"
+    assert p.triggered_pipeline(cand, only="targeted:3:platform/tests/test_b.py") is None, "targeted: adopts nothing else"
+    # without the full row, a different scoped set finds nothing -> a fresh trigger
+    ledger.write_text(json.dumps(rows[0]) + "\n")
+    assert p.triggered_pipeline(cand, only=b) is None
+    # the same rule on an OPEN proof record (status UNKNOWN)
+    d = tmp_path / "run" / "proofs"
+    (d / "proof-A-HOSTED-1.json").write_text(json.dumps({"proof_id": "proof-A-HOSTED-1", "sha": cand, "route": "gha",
+                                                         "pipeline_id": "1001", "status": "UNKNOWN", "only": a,
+                                                         "ts": "2026-09-20T17:13:00.000Z"}))
+    assert p.triggered_pipeline(cand, only=a)["pipeline_id"] == "1001"
+    assert p.triggered_pipeline(cand, only=b) is None and p.triggered_pipeline(cand) is None
+    # a pre-D117 ledger row (no `only` key) reads as a full run
+    ledger.write_text(json.dumps({"ts": "2026-09-20T17:14:00.000Z", "proof_id": "proof-OLD", "pipeline_id": "1003",
+                                  "account": "gha", "sha": cand, "status": "triggered"}) + "\n")
+    assert p.triggered_pipeline(cand)["pipeline_id"] == "1003" and p.triggered_pipeline(cand, only=b)["pipeline_id"] == "1003"
+    assert p.triggered_pipeline(cand, only="portal") is None
+    # a live trigger writes `only` into the ledger row
+    gha = FakeGha({"jobs": [{"id": "j1", "name": "vp/platform-twin", "status": "success", "job_number": 7}],
+                   "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]})
+    p2 = make_proof(tmp_path / "two", gha, FakeExec({}), cfg={"hosted": {"provider": "gha"},
+                                                            "circleci": {"enabled": True, "kinds": ["full"], "account": "A1"}})
+    p2.run("A-HOSTED", "proof-A-HOSTED-2", wt, base, cand, "platform", [], only=a)
+    row = [json.loads(l) for l in (tmp_path / "two" / "run" / "proofs" / "circleci-pipelines.jsonl").read_text().splitlines()][-1]
+    assert row["status"] == "triggered" and row["only"] == a
+
+
+def test_d118b_a_scoped_pass_that_collected_zero_tests_is_fail_infra(tmp_path):
+    """D118b (§137): the twin job over portal .test.tsx files ran `uv run pytest`
+    on nothing and came back green -- a scoped PASS must carry a junit case
+    count; zero collected = FAIL_INFRA (never reused, never VERIFIED)."""
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/platform-twin", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    gha.totals = {7: 0}
+    gha.junit_totals = lambda run_id, jobs, runner: {j["job_number"]: gha.totals.get(j["job_number"], 0) for j in jobs}
+    cfg = {"hosted": {"provider": "gha"}, "circleci": {"enabled": True, "kinds": ["full"], "account": "A1"}}
+    logs = []
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg, logs=logs)
+    only = "twin:3:portal/src/App.test.tsx"
+    rec = p.run("L20-HOSTED", "proof-L20-1", wt, base, cand, "portal", [], only=only)
+    assert rec["status"] == "FAIL_INFRA" and rec["tests_collected"] == 0 and "D118b" in rec["reason"]
+    assert any("scoped job collected 0 tests" in m for m in logs)
+    gha.totals = {7: 12}
+    rec = p.run("L20-HOSTED", "proof-L20-2", wt, base, cand, "platform", [], only="twin:3:platform/tests/test_a.py")
+    assert rec["status"] == "PASS" and rec["tests_collected"] == 12
+    # a full run is not counted (no junit download on green jobs)
+    rec = p.run("L20-HOSTED", "proof-L20-3", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS" and rec["tests_collected"] is None
