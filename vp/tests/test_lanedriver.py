@@ -2734,6 +2734,21 @@ def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_cap
     # a basename the tree does not have is dropped, never handed to pytest
     (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] test_not_here.py::test_x green\n")
     assert "test_not_here" not in (drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) or "")
+    # D125: a scope that pins open the seam its own row names is not an answer
+    (wt / "platform" / "tests" / "test_fences.py").write_text(
+        "def test_x(monkeypatch):\n"
+        "    import core.consent_grants as c\n"
+        "    monkeypatch.setattr(c, 'grant_is_live', lambda *a, **k: True)\n")
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B9 [hosted] a revoked consent holds the reply -- check: "
+                                             "platform/tests/test_fences.py\n")
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
+    assert "scoped twin refused: the scope stubs a seam its rows name" in \
+        (env.run_root / "driver.log").read_text()
+    # the same file is fine for a row that does not name that seam
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B9 [hosted] the reply renders once -- check: "
+                                             "platform/tests/test_fences.py\n")
+    got = drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt)
+    assert got and "platform/tests/test_fences.py" in got, got
     # D123: a cited file absent at base but OWNED by a sibling packet names its owner
     drv.pack["R-OWNS-IT"] = {"id": "R-OWNS-IT", "owned_files": ["platform/tests/test_future_db.py"]}
     (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] platform/tests/test_future_db.py::test_x green\n")
@@ -2931,3 +2946,47 @@ def test_d114_a_hosted_targeted_record_answers_the_plain_targeted_ask_and_nothin
     assert drv._reusable_proof(sha, "platform", []) is None, "never a full-suite answer"
     assert drv._reusable_proof(sha, "agent", ["platform/tests/test_a.py"]) is None, "kind-strict"
     assert drv._reusable_proof(sha, "platform", [], only="twin:3:platform/tests/test_a.py") is None, "never a twin's"
+
+
+def test_d126_unsound_grade_withdraws_one_row_keeps_the_old_verdict_and_re_raises_box_only(tmp_path):
+    """D126 (§152, Architect ruling (a)): a hosted row the driver graded from wrong
+    inputs -- a borrowed pipeline (§153) or a scope that stubs the seam the row
+    names (L17-HOSTED-R3 B9) -- is withdrawn as UNSOUND, never `invalidate`d.
+    The prior verdict is kept verbatim under `superseded`, box_only re-raises
+    because D45 clears only on PASS/DEFERRED, and the twin's scheduler state is
+    untouched: re-proving an ACCEPTED twin stays an owner verb."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    twin = {"id": "L17-HOSTED", "twin_of": "L17", "twin_gate": "CIRCLECI", "proof_only": "",
+            "hosted_rows": ["B8", "B9"]}
+    drv.pack.update({"L17-HOSTED": twin, "L17": {"id": "L17"}})
+    drv.pack_by_task.update({"L17-HOSTED-R3": "L17-HOSTED", "L17-V13": "L17"})
+    hdir = env.run_root / "hosted"
+    hdir.mkdir(parents=True, exist_ok=True)
+    (hdir / "L17-V13.json").write_text(json.dumps({
+        "task": "L17-V13", "packet": "L17", "box_only": False,
+        "twins": {"L17-HOSTED": {"gate": "CIRCLECI", "outcome": "VERIFIED", "attempt": "a1"}},
+        "hosted_rows": {"B8": {"verdict": "PASS", "twin": "L17-HOSTED", "attempt": "a1", "source": "findings"},
+                        "B9": {"verdict": "PASS", "twin": "L17-HOSTED", "attempt": "a1", "source": "findings"}},
+    }))
+    out = drv.unsound_grade("L17-HOSTED-R3", "B9", "the scope stubs consent_grants.grant_is_live",
+                            evidence="evidence/L17-B9.md")
+    assert out["was"] == "PASS" and out["box_only"] is True
+    rec = json.loads((hdir / "L17-V13.json").read_text())
+    b9 = rec["hosted_rows"]["B9"]
+    assert b9["verdict"] == "UNSOUND" and b9["reason"].startswith("the scope stubs")
+    assert b9["evidence"] == "evidence/L17-B9.md"
+    assert b9["superseded"] == {"verdict": "PASS", "twin": "L17-HOSTED", "attempt": "a1",
+                                "source": "findings"}, "the old verdict is kept verbatim"
+    assert rec["hosted_rows"]["B8"]["verdict"] == "PASS", "only the named row moves"
+    assert rec["box_only"] is True, "D45 clears only on PASS/DEFERRED, so UNSOUND re-raises it"
+    assert rec["twins"]["L17-HOSTED"]["outcome"] == "VERIFIED", "the twin's own outcome is not rewritten"
+    log = (env.run_root / "driver.log").read_text()
+    assert "UNSOUND_GRADE L17-HOSTED-R3 B9 PASS -> UNSOUND" in log
+    with pytest.raises(ValueError, match="already UNSOUND"):
+        drv.unsound_grade("L17-HOSTED-R3", "B9", "again")
+    with pytest.raises(ValueError, match="no row B4"):
+        drv.unsound_grade("L17-HOSTED-R3", "B4", "no such row")
+    with pytest.raises(ValueError, match="not a hosted twin"):
+        drv.unsound_grade("L17-V13", "B9", "the parent is not a twin")

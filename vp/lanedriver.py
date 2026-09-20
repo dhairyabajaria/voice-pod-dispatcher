@@ -1313,6 +1313,44 @@ class LaneDriver(object):
                           if "tests" in h.parts and ".venv" not in h.parts]
         return sorted(set(named))
 
+    # D125: a row's clause names a seam in prose ("revoked consent", "STOP
+    # suppression"); the seam's code is a module/callable the scoped file may
+    # monkeypatch.  Map clause -> the symbols that implement it, and refuse a
+    # scope that pins any of them.  Prose is the key because the row is the
+    # contract (§147); the symbols are what a test can stub.
+    SEAM_SYMBOLS = {
+        r"revoked consent|consent (?:fence|revocation|withdrawn)": ("grant_is_live", "consent_grants"),
+        r"STOP suppression|suppression fence": ("suppression_active", "is_suppressed"),
+        r"erasure hold": ("erasure_hold", "erasure_state"),
+        r"knowledge pack|asset binding": ("resolve_published", "asset_binding"),
+        r"RLS|tenant role": ("tenant_session",),
+    }
+    STUB_RE = "(?:monkeypatch\\.setattr|setattr)\\([^)]*%s"
+
+    def _stubbed_seams(self, text, wt):
+        """-> ["<clause> stubbed: <file>:<line> setattr(... <symbol> ...)"] for every
+        seam a row names that the scoped files pin open.  Empty when the scope is
+        honest, which is the normal case."""
+        if wt is None:
+            return []
+        out = []
+        for clause, symbols in self.SEAM_SYMBOLS.items():
+            if not re.search(clause, text, re.I):
+                continue
+            for path in self._named_test_files(text, wt):
+                try:
+                    body = (Path(wt) / path).read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                for sym in symbols:
+                    m = re.search(self.STUB_RE % re.escape(sym), body)
+                    if not m:
+                        continue
+                    line = body[:m.start()].count("\n") + 1
+                    out.append("%s stubs %s at %s:%d" % (path, sym, path, line))
+                    break
+        return sorted(set(out))
+
     def _twin_scope_paths(self, task, p, tasks, wt=None):
         """the scoped twin's test files: the parent packet's test_paths, plus the
         parent_contract's own packet (<L-NN> of <L-NN>-V13) when twin_scope.
@@ -1382,6 +1420,17 @@ class LaneDriver(object):
         if m:
             self.log("PROOF %s scoped twin refused: a hosted row asks for a CI job/step (%r); full pipeline"
                      % (task, m.group(0)))
+            return None
+        stubbed = self._stubbed_seams(text, wt)
+        if stubbed:
+            # D125 (§150, Architect): the file a row names may pin OPEN the very
+            # seam the row is about -- L17-HOSTED-R3 B9 passed on
+            # test_reply_path.py, which monkeypatches core.consent_grants.
+            # grant_is_live to lambda: True at :1591/:1755/:1895, so the
+            # revoked-consent fence it credits was never exercised.  A scope that
+            # stubs its own subject is not an answer: take the full pipeline.
+            self.log("PROOF %s scoped twin refused: the scope stubs a seam its rows name (%s); full pipeline (D125)"
+                     % (task, "; ".join(stubbed)[:300]))
             return None
         db = self.DB_ASK_RE.search(text)
         if db and not self._named_test_files(text, wt):
@@ -1708,6 +1757,56 @@ class LaneDriver(object):
             self._pack_logged.add(("twin-slot", task))
             self.log("WAIT %s: %d CIRCLECI twin(s) live >= cap %d" % (task, len(live), cap))
         return True
+
+    def unsound_grade(self, task, row_id, reason, evidence=None):
+        """D126 (§152/§155): withdraw ONE hosted row verdict that the driver
+        recorded correctly from inputs that were wrong -- a borrowed pipeline
+        (§153), or a scope that stubbed the seam the row names (L17-HOSTED-R3 B9).
+
+        Never `invalidate`: nothing is contaminated, and calling a grading defect
+        commit contamination puts a false claim in the ledger that outlives the
+        fix.  The prior verdict is kept verbatim under `superseded`, so a reader
+        sees VERIFIED at T1 superseded at T2 with the reason.  box_only re-raises
+        for free: D45 already clears only on PASS/DEFERRED, and UNSOUND is
+        neither.  The task's scheduler state is NOT touched -- re-proving an
+        ACCEPTED twin stays an owner verb (Architect ruling: the driver does not
+        get the power the ACCEPTED guard exists to deny)."""
+        p = self.packet_for(task)
+        if not p or not vppack.is_hosted_twin(p):
+            raise ValueError("%s is not a hosted twin" % task)
+        ptask = next((t for t, pid in self.pack_by_task.items() if pid == p.get("twin_of")), None) \
+            or p.get("twin_of")
+        f = self.run_root / "hosted" / ("%s.json" % ptask)
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("no hosted record for %s (%s)" % (ptask, exc))
+        rows = rec.get("hosted_rows") or {}
+        cur = rows.get(row_id)
+        if not cur:
+            raise ValueError("%s has no row %s in %s" % (ptask, row_id, f.name))
+        if cur.get("verdict") == "UNSOUND":
+            raise ValueError("%s row %s is already UNSOUND" % (ptask, row_id))
+        rows[row_id] = {"verdict": "UNSOUND", "twin": task, "attempt": cur.get("attempt"),
+                        "ts": utc_ms(), "source": "unsound-grade", "reason": reason,
+                        "evidence": str(evidence) if evidence else None,
+                        "superseded": dict(cur)}
+        all_twins = [q["id"] for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")]
+        twins = rec.get("twins") or {}
+        rec["box_only"] = not (all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
+                               and all(r.get("verdict") in ("PASS", "DEFERRED") for r in rows.values())
+                               and set(rows) >= {rid for q in self.pack.values()
+                                                 if q.get("twin_of") == p.get("twin_of")
+                                                 for rid in (q.get("hosted_rows") or [])})
+        rec["ts"] = utc_ms()
+        f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.alert("UNSOUND_GRADE", "%s row %s withdrawn (was %s): %s%s"
+                   % (task, row_id, (cur.get("verdict") or "?"), reason,
+                      "; evidence %s" % evidence if evidence else ""), task)
+        self.log("UNSOUND_GRADE %s %s %s -> UNSOUND (parent %s, box_only=%s): %s"
+                 % (task, row_id, cur.get("verdict"), ptask, rec["box_only"], reason))
+        return {"task": task, "parent": ptask, "row": row_id, "was": cur.get("verdict"),
+                "box_only": rec["box_only"], "record": str(f)}
 
     def _twin_record(self, task, outcome, fpath, attempt):
         """§19(5): per-row verdicts on the parent's hosted record
@@ -3887,6 +3986,18 @@ class LaneDriver(object):
             bad.append((dep, shas[-1][:12]))
         return bad
 
+    def _dispatch_key(self, row):
+        """D124 (§150): a packet the Architect marked `critical: true` dispatches
+        before everything else, then dynamic rows, then oldest first.  Without the
+        first term TRUNK-STANDING-TEST-REDS-4 -- the packet that clears the
+        registry wall every full-pipeline twin was dying on -- sat READY for half
+        an hour behind a cap-full queue of rows it was supposed to unblock, and
+        would have kept losing as new rows joined."""
+        p = self.packet_for(row.get("task_id")) or {}
+        return (0 if p.get("critical") else 1,
+                0 if row.get("dynamic") else 1,
+                row.get("updated_at") or "")
+
     def _dispatch_ready(self, state):
         try:
             rows = self.control.ready().get("ready") or []
@@ -3898,7 +4009,7 @@ class LaneDriver(object):
         with self._lock:
             self._alerted.discard("control:ready")
         n = 0
-        for row in sorted(rows, key=lambda r: (0 if r.get("dynamic") else 1, r.get("updated_at") or "")):
+        for row in sorted(rows, key=self._dispatch_key):
             if self._stopping:
                 break
             task = row["task_id"]
@@ -6246,6 +6357,14 @@ def build_parser():
     rp.add_argument("--reason", required=True)
     rp.add_argument("--regrade", metavar="SHA", help="D21: prove + grade this exact commit of the previous "
                                                    "task again (benchmark amended); no builder round")
+    ug = sub.add_parser("unsound-grade", help="D126 (§152): withdraw ONE hosted row verdict the driver "
+                                              "recorded from wrong inputs (a borrowed pipeline, a scope that "
+                                              "stubs the seam the row names). Keeps the old verdict under "
+                                              "`superseded`, re-raises box_only, never touches scheduler state")
+    ug.add_argument("task", help="the hosted twin whose row is withdrawn, e.g. L17-HOSTED-R3")
+    ug.add_argument("--row", required=True, help="the row id, e.g. B9")
+    ug.add_argument("--reason", required=True, help="why the verdict is unsound, in one sentence")
+    ug.add_argument("--evidence", help="path to the evidence file for this withdrawal")
     vf = sub.add_parser("verify", help="AUDIT-3: check every seal (chain, prefixes), replay the scheduler "
                                        "events against run-state/LEDGER.md, resolve every harvest sha; "
                                        "writes verify/verify-<ts>.json; exit 1 on any problem")
@@ -6287,6 +6406,19 @@ def cmd_retry_packet(drv, args):
     print(json.dumps({"status": "REQUESTED", "retry": rec,
                       "note": "the loop instantiates <packet>-R<n> on its next pack reconcile "
                               "(alerts.pack_every_s, default 300 s)"}, indent=2))
+    return 0
+
+
+def cmd_unsound_grade(drv, args):
+    try:
+        rec = drv.unsound_grade(args.task, args.row, args.reason, evidence=getattr(args, "evidence", None))
+    except ValueError as exc:
+        print(json.dumps({"status": "REFUSED", "error": str(exc)}))
+        return 2
+    print(json.dumps({"status": "WITHDRAWN", "unsound": rec,
+                      "note": "the row no longer counts and box_only re-raises; the twin's scheduler state is "
+                              "untouched -- re-proving an ACCEPTED twin is still an owner `invalidate`"},
+                     indent=2))
     return 0
 
 
@@ -6385,7 +6517,7 @@ def cmd_reload(drv, args):
 
 
 SUBCOMMANDS = ("run", "drain", "undrain", "restart", "item", "comms", "seal", "render", "init-run",
-               "retry-packet", "reload", "contamination", "verify")
+               "retry-packet", "reload", "contamination", "verify", "unsound-grade")
 
 
 def main(argv=None):
@@ -6432,6 +6564,8 @@ def main(argv=None):
         return cmd_seal(drv, args)
     if args.cmd == "retry-packet":
         return cmd_retry_packet(drv, args)
+    if args.cmd == "unsound-grade":
+        return cmd_unsound_grade(drv, args)
     if args.cmd == "reload":
         return cmd_reload(drv, args)
     if args.cmd == "contamination":
