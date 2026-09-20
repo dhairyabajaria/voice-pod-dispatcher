@@ -71,6 +71,11 @@ JUNIOR_PROMPT = (
     "If .vp/PROOF.json exists it is the driver's own test run of this exact HEAD "
     "(status, route, failed_nodes, and the pytest log at .vp/proofs/<proof_id>.log): "
     "use it as the evidence for every [test] and proof line instead of running tests. "
+    "A PROOF.json with an `only` of the form twin:<n>:<paths> or targeted:<n>:<paths> is "
+    "a SCOPED hosted run: it answers a row whenever the row's test nodes are inside "
+    "that paths list and failed_nodes has none of them; the job name (vp/platform-twin, "
+    "vp/platform-targeted) and measured_commit differing from sha are never grounds to "
+    "fail or UNKNOWN a row (06-ROUTING rule 11). "
     "If the write is refused, print the complete "
     "FINDINGS JSON in a single ```json fence as your final message and stop."
 )

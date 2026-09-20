@@ -451,8 +451,17 @@ TWIN_PREAMBLE = """<!-- HOSTED TWIN {id} (PACKET-FORMAT-v13 §6, BULK-RULING §1
 
 """
 TWIN_HOW = {
-    "CIRCLECI": "> Proof: the driver runs the FULL CircleCI pipeline on this exact sha as the proof (06-ROUTING §5,"
-                " one pipeline per twin); grade each row from the proof record and the pipeline artefacts.",
+    "CIRCLECI": "> Proof: the driver runs the hosted (GitHub Actions self-hosted fleet, provider `gha`) proof on this"
+                " exact sha and files it as `.vp/PROOF.json` (+ `.vp/proofs/`). Two shapes are BOTH the gate's"
+                " evidence (06-ROUTING §5 + rule 11, BULK-RULING §114/§121): (a) the full pipeline (every job of the"
+                " candidate's ci.yml, no `only` field), or (b) a SCOPED run -- `only: twin:<n>:<paths>` -- one"
+                " `vp/platform-twin` job that ran exactly the test files these rows name plus the parent's and its"
+                " contract's, with junit. A scoped record answers a row when the row's test nodes are inside its"
+                " `paths`/`only` list and `failed_nodes` is empty for them: do NOT fail a row because the job is"
+                " named `vp/platform-twin` rather than a CircleCI shard, and do NOT fail a row because"
+                " `measured_commit` differs from `sha` -- by design (D83) the run measures `sha` + one generated"
+                " workflow file, nothing else. Fail a row only when its named test did not run, ran red, or the"
+                " row asks for something no test in the run covers (then say which).",
     "DELIVERY-2A": "> Host: the Oracle VPS is reachable over SSH/sudo/Docker per `voice-pod/deployment/VPS_HANDOVER.md`"
                    " §1-2 (DELIVERY-2A). Rehearsal secret policy (§18 ruling, standing default): agent-generated"
                    " values per VPS_HANDOVER.md §5, placeholder strings for the 3 owner API keys, hostname-coupled"

@@ -2860,3 +2860,24 @@ def test_d115_a_skipped_owner_gate_defers_its_rows_and_releases_its_twin_never_a
     # gate closed (false) -> nothing deferred
     drv.roster["owner_gates"]["DELIVERY-4"] = False
     assert drv._deferred_rows(wt) == {}
+
+
+def test_d114_a_hosted_targeted_record_answers_the_plain_targeted_ask_and_nothing_else(tmp_path):
+    """D114: the box-shaped targeted proof offloaded to the fleet carries
+    only=targeted:...; D79 reuses it for the same kind + paths plain ask, never
+    for a twin ask, a different path set or a full-suite ask."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "f" * 40
+    rec = {"proof_id": "proof-tg-001", "sha": sha, "kind": "platform", "paths": ["platform/tests/test_a.py"],
+           "route": "gha", "pipeline_id": "358001", "status": "PASS", "ts": "2026-09-20T17:30:00.000Z",
+           "only": "targeted:3:platform/tests/test_a.py"}
+    (proofs / "proof-tg-001.json").write_text(json.dumps(rec))
+    assert drv._reusable_proof(sha, "platform", ["platform/tests/test_a.py"])["proof_id"] == "proof-tg-001"
+    assert drv._reusable_proof(sha, "platform", ["platform/tests/test_b.py"]) is None
+    assert drv._reusable_proof(sha, "platform", []) is None, "never a full-suite answer"
+    assert drv._reusable_proof(sha, "agent", ["platform/tests/test_a.py"]) is None, "kind-strict"
+    assert drv._reusable_proof(sha, "platform", [], only="twin:3:platform/tests/test_a.py") is None, "never a twin's"

@@ -980,3 +980,70 @@ def test_d111_the_box_proof_lints_the_lanes_changed_platform_files_first(tmp_pat
     ex.script["ruff"] = (1, json.dumps(rows), "")
     rec = p.run("R-X", "proof-R-X-4", wt, base, cand, "platform", ["platform/tests/test_mine.py"])
     assert rec["status"] == "PASS"
+
+
+def test_d114_a_targeted_platform_proof_overflows_to_one_hosted_platform_targeted_job(tmp_path):
+    """D114 (§124): with the roster listing "targeted" and the box slot busy, a
+    targeted platform proof runs hosted as ONE platform-targeted job over its
+    paths (only=targeted:<n>:<paths>, counted against the scoped cap, any host);
+    the D111 lint gate runs on the Mac first; when the scoped cap is full too it
+    queues on the box as before; box free -> box as before."""
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/platform-targeted", "status": "success", "job_number": 9}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    ex = FakeExec({})
+    logs = []
+    cfg = {"hosted": {"provider": "gha"}, "targeted_workers": 4,
+           "circleci": {"enabled": True, "mode": "overflow", "kinds": ["full", "targeted"], "account": "A1",
+                        "max_only_in_flight": 2, "delete_branch_after": True}}
+    p = make_proof(tmp_path, gha, ex, cfg=cfg, logs=logs)
+    paths = ["platform/tests/test_a.py", "platform/tests/test_b.py::test_x"]
+    # box free -> box
+    rec = p.run("R-X", "proof-R-X-1", wt, base, cand, "platform", paths)
+    assert rec["route"] == "box" and not [c for c in gha.calls if c[0] == "trigger"]
+    # box busy -> hosted targeted job
+    p.box_active = 1
+    rec = p.run("R-X", "proof-R-X-2", wt, base, cand, "platform", paths)
+    only = "targeted:4:platform/tests/test_a.py,platform/tests/test_b.py::test_x"
+    assert rec["status"] == "PASS" and rec["route"] == "gha" and rec["only"] == only and rec["paths"] == paths
+    assert rec["host"] is None, "a scoped job keeps the shared label"
+    assert ("prepare", cand, only) in gha.calls
+    assert any("D114 overflow: box busy (1/1) -> hosted platform-targeted job: 2 path(s), -n 4" in m for m in logs)
+    assert p.circle_active == 0 and p.only_active == 0, "counted as a scoped job, released"
+    # scoped cap full -> box (queue), never a hold
+    p.only_active = 2
+    n = len([c for c in gha.calls if c[0] == "trigger"])
+    rec = p.run("R-X", "proof-R-X-3", wt, base, cand, "platform", paths)
+    assert rec["route"] == "box" and len([c for c in gha.calls if c[0] == "trigger"]) == n
+    assert any("D114 overflow: 2 scoped job(s) >= max_only_in_flight 2 -> box" in m for m in logs)
+    p.only_active = 0
+    # the D111 lint gate is a Mac pre-step: a red never reaches the fleet
+    rows = [{"filename": str(wt / "platform" / "hello.py"), "code": "F401", "message": "unused",
+             "location": {"row": 1, "column": 8}}]
+    ruff = wt / "platform" / ".venv" / "bin" / "ruff"
+    ruff.parent.mkdir(parents=True)
+    ruff.write_text("#!/bin/sh\n")
+    ex.script["ruff"] = (1, json.dumps(rows), "")
+    rec = p.run("R-X", "proof-R-X-4", wt, base, cand, "platform", paths)
+    assert rec["status"] == "FAIL_PRODUCT" and rec["failed_nodes"] == ["lint::platform/hello.py:1 F401 unused"]
+    assert len([c for c in gha.calls if c[0] == "trigger"]) == n and "D114" in rec["reason"]
+    # a full platform suite is untouched by D114 (still the full pipeline)
+    ex.script["ruff"] = (0, "[]", "")
+    rec = p.run("R-X", "proof-R-X-5", wt, base, cand, "platform", [])
+    assert rec["route"] == "gha" and rec.get("only") is None
+    # §125: mode_by_kind {platform: all} makes hosted primary for platform even with the box free;
+    # agent stays overflow
+    p.cfg["circleci"]["mode_by_kind"] = {"platform": "all"}
+    p.cfg["circleci"]["kinds"] = ["full", "platform"]
+    p.box_active = 0
+    assert p.route("platform", "targeted") == ("gha", "mode all (mode_by_kind.platform)")
+    assert p.route("agent", "targeted")[0] == "box"
+    rec = p.run("R-X", "proof-R-X-6", wt, base, cand, "platform", paths)
+    assert rec["route"] == "gha" and rec["only"] == only
+    # §125: a hosted FAIL_INFRA on the targeted job -> the box answers, no strike
+    gha.res = {"jobs": [{"id": "j1", "name": "vp/platform-targeted", "status": "failed", "job_number": 10}],
+                  "failed_tests": {}, "workflows": [{"id": "1", "status": "failed"}]}
+    rec = p.run("R-X", "proof-R-X-7", wt, base, cand, "platform", paths)
+    assert rec["route"] == "box" and rec["status"] == "PASS"
+    assert any("hosted targeted job FAIL_INFRA" in m and "the box answers (§125)" in m for m in logs)

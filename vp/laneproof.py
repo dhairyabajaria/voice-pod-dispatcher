@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vpcircle
 import vpgha   # noqa: E402
+import vpgha_overlay   # noqa: E402
 from vpdriver import circle_failed_nodes  # noqa: E402
 
 RERUN_KINDS = {"platform": "platform/", "deploy": "deploy/", "agent": "agent/"}
@@ -150,8 +151,12 @@ class Proof(object):
             if self.circle_active >= int(cc.get("max_in_flight", 2)):
                 return "box", "%s in flight %d/%d" % (self.hosted_route(), self.circle_active, cc.get("max_in_flight", 2))
             mode = str(cc.get("mode", "overflow"))
+            # §125 (D114): `mode_by_kind: {platform: all}` makes hosted PRIMARY for one
+            # proof_kind while the roster-wide mode stays overflow for the rest
+            by_kind = cc.get("mode_by_kind") if isinstance(cc.get("mode_by_kind"), dict) else {}
+            mode = str(by_kind.get(kind) or mode)
             if mode in ("all", "swap"):
-                return self.hosted_route(), "mode all"
+                return self.hosted_route(), "mode all%s" % (" (mode_by_kind.%s)" % kind if by_kind.get(kind) else "")
             if suite == "full" and "full" in listed:
                 return self.hosted_route(), "full suite is never run on the box (06-ROUTING §5)"
             slots = int(self.cfg.get("box_slots", 1))
@@ -274,7 +279,48 @@ class Proof(object):
         suite = "targeted" if paths else "full"
         route, why = self.route(kind, suite)
         self.log("PROOF %s %s route=%s (%s, %s %s)" % (task, pid, route, why, suite, kind))
-        if route in HOSTED_ROUTES:
+        if route in HOSTED_ROUTES and suite == "targeted" and kind == "platform" and self.provider() == "gha":
+            # D114 (§124): a TARGETED platform proof the router sends hosted (roster
+            # kinds lists "targeted"/"platform"; overflow: the box slot is busy) runs
+            # as ONE platform-targeted job (the twin shape: setup + pytest -n N over
+            # exactly `paths`, junit, no --cov) instead of the full pipeline.  The
+            # D111 lint gate stays a Mac pre-step; F6 re-runs untouched reds on the
+            # Mac (run_circleci).  The record carries only=targeted:... -- an answer
+            # for the same kind+paths ask only, never a twin's, never a full suite's.
+            lint, linted = self.lint_changed(wt, base, cand)
+            if lint:
+                rec = {"status": "FAIL_PRODUCT", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
+                       "kind": kind, "paths": paths, "failed_nodes": lint, "errors": {}, "rc": 1, "stderr": "",
+                       "counts": {"failed_nodes": lint, "lint_files": linted}, "pipeline_id": None,
+                       "reason": "D111: ruff reds in the lane's changed platform files (Mac pre-step, D114)",
+                       "ts": utc_ms()}
+                self._write(pid, rec)
+                self.log("PROOF %s %s -> FAIL_PRODUCT (%d lint red(s) in %d changed file(s), D111 pre-step; "
+                         "hosted targeted job not run)" % (task, pid, len(lint), len(linted)))
+                return rec
+            if linted:
+                self.log("LINT %s %s: %d changed platform file(s) clean (D111)" % (task, pid, len(linted)))
+            with self._lock:
+                only_active = getattr(self, "only_active", 0)
+            if only_active >= self.only_cap():
+                # the fleet's scoped slots are full too: queue on the box as before, no hold
+                self.log("PROOF %s %s D114 overflow: %d scoped job(s) >= max_only_in_flight %d -> box"
+                         % (task, pid, only_active, self.only_cap()))
+            else:
+                n = int(workers or self.cfg.get("targeted_workers") or vpgha_overlay.TWIN_WORKERS)
+                only = "%s%d:%s" % (vpgha_overlay.TARGETED_PREFIX, n, ",".join(str(x) for x in paths))
+                self.log("PROOF %s %s D114 %s -> hosted platform-targeted job: %d path(s), -n %d"
+                         % (task, pid, why, len(paths), n))
+                rec = self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort, only=only)
+                if rec.get("status") == "FAIL_INFRA" and not (abort and abort()):
+                    # §125: a hosted infrastructure failure on a targeted job is the
+                    # fleet's problem, not the candidate's -> the Mac answers instead
+                    # of a strike (the record above stays as the fleet's evidence)
+                    self.log("PROOF %s %s hosted targeted job FAIL_INFRA (pipeline %s) -> the box answers (§125)"
+                             % (task, pid, rec.get("pipeline_id")))
+                    return self.run_box(task, pid, wt, cand, kind, paths, workers=workers, base=base)
+                return rec
+        elif route in HOSTED_ROUTES:
             return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort, order=order)
         held_off = self.full_suite_held(suite, why)
         if held_off:

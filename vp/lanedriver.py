@@ -5181,10 +5181,15 @@ class LaneDriver(object):
             if (rec.get("only") or None) != (only or None):
                 # D113: a full hosted PASS on this tree (no only, no paths) still
                 # closes a scoped twin -- it ran the twin's files and every other
-                # suite; nothing else crosses the only= line (D98)
-                if not (only and str(only).startswith("twin:") and not rec.get("only")
-                        and rec.get("status") == "PASS" and route in laneproof.HOSTED_ROUTES
-                        and not rec.get("paths")):
+                # suite.  D114: a hosted targeted: record (the box-shaped proof
+                # offloaded to the fleet) answers the plain targeted ask for the
+                # same kind + paths (checked below).  Nothing else crosses the
+                # only= line (D98): never a twin record, never a full suite.
+                twin_adopts_full = (only and str(only).startswith("twin:") and not rec.get("only")
+                                    and rec.get("status") == "PASS" and route in laneproof.HOSTED_ROUTES
+                                    and not rec.get("paths"))
+                targeted_answers_plain = (not only and want and str(rec.get("only") or "").startswith("targeted:"))
+                if not (twin_adopts_full or targeted_answers_plain):
                     continue
             if order and not rec.get("order"):
                 # D100: a final canary needs the order job; an intermediate PASS

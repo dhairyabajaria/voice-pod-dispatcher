@@ -661,3 +661,16 @@ def test_d113_a_scoped_twin_renders_one_platform_twin_job_with_xdist_junit_and_n
         vpgha_overlay.render(MINI_CI, only="twin:tests/test_a.py")
     with pytest.raises(ValueError, match="twin:<workers>"):
         vpgha_overlay.render(MINI_CI, only="twin:3:")
+
+
+def test_d114_targeted_renders_the_twin_shaped_job_under_its_own_name():
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="targeted:2:platform/tests/test_a.py::test_x"))
+    assert list(doc["jobs"]) == ["platform-targeted"]
+    job = doc["jobs"]["platform-targeted"]
+    step = next(st for st in job["steps"] if "uv run pytest" in str(st.get("run", "")))
+    assert step["run"].startswith("uv run pytest -q -n 2 tests/test_a.py::test_x --junitxml=")
+    assert step["env"]["TMPDIR"] == "/dev/shm/pytest-platform-shards-targeted-${{ github.run_id }}"
+    assert job["steps"][-1]["with"]["name"] == "junit-platform-targeted"
+    assert vpgha_overlay.scoped_spec("portal") is None
+    with pytest.raises(ValueError, match="targeted:<workers>"):
+        vpgha_overlay.render(MINI_CI, only="targeted:x:tests/a.py")
