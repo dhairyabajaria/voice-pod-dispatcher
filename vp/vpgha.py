@@ -140,7 +140,7 @@ def _git(runner, args, cwd, what, env=None):
     return (res.stdout or "").strip()
 
 
-def render_overlay(wt, cand, runner, only=None, order=False, shard=None):
+def render_overlay(wt, cand, runner, only=None, order=False, shard=None, host=None):
     """vp-proof.yml text for this candidate, from ITS ci.yml and floor script;
     `only` (§95 item 2) narrows the workflow to one job / matrix leg; `order`
     (D100) adds the platform-order job for a final canary"""
@@ -151,17 +151,18 @@ def render_overlay(wt, cand, runner, only=None, order=False, shard=None):
         floor = ""
     shard = shard or {}
     return vpgha_overlay.render(ci_text, vpgha_overlay.floor_supports_branch(floor), only=only, order=order,
-                                shard_workers=shard.get("workers"), shard_stagger_s=shard.get("stagger_s"))
+                                shard_workers=shard.get("workers"), shard_stagger_s=shard.get("stagger_s"), host=host)
 
 
-def prepare_measured(wt, cand, runner=None, text=None, only=None, order=False, shard=None):
+def prepare_measured(wt, cand, runner=None, text=None, only=None, order=False, shard=None, host=None):
     """-> measured commit sha: `cand` + one commit that adds/replaces
     .github/workflows/vp-proof.yml, built through a temporary index so the
     worktree's HEAD, index and files are untouched.  Asserts (rule 2) that
     `git diff --name-only cand measured` is exactly that path."""
     runner = runner or Runner()
     wt = str(wt)
-    text = text if text is not None else render_overlay(wt, cand, runner, only=only, order=order, shard=shard)
+    text = text if text is not None else render_overlay(wt, cand, runner, only=only, order=order, shard=shard,
+                                                        host=host)
     with tempfile.TemporaryDirectory(prefix="vp-overlay-") as tmp:
         blob_path = Path(tmp) / "vp-proof.yml"
         blob_path.write_text(text, encoding="utf-8")

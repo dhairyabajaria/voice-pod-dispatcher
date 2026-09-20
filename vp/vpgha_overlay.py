@@ -50,6 +50,9 @@ REQUIRED_JOBS = ("platform", "platform-shards", "platform-coverage", "agent",
 # when `only=` names it; intermediate canaries run without it (~40 min).
 OPTIONAL_JOBS = ("platform-order",)
 RUNS_ON = ["self-hosted", "voicepod"]
+# D112 (Architect 2026-09-20, two boxes): a FULL proof is pinned to one host label
+# (voicepod-a / voicepod-b, `host=`) so two canaries never share a host; only=
+# and preflight runs keep the shared label.
 # GitHub's default job timeout is 360 min; canary run 35483670689 hung disk-bound
 # with no junit for 10+ min and nothing would have ended it.  A job past this
 # is timed_out -> FAIL_INFRA (rule 4), never PASS.  CircleCI's whole pipeline
@@ -280,7 +283,8 @@ def preflight_job(src, paths):
     return job
 
 
-def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_workers=None, shard_stagger_s=None):
+def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_workers=None, shard_stagger_s=None,
+                host=None):
     """{job_id: job} for the overlay, derived from a parsed ci.yml; `only`
     narrows it to one job / matrix leg (select_only); `order` adds the
     optional order-dependence job when the ci.yml has it (D100);
@@ -312,7 +316,7 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
                 job.pop("needs")
         suffix = matrix_suffix(job)
         job["name"] = "vp/%s%s" % (job_id, suffix)
-        job["runs-on"] = list(RUNS_ON)
+        job["runs-on"] = ["self-hosted", str(host)] if (host and not only) else list(RUNS_ON)
         job["timeout-minutes"] = JOB_TIMEOUT_MIN
         job.pop("if", None)
         legs = [0]
@@ -376,10 +380,10 @@ permissions:
 
 
 def render(ci_yml_text, floor_supports_branch=False, only=None, order=False, shard_workers=None,
-           shard_stagger_s=None):
+           shard_stagger_s=None, host=None):
     ci = yaml.safe_load(ci_yml_text)
     jobs = render_jobs(ci, floor_supports_branch, only=only, order=order, shard_workers=shard_workers,
-                       shard_stagger_s=shard_stagger_s)
+                       shard_stagger_s=shard_stagger_s, host=host)
     body = yaml.dump({"jobs": jobs}, Dumper=_Dumper, sort_keys=False, width=200, allow_unicode=True,
                      default_flow_style=False)
     return HEAD + body

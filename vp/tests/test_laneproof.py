@@ -678,9 +678,9 @@ class FakeGha(FakeCircle):
         FakeCircle.__init__(self, res)
         self.dirty = dirty
 
-    def prepare_measured(self, wt, cand, runner=None, only=None, order=False, shard=None):
+    def prepare_measured(self, wt, cand, runner=None, only=None, order=False, shard=None, host=None):
         self.calls.append(("prepare", cand) + ((only,) if only else ()) + (("order",) if order else ())
-                          + ((shard,) if shard else ()))
+                          + ((shard,) if shard else ()) + (("host", host) if host else ()))
         if self.dirty:
             raise self.OverlayDirty("measured differs by ['platform/a.py']")
         # a real child commit of cand (same tree): the branch must point at something
@@ -914,3 +914,31 @@ def test_roster_shard_workers_and_stagger_reach_the_overlay(tmp_path):
     del p.cfg["circleci"]["shard_workers"], p.cfg["circleci"]["shard_stagger_s"]
     p.run("L06", "proof-L06-2", wt, base, cand, "platform", [])
     assert ("prepare", cand) in gha.calls, "no roster keys -> the plain call"
+
+
+def test_d112_full_proofs_pin_the_least_loaded_host_and_only_runs_keep_the_shared_label(tmp_path):
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/agent", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    seen = []
+    real_poll = gha.poll
+    def poll(*a, **k):
+        seen.append(dict(p.host_active))
+        return real_poll(*a, **k)
+    gha.poll = poll
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "delete_branch_after": True, "hosts": ["voicepod-a", "voicepod-b"]}}
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg)
+    rec = p.run("L06", "proof-L06-1", wt, base, cand, "platform", [])
+    assert rec["host"] == "voicepod-a" and ("prepare", cand, "host", "voicepod-a") in gha.calls
+    assert seen[-1] == {"voicepod-a": 1} and p.host_active == {"voicepod-a": 0}
+    p.host_active = {"voicepod-a": 1}                     # one full proof already on -a
+    rec = p.run("L06", "proof-L06-2", wt, base, cand, "platform", [])
+    assert rec["host"] == "voicepod-b", "least loaded wins"
+    rec = p.run("R-X", "proof-R-X-1", wt, base, cand, "platform", [], only="portal")
+    assert rec["host"] is None and not any(c[:1] == ("prepare",) and "host" in c for c in gha.calls[-1:])
+    del p.cfg["circleci"]["hosts"]
+    rec = p.run("L06", "proof-L06-3", wt, base, cand, "platform", [])
+    assert rec["host"] is None, "no roster hosts -> the shared label"

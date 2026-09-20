@@ -621,3 +621,12 @@ def test_d105_the_pgserver_lock_log_rides_the_shard_artifact():
     text = vpgha_overlay.render(MINI_CI)
     assert text.count("VOICEPOD_PGSERVER_LOCK_LOG") == 1
     assert doc["jobs"]["platform"]["steps"][-1]["with"]["path"] == "${{ runner.temp }}/junit/*.xml"
+
+
+def test_d112_host_pins_every_job_of_a_full_overlay_but_never_an_only_run():
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, host="voicepod-b"))
+    assert all(j["runs-on"] == ["self-hosted", "voicepod-b"] for j in doc["jobs"].values())
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, host="voicepod-b", only="portal"))
+    assert doc["jobs"]["portal"]["runs-on"] == ["self-hosted", "voicepod"]
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, host="voicepod-b", only="preflight:tests/test_a.py"))
+    assert doc["jobs"]["platform-preflight"]["runs-on"] == ["self-hosted", "voicepod"]

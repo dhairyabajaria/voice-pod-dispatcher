@@ -430,8 +430,20 @@ class Proof(object):
         self.log("PROOF circleci account %s blocked for credits for %dh: %s"
                  % (acct, self.CREDIT_BLOCK_S // 3600, why[:160]))
 
+    def pick_host(self, cc):
+        """D112: the host label (roster proof.circleci.hosts) with the fewest FULL
+        proofs in flight, ties by list order; None when no hosts are listed (the
+        shared label).  only=/preflight runs never pin."""
+        hosts = [str(h) for h in (cc.get("hosts") or []) if str(h).strip()]
+        if not hosts:
+            return None
+        with self._lock:
+            live = dict(getattr(self, "host_active", {}) or {})
+        return min(hosts, key=lambda h: (int(live.get(h, 0)), hosts.index(h)))
+
     def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None, order=False):
         cc = self.circle_cfg()
+        host = None if only else self.pick_host(cc)
         runner = self.circle_runner or self.circle.Runner()
         branch = "%s%s-%s" % (cc.get("branch_prefix", "vp/proof/"), pid, cand[:12])
         param = cc.get("param") or "run_full_suite"
@@ -446,6 +458,9 @@ class Proof(object):
                 self.only_active = getattr(self, "only_active", 0) + 1
             else:
                 self.circle_active += 1
+                if host:
+                    self.host_active = dict(getattr(self, "host_active", {}) or {})
+                    self.host_active[host] = self.host_active.get(host, 0) + 1
         try:
             try:
                 if prior:
@@ -481,12 +496,15 @@ class Proof(object):
                                      if cc.get(v) is not None}
                             if shard:
                                 kw["shard"] = shard          # roster proof.circleci.shard_workers / shard_stagger_s
+                            if host:
+                                kw["host"] = host            # D112: one host per full proof
                             measured = prepare(wt, cand, runner, **kw) if kw else prepare(wt, cand, runner)
                         except getattr(self.circle, "OverlayDirty", ()) as exc:
                             raise self.Refused(self.REFUSED_OVERLAY, str(exc)[:300])
-                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83%s%s)"
+                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83%s%s%s)"
                                  % (task, pid, measured[:12], cand[:12], ", only=%s" % only if only else "",
-                                    ", order=final (platform-order rendered, D100)" if order else ""))
+                                    ", order=final (platform-order rendered, D100)" if order else "",
+                                    ", host=%s (D112)" % host if host else ""))
                     rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, measured])
                     if rc != 0:
                         raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
@@ -618,7 +636,7 @@ class Proof(object):
             except Exception as exc:
                 out_dir = "record failed: %s" % exc
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
-                   "paths": paths, "only": only, "order": bool(order),
+                   "paths": paths, "only": only, "order": bool(order), "host": host,
                    "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
                    "flake_suspect": flake, "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
@@ -638,6 +656,9 @@ class Proof(object):
                     self.only_active = max(0, getattr(self, "only_active", 0) - 1)
                 else:
                     self.circle_active = max(0, self.circle_active - 1)
+                    if host:
+                        self.host_active = dict(getattr(self, "host_active", {}) or {})
+                        self.host_active[host] = max(0, self.host_active.get(host, 0) - 1)
             if cc.get("delete_branch_after", True):
                 for acct, remote in (pushed or {"": cc.get("push_remote")}).items():
                     try:
