@@ -74,7 +74,13 @@ SHARD_SHM_MIN_GB = 6                                   # ~24 clusters x 150MB + 
 _SHARD_DIR_DISK = "${{ runner.temp }}/pgdata-${{ matrix.shard }}"
 _SHARD_DIR_SHM = "/dev/shm/pytest-platform-shards-${{ matrix.shard }}"
 SHARD_DIR = _SHARD_DIR_SHM if SHARD_TMP_ON_SHM else _SHARD_DIR_DISK
-SHARD_ENV = {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg", "TMPDIR": SHARD_DIR}
+# D105 (CircleCI Manager 2026-09-20): the pgserver lock's file sink defaulted to
+# $TMPDIR (the shard's tmpfs pgdata dir) and never left the runner -- zero
+# [pgserver-lock] lines in any uploaded log.  Pointed at the junit dir, it rides
+# the shard's artifact (junit-platform-shards-N) as pgserver-lock-<shard>.log.
+LOCK_LOG_ENV = "VOICEPOD_PGSERVER_LOCK_LOG"
+LOCK_LOG_PATH = "%s/pgserver-lock-${{ matrix.shard }}.log" % JUNIT_DIR
+SHARD_ENV = {"XDG_RUNTIME_DIR": "${{ runner.temp }}/xdg", "TMPDIR": SHARD_DIR, LOCK_LOG_ENV: LOCK_LOG_PATH}
 # R-TEST-PG-STAGGER (Architect 2026-09-20): worker gwN sleeps N x this before the
 # pgserver lock acquire; unset = no sleep (local untouched).  The overlay sets it
 # on the shard job only, from roster proof.circleci.shard_stagger_s (no product
@@ -321,7 +327,8 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
             "name": "Retain junit results (vp-proof)",
             "if": "always()",
             "uses": upload,
-            "with": {"name": "junit-%s%s" % (job_id, suffix), "path": "%s/*.xml" % JUNIT_DIR,
+            "with": {"name": "junit-%s%s" % (job_id, suffix),
+                     "path": "%s/*.xml%s" % (JUNIT_DIR, "\n%s/*.log" % JUNIT_DIR if job_id == SHARD_JOB else ""),
                      "if-no-files-found": "ignore", "retention-days": 7},
         })
         job["steps"] = steps

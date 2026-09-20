@@ -164,7 +164,8 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
         assert job["steps"][0]["run"] == 'mkdir -p "$RUNNER_TEMP/junit"'
         last = job["steps"][-1]
         assert last["if"] == "always()" and last["uses"] == "actions/upload-artifact@deadbeef", "ci.yml's own pin"
-        assert last["with"]["path"] == "${{ runner.temp }}/junit/*.xml" and last["with"]["if-no-files-found"] == "ignore"
+        want = "${{ runner.temp }}/junit/*.xml" + ("\n${{ runner.temp }}/junit/*.log" if jid == "platform-shards" else "")
+        assert last["with"]["path"] == want and last["with"]["if-no-files-found"] == "ignore"
     assert jobs["platform"]["name"] == "vp/platform" and jobs["platform"]["steps"][-1]["with"]["name"] == "junit-platform"
     assert jobs["platform-shards"]["name"] == "vp/platform-shards-${{ matrix.shard }}"
     assert jobs["platform-shards"]["steps"][-1]["with"]["name"] == "junit-platform-shards-${{ matrix.shard }}"
@@ -594,3 +595,15 @@ def test_d103_a_retriggered_proof_never_adopts_its_earlier_attempts_run():
     gh = FakeGh(rows_before=[], run_rows=[old])
     with pytest.raises(RuntimeError, match="no vp-proof run named"):
         vpgha.trigger("vp/proof/p-R9-4c72", {}, vpgha.Runner(run=gh, binary="gh"), sleep=lambda s: None)
+
+
+def test_d105_the_pgserver_lock_log_rides_the_shard_artifact():
+    """D105: VOICEPOD_PGSERVER_LOCK_LOG on the shard pytest step points into the
+    junit dir (per shard) and the shard artifact uploads *.log beside *.xml;
+    other jobs are untouched (junit_by_job reads *.xml only)."""
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI))
+    run = next(st for st in doc["jobs"]["platform-shards"]["steps"] if "uv run pytest" in str(st.get("run", "")))
+    assert run["env"]["VOICEPOD_PGSERVER_LOCK_LOG"] == "${{ runner.temp }}/junit/pgserver-lock-${{ matrix.shard }}.log"
+    text = vpgha_overlay.render(MINI_CI)
+    assert text.count("VOICEPOD_PGSERVER_LOCK_LOG") == 1
+    assert doc["jobs"]["platform"]["steps"][-1]["with"]["path"] == "${{ runner.temp }}/junit/*.xml"
