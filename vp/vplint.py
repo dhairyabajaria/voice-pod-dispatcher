@@ -235,7 +235,35 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
                                    for t in tests):
                 out.append("WARN benchmark: %s test path %s is not in header test_paths"
                            % (r["id"], m.group(1)))
+    out += lint_pack_overlay(Path(packet_path).parent, packets_dir)
     return out
+
+
+PACK_CHECK = "check-v13.py"
+
+
+def lint_pack_overlay(packet_dir, packets_dir):
+    """the pack's own extra linter, layered on this one (D85).  check-v13.py
+    in 03-PACKETS adds the v13 rules (required v13 keys, the standing
+    Prohibitions line, gate rows) ON TOP of lint_packet; a draft that passed
+    here alone was placed with a rule it lacked (R-TEST-PG-WAL-CAP, §47), so
+    when `packets_dir` carries the file its `check_dir` runs too and its
+    findings join ours.  The pack's file is the only copy of those rules --
+    nothing is duplicated here.  A broken checker is a WARN, never silence."""
+    if not packets_dir:
+        return []
+    script = Path(packets_dir) / PACK_CHECK
+    if not script.is_file():
+        return []
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vp_pack_check", str(script))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        found = list(mod.check_dir(Path(packet_dir)))
+    except Exception as exc:                          # noqa: BLE001 -- report, never hide
+        return ["WARN pack: %s could not run: %s" % (PACK_CHECK, exc)]
+    return [f for f in found if f.startswith(("ERROR", "WARN"))]
 
 
 def lint_benchmark_literals(rows, base_sha=""):
