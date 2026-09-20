@@ -22,6 +22,7 @@ VP = HERE.parent
 sys.path.insert(0, str(VP))
 
 import lanedriver  # noqa: E402
+import vppack  # noqa: E402
 from vprunners import TurnOutcome, STATUS_DONE  # noqa: E402
 
 PY = sys.executable
@@ -2571,16 +2572,31 @@ def test_d101_an_amended_pack_reaches_the_next_round_and_keeps_the_migration_not
     log = (env.run_root / "driver.log").read_text()
     assert "REPACK R-X-a1 round 2 grade (PACKET.md " in log and "BENCHMARK.md " in log and "D101" in log
     assert drv._repack(wt, "R-X-a1", 3, "build") is False, "now equal again"
-    # a twin keeps its derived text
-    drv.pack["R-X-HOSTED"] = {"id": "R-X-HOSTED", "twin_of": "R-X", "twin_gate": "CIRCLECI"}
+    # D122: a twin's text is DERIVED, so the file copy cannot carry an amendment --
+    # it is re-derived from the pack's twin entry instead (L31-HOSTED-CIRCLECI-R1
+    # sat READY with pre-amendment rows and retry-packet refuses an unfinished task)
+    parent = {"id": "R-X", "dir": pack / "R-X", "runner_role": "builder", "template": "REPAIR",
+              "owned_files": [], "test_paths": [], "proof_kind": "platform", "max_rounds": 2,
+              "parent_contract": "L31", "group": 1, "body": "body v2\n", "critical": False}
+    twin = dict(parent, id="R-X-HOSTED", v13_kind=vppack.TWIN_KIND, scheduler_task="NEW:REPAIR",
+                closes=[], depends_on=["R-X"], hosted_owed=False, owner_gate="CIRCLECI", base_sha="",
+                review_base="", coverage_targets=[], twin_of="R-X", twin_gate="CIRCLECI",
+                hosted_rows=["B7"], hosted_lines=["B7 [hosted] the old row"], proof_only="")
+    drv.pack["R-X-HOSTED"] = twin
     drv.pack_by_task["R-X-HOSTED-a1"] = "R-X-HOSTED"
-    (pack / "R-X-HOSTED").mkdir()
-    (pack / "R-X-HOSTED" / "PACKET.md").write_text("x\n")
     wt2 = env.tmp / "wt" / "R-X-HOSTED-a1"
     (wt2 / ".vp").mkdir(parents=True)
-    (wt2 / ".vp" / "PACKET.md").write_text("twin text\n")
-    assert drv._repack(wt2, "R-X-HOSTED-a1", 1, "build") is False
-    assert (wt2 / ".vp" / "PACKET.md").read_text() == "twin text\n"
+    (wt2 / ".vp" / "BASE").write_text("bc8bdb14a0cf\n")
+    (wt2 / ".vp" / "PACKET.md").write_text(vppack.twin_packet_text(twin, "bc8bdb14a0cf"))
+    (wt2 / ".vp" / "BENCHMARK.md").write_text(vppack.twin_benchmark(twin))
+    assert drv._repack(wt2, "R-X-HOSTED-a1", 1, "build") is False, "unamended twin: no rewrite"
+    twin["hosted_lines"] = ["B7 [hosted] the amended row names platform/tests/test_migration_runner.py"]
+    assert drv._repack(wt2, "R-X-HOSTED-a1", 1, "build") is True
+    assert "test_migration_runner.py" in (wt2 / ".vp" / "BENCHMARK.md").read_text()
+    assert "test_migration_runner.py" in (wt2 / ".vp" / "PACKET.md").read_text()
+    assert "bc8bdb14a0cf" in (wt2 / ".vp" / "PACKET.md").read_text(), "the base is kept, never re-pointed"
+    assert "twin rows re-derived" in (env.run_root / "driver.log").read_text() and \
+        "D122" in (env.run_root / "driver.log").read_text()
 
 
 def test_d104_a_cancelled_hosted_proof_closes_the_attempt_on_first_read_no_retrigger(tmp_path, monkeypatch):
@@ -2718,6 +2734,12 @@ def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_cap
     # a basename the tree does not have is dropped, never handed to pytest
     (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] test_not_here.py::test_x green\n")
     assert "test_not_here" not in (drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) or "")
+    # D123: a cited file absent at base but OWNED by a sibling packet names its owner
+    drv.pack["R-OWNS-IT"] = {"id": "R-OWNS-IT", "owned_files": ["platform/tests/test_future_db.py"]}
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] platform/tests/test_future_db.py::test_x green\n")
+    drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt)
+    assert "platform/tests/test_future_db.py is absent at base but owned by packet R-OWNS-IT (D123)" in \
+        (env.run_root / "driver.log").read_text()
     # D119: a row asking for live-DB evidence while naming no test file of its own
     # cannot be answered by the parent's test_paths -> full pipeline
     twin["hosted_lines"] = ["B9 [hosted] the DB-backed fence rehearsal holds the reply on a live database"]

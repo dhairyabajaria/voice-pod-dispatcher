@@ -1291,7 +1291,18 @@ class LaneDriver(object):
         if wt is None:
             return sorted(set(named))
         root = Path(wt)
+        missing = [x for x in named if not (root / x).exists()]
         named = [x for x in named if (root / x).exists()]
+        for x in missing:
+            # D123 (§149, Architect): absence at base is not absence of plan -- a
+            # row may forward-reference a file a SIBLING packet owns and creates
+            # (WA-04 B9 cites test_campaign_legacy_reconciliation_db.py, which
+            # R-L10-DB-REHEARSAL writes).  Drop it from the scope either way, but
+            # name the owner so nobody reads it as a broken citation.
+            owner = next((q.get("id") for q in (self.pack or {}).values()
+                          if x in (q.get("owned_files") or [])), None)
+            if owner:
+                self.log("PROOF twin scope: %s is absent at base but owned by packet %s (D123)" % (x, owner))
         bare = set(self.BARE_TEST_RE.findall(text)) - {Path(x).name for x in named}
         for base in sorted(bare):
             for suite in ("platform", "agent", "portal"):
@@ -2864,6 +2875,45 @@ class LaneDriver(object):
 
     MIGRATION_NOTE_RE = re.compile(r"(?m)^> MIGRATION NUMBERS[^\n]*\n\n?")
 
+    def _repack_twin(self, wt, task, twin, rnd, stage):
+        """D122: re-derive a hosted twin's PACKET.md / BENCHMARK.md from the pack's
+        current copy of the twin packet (hosted_rows / hosted_lines come from the
+        parent, so an amended parent row lands here).  The base in the preamble is
+        the one already written, never a new one -- this refreshes the text, it
+        does not re-point the run."""
+        vp = Path(wt) / ".vp"
+        try:
+            base = (vp / "BASE").read_text(encoding="utf-8").strip()
+        except OSError:
+            base = ""
+        if not base:
+            try:
+                m = re.search(r"^base_sha:\s*([0-9a-f]{7,40})",
+                              (vp / "PACKET.md").read_text(encoding="utf-8"), re.M)
+            except OSError:
+                return False
+            if not m:
+                return False
+            base = m.group(1)
+        changed = []
+        try:
+            for name, new in (("PACKET.md", vppack.twin_packet_text(twin, base)),
+                              ("BENCHMARK.md", vppack.twin_benchmark(twin))):
+                dst = vp / name
+                cur = dst.read_text(encoding="utf-8") if dst.exists() else ""
+                if cur == new:
+                    continue
+                dst.write_text(new, encoding="utf-8")
+                changed.append("%s %s->%s" % (name, hashlib.sha256(cur.encode("utf-8")).hexdigest()[:8],
+                                              hashlib.sha256(new.encode("utf-8")).hexdigest()[:8]))
+        except OSError as exc:
+            self.log("REPACK %s round %d %s (twin) failed: %s" % (task, rnd, stage, exc))
+            return False
+        if changed:
+            self.log("REPACK %s round %d %s twin rows re-derived (%s; the parent was amended -- D122)"
+                     % (task, rnd, stage, ", ".join(changed)))
+        return bool(changed)
+
     def _repack(self, wt, task, rnd, stage):
         """D101 (Architect 2026-09-20): at EVERY round boundary -- before the
         builder's turn and before the grader's -- re-copy PACKET.md /
@@ -2877,7 +2927,15 @@ class LaneDriver(object):
         except Exception:  # noqa: BLE001
             return False
         twin = self.packet_for(task)
-        if not pp or (twin and vppack.is_hosted_twin(twin)):
+        if twin and vppack.is_hosted_twin(twin):
+            # D122 (§149): a twin's text is DERIVED, so D101's file copy cannot
+            # carry an amendment to it -- and the derivation is a pure function of
+            # the parent's rows, which the pack reconcile has already re-read.
+            # Re-derive instead of skipping: L31-HOSTED-CIRCLECI-R1 sat READY with
+            # its pre-amendment rows and retry-packet refuses an unfinished task,
+            # so without this the amendment could only land after a wasted run.
+            return self._repack_twin(wt, task, twin, rnd, stage)
+        if not pp:
             return False
         vp = Path(wt) / ".vp"
         changed = []
