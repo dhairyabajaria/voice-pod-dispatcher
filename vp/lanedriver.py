@@ -1808,7 +1808,7 @@ class LaneDriver(object):
         return {"task": task, "parent": ptask, "row": row_id, "was": cur.get("verdict"),
                 "box_only": rec["box_only"], "record": str(f)}
 
-    def _twin_record(self, task, outcome, fpath, attempt):
+    def _twin_record(self, task, outcome, fpath, attempt, wt=None):
         """§19(5): per-row verdicts on the parent's hosted record
         (RUN_ROOT/hosted/<parent_task>.json), and box_only clears only once
         every twin of the parent is VERIFIED.  A sidecar, never an edit of the
@@ -1817,7 +1817,7 @@ class LaneDriver(object):
         if not p or not vppack.is_hosted_twin(p):
             return
         ptask = next((t for t, pid in self.pack_by_task.items() if pid == p.get("twin_of")), None) or p.get("twin_of")
-        verdicts, source = {}, {}
+        verdicts, source, defer_meta = {}, {}, {}
         try:
             doc = json.loads(Path(fpath).read_text(encoding="utf-8")) if fpath and Path(fpath).exists() else {}
             for line in (doc.get("lines") or []):
@@ -1832,6 +1832,24 @@ class LaneDriver(object):
             # called UNKNOWN (Architect, union-12 fact sheet)
             verdicts.setdefault(rid, "UNKNOWN")
             source.setdefault(rid, "default")
+        # D127 (§123, Architect option (b)): D115's defer runs on FINDINGS.json after a
+        # grader turn, so a probe-kind twin -- no grader, no FINDINGS.json -- left its
+        # owner-skipped rows at D45's UNKNOWN and held box_only up for a gate the owner
+        # had already skipped.  Defer HERE, the one funnel every twin passes, whatever
+        # the pipeline, and carry the gate name, the roster's exact value and skipped_on
+        # onto the row so a reader can check the deferral against 09-OWNER-GATES.
+        gates = self.roster.get("owner_gates") or {}
+        for rid, gate in (self._deferred_rows(wt) if wt else {}).items():
+            if rid not in verdicts or verdicts[rid] == "DEFERRED":
+                continue
+            was, verdicts[rid] = verdicts[rid], "DEFERRED"
+            defer_meta[rid] = {"gate": gate, "gate_value": gates.get(gate),
+                               "skipped_on": str(gates.get("%s_skipped_on" % gate)
+                                                 or gates.get("skipped_on") or ""),
+                               "deferred_from": was, "deferred_source": source.get(rid)}
+            source[rid] = "gate-skipped"
+            self.log("DEFER %s %s %s -> DEFERRED: gate %s = %r skipped by the owner on %s (D127)"
+                     % (task, rid, was, gate, gates.get(gate), defer_meta[rid]["skipped_on"] or "?"))
         hdir = self.run_root / "hosted"
         hdir.mkdir(parents=True, exist_ok=True)
         f = hdir / ("%s.json" % ptask)
@@ -1846,6 +1864,7 @@ class LaneDriver(object):
         rows = rec.setdefault("hosted_rows", {})
         for rid, v in verdicts.items():
             rows[rid] = {"verdict": v, "twin": task, "attempt": attempt, "ts": utc_ms(), "source": source[rid]}
+            rows[rid].update(defer_meta.get(rid) or {})
         all_twins = [q["id"] for q in self.pack.values() if q.get("twin_of") == p.get("twin_of")]
         # D45: box_only clears only when every twin is VERIFIED AND every hosted row is PASS
         rec["box_only"] = not (all(twins.get(t, {}).get("outcome") == "VERIFIED" for t in all_twins)
@@ -4501,7 +4520,7 @@ class LaneDriver(object):
             self.alert("FAIL_AFTER_RETRY", "%s (%s) -> %s: %s" % (task, attempt, outcome, (reason or "")[:300]), task)
         self.completed.append((task, attempt, outcome))
         try:
-            self._twin_record(task, outcome, (wt / ".vp" / "FINDINGS.json") if wt else None, attempt)
+            self._twin_record(task, outcome, (wt / ".vp" / "FINDINGS.json") if wt else None, attempt, wt)
         except Exception as exc:  # noqa: BLE001 -- a sidecar never undoes a completion
             self.alert("HOSTED_RECORD_FAILED", "%s: %s: %s" % (task, type(exc).__name__, str(exc)[:200]), task)
         if outcome == "VERIFIED":

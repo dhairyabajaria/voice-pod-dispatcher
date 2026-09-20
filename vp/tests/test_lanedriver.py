@@ -2927,6 +2927,55 @@ def test_d115_a_skipped_owner_gate_defers_its_rows_and_releases_its_twin_never_a
     assert drv._deferred_rows(wt) == {}
 
 
+def test_d127_a_probe_twin_defers_its_owner_skipped_row_at_the_record_not_at_the_grader(tmp_path):
+    """D127 (§123, Architect option (b)): D115 defers on FINDINGS.json after a grader
+    turn, so a probe-kind twin -- no grader, no FINDINGS.json -- left its
+    owner-skipped rows at D45's UNKNOWN and held box_only up for a gate the owner
+    had already skipped.  _twin_record is the one funnel every twin passes, so the
+    defer belongs there, carrying the gate name, the roster's exact value and
+    skipped_on onto the row.  An open gate still defers nothing."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    drv.roster["owner_gates"] = {"DELIVERY-4": "skipped", "DELIVERY-4_skipped_on": "2026-09-20", "CIRCLECI": True}
+    # the live shape (74 of 76 hosted records): the twin's pack id IS its task id,
+    # which is what D45's all_twins check compares against
+    twin = {"id": "L34-HOSTED-R1", "twin_of": "L34", "twin_gate": "DELIVERY-4", "proof_only": "",
+            "hosted_rows": ["B8", "B9"]}
+    drv.pack.update({"L34-HOSTED-R1": twin, "L34": {"id": "L34"}})
+    drv.pack_by_task.update({"L34-HOSTED-R1": "L34-HOSTED-R1", "L34-V13": "L34"})
+    wt = env.tmp / "wt" / "L34-HOSTED-R1"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / ".vp" / "BENCHMARK.md").write_text(
+        "- B8 [invariant] [hosted] Live drill with the receiver (gate: DELIVERY-4)\n"
+        "- B9 [invariant] [hosted] CI shard green (gate: CIRCLECI)\n")
+    # the probe pipeline returns VERIFIED with a RESULT.json and NO findings at all
+    drv._twin_record("L34-HOSTED-R1", "VERIFIED", None, "a1", wt)
+    rec = json.loads((env.run_root / "hosted" / "L34-V13.json").read_text())
+    b8, b9 = rec["hosted_rows"]["B8"], rec["hosted_rows"]["B9"]
+    assert b8["verdict"] == "DEFERRED" and b8["source"] == "gate-skipped"
+    assert b8["gate"] == "DELIVERY-4" and b8["gate_value"] == "skipped" and b8["skipped_on"] == "2026-09-20"
+    assert b8["deferred_from"] == "UNKNOWN" and b8["deferred_source"] == "default", "it says what it moved"
+    assert b9["verdict"] == "UNKNOWN" and "gate" not in b9, "an open gate defers nothing"
+    assert rec["box_only"] is True, "B9 is still owed, so the box-only flag stays up"
+    assert "DEFER L34-HOSTED-R1 B8 UNKNOWN -> DEFERRED: gate DELIVERY-4" in (env.run_root / "driver.log").read_text()
+    # the open row lands PASS from a grader: DEFERRED + PASS clears box_only (D45)
+    f = wt / ".vp" / "FINDINGS.json"
+    f.write_text(json.dumps({"item": "L34-HOSTED", "attempt": 1, "commit": "a" * 40, "all_pass": True, "lines": [
+        {"id": "B8", "kind": "invariant", "verdict": "UNKNOWN", "evidence": "no receiver", "note": ""},
+        {"id": "B9", "kind": "invariant", "verdict": "PASS", "evidence": "shard green", "note": ""}]}))
+    drv._twin_record("L34-HOSTED-R1", "VERIFIED", f, "a2", wt)
+    rec = json.loads((env.run_root / "hosted" / "L34-V13.json").read_text())
+    assert rec["hosted_rows"]["B8"]["verdict"] == "DEFERRED", "a graded UNKNOWN on a skipped gate defers too"
+    assert rec["hosted_rows"]["B8"]["deferred_source"] == "findings"
+    assert rec["hosted_rows"]["B9"]["verdict"] == "PASS" and rec["box_only"] is False
+    # the owner closes the gate again -> nothing is deferred and the row is owed once more
+    drv.roster["owner_gates"]["DELIVERY-4"] = False
+    drv._twin_record("L34-HOSTED-R1", "VERIFIED", f, "a3", wt)
+    rec = json.loads((env.run_root / "hosted" / "L34-V13.json").read_text())
+    assert rec["hosted_rows"]["B8"]["verdict"] == "UNKNOWN" and rec["box_only"] is True
+
+
 def test_d114_a_hosted_targeted_record_answers_the_plain_targeted_ask_and_nothing_else(tmp_path):
     """D114: the box-shaped targeted proof offloaded to the fleet carries
     only=targeted:...; D79 reuses it for the same kind + paths plain ask, never
