@@ -24,9 +24,9 @@ the jobs the candidate ships (rule 3: every required ci.yml job), with:
     ci/self-hosted-runner-trial-2 put TMPDIR on /dev/shm and run 35478392897
     filled it (psycopg DiskFull / ENOSPC on every shard, 00:20Z), so the
     overlay keeps pgdata on the runner's disk;
-  * `--branch "$GITHUB_REF_NAME"` on every ci_collection_floor.py call
-    when the candidate's script accepts it (rule 5; $CIRCLE_BRANCH is
-    absent on GHA).
+  * `--branch "$GITHUB_REF_NAME"` on the ci_collection_floor.py `freshness`
+    call when the candidate's script accepts it (rule 5; $CIRCLE_BRANCH is
+    absent on GHA); `floor` / `control` never take it.
 
 Non-required jobs (kb-real-provider-eval, scheduled scans, security-triage,
 deploy, required-checks) are dropped: `deploy` needs GitHub-hosted image
@@ -92,7 +92,10 @@ LINGER_ASSERT = {"name": "Assert the runner user has linger enabled (vp-proof)",
                         '(loginctl enable-linger + RemoveIPC=no), not here"; exit 1; }'}
 
 PYTEST_RE = re.compile(r"^(?P<indent>\s*)(?P<cmd>uv run pytest\b[^\n]*?)(?P<cont>\s*\\)?$", re.M)
-FLOOR_RE = re.compile(r"ci_collection_floor\.py (floor|control|freshness)\b[^\n]*")
+# only the `freshness` subcommand takes --branch (L04-FLOOR-PROOF-BRANCH adds it
+# under `elif mode == "freshness":`); `floor` / `control` refuse it with
+# "unrecognized arguments" -- canary run 35483670689's vp/platform job (D83d)
+FLOOR_RE = re.compile(r"ci_collection_floor\.py freshness\b[^\n]*")
 VITEST_RE = re.compile(r"npm run test -- --reporter=json --outputFile=(?P<json>\S+)")
 
 

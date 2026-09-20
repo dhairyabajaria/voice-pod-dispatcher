@@ -43,6 +43,8 @@ jobs:
       - name: Enforce platform collected-test floor
         working-directory: platform
         run: uv run python ../scripts/ci_collection_floor.py floor --suite platform --baseline-file tests/collection_baseline.json
+      - name: Collection baseline freshness
+        run: python3 scripts/ci_collection_floor.py freshness --baseline-file platform/tests/collection_baseline.json
       - name: Run platform tests with coverage
         working-directory: platform
         run: |
@@ -173,10 +175,10 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
         assert st["name"].startswith("Assert the runner user has linger"), jid
         assert 'loginctl show-user "$(id -un)" -p Linger --value' in st["run"] and "enable-linger" not in st["run"].split("::error::")[0], "assert only"
     assert not any("linger" in str(st.get("name", "")) for st in jobs["portal"]["steps"]), "no pytest, no linger step"
-    plat = jobs["platform"]["steps"][4]["run"]
+    plat = jobs["platform"]["steps"][5]["run"]
     assert ("uv run pytest -q --cov=core --junitxml=${{ runner.temp }}/junit/platform-1.xml -o junit_family=xunit1 \\\n"
             "  --cov-report=json:/tmp/platform-coverage.json --cov-fail-under=80\n") in plat
-    assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][5]["run"]
+    assert "check_module_coverage.py" in plat and "shuffled_runner -q" in jobs["platform"]["steps"][6]["run"]
     # the shard job gets its own pgserver lockfile + tmpfs pgdata (Advisor / 894cdeec)
     prep = jobs["platform-shards"]["steps"][2]
     assert prep["run"] == ('rm -rf "${{ runner.temp }}/pgdata-${{ matrix.shard }}"\n'
@@ -195,10 +197,13 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     agent = [s["run"] for s in jobs["agent"]["steps"] if s.get("run")]
     assert agent[2].endswith("--junitxml=${{ runner.temp }}/junit/agent-1.xml -o junit_family=xunit1")
     assert "--junitxml=${{ runner.temp }}/junit/agent-2.xml" in agent[3]
-    # rule 5: --branch on every floor call when the candidate's script takes it
-    assert jobs["platform"]["steps"][3]["run"].endswith('--baseline-file tests/collection_baseline.json --branch "$GITHUB_REF_NAME"')
-    assert agent[4].endswith('--branch "$GITHUB_REF_NAME"')
-    assert jobs["portal"]["steps"][2]["run"].endswith('--branch "$GITHUB_REF_NAME"')
+    # rule 5: --branch on the `freshness` call only -- `floor`/`control` refuse it
+    # ("unrecognized arguments: --branch", canary run 35483670689 vp/platform, D83d)
+    assert jobs["platform"]["steps"][3]["run"].endswith('floor --suite platform --baseline-file tests/collection_baseline.json')
+    assert jobs["platform"]["steps"][4]["run"].endswith('freshness --baseline-file platform/tests/collection_baseline.json --branch "$GITHUB_REF_NAME"')
+    assert agent[4].endswith('control --suite agent --baseline-file ../platform/tests/collection_baseline.json')
+    assert jobs["portal"]["steps"][2]["run"].endswith('floor --suite portal --baseline-file ../platform/tests/collection_baseline.json')
+    assert text.count('--branch "$GITHUB_REF_NAME"') == 1
     # vitest: junit reporter beside the json one
     assert ("npm run test -- --reporter=json --reporter=junit --outputFile.json=/tmp/portal-test-results.json "
             "--outputFile.junit=${{ runner.temp }}/junit/portal-1.xml") in jobs["portal"]["steps"][1]["run"]
