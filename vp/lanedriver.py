@@ -1317,6 +1317,17 @@ class LaneDriver(object):
                             r"deploy-contracts|supply-chain|vp/(?:platform|agent|portal|deploy)\b|"
                             r"\b(?:agent|portal) (?:job|suite)\b", re.I)
 
+    # D119 (§145): a hosted row that asks for evidence on a LIVE DATABASE while
+    # naming no test file of its own cannot be answered by the parent contract's
+    # test_paths -- L17-HOSTED-R2 B8/B9 (20:44:19Z) scoped to
+    # platform/tests/test_campaign_release_pins.py, whose own docstring says
+    # "All tests are DB-less on purpose"; the rehearsal the rows name lives in
+    # platform/tests/test_reply_path.py and the scoped job never ran it.  A row
+    # that names its file is fine (D113a widens the scope to it) -- only the
+    # file-less DB ask is refused.
+    DB_ASK_RE = re.compile(r"live database|\bon a live db\b|\breal rows\b|DB-backed|against real `|"
+                           r"live Postgres|real Postgres|tenant role\b", re.I)
+
     def _twin_scope_only(self, task, p, tasks=None, wt=None, hdr=None):
         """-> "twin:<workers>:<p1,p2,...>" for a scoped twin, None otherwise
         (twin_scope off, the canary row, header `twin_scope: full`, a row that
@@ -1336,6 +1347,11 @@ class LaneDriver(object):
         if m:
             self.log("PROOF %s scoped twin refused: a hosted row asks for a CI job/step (%r); full pipeline"
                      % (task, m.group(0)))
+            return None
+        db = self.DB_ASK_RE.search(text)
+        if db and not self.TEST_FILE_RE.search(text):
+            self.log("PROOF %s scoped twin refused: a hosted row asks for live-DB evidence (%r) and names no "
+                     "test file; full pipeline (D119)" % (task, db.group(0)))
             return None
         if tasks is None:
             tasks = self.control.state_view().get("tasks") or {}

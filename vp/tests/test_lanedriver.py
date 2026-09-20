@@ -2704,7 +2704,21 @@ def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_cap
     assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
     assert "scoped twin refused: a hosted row asks for a CI job/step ('collected-test-floor')" in \
         (env.run_root / "driver.log").read_text()
+    # D119: a row asking for live-DB evidence while naming no test file of its own
+    # cannot be answered by the parent's test_paths -> full pipeline
+    twin["hosted_lines"] = ["B9 [hosted] the DB-backed fence rehearsal holds the reply on a live database"]
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B9 [hosted] against real `messages` rows under the tenant "
+                                             "role, the reply resolves the original pin\n")
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
+    assert "scoped twin refused: a hosted row asks for live-DB evidence" in \
+        (env.run_root / "driver.log").read_text()
+    # the same ask that names its own file stays scoped: D113a widens to that file
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B9 [hosted] the DB-backed rehearsal in "
+                                             "platform/tests/test_bench.py::test_z on a live database\n")
     twin.pop("hosted_lines")
+    got = drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt)
+    assert got and "platform/tests/test_bench.py" in got, got
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] platform/tests/test_bench.py::test_z green\n")
     assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, hdr={"twin_scope": "full"}) is None
     assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, hdr={"twin_scope": "scoped"}).startswith("twin:4:")
     assert drv._twin_scope_only("L06-HOSTED-R12", canary, tasks) is None, "the canary's row stays the full pipeline"
