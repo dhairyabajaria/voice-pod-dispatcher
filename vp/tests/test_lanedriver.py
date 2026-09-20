@@ -2298,6 +2298,42 @@ def test_d94_a_hosted_full_suite_pass_is_adopted_by_a_twin_of_any_kind_on_the_sa
     assert drv._reusable_proof(sha, "agent", []) is None, "a targeted hosted PASS is not the full suite"
 
 
+def test_d98_an_only_record_is_never_adopted_as_a_full_suite_answer(tmp_path):
+    """§95 item 2 (D98): a single-job/shard hosted run proves one packet's own
+    claim.  D79/D94 adoption refuses it for any full-suite or targeted ask,
+    a full-suite record never answers an only= ask, and the canary release
+    ignores it (one job is no answer for a full-suite gate)."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "d" * 40
+    def rec(pid, **kw):
+        d = {"proof_id": pid, "sha": sha, "kind": "platform", "paths": [], "route": "gha",
+             "pipeline_id": "356" + pid[-3:], "status": "PASS", "ts": "2026-09-20T13:00:00.000Z"}
+        d.update(kw)
+        (proofs / (pid + ".json")).write_text(json.dumps(d))
+    rec("proof-shard-001", only="platform-shards-3")
+    for kind in ("platform", "agent", "portal", "deploy"):
+        assert drv._reusable_proof(sha, kind, []) is None, "%s: one shard is not the full suite" % kind
+    assert drv._reusable_proof(sha, "platform", ["t/x.py"]) is None
+    assert drv._reusable_proof(sha, "platform", [], only="platform-shards-3")["proof_id"] == "proof-shard-001"
+    assert drv._reusable_proof(sha, "platform", [], only="platform-shards-4") is None, "a different leg"
+    rec("proof-full-002", ts="2026-09-20T13:01:00.000Z")
+    assert drv._reusable_proof(sha, "platform", [])["proof_id"] == "proof-full-002"
+    assert drv._reusable_proof(sha, "platform", [], only="portal") is None, "a full-suite record never answers only="
+    # canary: an only= record on the canary row keeps the hold
+    drv.proof_cfg["circleci"] = {"canary": {"task": "L06-HOSTED", "release_on": ["PASS"]}}
+    (proofs / "proof-full-002.json").unlink()
+    (proofs / "proof-shard-001.json").unlink()
+    rec("proof-L06-HOSTED-R9-a1", only="platform-shards-3", ts="2026-09-20T13:02:00.000Z")
+    drv._canary_step({"tasks": {"L06-HOSTED-R9": {}}})
+    assert not drv._canary().get("released_at"), "one job/leg never releases the canary"
+    log = (env.run_root / "driver.log").read_text()
+    assert "CANARY_NOT_ANSWERED" in log and "only=platform-shards-3 run (one job/leg)" in log
+
+
 def test_d96_the_driver_fills_a_missing_or_string_result_attempt_with_the_round(tmp_path):
     """D96 (§86/§91): `attempt` is the integer round number, a value the driver
     owns.  L-TRANSCRIPT-READ-AUDIT-TESTBENCH lost three builder turns to its

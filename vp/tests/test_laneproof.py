@@ -678,8 +678,8 @@ class FakeGha(FakeCircle):
         FakeCircle.__init__(self, res)
         self.dirty = dirty
 
-    def prepare_measured(self, wt, cand, runner=None):
-        self.calls.append(("prepare", cand))
+    def prepare_measured(self, wt, cand, runner=None, only=None):
+        self.calls.append(("prepare", cand) + ((only,) if only else ()))
         if self.dirty:
             raise self.OverlayDirty("measured differs by ['platform/a.py']")
         # a real child commit of cand (same tree): the branch must point at something
@@ -801,3 +801,45 @@ def test_d93_a_triggered_ledger_row_without_a_proof_record_is_an_open_pipeline(t
     assert any("re-polls circleci pipeline 35502871574" in m and "D81" in m for m in logs)
     # answered now: the proof record names the pipeline, so the ledger row is closed
     assert p.triggered_pipeline(cand) is None
+
+
+def test_d98_only_dispatches_one_hosted_job_as_a_targeted_record(tmp_path):
+    """§95 item 2 (D98): `only=<job|shard>` renders and triggers ONE workflow
+    job / matrix leg on the hosted route; the record carries `only`, so it is
+    a targeted proof of that packet's own claim and never a full-suite PASS."""
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/platform-shards-3", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    logs = []
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "overflow", "kinds": ["full"], "account": "A1",
+                        "delete_branch_after": True}}
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg, logs=logs)
+    # a targeted (paths given) platform proof would route to the box under this
+    # roster; only= forces the hosted route regardless
+    assert p.route("platform", "targeted")[0] == "box"
+    rec = p.run("R-X", "proof-R-X-1", wt, base, cand, "platform", ["platform/tests/test_a.py"],
+                only="platform-shards-3")
+    assert rec["status"] == "PASS" and rec["route"] == "gha" and rec["only"] == "platform-shards-3"
+    assert rec["paths"] == ["platform/tests/test_a.py"]
+    assert ("prepare", cand, "platform-shards-3") in gha.calls, "the overlay was rendered for that leg alone"
+    assert [c for c in gha.calls if c[0] == "trigger"], "triggered on the hosted route"
+    assert any("only=platform-shards-3" in m and "never a full-suite answer" in m for m in logs)
+
+
+def test_d98_only_never_runs_on_the_box_and_needs_a_rendering_provider(tmp_path):
+    wt, base, cand = repo(tmp_path)
+    ex = FakeExec({})
+    # hosted disabled: held (BLOCKED_OFF), not dropped on the box
+    p = make_proof(tmp_path, FakeGha({}), ex, cfg={"hosted": {"provider": "gha"},
+                                                   "circleci": {"enabled": False}})
+    rec = p.run("R-X", "proof-R-X-2", wt, base, cand, "platform", [], only="portal")
+    assert rec["status"] == "BLOCKED_OFF" and "only=portal needs the hosted route" in rec["reason"]
+    assert not ex.calls, "no box run"
+    # the circleci provider cannot render a per-job workflow: UNKNOWN, no trigger, no box run
+    circle = FakeCircle({"jobs": [], "failed_tests": {}, "workflows": []})
+    p = make_proof(tmp_path, circle, ex)
+    rec = p.run("R-X", "proof-R-X-3", wt, base, cand, "platform", [], only="portal")
+    assert rec["status"] == "UNKNOWN" and "only=portal needs a provider that renders" in rec["reason"]
+    assert not [c for c in circle.calls if c[0] == "trigger"] and not ex.calls

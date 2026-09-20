@@ -456,7 +456,7 @@ def twin_front_matter(packet, base):
         end = lines.index("---", 1)
     except ValueError:
         return None, body
-    drop = set(TWIN_HEADER_OVERRIDES)
+    drop = set(TWIN_HEADER_OVERRIDES) | {"proof_only"}   # D98: a twin is the full suite, never one job/leg
     if not packet["test_paths"]:
         drop |= {"proof_paths", "proof_workers"}   # a full-suite twin keeps no box narrowing (F-B)
     kept, skip = [], False

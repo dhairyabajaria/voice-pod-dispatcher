@@ -1623,3 +1623,16 @@ def test_d75_codex_max_is_bounded_not_pinned():
     assert any("codex_max 1..20" in m for m in msgs(21))
     assert any("codex_max 1..20" in m for m in msgs(0))
     assert any("claude_max 2" in m for m in msgs(3, 3))
+
+
+def test_d98_a_twin_header_never_carries_proof_only():
+    """§95 item 2 (D98): `proof_only` narrows a packet's own proof to one hosted
+    job/leg; a twin is the full suite of the union tip, so the parent's
+    proof_only never reaches the twin's header (nor proof_paths without test_paths)."""
+    body = ("---\nitem: R-X\ntitle: x\nproof_kind: platform\nproof_only: platform-shards-3\n"
+            "proof_paths:\n  - platform/tests/test_a.py\nproof_workers: 1\n---\nbody\n")
+    packet = {"body": body, "id": "R-X-HOSTED", "title": "x", "twin_gate": "G", "max_rounds": 2,
+              "twin_of": "R-X", "depends_on": [], "test_paths": [], "hosted_rows": []}
+    head, rest = vppack.twin_front_matter(packet, "a" * 40)
+    assert "proof_only" not in head and "proof_paths" not in head and "proof_workers" not in head
+    assert "proof_kind: platform" in head and rest == "body\n"

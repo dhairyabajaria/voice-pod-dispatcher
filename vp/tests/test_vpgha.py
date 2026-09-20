@@ -270,6 +270,30 @@ def test_overlay_drops_a_needs_that_only_named_dropped_jobs():
     assert "needs" not in doc["jobs"]["platform-order"]
 
 
+def test_overlay_only_narrows_to_one_shard_or_job():
+    # §95 item 2: only=platform-shards-1 renders that job alone with matrix [1]
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="platform-shards-1"))
+    assert list(doc["jobs"]) == ["platform-shards"]
+    job = doc["jobs"]["platform-shards"]
+    assert job["strategy"]["matrix"]["shard"] == [1]
+    assert job["name"] == "vp/platform-shards-${{ matrix.shard }}", "the job/artifact names keep their shape"
+    assert job["steps"][-1]["with"]["name"] == "junit-platform-shards-${{ matrix.shard }}"
+    # only=<job> renders that job alone; a needs on an unrendered job is pruned
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB, only="platform-order"))
+    assert list(doc["jobs"]) == ["platform-order"] and "needs" not in doc["jobs"]["platform-order"]
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="portal"))
+    assert list(doc["jobs"]) == ["portal"]
+
+
+def test_overlay_only_refuses_an_unknown_job_or_leg():
+    with pytest.raises(ValueError, match="no matrix leg 7"):
+        vpgha_overlay.render(MINI_CI, only="platform-shards-7")
+    with pytest.raises(ValueError, match="names no rendered job"):
+        vpgha_overlay.render(MINI_CI, only="deploy")
+    with pytest.raises(ValueError, match="names no rendered job"):
+        vpgha_overlay.render(MINI_CI, only="platform-order")     # absent from this ci.yml
+
+
 def test_overlay_on_tmpfs_asserts_the_shm_size_and_never_remounts(monkeypatch):
     """Advisor 2026-09-20: the tmpfs size is the runner image's (/etc/fstab);
     the job only ASSERTS it (clear failure), never remounts; pgdata under

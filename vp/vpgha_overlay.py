@@ -134,15 +134,21 @@ class _Dumper(yaml.SafeDumper):
 _Dumper.add_representer(_Literal, _represent_literal)
 
 
-def matrix_suffix(job):
-    """`${{ matrix.<key> }}` expression for the job's matrix (one key), else ''"""
+def matrix_key(job):
+    """the job's one matrix key ("shard", "component"), else None"""
     strat = (job.get("strategy") or {}).get("matrix") or {}
     if "include" in strat:
         keys = [k for k in (strat["include"][0] if strat["include"] else {}) if k == "component"] or \
                list((strat["include"][0] if strat["include"] else {}).keys())[:1]
     else:
         keys = list(strat.keys())[:1]
-    return ("-${{ matrix.%s }}" % keys[0]) if keys else ""
+    return keys[0] if keys else None
+
+
+def matrix_suffix(job):
+    """`${{ matrix.<key> }}` expression for the job's matrix (one key), else ''"""
+    key = matrix_key(job)
+    return ("-${{ matrix.%s }}" % key) if key else ""
 
 
 def _rewrite_run(script, job_id, suffix, floor_supports_branch, legs):
@@ -175,14 +181,54 @@ def _upload_action(ci):
     return DEFAULT_UPLOAD_ACTION
 
 
-def render_jobs(ci, floor_supports_branch=False):
-    """{job_id: job} for the overlay, derived from a parsed ci.yml"""
+def select_only(src, selected, only):
+    """§95 item 2 `only=<job|shard>` -> ([job_id], {job_id: narrowed job}).
+    `only` names one rendered job ("portal", "platform-order") or one leg of a
+    matrix job ("platform-shards-3" = matrix value 3 of platform-shards).  The
+    overlay then carries THAT job alone (no skipped siblings: a skipped job
+    classifies as infrastructure_fail); the record it produces is a targeted
+    proof, never a full-suite answer (lanedriver refuses to adopt it)."""
+    only = str(only or "").strip()
+    if only in selected:
+        return [only], {only: dict(src[only])}
+    # longest job id first: "platform-shards-3" is a leg of platform-shards, not
+    # a leg "shards-3" of platform (which has no matrix)
+    for job_id in sorted(selected, key=len, reverse=True):
+        if not only.startswith(job_id + "-") or not matrix_key(src[job_id]):
+            continue
+        leg = only[len(job_id) + 1:]
+        job = dict(src[job_id])
+        strat = dict(job.get("strategy") or {})
+        matrix = dict(strat.get("matrix") or {})
+        key = matrix_key(job)
+        if "include" in matrix:
+            rows = [r for r in matrix["include"] or [] if key and str(r.get(key)) == leg]
+            if not rows:
+                raise ValueError("only=%s: %s has no matrix leg %s" % (only, job_id, leg))
+            matrix["include"] = rows
+        else:
+            vals = list(matrix[key]) if key and isinstance(matrix.get(key), list) else []
+            hit = [v for v in vals if str(v) == leg]
+            if not hit:
+                raise ValueError("only=%s: %s has no matrix leg %s" % (only, job_id, leg))
+            matrix[key] = hit
+        strat["matrix"] = matrix
+        job["strategy"] = strat
+        return [job_id], {job_id: job}
+    raise ValueError("only=%s names no rendered job or matrix leg (jobs: %s)" % (only, ", ".join(selected)))
+
+
+def render_jobs(ci, floor_supports_branch=False, only=None):
+    """{job_id: job} for the overlay, derived from a parsed ci.yml; `only`
+    narrows it to one job / matrix leg (select_only)"""
     upload = _upload_action(ci)
     src = ci.get("jobs") or {}
     missing = [j for j in REQUIRED_JOBS if j not in src]
     if missing:
         raise ValueError("ci.yml lacks required job(s): %s" % ", ".join(missing))
     selected = list(REQUIRED_JOBS) + [j for j in OPTIONAL_JOBS if j in src]
+    if only:
+        selected, src = select_only(src, selected, only)
     out = {}
     for job_id in selected:
         job = dict(src[job_id])
@@ -256,9 +302,9 @@ permissions:
 """ % {"name": WORKFLOW_NAME}
 
 
-def render(ci_yml_text, floor_supports_branch=False):
+def render(ci_yml_text, floor_supports_branch=False, only=None):
     ci = yaml.safe_load(ci_yml_text)
-    jobs = render_jobs(ci, floor_supports_branch)
+    jobs = render_jobs(ci, floor_supports_branch, only=only)
     body = yaml.dump({"jobs": jobs}, Dumper=_Dumper, sort_keys=False, width=200, allow_unicode=True,
                      default_flow_style=False)
     return HEAD + body

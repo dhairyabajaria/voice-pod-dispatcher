@@ -224,7 +224,24 @@ class Proof(object):
 
     NO_RUN_KINDS = ("docs",)
 
-    def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None):
+    def run(self, task, pid, wt, base, cand, kind, paths, abort=None, workers=None, only=None):
+        if only:
+            # §95 item 2: `only=<job|shard>` is a targeted HOSTED proof of one
+            # workflow job / matrix leg (the overlay carries that job alone).  It
+            # never routes to the box and its record carries `only`, so D79/D94
+            # adoption and the canary release refuse it as a full-suite answer.
+            cc = self.circle_cfg()
+            if not cc.get("enabled") or self.circle_off():
+                rec = {"status": "BLOCKED_OFF", "route": self.hosted_route(), "proof_id": pid, "sha": cand,
+                       "kind": kind, "paths": paths, "only": only, "pipeline_id": None, "account": None,
+                       "reason": "only=%s needs the hosted route (%s %s)"
+                                 % (only, self.hosted_route(), "flipped off" if cc.get("enabled") else "disabled"),
+                       "failed_nodes": [], "ts": utc_ms()}
+                self._write(pid, rec)
+                self.log("PROOF %s %s -> BLOCKED_OFF: only=%s needs the hosted route" % (task, pid, only))
+                return rec
+            self.log("PROOF %s %s route=%s (only=%s: one job/leg, targeted, %s)" % (task, pid, self.hosted_route(), only, kind))
+            return self.run_circleci(task, pid, wt, base, cand, kind, paths, abort=abort, only=only)
         if kind in self.NO_RUN_KINDS:
             # 06-ROUTING §5: docs-only proofs pass without a run
             rec = {"status": "PASS", "route": "none", "proof_id": pid, "sha": cand, "kind": kind,
@@ -392,7 +409,7 @@ class Proof(object):
         self.log("PROOF circleci account %s blocked for credits for %dh: %s"
                  % (acct, self.CREDIT_BLOCK_S // 3600, why[:160]))
 
-    def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None):
+    def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None):
         cc = self.circle_cfg()
         runner = self.circle_runner or self.circle.Runner()
         branch = "%s%s-%s" % (cc.get("branch_prefix", "vp/proof/"), pid, cand[:12])
@@ -422,16 +439,19 @@ class Proof(object):
                     accounts = []
                 else:
                     prepare = getattr(self.circle, "prepare_measured", None)
+                    if only and prepare is None:
+                        raise RuntimeError("only=%s needs a provider that renders the workflow (gha); %s cannot"
+                                           % (only, self.provider()))
                     if prepare is not None:
                         # D83 §46 rule 2: the measured commit = candidate + exactly one
                         # overlay commit (.github/workflows/vp-proof.yml); anything else
                         # in the diff is OVERLAY_DIRTY and nothing is triggered
                         try:
-                            measured = prepare(wt, cand, runner)
+                            measured = prepare(wt, cand, runner, only=only) if only else prepare(wt, cand, runner)
                         except getattr(self.circle, "OverlayDirty", ()) as exc:
                             raise self.Refused(self.REFUSED_OVERLAY, str(exc)[:300])
-                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83)"
-                                 % (task, pid, measured[:12], cand[:12]))
+                        self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83%s)"
+                                 % (task, pid, measured[:12], cand[:12], ", only=%s" % only if only else ""))
                     rc, out, err = self.git(["-C", str(wt), "branch", "-f", branch, measured])
                     if rc != 0:
                         raise RuntimeError("git branch -f %s failed: %s" % (branch, (err or out)[:200]))
@@ -494,8 +514,9 @@ class Proof(object):
                 return rec
             except self.Refused as exc:
                 # our own gate/cap/off switch said no at trigger time: no pipeline was spent
-                if exc.status == self.REFUSED_CAP and paths:
+                if exc.status == self.REFUSED_CAP and paths and not only:
                     # a targeted suite can still run on the box, exactly as route() would have sent it
+                    # (never an only= job: it is one workflow job, not a node list)
                     self.log("PROOF %s %s circleci refused (%s) -> box" % (task, pid, exc))
                     return self.run_box(task, pid, wt, cand, kind, paths)
                 status = {self.REFUSED_GATE: "BLOCKED_GATE", self.REFUSED_CAP: "BLOCKED_CAP",
@@ -562,7 +583,7 @@ class Proof(object):
             except Exception as exc:
                 out_dir = "record failed: %s" % exc
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
-                   "paths": paths, "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
+                   "paths": paths, "only": only, "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
                    "flake_suspect": flake, "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
                    "provider": self.provider(), "measured_commit": measured,
@@ -571,8 +592,9 @@ class Proof(object):
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
             self._write(pid, rec)
-            self.log("PROOF %s %s -> %s (%s pipeline %s, %d red job(s), %d red node(s))"
-                     % (task, pid, status, self.hosted_route(), pipeline_id, len(cls["reds"]), len(failed)))
+            self.log("PROOF %s %s -> %s (%s pipeline %s, %d red job(s), %d red node(s)%s)"
+                     % (task, pid, status, self.hosted_route(), pipeline_id, len(cls["reds"]), len(failed),
+                        "; only=%s, targeted: never a full-suite answer" % only if only else ""))
             return rec
         finally:
             with self._lock:

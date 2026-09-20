@@ -1305,6 +1305,12 @@ class LaneDriver(object):
         # twin (7 x ~2,300 credits saved on 722a0b89's known-red tip)
         release_on = [str(x) for x in (c.get("release_on") or ["PASS"])]
         answers = set(release_on) | ({"FAIL_PRODUCT"} if "FAIL" in release_on else set())
+        if rec.get("only"):
+            # D98: one job/leg is no answer for the canary (a full-suite gate)
+            self.alert_once("canary-only:%s" % rec.get("proof_id"), "CANARY_NOT_ANSWERED",
+                            "%s: canary record is an only=%s run (one job/leg), not a full-suite answer; the "
+                            "hold stays" % (rec.get("proof_id"), rec.get("only")))
+            return
         if pipeline and status in answers:
             ts = utc_ms()
             try:
@@ -4206,12 +4212,19 @@ class LaneDriver(object):
         paths = list(hdr.get("proof_paths") or hdr.get("test_paths") or [])
         workers = hdr.get("proof_workers")
         workers = int(workers) if str(workers or "").strip().isdigit() else None
-        pending = {"sha": cand, "base": base, "kind": pkind, "paths": paths, "workers": workers, "ts": utc_ms()}
+        # §95 item 2 (D98): `proof_only: <job|shard>` dispatches ONE workflow job /
+        # matrix leg on the hosted route ("platform-shards-3", "platform-order",
+        # "portal").  A targeted proof of that packet's own claim: its record
+        # carries `only` and is never adopted as a twin's full-suite PASS.
+        only = str(hdr.get("proof_only") or "").strip() or None
+        pending = {"sha": cand, "base": base, "kind": pkind, "paths": paths, "workers": workers, "only": only,
+                   "ts": utc_ms()}
         (tdir / "proof-pending.json").write_text(json.dumps(pending, indent=2), encoding="utf-8")
         pid = "proof-%s-%s" % (task, attempt[-15:])
-        if hdr.get("proof_paths") or workers:
-            self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s" % (task, len(paths), workers))
-        prior = self._reusable_proof(cand, pkind, paths, exclude=pid)
+        if hdr.get("proof_paths") or workers or only:
+            self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s%s"
+                     % (task, len(paths), workers, ", only=%s (one hosted job/leg, D98)" % only if only else ""))
+        prior = self._reusable_proof(cand, pkind, paths, exclude=pid, only=only)
         if prior is not None:
             # D79: the same sha + kind + paths already has a real answer (a CircleCI
             # pipeline or a completed box run, PASS/FAIL_PRODUCT): reuse it, never
@@ -4223,8 +4236,10 @@ class LaneDriver(object):
                      % (prior.get("proof_id"), cand[:12], rec.get("status"), rec.get("route"),
                         " pipeline %s" % rec.get("pipeline_id") if rec.get("pipeline_id") else "", pid))
         else:
+            # `only` is passed only when set: a pre-D98 Proof (a fake, or a live
+            # instance across the hot reload) keeps its signature
             rec = self.proof.run(task, pid, wt, base, cand, pkind, paths, abort=lambda: self._abort.is_set(),
-                                 workers=workers)
+                                 workers=workers, **({"only": only} if only else {}))
         status = rec.get("status")
         self._copy_proof_into_worktree(wt, pid, rec)
         outcome = build_outcome or vprunners.TurnOutcome(STATUS_DONE, "proof only", runner="proof")
@@ -4619,24 +4634,29 @@ class LaneDriver(object):
 
     REUSABLE_STATUSES = ("PASS", "FAIL_PRODUCT")
 
-    def _reusable_proof(self, sha, kind, paths, exclude=None):
+    def _reusable_proof(self, sha, kind, paths, exclude=None, only=None):
         """D79: the newest real answer already recorded for sha + kind + paths --
         a circleci record with a pipeline_id, or a box record -- with status
         PASS/FAIL_PRODUCT; None otherwise (FAIL_INFRA/UNKNOWN/CANCELLED/BLOCKED_*
-        are not answers and the proof runs again)."""
+        are not answers and the proof runs again).  D98: an `only=` record (one
+        hosted job/leg) answers only the same `only`; it is never a full-suite
+        PASS for a twin, and a full-suite record never answers an `only=` ask
+        for the same sha (its per-job answer is what the packet wants)."""
         want = [str(x) for x in (paths or [])]
         found = []
         for rec in self._proof_index().get(sha) or []:
             if rec.get("proof_id") == exclude:
                 continue
             route = rec.get("route")
+            if (rec.get("only") or None) != (only or None):
+                continue
             if rec.get("kind") != kind:
                 # D94 (§77): a hosted FULL-SUITE PASS ran every suite the workflow
                 # has (platform shards + serial, agent, portal, deploy-contracts) on
                 # this exact tree, so a twin of any kind on the same base adopts it;
                 # a FAIL_PRODUCT stays kind-strict (its reds belong to one suite)
                 if not (rec.get("status") == "PASS" and route in laneproof.HOSTED_ROUTES
-                        and not want and not rec.get("paths")):
+                        and not want and not rec.get("paths") and not rec.get("only")):
                     continue
             if [str(x) for x in (rec.get("paths") or [])] != want:
                 continue
