@@ -1275,6 +1275,32 @@ class LaneDriver(object):
         return not (c and self._is_canary_row(task, c))
 
     TEST_FILE_RE = re.compile(r"\b((?:platform|agent|portal)/[\w./-]*?tests?/[\w./-]+?\.(?:py|ts|tsx))(?=::|[`'\"\s,;)]|$)")
+    # D120 (§145): rows cite bare basenames as often as full paths -- L10-HOSTED-R2
+    # B8/B9 named test_campaign_legacy_reconciliation_db.py::<node> with no
+    # directory, so TEST_FILE_RE missed it and the scope kept only the non-DB
+    # sibling test_campaign_legacy_reconciliation.py the parent listed
+    BARE_TEST_RE = re.compile(r"(?<![\w./-])(test_[\w-]+\.(?:py|ts|tsx))(?=::|[`'\"\s,;)]|$)")
+
+    def _named_test_files(self, text, wt):
+        """every test file a row names, as repo-relative paths that exist in wt:
+        TEST_FILE_RE's full paths, plus D120's bare basenames resolved under
+        <suite>/**/tests/.  A basename living in two suites resolves to both, so
+        the non-platform refusal in _twin_scope_only sees it and takes the full
+        pipeline rather than guessing."""
+        named = [x for x in self.TEST_FILE_RE.findall(text)]
+        if wt is None:
+            return sorted(set(named))
+        root = Path(wt)
+        named = [x for x in named if (root / x).exists()]
+        bare = set(self.BARE_TEST_RE.findall(text)) - {Path(x).name for x in named}
+        for base in sorted(bare):
+            for suite in ("platform", "agent", "portal"):
+                d = root / suite
+                if not d.is_dir():
+                    continue
+                named += [str(h.relative_to(root)) for h in d.rglob(base)
+                          if "tests" in h.parts and ".venv" not in h.parts]
+        return sorted(set(named))
 
     def _twin_scope_paths(self, task, p, tasks, wt=None):
         """the scoped twin's test files: the parent packet's test_paths, plus the
@@ -1293,12 +1319,10 @@ class LaneDriver(object):
                 text += "\n" + (Path(wt) / ".vp" / "BENCHMARK.md").read_text(encoding="utf-8")
             except OSError:
                 pass
-        named = self.TEST_FILE_RE.findall(text)
-        if wt is not None:
-            # a row may cite a file the candidate does not have (a typo, a moved
-            # test): pytest would error on it -> FAIL_INFRA; keep the tree's files
-            named = [x for x in named if (Path(wt) / x).exists()]
-        paths += named
+        # a row may cite a file the candidate does not have (a typo, a moved
+        # test): pytest would error on it -> FAIL_INFRA; _named_test_files keeps
+        # only what the tree has, and resolves bare basenames (D120)
+        paths += self._named_test_files(text, wt)
         if str(cfg.get("contract_from") or "parent_contract") == "parent_contract":
             row = (tasks or {}).get(task) or {}
             cid = row.get("parent_contract_id") or parent.get("parent_contract")
@@ -1349,7 +1373,7 @@ class LaneDriver(object):
                      % (task, m.group(0)))
             return None
         db = self.DB_ASK_RE.search(text)
-        if db and not self.TEST_FILE_RE.search(text):
+        if db and not self._named_test_files(text, wt):
             self.log("PROOF %s scoped twin refused: a hosted row asks for live-DB evidence (%r) and names no "
                      "test file; full pipeline (D119)" % (task, db.group(0)))
             return None

@@ -460,7 +460,11 @@ TWIN_HOW = {
                 " `paths`/`only` list and `failed_nodes` is empty for them: do NOT fail a row because the job is"
                 " named `vp/platform-twin` rather than a CircleCI shard, and do NOT fail a row because"
                 " `measured_commit` differs from `sha` -- by design (D83) the run measures `sha` + one generated"
-                " workflow file, nothing else. Fail a row only when its named test did not run, ran red, or the"
+                " workflow file, nothing else. The `only`-equals-the-twin-step check is for shape (b) ONLY: a record"
+                " with no `only` field is shape (a) and has no twin step by construction, so a missing"
+                " `vp/platform-twin` step -- or a missing `vp-proof.yml` -- at `measured_commit` is expected and is"
+                " never a reason to fail, UNKNOWN or doubt a row; ground it on the jobs and `failed_nodes` (D121)."
+                " Fail a row only when its named test did not run, ran red, or the"
                 " row asks for something no test in the run covers (then say which).",
     "DELIVERY-2A": "> Host: the Oracle VPS is reachable over SSH/sudo/Docker per `voice-pod/deployment/VPS_HANDOVER.md`"
                    " §1-2 (DELIVERY-2A). Rehearsal secret policy (§18 ruling, standing default): agent-generated"

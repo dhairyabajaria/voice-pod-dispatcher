@@ -2704,6 +2704,20 @@ def test_d113_a_released_lanes_twin_runs_scoped_and_is_neither_held_nor_slot_cap
     assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
     assert "scoped twin refused: a hosted row asks for a CI job/step ('collected-test-floor')" in \
         (env.run_root / "driver.log").read_text()
+    # D120: a row citing a BARE basename (no directory) still widens the scope
+    twin.pop("hosted_lines")
+    (wt / "platform" / "tests" / "test_legacy_db.py").write_text("")
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] test_legacy_db.py::test_two_workers_mint_one "
+                                             "green on a live database\n")
+    got = drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt)
+    assert got and "platform/tests/test_legacy_db.py" in got, got
+    # the same basename in a suite the platform-twin job cannot run -> full pipeline
+    (wt / "agent" / "tests" / "test_legacy_db.py").write_text("")
+    assert drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) is None
+    (wt / "agent" / "tests" / "test_legacy_db.py").unlink()
+    # a basename the tree does not have is dropped, never handed to pytest
+    (wt / ".vp" / "BENCHMARK.md").write_text("- B8 [hosted] test_not_here.py::test_x green\n")
+    assert "test_not_here" not in (drv._twin_scope_only("R-A-HOSTED-R1", twin, tasks, wt=wt) or "")
     # D119: a row asking for live-DB evidence while naming no test file of its own
     # cannot be answered by the parent's test_paths -> full pipeline
     twin["hosted_lines"] = ["B9 [hosted] the DB-backed fence rehearsal holds the reply on a live database"]

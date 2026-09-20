@@ -79,6 +79,11 @@ JUNIOR_PROMPT = (
     "its `only` paths must equal the pytest paths of the twin step in "
     "`git show <measured_commit>:.github/workflows/vp-proof.yml`; if they differ the "
     "record is not this twin's run -- FAIL the proof row and say so. "
+    "That check applies to a scoped record ONLY. A PROOF.json with NO `only` field is "
+    "the FULL pipeline: it has no twin step by construction, so a missing "
+    "vp/platform-twin step -- or a missing vp-proof.yml -- at measured_commit is "
+    "expected and is never a reason to fail, UNKNOWN or doubt a row. Ground a "
+    "full-pipeline record on its jobs and failed_nodes (D121). "
     "If the write is refused, print the complete "
     "FINDINGS JSON in a single ```json fence as your final message and stop."
 )
