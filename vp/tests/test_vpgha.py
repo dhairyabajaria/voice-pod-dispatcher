@@ -159,6 +159,7 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     assert list(jobs) == list(vpgha_overlay.REQUIRED_JOBS), "only the required jobs, in order; deploy/gate/eval dropped"
     for jid, job in jobs.items():
         assert job["runs-on"] == ["self-hosted", "voicepod"], jid
+        assert job["timeout-minutes"] == vpgha_overlay.JOB_TIMEOUT_MIN == 90, "a hung run ends as timed_out (D83f)"
         assert "if" not in job
         assert job["steps"][0]["run"] == 'mkdir -p "$RUNNER_TEMP/junit"'
         last = job["steps"][-1]

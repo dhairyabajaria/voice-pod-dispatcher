@@ -44,6 +44,11 @@ import yaml
 REQUIRED_JOBS = ("platform", "platform-shards", "platform-coverage", "agent",
                  "deploy-contracts", "portal", "supply-chain")
 RUNS_ON = ["self-hosted", "voicepod"]
+# GitHub's default job timeout is 360 min; canary run 35483670689 hung disk-bound
+# with no junit for 10+ min and nothing would have ended it.  A job past this
+# is timed_out -> FAIL_INFRA (rule 4), never PASS.  CircleCI's whole pipeline
+# took ~31-49 min (2026-09-14), so 90 covers a slow fleet with room.
+JOB_TIMEOUT_MIN = 90
 WORKFLOW_PATH = ".github/workflows/vp-proof.yml"
 WORKFLOW_NAME = "vp-proof"
 JUNIT_DIR = "${{ runner.temp }}/junit"
@@ -176,6 +181,7 @@ def render_jobs(ci, floor_supports_branch=False):
         suffix = matrix_suffix(job)
         job["name"] = "vp/%s%s" % (job_id, suffix)
         job["runs-on"] = list(RUNS_ON)
+        job["timeout-minutes"] = JOB_TIMEOUT_MIN
         job.pop("if", None)
         legs = [0]
         steps = [{"name": "Prepare junit dir (vp-proof)", "run": 'mkdir -p "$RUNNER_TEMP/junit"'}]
