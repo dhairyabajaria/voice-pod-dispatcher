@@ -116,6 +116,8 @@ class FakeExec(object):
 
     def run(self, argv, cwd=None, timeout_s=120, env=None):
         self.calls.append(list(argv))
+        if str(argv[0]).endswith("/ruff"):
+            return self.script.get("ruff", (0, "[]", ""))
         if any(str(a).endswith("vpproof.py") for a in argv):
             pid = argv[argv.index("--proof-id") + 1]
             for key, res in self.script.items():
@@ -942,3 +944,39 @@ def test_d112_full_proofs_pin_the_least_loaded_host_and_only_runs_keep_the_share
     del p.cfg["circleci"]["hosts"]
     rec = p.run("L06", "proof-L06-3", wt, base, cand, "platform", [])
     assert rec["host"] is None, "no roster hosts -> the shared label"
+
+
+def test_d111_the_box_proof_lints_the_lanes_changed_platform_files_first(tmp_path):
+    """D111: `ruff check` on the diff's platform .py files before the suite; a
+    red is FAIL_PRODUCT with lint:: node ids and the suite is not run; clean
+    -> the suite runs as before; no ruff in the worktree -> skipped, never red."""
+    wt, base, cand = repo(tmp_path)
+    rows = [{"filename": str(wt / "platform" / "hello.py"), "code": "F401",
+             "message": "`os` imported but unused", "location": {"row": 1, "column": 8}}]
+    ex = FakeExec({"ruff": (1, json.dumps(rows), "")})
+    logs = []
+    p = make_proof(tmp_path, FakeCircle({}), ex, cfg={"circleci": {"enabled": False}}, logs=logs)
+    rec = p.run("R-X", "proof-R-X-1", wt, base, cand, "platform", ["platform/tests/test_mine.py"])
+    assert rec["status"] == "PASS"                      # no ruff binary in this worktree: lint skipped, suite ran
+    assert not any(str(c[0]).endswith("/ruff") for c in ex.calls)
+    assert any("no platform/.venv/bin/ruff" in m for m in logs)
+    ruff = wt / "platform" / ".venv" / "bin" / "ruff"
+    ruff.parent.mkdir(parents=True)
+    ruff.write_text("#!/bin/sh\n")
+    rec = p.run("R-X", "proof-R-X-2", wt, base, cand, "platform", ["platform/tests/test_mine.py"])
+    assert rec["status"] == "FAIL_PRODUCT" and rec["route"] == "box"
+    assert rec["failed_nodes"] == ["lint::platform/hello.py:1 F401 `os` imported but unused"]
+    call = next(c for c in ex.calls if str(c[0]).endswith("/ruff"))
+    assert call[1:4] == ["check", "--output-format", "json"] and sorted(call[5:]) == ["hello.py", "tests/test_mine.py"]
+    assert not any("vpproof.py" in str(a) for c in ex.calls[-1:] for a in c), "the suite did not run"
+    assert rec["counts"]["lint_files"] == ["platform/hello.py", "platform/tests/test_mine.py"]
+    # clean -> the suite runs
+    ex.script["ruff"] = (0, "[]", "")
+    rec = p.run("R-X", "proof-R-X-3", wt, base, cand, "platform", ["platform/tests/test_mine.py"])
+    assert rec["status"] == "PASS" and any("vpproof.py" in str(a) for a in ex.calls[-1])
+    assert any("2 changed platform file(s) clean (D111)" in m for m in logs)
+    # roster off-switch
+    p.cfg["lint_changed"] = False
+    ex.script["ruff"] = (1, json.dumps(rows), "")
+    rec = p.run("R-X", "proof-R-X-4", wt, base, cand, "platform", ["platform/tests/test_mine.py"])
+    assert rec["status"] == "PASS"

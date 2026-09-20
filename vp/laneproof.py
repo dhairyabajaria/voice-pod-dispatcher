@@ -302,7 +302,7 @@ class Proof(object):
             self._write(pid, rec)
             self.log("PROOF %s %s -> BLOCKED_MEMORY: %s" % (task, pid, held))
             return rec
-        return self.run_box(task, pid, wt, cand, kind, paths, workers=workers)
+        return self.run_box(task, pid, wt, cand, kind, paths, workers=workers, base=base)
 
     def full_suite_held(self, suite, why):
         """D87: True when a full suite that the roster routes hosted (`kinds`
@@ -343,7 +343,58 @@ class Proof(object):
 
     # -- box -------------------------------------------------------------------------------
 
-    def run_box(self, task, pid, wt, cand, kind, paths, no_record=True, workers=None):
+    LINT_RULES_NOTE = "ruff check (platform/pyproject rule set, the same as vp/platform's Lint step)"
+
+    def lint_changed(self, wt, base, cand):
+        """D111 (Architect 2026-09-20): `ruff check` on the lane's changed platform
+        .py files before the box suite -- the hosted vp/platform job runs
+        `uv run ruff check .` and the box proof never did, so D04 verified with
+        lint reds and trunk 5deac821 itself reds on 6 files.  -> (reds, files):
+        reds as "lint::<file>:<line> <code> <msg>" node ids, [] when clean or
+        nothing to lint; None when ruff could not run (never a red)."""
+        if not base or not self.cfg.get("lint_changed", True):
+            return [], []
+        rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "%s..%s" % (base, cand), "--", "platform/*.py"])
+        files = [l.strip() for l in (out or "").splitlines() if l.strip().endswith(".py")] if rc == 0 else []
+        files = [f for f in files if (Path(wt) / f).exists()]
+        if not files:
+            return [], []
+        ruff = Path(wt) / "platform" / ".venv" / "bin" / "ruff"
+        if not ruff.exists():
+            self.log("LINT %s: no platform/.venv/bin/ruff in the worktree; lint skipped" % wt)
+            return None, files
+        rel = [f[len("platform/"):] for f in files]
+        rc, out, err = self.exec.run([str(ruff), "check", "--output-format", "json", "--no-cache"] + rel,
+                                     cwd=str(Path(wt) / "platform"), timeout_s=120)
+        try:
+            rows = json.loads(out or "[]")
+        except ValueError:
+            self.log("LINT %s: ruff output unreadable (rc %s): %s" % (wt, rc, (err or out or "")[-200:]))
+            return None, files
+        reds = ["lint::platform/%s:%s %s %s" % (Path(r.get("filename", "")).relative_to(Path(wt) / "platform")
+                                                if str(r.get("filename", "")).startswith(str(Path(wt) / "platform"))
+                                                else r.get("filename", ""),
+                                                (r.get("location") or {}).get("row"), r.get("code"),
+                                                str(r.get("message") or "")[:120])
+                for r in rows if isinstance(r, dict)]
+        return reds, files
+
+    def run_box(self, task, pid, wt, cand, kind, paths, no_record=True, workers=None, base=None):
+        lint, linted = self.lint_changed(wt, base, cand)
+        if lint:
+            # a lint red is a product red on the hosted route (vp/platform's first step),
+            # so it is one here too: FAIL_PRODUCT before any test runs
+            rec = {"status": "FAIL_PRODUCT", "route": "box", "proof_id": pid, "sha": cand, "kind": kind,
+                   "paths": paths, "failed_nodes": lint, "errors": {}, "rc": 1, "stderr": "",
+                   "counts": {"failed_nodes": lint, "lint_files": linted},
+                   "reason": "D111: ruff reds in the lane's changed platform files (the hosted Lint gate would fail)",
+                   "ts": utc_ms()}
+            self._write(pid, rec)
+            self.log("PROOF %s %s -> FAIL_PRODUCT (box, %d lint red(s) in %d changed file(s), D111; suite not run)"
+                     % (task, pid, len(lint), len(linted)))
+            return rec
+        if linted:
+            self.log("LINT %s %s: %d changed platform file(s) clean (D111)" % (task, pid, len(linted)))
         # v13 keeps its proof records in RUN_ROOT/proofs/<pid>.json (self._write);
         # vpproof's own store row needs a prior proof_request the lane driver
         # never makes ("unknown proof <pid>" -> UNKNOWN on the very first live
@@ -571,7 +622,7 @@ class Proof(object):
                     # a targeted suite can still run on the box, exactly as route() would have sent it
                     # (never an only= job: it is one workflow job, not a node list)
                     self.log("PROOF %s %s circleci refused (%s) -> box" % (task, pid, exc))
-                    return self.run_box(task, pid, wt, cand, kind, paths)
+                    return self.run_box(task, pid, wt, cand, kind, paths, base=base)
                 status = {self.REFUSED_GATE: "BLOCKED_GATE", self.REFUSED_CAP: "BLOCKED_CAP",
                           self.REFUSED_OFF: "BLOCKED_OFF", self.REFUSED_OVERLAY: "OVERLAY_DIRTY"}[exc.status]
                 rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
