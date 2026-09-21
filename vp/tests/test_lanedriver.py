@@ -4990,3 +4990,26 @@ def test_d170_a_full_suite_run_is_still_adoptable_across_items(tmp_path, monkeyp
                              {"proof_id": "proof-L30-REGISTRY-DISCOVERY-60918T104640917",
                               "paths": ["platform/tests/rls/test_l30_privilege_matrix_static.py"]}) is False, (
         "the live L04 <- L30 case must be refused")
+
+
+def test_d172_the_rule_the_reviewer_reads_names_the_fields_that_decide_scope():
+    """D168 put a `scope` label on every entry and D170 put `only` in PROOF_FIELDS,
+    but the sentence the reviewer actually reads still said "whose paths cover the
+    criterion's tests" -- it named the one field that does NOT decide scope and
+    neither of the two that do, so a scoped proof with `paths: []` satisfied it
+    vacuously and both earlier fixes changed no verdict.
+
+    This binds the rule text to the closed vocabulary `scope_label` emits: adding a
+    scope class without teaching the rule to speak about it fails here rather than
+    shipping a label no rule reads."""
+    from vp.lanedriver import PROOFS_RULE, REVIEW_PROMPT, LaneDriver
+
+    assert "whose paths cover" not in PROOFS_RULE, "the superseded rule is back"
+    for token in (LaneDriver.SCOPE_SCOPED, LaneDriver.SCOPE_FULL, LaneDriver.SCOPE_UNKNOWN):
+        assert token in PROOFS_RULE, "the rule never mentions the %r scope class" % token
+    assert "`scope`" in PROOFS_RULE and "`only`" in PROOFS_RULE
+    assert "`paths` is" in PROOFS_RULE, "the rule must say what an empty paths is NOT"
+    assert "proof_required" in PROOFS_RULE, "the exemption must be stated where it is applied"
+    # The same rule is stated twice: this string (the packet head) and REVIEW_PROMPT
+    # (the reviewer's system prompt). Fixing one copy of two is how a rule returns.
+    assert "scope" in REVIEW_PROMPT and "D170" in REVIEW_PROMPT

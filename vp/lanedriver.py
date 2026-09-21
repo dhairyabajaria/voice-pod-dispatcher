@@ -82,15 +82,31 @@ REVIEW_PROMPT = (
     "Verdict APPROVE only when every benchmark id is PASS with evidence and no "
     "finding of severity medium or higher carries a reproduce command. "
     "Runtime criteria ([box]/[hosted]) are judged from .vp/PROOFS.json, the driver's "
-    "record of each member's proof at its output sha: cite the proof_id; UNKNOWN only "
-    "when no record exists for that member (D77)."
+    "record of each member's proof at its output sha: cite the proof_id AND the entry's "
+    "`scope`. A `scoped:` or `unknown` scope does not answer a criterion outside it, so "
+    "UNKNOWN when no record exists for that member and equally when one exists whose "
+    "scope does not cover the criterion (D77, D170)."
 )
 
 # D77 (§36 F.2, Architect 2026-09-19): the reviewer's worktree carried no proof
 # records, so every runtime criterion was an honest UNKNOWN
+# D172: the rule the reviewer actually READS is this sentence.  D168 put a `scope`
+# label on every entry and D170 put `only` in PROOF_FIELDS, but this sentence still
+# said "whose paths cover the criterion's tests" -- it named the one field that does
+# NOT decide scope, and never named the two that do.  A scoped proof with `paths: []`
+# satisfied it vacuously, so both earlier fixes changed no verdict: the field shipped
+# and the rule did not.  A policy only a reader can enforce is not enforced, and a
+# field no rule reads is inert.
 PROOFS_RULE = ("Runtime criteria ([box]/[hosted]): PASS when .vp/PROOFS.json records a PASS proof at the "
-               "member's output sha whose paths cover the criterion's tests — cite the proof_id; UNKNOWN only "
-               "when no such record exists. Collection-baseline provenance: a union tip is pre-merge, so "
+               "member's output sha whose SCOPE covers the criterion's tests — cite the proof_id and the "
+               "scope. Read the entry's `scope` field; do not infer scope from `paths`. `full` means the "
+               "record's `only` was null and the whole suite ran, so it answers any criterion on that tree. "
+               "`scoped:<what>` means the run was narrowed to exactly that, and it answers only a criterion "
+               "whose tests are inside it. `unknown` means the entry predates the scope field and says "
+               "nothing about what ran: treat it as covering nothing, never as full. An empty `paths` is "
+               "NOT evidence of a full run — 287 scoped proofs were written that way. UNKNOWN when no "
+               "record exists for the member, and equally when a record exists whose scope does not reach "
+               "the criterion. An entry marked proof_required: false is exempt and scores neither way. Collection-baseline provenance: a union tip is pre-merge, so "
                "measured_commit, the test-ID diff and the merge count in platform/tests/collection_baseline.json "
                "are expected to stop at the base; L35 Step 6 rebaselines at the union tip before the trunk merge. "
                "Record the merge count from `scripts/ci_collection_floor.py freshness --branch vp/proof/review` "
