@@ -1700,7 +1700,11 @@ def test_load_pack_gives_the_circleci_twin_no_proof_only(tmp_path):
     (d / "PACKET.md").write_text("---\nitem: R-X\ntitle: x\nrunner_role: builder\nowned_files:\n  - platform/a.py\n"
                                  "test_paths:\n  - platform/tests/test_a.py\nproof_only: portal\n"
                                  "twin_proof_only: platform-shards-3\n---\nbody\n")
-    (d / "BENCHMARK.md").write_text("- B1 the hosted row [hosted] (gate: CIRCLECI)\n")
+    # D169: the tag goes in the row's LEADING tag block, which is where all 1110
+    # hosted rows on disk carry it.  This fixture used to write `- B1 the hosted row
+    # [hosted] ...` -- a shape the real corpus never produces -- so it was asserting
+    # against a row no packet author writes.
+    (d / "BENCHMARK.md").write_text("- B1 [evidence] [hosted] the hosted row (gate: CIRCLECI)\n")
     pack, lint = vppack.load_pack(tmp_path)[:2]
     assert pack["R-X"]["proof_only"] == "portal" and pack["R-X-HOSTED"]["proof_only"] == ""
     assert "proof_only" not in vppack.twin_packet_text(pack["R-X-HOSTED"], "a" * 40)
@@ -1843,3 +1847,44 @@ def test_d163_a_scoped_record_is_left_to_the_d140_filter():
     with_paths = _fp("proof-L04-FLOOR-HOSTED-R2-60920T210540342", ["a::t"],
                      paths=["platform/tests/test_a.py"])
     assert D.unattributable_for("L34-X", with_paths) == ""
+
+
+def test_d169_a_runtime_tag_is_a_tag_not_a_word_in_the_prose():
+    """Both polarities, because a narrowing tested only on the negative case can match
+    nothing at all and pass vacuously.
+
+    The real row: L17-REGISTRY-REPLY-PINS B10 is [box] and its own prose explains why
+    it is not hosted. The sentence justifying the classification flipped it, and the
+    row then errored for naming no (gate: X).
+    """
+    from vppack import hosted_row_gates
+
+    l17_b10 = ("- B10 [invariant] [box] `deploy/tests/test_worker_packaging.py::test_x` passes "
+               "— check: run that node. This row is `[box]` deliberately. The claim was "
+               "previously the second half of a compound `[hosted]` row, which a kind:platform "
+               "twin is structurally incapable of seeing. Making it `[hosted]` again would only "
+               "relocate the same unanswerability.\n")
+    genuine = "- B3 [evidence] [hosted] the shards pass — check: the pipeline (gate: CIRCLECI)\n"
+
+    both = hosted_row_gates(l17_b10 + genuine)
+    assert "B10" not in both, (
+        "prose ABOUT [hosted] must not classify the row as hosted: %r" % (both.get("B10"),))
+    assert "B3" in both and both["B3"][0] == "CIRCLECI", (
+        "and a genuine hosted row must still be found, with its gate: %r" % (both,))
+
+    # the negative case alone would pass against a pattern that matches nothing, so
+    # pin that the positive case is what discriminates
+    assert hosted_row_gates(l17_b10) == {}
+    assert set(hosted_row_gates(genuine)) == {"B3"}
+
+    # the tag block is the LEADING run of tags: a tag after prose is prose
+    assert hosted_row_gates("- B4 [box] runs the thing [hosted] later — check: x\n") == {}
+    assert set(hosted_row_gates("- B5 [hosted] first — check: y (gate: O1)\n")) == {"B5"}
+
+    # the gate is still read from the whole line -- (gate: X) lives in the check clause,
+    # long past the tag block, so only the runtime tag is position-bound
+    assert hosted_row_gates("- B6 [evidence] [hosted] x — check: y (gate: DELIVERY-2)\n")["B6"][0] == "DELIVERY-2"
+
+    # and a hosted row with no gate still reports None rather than vanishing: that is
+    # the lint error path, and swallowing the row would hide it
+    assert hosted_row_gates("- B7 [hosted] x — check: y\n")["B7"][0] is None

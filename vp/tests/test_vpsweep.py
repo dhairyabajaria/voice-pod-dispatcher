@@ -99,7 +99,10 @@ def _twin_pair(tmp_path, parent_state, parent_out):
     pack = tmp_path / "PACKETS"
     d = _packet(pack, "L17-FIX", "L17-FIX")
     (d / "BENCHMARK.md").write_text(
-        "## Benchmark\n\n- B1 proves the thing [hosted] (gate: DELIVERY-1)\n", encoding="utf-8")
+        # D169: the runtime tag goes in the row's LEADING tag block, which is where
+        # all 1110 hosted rows on disk carry it.  This fixture wrote `- B1 proves the
+        # thing [hosted] ...` -- a shape the real corpus never produces.
+        "## Benchmark\n\n- B1 [evidence] [hosted] proves the thing (gate: DELIVERY-1)\n", encoding="utf-8")
     rs = _run_state(tmp_path, {"L17-FIX": {"state": parent_state, "output_sha": parent_out}})
     # The durable binding, as the driver keeps it. Without it `bound_task` falls
     # back to bind(), which for a FINISHED parent with no template returns

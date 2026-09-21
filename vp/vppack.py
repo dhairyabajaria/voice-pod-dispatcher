@@ -346,7 +346,21 @@ def closure_plan(packet, pack, tasks, bindings=None):
 
 
 HOSTED_TWIN_SUFFIX = "-HOSTED"
-HOSTED_ROW_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\].*$", re.M)
+# D169: a benchmark row's runtime tag is one of its LEADING tags, never any text
+# on the line.  `.*\[hosted\].*` classified L17-REGISTRY-REPLY-PINS B10 as hosted --
+# a [box] row whose own prose explains why it is not hosted ("This row is `[box]`
+# deliberately... Making it `[hosted]` again would only relocate the same
+# unanswerability") -- and it then errored for naming no (gate: X).  The sentence
+# justifying the classification flipped the classification.
+#
+# Same shape as the census opt-out rule, polarity reversed: an instrument matching a
+# token in text ABOUT the property rather than text EXPRESSING it.  So the fix is the
+# property, not the row: group 2 is the contiguous leading tag block and only that is
+# searched, which leaves prose free to say anything.  Measured over all 194
+# BENCHMARK.md in the v13 pack: 1 row reclassified OUT (B10), 0 reclassified IN, 175
+# genuine hosted rows unchanged.
+BENCH_ROW_RE = re.compile(r"^-\s*(B\d+)\b((?:\s*\[[^\]]+\])*)(.*)$", re.M)
+HOSTED_TAG = "[hosted]"
 ROW_GATE_RE = re.compile(r"\(gate: (DELIVERY-[1-5][AB]?|O[1-9]|CIRCLECI)\)")   # check-v13.py GATES_RE
 GATE_ROSTER_KEY = {"CIRCLECI": "DELIVERY-1"}    # 00-SCOPE §5: CIRCLECI rows run once DELIVERY-1 is usable
 GATE_TEMPLATE = {"CIRCLECI": "TEST_GAP"}        # §19(2): product proof via CircleCI; DELIVERY-*/O* -> EXTERNAL_PREP
@@ -373,7 +387,11 @@ def is_hosted_twin(packet):
 def hosted_row_gates(text):
     """{row_id: (gate|None, verbatim line)} for every [hosted] row of a BENCHMARK.md"""
     out = {}
-    for m in HOSTED_ROW_RE.finditer(text):
+    for m in BENCH_ROW_RE.finditer(text):
+        if HOSTED_TAG not in (m.group(2) or ""):
+            continue
+        # the GATE is still read from the whole line: (gate: X) sits in the check
+        # clause, well past the tag block.  Only the runtime tag is position-bound.
         g = ROW_GATE_RE.search(m.group(0))
         out[m.group(1)] = (g.group(1) if g else None, m.group(0).strip())
     return out
