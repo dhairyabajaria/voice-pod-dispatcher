@@ -135,6 +135,12 @@ INFRA_JOB_STATUSES = {"infrastructure_fail", "timedout"}
 # FAIL_PRODUCT/FAIL_INFRA with reds, and never reusable (lanedriver D79).
 CANCELLED_JOB_STATUSES = {"canceled"}
 
+#: the reason `classify` gives a failed job with no failed tests.  A named
+#: constant because laneproof matches on it exactly (D190: only a red whose
+#: sole stated reason is this default is eligible for a guard re-read), and a
+#: string compared in one file and produced in another drifts silently.
+ZERO_FAILED_TESTS = "failed with zero failed tests"
+
 # D82: consecutive failed reads a poll tolerates before it gives up.
 POLL_TRANSIENT_MAX = 5
 
@@ -521,7 +527,7 @@ def classify(jobs, failed_tests, workflows=None):
                 has_infra = True
                 reds.append({
                     "job": name, "job_number": job_number, "status": status,
-                    "kind": "infra", "reason": "failed with zero failed tests",
+                    "kind": "infra", "reason": ZERO_FAILED_TESTS,
                 })
             continue
 

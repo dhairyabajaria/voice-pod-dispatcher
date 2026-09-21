@@ -420,3 +420,69 @@ def cancel_pipeline(run_id, runner=None, account=None):
 
 def credit_block(jobs, runner=None, account=None, targets=None):
     return None
+
+
+#: D190: guard steps whose failure is a DETERMINISTIC verdict about the
+#: candidate, not an infrastructure wobble.  Matched against the line the guard
+#: itself prints, never against a step name: a step can be renamed in the
+#: workflow without anyone thinking about this file, and `scripts/
+#: ci_collection_floor.py` is a trunk product path this repo must not edit --
+#: so its OUTPUT is the contract we can rely on, and its step name is not.
+#: Anchored at line start after the GHA timestamp prefix so a line merely
+#: quoting one of these phrases (a comment, a diff, an echo of a prior run)
+#: does not match.
+GUARD_VERDICT_RE = re.compile(
+    r"^(?:\S+\s+)?((?:ABOVE CEILING|BELOW FLOOR):\s*\S.*?)\s*$", re.M)
+
+
+def guard_verdict(job_number, runner, repo=None):
+    """D190: the deterministic-guard line behind a job that failed with zero
+    failed tests, or None.
+
+    Returns {"step": <failed step name>, "line": <the guard's own output>}.
+
+    Why this exists: R-L28-HOSTED-R1-B11-1 burned all three retries on
+    `vp/agent(infra:failed with zero failed tests)`.  Every test in that job
+    PASSED -- step 8 "Run agent tests with coverage" was green and step 9
+    "Enforce agent collected-test floor" was red with
+    `ABOVE CEILING: collected=1593 baseline=1538 ceiling=1584 band_pct=3`.
+    "Zero failed tests" was literally true and completely misleading: the
+    candidate added 55 agent tests without updating
+    platform/tests/collection_baseline.json.  Retrying a deterministic guard
+    re-runs the same arithmetic and gets the same answer, three times, 45
+    minutes each.
+
+    FAILS CLOSED.  Any error -- no `gh`, a shape we do not recognise, a log we
+    cannot read, no matching line -- returns None and leaves the caller's
+    existing FAIL_INFRA alone.  An instrument failure must never manufacture a
+    FAIL_PRODUCT: the cost of missing one guard trip is three wasted retries,
+    and the cost of inventing one is a packet failed for a reason nobody can
+    point at.
+    """
+    if job_number is None or runner is None:
+        return None
+    r = repo or REPO
+    try:
+        steps = _json(runner.gh(["api", "repos/%s/actions/jobs/%s" % (r, job_number),
+                                 "--jq", "[.steps[] | {name, conclusion}]"]),
+                      "gh api job steps")
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return None
+    failed = [s for s in (steps or [])
+              if isinstance(s, dict) and s.get("conclusion") == "failure"]
+    if len(failed) != 1:
+        # 0: the job failed outside a step (a runner death) -- infra, correctly.
+        # >1: two independent failures; which one is "the" verdict is not ours
+        # to pick, and a guard trip alongside a real infra red is still infra.
+        return None
+    try:
+        res = runner.gh(["api", "repos/%s/actions/jobs/%s/logs" % (r, job_number),
+                         "--allow-escape-sequences"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(res, "returncode", 1) != 0:
+        return None
+    m = GUARD_VERDICT_RE.search(res.stdout or "")
+    if not m:
+        return None
+    return {"step": failed[0].get("name"), "line": m.group(1).strip()}

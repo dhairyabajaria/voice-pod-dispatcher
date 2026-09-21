@@ -938,3 +938,100 @@ def test_d162_the_check_is_off_unless_a_caller_supplies_exists(tmp_path):
     runs = [str(st.get("run", "")) for st in doc["jobs"]["platform-preflight"]["steps"]]
     assert any("uv run pytest -q agent/tests/x.py" in r for r in runs), (
         "unchanged without `exists`: D162 refuses, it never rewrites a path")
+
+
+# ---------------------------------------------------------------- D190 ------
+#: the real step list and the real guard line from GHA job 106475795431 of
+#: pipeline 35642759301 (R-L28-HOSTED-R1-B11-1's third and final retry). Note
+#: step 8: the tests themselves were GREEN. "Zero failed tests" was true.
+_L28_STEPS = [
+    {"name": "Set up job", "conclusion": "success"},
+    {"name": "Lint (same rule set as platform)", "conclusion": "success"},
+    {"name": "Run agent tests with coverage", "conclusion": "success"},
+    {"name": "Enforce agent collected-test floor", "conclusion": "failure"},
+    {"name": "Negative control: agent collection falls below floor when "
+             "tests/test_config.py is ignored", "conclusion": "skipped"},
+    {"name": "Complete job", "conclusion": "success"},
+]
+_L28_LOG = (
+    "2026-09-21T19:09:40.4996089Z guards.py: 93.36% (floor: 80%)\n"
+    "2026-09-21T19:09:40.5156155Z ##[group]Run uv run python "
+    "../scripts/ci_collection_floor.py floor --suite agent "
+    "--baseline-file ../platform/tests/collection_baseline.json\n"
+    "2026-09-21T19:09:44.8036296Z ABOVE CEILING: collected=1593 baseline=1538 "
+    "ceiling=1584 band_pct=3\n"
+)
+
+
+class _GhRunner(object):
+    """answers `gh api .../jobs/<n>` and `.../jobs/<n>/logs`, nothing else"""
+
+    def __init__(self, steps=_L28_STEPS, log=_L28_LOG, rc_logs=0, boom=False):
+        self.steps, self.log, self.rc_logs, self.boom = steps, log, rc_logs, boom
+        self.calls = []
+
+    def gh(self, args, timeout_s=None, input_text=None):
+        self.calls.append(list(args))
+        if self.boom:
+            raise OSError("gh not found")
+        joined = " ".join(args)
+        if joined.endswith("/logs") or "/logs" in joined:
+            return subprocess.CompletedProcess(args, self.rc_logs, self.log, "")
+        return subprocess.CompletedProcess(args, 0, json.dumps(self.steps), "")
+
+
+def test_d190_guard_verdict_reads_the_real_l28_job():
+    got = vpgha.guard_verdict(106475795431, _GhRunner())
+    assert got == {"step": "Enforce agent collected-test floor",
+                   "line": "ABOVE CEILING: collected=1593 baseline=1538 "
+                           "ceiling=1584 band_pct=3"}, got
+
+
+def test_d190_guard_verdict_matches_the_guards_output_not_a_step_name():
+    """Matched on the line `ci_collection_floor.py` prints, never on the step
+    name: the step can be renamed in the workflow by someone who never opens
+    this file, and that script is a trunk product path this repo must not edit,
+    so its OUTPUT is the only contract we get to rely on. The `##[group]Run ...`
+    line that INVOKES it is in the log too and must not match.
+    """
+    steps = [{"name": "some step nobody named helpfully", "conclusion": "failure"}]
+    got = vpgha.guard_verdict(1, _GhRunner(steps=steps))
+    assert got and got["line"].startswith("ABOVE CEILING:"), got
+    assert got["step"] == "some step nobody named helpfully", got
+
+    # a line that merely quotes the phrase mid-line is not a verdict
+    quoted = ("2026-01-01T00:00:00Z ##[group]Run ci_collection_floor.py "
+              "# prints ABOVE CEILING: when over\n")
+    assert vpgha.guard_verdict(1, _GhRunner(steps=steps, log=quoted)) is None
+
+
+def test_d190_guard_verdict_fails_closed_on_every_unreadable_shape():
+    """Missing a guard trip costs three retries; inventing one fails a packet
+    for a reason nobody can point at. Every unknown answers None.
+    """
+    assert vpgha.guard_verdict(None, _GhRunner()) is None, "no job number"
+    assert vpgha.guard_verdict(1, None) is None, "no runner"
+    assert vpgha.guard_verdict(1, _GhRunner(boom=True)) is None, "gh missing"
+    assert vpgha.guard_verdict(1, _GhRunner(rc_logs=1)) is None, "log fetch failed"
+    assert vpgha.guard_verdict(1, _GhRunner(log="nothing of interest\n")) is None, "no guard line"
+    assert vpgha.guard_verdict(1, _GhRunner(steps=[])) is None, "no failed step"
+    assert vpgha.guard_verdict(
+        1, _GhRunner(steps=[{"name": "a", "conclusion": "success"}])) is None, "job failed outside a step"
+
+
+def test_d190_two_failed_steps_is_not_a_verdict():
+    """Which of two independent failures is "the" verdict is not ours to pick,
+    and a guard trip alongside a real failure is still an unanswered run.
+    """
+    steps = [{"name": "Run agent tests with coverage", "conclusion": "failure"},
+             {"name": "Enforce agent collected-test floor", "conclusion": "failure"}]
+    assert vpgha.guard_verdict(1, _GhRunner(steps=steps)) is None
+
+
+def test_d190_guard_verdict_asks_for_the_log_only_after_it_has_a_failed_step():
+    """The steps call is cheap and the log is ~43KB; on a job that failed
+    outside a step there is nothing to look for, so it must not be fetched.
+    """
+    r = _GhRunner(steps=[{"name": "a", "conclusion": "success"}])
+    assert vpgha.guard_verdict(1, r) is None
+    assert not any("/logs" in " ".join(c) for c in r.calls), r.calls

@@ -611,7 +611,13 @@ class Proof(object):
         reds = [r for r in (cls.get("reds") or []) if isinstance(r, dict)]
         parts = []
         for r in reds[:6]:
-            why = str(r.get("reason") or r.get("status") or "")[:40]
+            # D190: a guard red's reason IS the actionable number
+            # ("ABOVE CEILING: collected=1593 baseline=1538 ceiling=1584
+            # band_pct=3", 68 chars).  Truncated at 40 it stops one character
+            # into the evidence and the blocker is back to being unactionable,
+            # which is the exact defect D157 wrote this function to fix.
+            cap = 140 if r.get("kind") == "guard" else 40
+            why = str(r.get("reason") or r.get("status") or "")[:cap]
             parts.append("%s(%s%s)" % (r.get("job"), r.get("kind") or "?",
                                        ":" + why if why else ""))
         bits = []
@@ -651,6 +657,69 @@ class Proof(object):
     #: a broken collection step plausibly bears on whether a file ran, and
     #: neither has a measured case behind it.
     AGGREGATOR_JOBS = ("vp/platform-coverage", "combine-coverage")
+
+    def _guard_reclassify(self, task, pid, cls, status, runner):
+        """D190: a deterministic guard trip is a verdict, not a missing answer.
+
+        R-L28-HOSTED-R1-B11-1 burned all three retries on
+        `vp/agent(infra:failed with zero failed tests)`.  Every test in that job
+        passed; the job died in a later step on
+        `ABOVE CEILING: collected=1593 baseline=1538 ceiling=1584 band_pct=3` --
+        the candidate added 55 agent tests without updating
+        platform/tests/collection_baseline.json.  "Zero failed tests" was
+        literally true and read as "the box wobbled, try again", so the driver
+        re-ran the same arithmetic three times at ~45 minutes each and then
+        retired the row INVALID_EVIDENCE, which reads as "we could not tell"
+        rather than "the candidate is wrong and here is the number".
+
+        `classify()` cannot fix this: it sees job name, status and failed tests
+        and nothing else, so a guard step is invisible to it by construction.
+        The provider knows, which is why this sits here and asks the provider.
+
+        Duck-typed on `guard_verdict`: the GHA module implements it, vpcircle
+        does not, and a provider without it is left exactly as it was.  That is
+        deliberate -- the measured case is a GHA run, and writing a CircleCI
+        path I cannot exercise would be guessing in the one direction that
+        turns "no answer" into "your fault".
+
+        ONLY ever narrows infra -> product, never the reverse, and only for
+        reds whose sole stated reason was the zero-failed-tests default.  Any
+        probe failure leaves the red alone (see `guard_verdict`, which fails
+        closed).
+        """
+        probe = getattr(self.circle, "guard_verdict", None)
+        if not callable(probe) or status != "FAIL_INFRA":
+            return status
+        hits = 0
+        for r in (cls.get("reds") or []):
+            if not isinstance(r, dict) or r.get("kind") != "infra":
+                continue
+            if str(r.get("reason") or "") != vpcircle.ZERO_FAILED_TESTS:
+                continue                      # a status-derived infra red is not this
+            try:
+                got = probe(r.get("job_number"), runner)
+            except Exception as exc:          # noqa: BLE001 -- a probe never takes the proof down
+                self.log("PROOF %s %s guard probe failed for %s: %s" % (task, pid, r.get("job"), exc))
+                continue
+            if not got:
+                continue
+            r["kind"] = "guard"
+            r["reason"] = got["line"]
+            r["guard_step"] = got.get("step")
+            hits += 1
+            self.log("PROOF %s %s %s failed a deterministic guard, not infra: %s (step %r) "
+                     "-> FAIL_PRODUCT, retrying cannot change it (D190)"
+                     % (task, pid, r.get("job"), got["line"], got.get("step")))
+        if not hits:
+            return status
+        if any(isinstance(r, dict) and r.get("kind") == "infra" for r in (cls.get("reds") or [])):
+            # a real infra red alongside the guard trip: the run still failed to
+            # answer, and a guard verdict does not make the rest of it readable
+            self.log("PROOF %s %s guard trip recorded, but an infra red remains -> stays FAIL_INFRA"
+                     % (task, pid))
+            return status
+        cls["status"] = "FAIL_PRODUCT"
+        return "FAIL_PRODUCT"
 
     @classmethod
     def blocking_infra(cls, reds):
@@ -908,6 +977,10 @@ class Proof(object):
             except TypeError:                     # an older classify without the D79b kwarg
                 cls = self.circle.classify(res["jobs"], res["failed_tests"])
             status = cls["status"]
+            # D190: before anything reads `status`, let a deterministic guard
+            # trip be told apart from an unanswered run.  Narrows only
+            # FAIL_INFRA -> FAIL_PRODUCT, and only when the provider can prove it.
+            status = self._guard_reclassify(task, pid, cls, status, runner)
             failed, errors = circle_failed_nodes(res["failed_tests"])
             flake = None
             collected = None

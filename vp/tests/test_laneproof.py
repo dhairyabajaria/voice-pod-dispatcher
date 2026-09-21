@@ -2004,3 +2004,139 @@ def test_d175_an_identically_scoped_row_is_still_adoptable(tmp_path):
 
     got = p.ledger_open_pipeline(cand, only=only)
     assert got and got["pipeline_id"] == "35526024100"
+
+
+# ---------------------------------------------------------------- D190 ------
+# R-L28-HOSTED-R1-B11-1 burned 3/3 retries on
+# `vp/agent(infra:failed with zero failed tests)`. Every test in that job PASSED;
+# it died in a later step on the real line below. Retrying a deterministic guard
+# re-runs the same arithmetic and gets the same answer.
+GUARD_LINE = "ABOVE CEILING: collected=1593 baseline=1538 ceiling=1584 band_pct=3"
+
+
+class GuardCircle(FakeCircle):
+    """a provider that CAN answer "why did it fail with no failed tests"."""
+
+    def __init__(self, res, verdicts=None, boom=False):
+        FakeCircle.__init__(self, res)
+        self.verdicts = verdicts or {}
+        self.boom = boom
+        self.probed = []
+
+    def guard_verdict(self, job_number, runner, repo=None):
+        self.probed.append(job_number)
+        if self.boom:
+            raise RuntimeError("gh exploded")
+        return self.verdicts.get(job_number)
+
+
+def _infra_cls(*reds):
+    return {"status": "FAIL_INFRA", "reds": list(reds)}
+
+
+def _zero(job, num):
+    return {"job": job, "job_number": num, "status": "failed",
+            "kind": "infra", "reason": vpcircle.ZERO_FAILED_TESTS}
+
+
+def test_d190_a_deterministic_guard_trip_is_a_product_verdict_not_a_missing_answer(tmp_path):
+    logs = []
+    circle = GuardCircle(pipeline([]), {106475795431: {"step": "Enforce agent collected-test floor",
+                                                      "line": GUARD_LINE}})
+    p = make_proof(tmp_path, circle, FakeExec({}), logs=logs)
+    cls = _infra_cls(_zero("vp/agent", 106475795431))
+
+    got = p._guard_reclassify("R-L28", "proof-1", cls, "FAIL_INFRA", circle.Runner())
+
+    assert got == "FAIL_PRODUCT" and cls["status"] == "FAIL_PRODUCT", (got, cls)
+    red = cls["reds"][0]
+    assert red["kind"] == "guard", red
+    assert red["reason"] == GUARD_LINE, "the guard's own number IS the reason: %r" % red
+    assert red["guard_step"] == "Enforce agent collected-test floor", red
+    assert any("retrying cannot change it" in m for m in logs), logs
+
+
+def test_d190_the_blocker_carries_the_whole_guard_line(tmp_path):
+    """D157 wrote the reason builder because a blocker ending in a bare colon is
+    unactionable. A 40-char truncation of this line stops one character into the
+    evidence -- `...collected=1593 baseline=15` -- which is the same defect.
+    """
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), FakeExec({}))
+    cls = {"status": "FAIL_PRODUCT",
+           "reds": [{"job": "vp/agent", "kind": "guard", "reason": GUARD_LINE}]}
+    reason = p._derived_reason("FAIL_PRODUCT", cls, [], "35642759301", None)
+    assert GUARD_LINE in reason, "the actionable number must survive into the blocker: %r" % reason
+    assert "baseline=1538" in reason and "ceiling=1584" in reason, reason
+
+
+def test_d190_a_guard_trip_beside_a_real_infra_red_stays_infra(tmp_path):
+    """The guard verdict is sound; the RUN is still unreadable. Narrowing to
+    FAIL_PRODUCT here would charge the packet for a run that also failed to
+    answer, and the other red is exactly the kind a retry can clear.
+    """
+    logs = []
+    circle = GuardCircle(pipeline([]), {1: {"step": "Enforce agent collected-test floor",
+                                            "line": GUARD_LINE}})
+    p = make_proof(tmp_path, circle, FakeExec({}), logs=logs)
+    cls = _infra_cls(_zero("vp/agent", 1),
+                     {"job": "vp/platform", "job_number": 2, "status": "timedout",
+                      "kind": "infra", "reason": "timedout"})
+
+    got = p._guard_reclassify("R-L28", "proof-1", cls, "FAIL_INFRA", circle.Runner())
+
+    assert got == "FAIL_INFRA" and cls["status"] == "FAIL_INFRA", (got, cls)
+    assert cls["reds"][0]["kind"] == "guard", "the guard trip is still RECORDED, just not decisive"
+    assert any("an infra red remains" in m for m in logs), logs
+
+
+def test_d190_the_probe_fails_closed(tmp_path):
+    """An instrument failure must never manufacture a FAIL_PRODUCT. Missing a
+    guard trip costs three retries; inventing one fails a packet for a reason
+    nobody can point at.
+    """
+    for circle in (GuardCircle(pipeline([]), {}),                 # probe says "I don't know"
+                   GuardCircle(pipeline([]), boom=True)):         # probe raises
+        logs = []
+        p = make_proof(tmp_path, circle, FakeExec({}), logs=logs)
+        cls = _infra_cls(_zero("vp/agent", 1))
+        got = p._guard_reclassify("R-L28", "proof-1", cls, "FAIL_INFRA", circle.Runner())
+        assert got == "FAIL_INFRA" and cls["reds"][0]["kind"] == "infra", (got, cls)
+
+
+def test_d190_only_the_zero_failed_tests_default_is_re_read(tmp_path):
+    """A status-derived infra red (`timedout`, `infrastructure_fail`) already
+    says why it failed. Re-reading it would be asking a question that has an
+    answer, and the guard probe is not that answer.
+    """
+    circle = GuardCircle(pipeline([]), {1: {"step": "s", "line": GUARD_LINE}})
+    p = make_proof(tmp_path, circle, FakeExec({}), logs=[])
+    cls = _infra_cls({"job": "vp/agent", "job_number": 1, "status": "timedout",
+                      "kind": "infra", "reason": "timedout"})
+
+    got = p._guard_reclassify("R-L28", "proof-1", cls, "FAIL_INFRA", circle.Runner())
+
+    assert got == "FAIL_INFRA" and circle.probed == [], (
+        "a red that already states its cause is not probed: %r" % circle.probed)
+
+
+def test_d190_a_provider_without_the_probe_is_untouched(tmp_path):
+    """vpcircle has no guard_verdict. The measured case is a GHA run, and a
+    CircleCI path I cannot exercise would be guessing in the one direction that
+    turns "no answer" into "your fault".
+    """
+    circle = FakeCircle(pipeline([]))
+    assert not hasattr(circle, "guard_verdict")
+    p = make_proof(tmp_path, circle, FakeExec({}))
+    cls = _infra_cls(_zero("vp/agent", 1))
+    got = p._guard_reclassify("R-L28", "proof-1", cls, "FAIL_INFRA", circle.Runner())
+    assert got == "FAIL_INFRA" and cls["reds"][0]["kind"] == "infra", (got, cls)
+
+
+def test_d190_a_pass_or_product_status_is_never_widened(tmp_path):
+    """Only ever narrows FAIL_INFRA -> FAIL_PRODUCT."""
+    circle = GuardCircle(pipeline([]), {1: {"step": "s", "line": GUARD_LINE}})
+    p = make_proof(tmp_path, circle, FakeExec({}))
+    for status in ("PASS", "FAIL_PRODUCT", "CANCELLED", "UNKNOWN"):
+        cls = {"status": status, "reds": [_zero("vp/agent", 1)]}
+        assert p._guard_reclassify("R-L28", "p", cls, status, circle.Runner()) == status
+    assert circle.probed == [], circle.probed
