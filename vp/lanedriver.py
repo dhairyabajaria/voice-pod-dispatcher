@@ -2894,14 +2894,44 @@ class LaneDriver(object):
         # many it has -- a full-suite claim about the union's tree must not be
         # assemblable from scoped parts without that being visible (the union-104
         # mistake).  Derived per member from its own proof record, never assumed.
+        # D187 (Architect ruling, 2026-09-21): pass row=.  D174 left this
+        # un-widened ON PURPOSE and asked for a ruling rather than deciding it
+        # here; this is that ruling, so the old comment is replaced rather than
+        # annotated.  An exemption is a property of the ROW, not of the reader:
+        # two readers disagreeing about the same row is exactly the drift D168
+        # already paid for.  :6631 (review grading) already passes row=; :2178
+        # (the dashboard cell) deliberately does NOT and stays that way -- it
+        # returns "-" for anything not VERIFIED, so an INTEGRATED row never
+        # reaches it and (0b) cannot apply.  Three call sites, two behaviours,
+        # and the difference is now a ruling at each one instead of an accident.
+        #
+        # The old comment's worry -- that passing the row would "silently move
+        # members out of the union's `unproven` tally" -- does not occur, and it
+        # never could have.  Measured over the 324 rows a union tally actually
+        # classifies (UNION_MEMBER_STATES with an output_sha):
+        #
+        #     class   BEFORE = AFTER : full 148, not_required 78, scoped 71,
+        #                              unproven 27
+        #     unproven 27 -> 27, and the ONLY transition is
+        #     not_required/kind_unknown -> not_required/integrated_not_dynamic,
+        #     on 25 rows, all INTEGRATED, all kind None.
+        #
+        # Those 25 were already `not_required` before the ruling, by D148's
+        # `kind_unknown` -- the same accident D186 fixed one layer up.  So this
+        # ruling buys BASIS FIDELITY, not a tally change: the reason travels into
+        # the union record instead of a reason that was true by coincidence.
+        # Worth doing for that alone (D174 put the basis on the entry precisely
+        # so "exempt" never appears without one), but nobody should expect the
+        # union's alarm count to move, and a review that cites this as the reason
+        # a member left `unproven` is citing the wrong change.
+        try:
+            rows = self.control.state_view().get("tasks") or {}
+        except Exception:  # noqa: BLE001 -- a union tally never takes the tick down
+            rows = {}      # and an unreadable view must not read as "exempt":
+                           # row={} gives pre_v13 False, i.e. the pre-ruling answer
         for m in merged:
-            # D174: no row= here either, and this one IS a judgement call.  The
-            # ruling that created exemption (0b) was about how a REVIEW grades a
-            # member, not about how a union counts its parts.  UNION_MEMBER_STATES
-            # includes INTEGRATED, so passing the row would silently move members
-            # out of the union's `unproven` tally as a side effect of a review
-            # change.  Flagged for a ruling rather than widened quietly.
-            m["proof_scope"] = self.member_scope(m["task"], m.get("kind"))
+            m["proof_scope"] = self.member_scope(m["task"], m.get("kind"),
+                                                 row=rows.get(m["task"]) or {})
         def _of(cls):
             return sorted(m["task"] for m in merged
                           if (m.get("proof_scope") or {}).get("class") == cls)
@@ -6424,11 +6454,17 @@ class LaneDriver(object):
         except OSError:
             packet_benchmark = ""
         head = "# Review subject: %s..%s (%s)\n" % (rbase[:12], cand[:12], ", ".join(targets))
-        proofs = self._review_proofs(targets, state, union, cand)
+        proofs = self._review_proofs(targets, state, union, cand, review=task)
         mem = [e for e in proofs["entries"] if e["task"] != "<union tip>"]
-        head += "%s (.vp/PROOFS.json: %d member record(s), %d with a proof%s)\n" % (
+        head += "%s (.vp/PROOFS.json: %d member record(s), %d with a proof%s%s)\n" % (
             PROOFS_RULE, len(mem), sum(1 for e in mem if e.get("proof_id")),
-            "; union tip proof present" if len(mem) != len(proofs["entries"]) else "")
+            "; union tip proof present" if len(mem) != len(proofs["entries"]) else "",
+            # D188: say it in the reviewer's own header.  A member dropped for
+            # circularity is a fact about the review's scope, and the reviewer is
+            # the one person who would otherwise wonder where the row went.
+            ("; %d member(s) excluded as depending on this review: %s"
+             % (len(proofs["circular_members"]), ", ".join(proofs["circular_members"])))
+            if proofs.get("circular_members") else "")
         head += LaneDriver.scope_summary(mem)
         reg = (state.get("candidate") or {}).get("sha")
         if reg:
@@ -6592,10 +6628,15 @@ class LaneDriver(object):
                 idx.setdefault(rec["sha"], []).append(rec)
         return idx
 
-    def _review_proofs(self, targets, state, union, cand):
+    def _review_proofs(self, targets, state, union, cand, review=None):
         """D77: one entry per union member (and per coverage target), sourced from
         the proof record of its VERIFIED attempt (the newest PASS at its output
-        sha, else the newest record), plus the union tip's own proof if any."""
+        sha, else the newest record), plus the union tip's own proof if any.
+
+        D188: `review` is this review's own task id, used to drop members that
+        depend on it.  Optional and defaulting to None because this function is
+        also reached unbound against a SimpleNamespace stub (test_vppack.py:609);
+        omitting it restores the pre-D188 behaviour exactly."""
         idx = self._proof_index()
         tasks = state.get("tasks") or {}
         members = [str(m.get("task")) for m in ((union or {}).get("members") or []) if m.get("task")]
@@ -6613,8 +6654,35 @@ class LaneDriver(object):
             ranked = sorted(recs, key=lambda r: (r.get("status") == "PASS", str(r.get("ts") or "")))
             return ranked[-1]
 
-        entries = []
+        def _depends_on(t):
+            """this row's declared dependencies, from the state row if it has the
+            key, else the packet.  `self.pack` via getattr: the stub caller has no
+            pack, and a missing pack must answer "no declared deps", never raise."""
+            row = tasks.get(t) or {}
+            deps = row.get("depends_on")
+            if deps is None:
+                deps = ((getattr(self, "pack", None) or {}).get(t) or {}).get("depends_on")
+            return [str(d) for d in (deps or [])]
+
+        entries, circular = [], []
         for t in list(dict.fromkeys(members + list(targets))):
+            # D188 (Architect ruling, 2026-09-21): a row whose depends_on names
+            # THIS review cannot be one of its members.  Its output is gated on
+            # the review finishing, so at the review's subject sha it has no
+            # proof and never can -- REVIEW-JUNIOR-UNION-R4 carried
+            # {"task": "L42", "status": None} among 69 entries, an entry that was
+            # structurally incapable of being anything but UNKNOWN.  Fixed here,
+            # at the generator, and not by hand-editing PROOFS.json, which is
+            # rewritten on every instantiation.
+            #
+            # Recorded, not silently dropped.  An excluded member that leaves no
+            # trace is the same fail-open shape as an exemption with no basis
+            # (D174): the count goes down and nobody can tell whether the row was
+            # answered or removed.  It rides in the returned doc under
+            # `circular_members` so the header and any later reader can say so.
+            if review and review in _depends_on(t):
+                circular.append(t)
+                continue
             sha = (tasks.get(t) or {}).get("output_sha") or member_sha.get(t)
             rec = best(idx.get(sha), task=t) if sha else None
             e = {"task": t, "output_sha": sha}
@@ -6651,7 +6719,7 @@ class LaneDriver(object):
             e["proof_required"] = LaneDriver.scope_scored(e["scope"])
             entries.append(e)
         return {"generated": utc_ms(), "subject_sha": cand, "union": (union or {}).get("union"),
-                "rule": PROOFS_RULE, "entries": entries}
+                "rule": PROOFS_RULE, "entries": entries, "circular_members": sorted(circular)}
 
     REUSABLE_STATUSES = ("PASS", "FAIL_PRODUCT")
 

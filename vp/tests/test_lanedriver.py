@@ -5602,3 +5602,145 @@ def test_d113b_does_not_reuse_the_prose_pattern_and_says_why():
         "and drops every non-platform/agent/portal path, incl. the L04 deploy/ case")
     doc = inspect.getdoc(LaneDriver._contract_owned_test_files) or ""
     assert "deploy/" in doc, "the reason the two patterns differ is no longer recorded"
+
+
+def test_d187_the_union_tally_and_the_review_grader_classify_a_row_the_same_way(tmp_path, monkeypatch):
+    """D187 (Architect ruling): an exemption is a property of the ROW, not of the
+    reader.  D174 left the union tally calling member_scope WITHOUT row= and asked
+    for a ruling; this is it.  Two readers disagreeing about the same row is the
+    drift D168 already paid for, so the test is a mirror: whatever the review
+    grader records for a row, the union tally must record for the same row.
+
+    Note what this does NOT claim.  Measured over the 324 union-eligible rows in
+    the live run-state, the ruling moves no member between classes and leaves the
+    `unproven` alarm at 27 -- the only transition is
+    not_required/kind_unknown -> not_required/integrated_not_dynamic on 25 rows,
+    which were already exempt by D148's accident.  What it buys is the BASIS, so
+    the asserts below are on the basis and not on the tally.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    def commit(name):
+        git(env.trunk, "checkout", "-q", "-B", "m-" + name, env.base)
+        (env.trunk / "platform" / (name + ".py")).write_text("# %s\n" % name)
+        git(env.trunk, "add", "-A")
+        git(env.trunk, "commit", "-q", "-m", name)
+        return git(env.trunk, "rev-parse", "HEAD")
+
+    pre_v13 = commit("PREV13")        # INTEGRATED, not dynamic, no kind -> exempt
+    plain = commit("PLAIN")           # VERIFIED, no kind            -> not exempt
+    git(env.trunk, "checkout", "-q", "successor/s3")
+
+    rows = {"PREV13": {"state": "INTEGRATED", "output_sha": pre_v13},
+            "PLAIN": {"state": "VERIFIED", "output_sha": plain}}
+    monkeypatch.setattr(drv.control, "state_view", lambda: {"tasks": rows})
+
+    members = [{"task": "PREV13", "output_sha": pre_v13, "depth": 0},
+               {"task": "PLAIN", "output_sha": plain, "depth": 0}]
+    rec = drv._build_union("FOR", env.base, members)
+    by = {m["task"]: m["proof_scope"] for m in rec["members"]}
+
+    assert by["PREV13"]["basis"] == "integrated_not_dynamic", (
+        "the union tally must see the row's own exemption, not re-derive a reason "
+        "from the kind alone: %r" % (by["PREV13"],))
+    assert by["PLAIN"]["basis"] == "kind_unknown", (
+        "and it must NOT widen: a VERIFIED row is not pre-v13 %r" % (by["PLAIN"],))
+
+    # the mirror itself -- production calls it this way at :6631, so the test does too
+    for t, sc in by.items():
+        assert sc == drv.member_scope(t, rows[t].get("kind"), row=rows[t]), (
+            "%s: union tally and review grader disagree about the same row" % t)
+
+    # and the ruling's own stated consequence, pinned as NOT happening, so nobody
+    # re-derives it from the comment: both rows stay out of the alarm either way
+    assert rec["unproven_members"] == [], rec["unproven_members"]
+
+
+def test_d187_an_unreadable_state_view_gives_the_pre_ruling_answer_not_an_exemption(tmp_path, monkeypatch):
+    """An instrument failure must never read as the fact.  If the state view
+    raises, the tally falls back to row={}, which is `pre_v13 False` -- the
+    conservative pre-ruling answer.  The failure mode that would matter is the
+    other one: an unreadable view quietly exempting every member.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    git(env.trunk, "checkout", "-q", "-B", "m-x", env.base)
+    (env.trunk / "platform" / "x.py").write_text("# x\n")
+    git(env.trunk, "add", "-A")
+    git(env.trunk, "commit", "-q", "-m", "x")
+    sha = git(env.trunk, "rev-parse", "HEAD")
+    git(env.trunk, "checkout", "-q", "successor/s3")
+
+    def boom():
+        raise RuntimeError("state view unavailable")
+
+    monkeypatch.setattr(drv.control, "state_view", boom)
+    rec = drv._build_union("FOR", env.base, [{"task": "PREV13", "output_sha": sha, "depth": 0}])
+    sc = rec["members"][0]["proof_scope"]
+    assert sc["basis"] == "kind_unknown", (
+        "an unreadable state view must not answer `exempt`: %r" % (sc,))
+
+
+def test_d188_a_member_that_depends_on_the_review_is_excluded_and_said_so(tmp_path, monkeypatch):
+    """D188 (Architect ruling): REVIEW-JUNIOR-UNION-R4 carried
+    {"task": "L42", "status": None} among 69 entries.  L42.depends_on names that
+    very review, so its output is gated on the review finishing -- at the review's
+    subject sha it has no proof and never can.  An entry that is structurally
+    incapable of being anything but UNKNOWN is not a finding, it is a generator
+    bug, and it is fixed at the generator because PROOFS.json is rewritten on
+    every instantiation.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    sha = "a" * 40
+    _write_proof(env.run_root, "proof-MEMBER-60921T000104", only=None)
+
+    state = {"tasks": {
+        "MEMBER": {"output_sha": sha, "kind": "builder"},
+        "L42": {"output_sha": sha, "kind": "builder",
+                "depends_on": ["L36", "REVIEW-UNION-R4", "REVIEW-SECURITY-S4"]},
+    }}
+    union = {"union": "u1", "members": [{"task": t, "output_sha": sha}
+                                        for t in ("MEMBER", "L42")]}
+
+    out = drv._review_proofs([], state, union, sha, review="REVIEW-UNION-R4")
+    tasks = [e["task"] for e in out["entries"] if e["task"] != "<union tip>"]
+    assert tasks == ["MEMBER"], "the circular member is not graded: %r" % tasks
+    assert out["circular_members"] == ["L42"], (
+        "and it is RECORDED, not silently dropped -- a member that leaves no trace "
+        "is the same fail-open shape as an exemption with no basis: %r" % (out,))
+
+    # a different review does not inherit the exclusion: L42 depends on THAT one
+    other = drv._review_proofs([], state, union, sha, review="REVIEW-SOMETHING-ELSE")
+    assert sorted(e["task"] for e in other["entries"] if e["task"] != "<union tip>") == ["L42", "MEMBER"]
+    assert other["circular_members"] == []
+
+    # and omitting `review` restores the pre-D188 behaviour exactly, because the
+    # unbound SimpleNamespace caller (test_vppack.py:609) passes four positional args
+    old = drv._review_proofs([], state, union, sha)
+    assert sorted(e["task"] for e in old["entries"] if e["task"] != "<union tip>") == ["L42", "MEMBER"]
+    assert old["circular_members"] == []
+
+
+def test_d188_exclusion_reads_depends_on_from_the_packet_when_the_row_lacks_it(tmp_path, monkeypatch):
+    """The state row is not the only place a dependency is declared -- the pack
+    carries it too, and a row that has not been rewired yet has no key at all.
+    Reading only the row would make the exclusion depend on which of two stores
+    happened to be written first.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    sha = "a" * 40
+
+    state = {"tasks": {"L42": {"output_sha": sha, "kind": "builder"}}}   # no depends_on key
+    union = {"union": "u1", "members": [{"task": "L42", "output_sha": sha}]}
+    drv.pack = {"L42": {"depends_on": ["REVIEW-UNION-R4"]}}
+
+    out = drv._review_proofs([], state, union, sha, review="REVIEW-UNION-R4")
+    assert out["circular_members"] == ["L42"], out
