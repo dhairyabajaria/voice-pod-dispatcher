@@ -16,6 +16,7 @@ VP = HERE.parent
 sys.path.insert(0, str(VP))
 sys.path.insert(0, str(HERE))
 
+import lanedriver  # noqa: E402
 import vplint  # noqa: E402
 import vppack  # noqa: E402
 from test_lanedriver import Env, FakeRunner, TurnOutcome, by_role, findings, git, result_ok, settle  # noqa: E402
@@ -1039,7 +1040,11 @@ def test_divergent_dependency_outputs_hold_the_build_until_the_integrator_cuts_t
     assert rows["P-ON-BOTH"]["state"] == "READY" and "P-ON-BOTH" not in seen
     alerts = (env.run_root / "alerts.jsonl").read_text()
     assert "STACKED_BASE_MISSING" in alerts and "divergent dependency outputs ['P-FIX-A', 'P-FIX-B']" in alerts
-    assert "HOLD P-ON-BOTH 600s STACKED_BASE_MISSING" in (env.run_root / "driver.log").read_text()
+    # D196: the interval is read from the constant, so lowering it cannot make
+    # this test stale again (it was baked in as "600s" and broke when STACK_HOLD_S
+    # went 600 -> 60; the behaviour under test is the HOLD, not its duration).
+    assert ("HOLD P-ON-BOTH %ds STACKED_BASE_MISSING" % lanedriver.LaneDriver.STACK_HOLD_S) \
+        in (env.run_root / "driver.log").read_text()
     # the integrator cuts the integration union (D39: every verified row, the two fixes among
     # them) and lifts the hold itself; the build stands on its tip
     del drv._union_step
@@ -1084,7 +1089,8 @@ def test_build_whose_scheduler_dependency_is_a_verified_fix_not_in_its_base_is_h
     assert rows["P-STACKED"]["state"] == "READY", rows["P-STACKED"]["state"]
     alerts = (env.run_root / "alerts.jsonl").read_text()
     assert "STACK_REQUIRED" in alerts and "['P-DEP']" in alerts
-    assert "HOLD P-STACKED 600s STACK_REQUIRED" in (env.run_root / "driver.log").read_text()
+    assert ("HOLD P-STACKED %ds STACK_REQUIRED" % lanedriver.LaneDriver.STACK_HOLD_S) \
+        in (env.run_root / "driver.log").read_text()      # D196: constant, not a literal
     # with the real stack plan the same row builds on the dependency
     monkeypatch.undo()
     drv.clear_failures("P-STACKED")
@@ -1120,7 +1126,8 @@ def test_d63_base_invariant_holds_a_claim_whose_base_lacks_a_verified_dependency
     alerts = (env.run_root / "alerts.jsonl").read_text()
     assert "BASE_INVARIANT" in alerts and "P-DEP@%s" % rows["P-DEP"]["output_sha"][:12] in alerts
     assert "STACK_REQUIRED" not in alerts, "the D32 check was silenced: the invariant caught it alone"
-    assert "HOLD P-STACKED 600s BASE_INVARIANT" in (env.run_root / "driver.log").read_text()
+    assert ("HOLD P-STACKED %ds BASE_INVARIANT" % lanedriver.LaneDriver.STACK_HOLD_S) \
+        in (env.run_root / "driver.log").read_text()      # D196: constant, not a literal
     # the stacking patches back: the row builds on the dependency, the invariant agrees
     monkeypatch.undo()
     drv.clear_failures("P-STACKED")

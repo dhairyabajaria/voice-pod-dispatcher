@@ -136,7 +136,15 @@ def test_the_l28_split_classifies_as_the_ruling_says_it_should():
 # strict 184, loose 185, the one divergence still being that same
 # L17-REGISTRY-REPLY-PINS B10 `[box]` row. Confirmed pre-existing by running
 # this test at dispatcher e9fbfe2 (before D194): fails there identically.
-EXPECTED_HOSTED = 184
+# 2026-09-22 (~23:20Z): 184 -> 185, 206 packets. Verified independently with this
+# test's own regex first: strict 185, loose 186, sole divergence still that same
+# L17-REGISTRY-REPLY-PINS `[box]` row whose TEXT contains '[hosted]'.
+# DRIFT RATE, worth knowing before anyone treats a bump as noise: 169 -> 181 -> 184
+# -> 185 across one night, i.e. it moves roughly hourly while the pack is being
+# written. Every bump so far has been GROWTH (every hosted row still ABSENT), which
+# is the benign case this test distinguishes. The day it fails with rows no longer
+# ABSENT is the day the census actually started moving -- that one is not a bump.
+EXPECTED_HOSTED = 185
 
 
 def test_every_live_hosted_row_is_absent_today_so_the_census_starts_at_the_whole_corpus():
