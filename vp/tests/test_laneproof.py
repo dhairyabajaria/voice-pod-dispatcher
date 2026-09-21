@@ -1220,9 +1220,20 @@ def test_d135_run_circleci_reserves_its_host_and_does_not_increment_again():
         "run_circleci increments host_active itself -- reserve_host already took "
         "the slot, so this double-counts and the single decrement on release "
         "leaves the host permanently 'busy', shrinking the fleet silently")
-    assert "max(0, self.host_active.get(host, 0) - 1)" in src, (
+    # D143 re-point: the release moved into `_release_host_locked`, so this guard
+    # follows the PROPERTY rather than the line it used to live on -- a guard that
+    # tracks a spelling reddens on every refactor and protects nothing after one.
+    rel = inspect.getsource(laneproof.Proof._release_host_locked)
+    assert "max(0, self.host_active.get(host, 0) - 1)" in rel, (
         "the release path is gone: a reserved slot that is never freed is the "
         "same fleet-shrinking bug from the other direction")
+    assert "_release_host_locked" in src, (
+        "run_circleci no longer releases its reserved host on any path")
+    # and the property that matters, measured rather than grepped: both the success
+    # path and the D143 cap refusal give the slot back.
+    assert src.count("_release_host_locked(host)") >= 2, (
+        "both exits must release: the finally (success/failure) and the D143 "
+        "BLOCKED_CAP refusal, which returns before the try block is ever entered")
 
 
 def _open_full_record(run_root, cand, pipeline_id="pipe-206", proof_id="proof-full"):
@@ -1458,3 +1469,101 @@ def test_d140b_a_bare_job_name_only_is_legitimate_and_must_not_be_failed(tmp_pat
         "an underivable scope: %s / %s" % (rec["status"], rec.get("unscoped")))
     assert rec.get("unscoped") is None
     assert not [k for k, _ in alerts if k == "PROOF_SCOPE_UNPARSED"], alerts
+
+
+def test_d143_the_in_flight_cap_is_enforced_where_the_slot_is_taken(tmp_path):
+    """Four full-suite triggers race at a cap of 1; exactly one may win.
+
+    route() tests `circle_active` under the lock and then RELEASES it, and the
+    increment happens in a second acquisition inside run_circleci.  Every thread
+    arriving in that window read the same count and every one of them proceeded.
+    The barrier below sits in `triggered_pipeline` -- real work that genuinely runs
+    between the advisory check and the increment -- so the window is reproduced
+    rather than simulated.  Per D135, a control that does not reproduce the window
+    passes for the broken code too and proves nothing.
+    """
+    import threading
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/platform", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    gha = FakeGha(green)
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform", "full"],
+                        "account": "A1", "max_full_in_flight": 1, "delete_branch_after": True}}
+    p = make_proof(tmp_path, gha, FakeExec({}), cfg=cfg)
+    assert int(p.circle_cfg()["max_in_flight"]) == 1
+
+    N = 4
+    gate = threading.Barrier(N)
+    advisory_saw, real = [], p.triggered_pipeline
+
+    def triggered_pipeline(*a, **k):
+        # every racer is now past route()'s advisory check and none has incremented
+        advisory_saw.append(p.circle_active)
+        gate.wait(timeout=30)
+        return real(*a, **k)
+    p.triggered_pipeline = triggered_pipeline
+
+    recs, lock = [], threading.Lock()
+
+    def go(i):
+        r = p.run("L%02d" % i, "proof-L%02d-1" % i, wt, base, cand, "platform", [])
+        with lock:
+            recs.append(r)
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "a racer hung"
+
+    # the window is real: every racer passed the advisory check seeing an empty fleet
+    assert advisory_saw == [0] * N, (
+        "control: all %d racers must clear route()'s cap test before any increments, "
+        "or this test is not exercising the race at all: %r" % (N, advisory_saw))
+
+    triggered = [r for r in recs if r["status"] != "BLOCKED_CAP"]
+    blocked = [r for r in recs if r["status"] == "BLOCKED_CAP"]
+    assert len(triggered) == 1, (
+        "exactly one may hold the single slot; got %d: %r" % (len(triggered), [r["status"] for r in recs]))
+    assert len(blocked) == N - 1
+    assert all("max_full_in_flight 1" in r["reason"] for r in blocked), [r["reason"] for r in blocked]
+    assert len([c for c in gha.calls if c[0] == "trigger"]) == 1, (
+        "a refused racer must trigger nothing: %r" % (gha.calls,))
+    assert p.circle_active == 0, "every slot taken is given back"
+
+
+def test_d143_refusing_on_cap_gives_the_reserved_host_slot_back(tmp_path):
+    """The refusal path must not leak the D135 host reservation.
+
+    run_circleci reserves a host BEFORE the cap is tested, so a naive refusal
+    returns without releasing it.  That is strictly worse than the race it fixes:
+    the race over-admits by one, a leak removes a box from the fleet permanently.
+    """
+    wt, base, cand = repo(tmp_path)
+    green = {"jobs": [{"id": "j1", "name": "vp/platform", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "hosts": ["voicepod-a", "voicepod-b"], "max_full_in_flight": 1,
+                        "delete_branch_after": True}}
+    p = make_proof(tmp_path, FakeGha(green), FakeExec({}), cfg=cfg)
+
+    rec = p.run("L01", "proof-L01-1", wt, base, cand, "platform", [])
+    assert rec["status"] == "PASS"
+    assert not any((p.host_active or {}).values()), "a completed run releases its host"
+
+    # Reproduce the real refusal: route() saw a free fleet, and another racer took
+    # the last slot while this one was still doing setup.  Setting circle_active
+    # before p.run() instead would be refused by route()'s advisory gate and diverted
+    # to the box, never reaching the gate under test.
+    real = p.triggered_pipeline
+    def triggered_pipeline(*a, **k):
+        p.circle_active = 1          # the window: someone else won the slot
+        return real(*a, **k)
+    p.triggered_pipeline = triggered_pipeline
+    rec = p.run("L02", "proof-L02-1", wt, base, cand, "platform", [])
+    p.circle_active = 0
+    assert rec["status"] == "BLOCKED_CAP" and "max_full_in_flight 1" in rec["reason"]
+    assert not any((p.host_active or {}).values()), (
+        "the refusal leaked a host slot: %r" % (p.host_active,))

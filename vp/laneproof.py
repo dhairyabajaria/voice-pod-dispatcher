@@ -575,6 +575,21 @@ class Proof(object):
             self.host_active[host] = self.host_active.get(host, 0) + 1
             return host
 
+    def _release_host_locked(self, host):
+        """D143: give a reserved host slot back.  CALLER MUST HOLD `self._lock`
+        (`self._lock` is a plain Lock, not an RLock -- taking it again deadlocks)."""
+        if not host:
+            return
+        self.host_active = dict(getattr(self, "host_active", {}) or {})
+        self.host_active[host] = max(0, self.host_active.get(host, 0) - 1)
+
+    def release_host(self, host):
+        """The same, for callers that do NOT hold the lock."""
+        if not host:
+            return
+        with self._lock:
+            self._release_host_locked(host)
+
     def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None, order=False):
         cc = self.circle_cfg()
         host = None if only else self.reserve_host(cc)   # D135: choose+take atomically
@@ -586,22 +601,64 @@ class Proof(object):
         measured = cand                               # D83: the commit the run measures (cand + overlay on gha)
         pushed = {}                                   # account -> remote the branch was pushed to
         prior = self.triggered_pipeline(cand, only=only)
+        blocked = None
         with self._lock:
             # Fleet-1: only= runs count against their own cap, never the full-pipeline one
             # D141: `prior` means D81 adoption -- we re-poll an existing pipeline and
             # trigger nothing, so taking an in-flight slot throttles waiting rather
             # than triggering. Only a real trigger takes one, and `took_slot` decides
             # what the finally gives back.
+            #
+            # D143: this is the AUTHORITATIVE cap test, and it lives here because this
+            # is the acquisition that takes the slot.  route() (:151) and the only=
+            # gate (:260) read the same counters and then RELEASE the lock, so two
+            # proof threads arriving in that window both passed and both incremented
+            # -- check-then-act across two critical sections, the same shape as D135
+            # (pick_host) and D138 (_pick_server), a third time in a third module.
+            # Those two stay as ADVISORY pre-filters: they avoid wasted setup and keep
+            # producing the existing BLOCKED_CAP records, but they cannot be trusted to
+            # bound anything.  Reserving in route() was rejected -- it has early returns
+            # between there and here (the D111 lint gate at :293 builds a rec and
+            # returns), so a slot taken there leaks, and a leaked slot removes capacity
+            # permanently while the race only over-admits by one.
+            # An adopter (`prior`) takes no slot, so it is never capped: refusing a
+            # re-poll that triggers nothing would throttle waiting, which is the exact
+            # bug D141 fixed.
             took_slot = not prior
             if only:
                 if took_slot:
-                    self.only_active = getattr(self, "only_active", 0) + 1
+                    if getattr(self, "only_active", 0) >= self.only_cap():
+                        blocked = ("only=%s held: %d only= proofs in flight >= "
+                                   "max_only_in_flight %d (Fleet-1, D143)"
+                                   % (only, self.only_active, self.only_cap()))
+                    else:
+                        self.only_active = getattr(self, "only_active", 0) + 1
             else:
                 if took_slot:
-                    self.circle_active += 1
+                    fcap = int(cc.get("max_in_flight", 2))
+                    if self.circle_active >= fcap:
+                        blocked = ("full suite held: %d pipeline(s) in flight >= "
+                                   "max_full_in_flight %d (D143)" % (self.circle_active, fcap))
+                        # the host reserved above goes back under this same acquisition:
+                        # refusing on cap must not leak a box slot.
+                        self._release_host_locked(host)
+                        host = None
+                    else:
+                        self.circle_active += 1
                 # D135: the host slot was already taken by reserve_host() above --
                 # incrementing again here would double-count it and the release
                 # path (one decrement) would leave the host permanently "busy".
+        if blocked:
+            # Same record shape the advisory gates emit, so the driver's handling
+            # (HOLD + re-ask each tick, no strike) is unchanged.
+            rec = {"status": "BLOCKED_CAP", "route": self.hosted_route(), "proof_id": pid,
+                   "sha": cand, "kind": kind, "paths": paths, "pipeline_id": None,
+                   "account": None, "reason": blocked, "failed_nodes": [], "ts": utc_ms()}
+            if only:
+                rec["only"] = only
+            self._write(pid, rec)
+            self.log("PROOF %s %s -> BLOCKED_CAP: %s" % (task, pid, blocked))
+            return rec
         try:
             try:
                 if prior:
@@ -884,9 +941,7 @@ class Proof(object):
                 else:
                     if took_slot:
                         self.circle_active = max(0, self.circle_active - 1)
-                    if host:
-                        self.host_active = dict(getattr(self, "host_active", {}) or {})
-                        self.host_active[host] = max(0, self.host_active.get(host, 0) - 1)
+                    self._release_host_locked(host)      # D143: one spelling, lock held here
             if cc.get("delete_branch_after", True):
                 for acct, remote in (pushed or {"": cc.get("push_remote")}).items():
                     try:
