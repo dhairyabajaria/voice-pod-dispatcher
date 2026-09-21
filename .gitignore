@@ -2,3 +2,10 @@ __pycache__/
 *.py[cod]
 *.log
 .DS_Store
+
+# §181 clause 4: guard-mutation control logs are EVIDENCE, not output. `*.log`
+# above silently dropped every one of them -- the WA-03 defect exactly: the
+# controls really ran, the logs really existed, and nothing shipped, so on the
+# artifact alone genuine controls were indistinguishable from controls that
+# never ran. A reviewer must be able to reach these from a clean clone.
+!vp/guard-controls/**/*.log

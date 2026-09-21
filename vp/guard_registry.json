@@ -1,0 +1,83 @@
+{
+  "_spec": "v13-pack/SPECS/GUARD-MUTATION-REGISTRY-SPEC.md (Architect, 2026-09-20T23:59:39Z), Part A.",
+  "_what_this_does_not_claim": "Coverage of the whole guard population. The registry is authoritative for what it CONTAINS and says nothing about what it omits. Enumerating 'every guard' by any literal -- a name pattern, a `raise` spelling, a decorator -- is the same defect in a new costume. Completeness is a review obligation, not a check here.",
+  "_why_dispatcher": "All three settled vacuous-guard instances are in orchestration code; zero are under platform/. A meta-test in platform/tests/ would have covered none of them.",
+  "_who_runs_these": "This harness, from dispatcher/, where pytest execution is available. The OpenCode vp-builder sandbox denies pytest in every spelling (D88), so a builder can never produce this evidence -- which is why packet-side controls ship as pre-run logs in the packet directory and are copied in by D116.",
+  "guards": [
+    {
+      "guard_id": "laneproof.Proof.open_answers.scope",
+      "path": "vp/laneproof.py",
+      "symbol": "Proof.open_answers",
+      "base_sha": "1bdb60f",
+      "why": "D117/\u00a7136: an open pipeline may be re-polled for an ask only when it ran the SAME thing. Without it one scoped set is adopted for another -- five siblings adopted one twin's pipeline in a single day -- and a row is then graded on a measurement of different files.",
+      "controls": [
+        {
+          "edit": "the twin-adopts-full clause returns True unconditionally, so any open record answers any ask",
+          "_edit_old": "        return bool(only and str(only).startswith(\"twin:\") and not rec_only)",
+          "_edit_new": "        return True",
+          "node": "tests/test_laneproof.py::test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set",
+          "observed": "AssertionError: targeted: adopts nothing else",
+          "log": "guard-controls/laneproof_Proof_open_answers_scope/RUN-20260921T010158Z.log",
+          "ts": "RUN-20260921T010158Z"
+        },
+        {
+          "edit": "the equal-only fast path is inverted, so an exact match is refused and a mismatch accepted",
+          "_edit_old": "        if rec_only == only:\n            return True",
+          "_edit_new": "        if rec_only != only:\n            return True",
+          "node": "tests/test_laneproof.py::test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set",
+          "observed": "AssertionError: assert '1002' == '1001'",
+          "log": "guard-controls/laneproof_Proof_open_answers_scope/RUN-20260921T010235Z.log",
+          "ts": "RUN-20260921T010235Z"
+        }
+      ],
+      "source_sha256": "04acf5d5685b1f27ef68c722bec1816f1bdb59305b8442858c2019b4393a152e"
+    },
+    {
+      "guard_id": "lanedriver.LaneDriver._pick_server.spread",
+      "path": "vp/lanedriver.py",
+      "symbol": "LaneDriver._pick_server",
+      "base_sha": "1bdb60f",
+      "why": "D134: first-fit over sorted names never spreads, because max_concurrent 100 against a driver cap of 15 means capacity never runs out and the first name absorbs everything. The fleet reads as three servers and behaves as one.",
+      "controls": [
+        {
+          "edit": "least-loaded selection replaced by first-fit over the sorted names (the pre-D134 body)",
+          "_edit_old": "        free = [(srv[\"active\"], name) for name, srv in sorted(self.servers.items())\n                if not self._parked(srv) and srv[\"active\"] < srv[\"max_concurrent\"]]\n        return min(free)[1] if free else None",
+          "_edit_new": "        for name in sorted(self.servers):\n            srv = self.servers.get(name)\n            if srv and not self._parked(srv) and srv[\"active\"] < srv[\"max_concurrent\"]:\n                return name\n        return None",
+          "node": "tests/test_lanedriver.py::test_d134_an_unpinned_role_spreads_across_the_fleet_and_a_pin_still_wins",
+          "observed": "AssertionError: ['go1', 'go1', 'go1']",
+          "log": "guard-controls/lanedriver_LaneDriver__pick_server_spread/RUN-20260921T010236Z.log",
+          "ts": "RUN-20260921T010236Z"
+        },
+        {
+          "edit": "an explicit server: pin is ignored, so a placement decision silently becomes a hint",
+          "_edit_old": "        want = rcfg.get(\"server\")\n        if want:",
+          "_edit_new": "        want = None\n        if want:",
+          "node": "tests/test_lanedriver.py::test_d134_an_unpinned_role_spreads_across_the_fleet_and_a_pin_still_wins",
+          "observed": "AssertionError: assert 'go2' == 'go1'",
+          "log": "guard-controls/lanedriver_LaneDriver__pick_server_spread/RUN-20260921T010237Z.log",
+          "ts": "RUN-20260921T010237Z"
+        }
+      ],
+      "source_sha256": "08016b2ebc2d9004128e4c760a90404252f3e017ee94ac562d1a66c2d00ba6a2"
+    },
+    {
+      "guard_id": "lanedriver.LaneDriver._check_role_variants.undeclared",
+      "path": "vp/lanedriver.py",
+      "symbol": "LaneDriver._check_role_variants",
+      "base_sha": "1bdb60f",
+      "why": "D132: neither end validates spec.variant. vprunners puts the string straight into the prompt_async body and the server answers 204 to ANY string and echoes it back -- measured live with 'definitely-not-a-variant'. A misrouted role produces no error, no red and no log line; the provider catalog is the only place it is visible.",
+      "controls": [
+        {
+          "edit": "the declared-variants map is emptied, so the check returns before comparing anything",
+          "_edit_old": "        if not declared:\n            return",
+          "_edit_new": "        declared = {}\n        if not declared:\n            return",
+          "node": "tests/test_lanedriver.py::test_d132_a_role_asking_for_a_variant_its_model_does_not_declare_is_alerted",
+          "observed": "FileNotFoundError: alerts.jsonl never written -- the check emitted no alert at all",
+          "log": "guard-controls/lanedriver_LaneDriver__check_role_variants_undeclared/RUN-20260921T010238Z.log",
+          "ts": "RUN-20260921T010238Z"
+        }
+      ],
+      "source_sha256": "a7f0e9f4a6fd7625df4d2fd06cd77d1b10649bc128f8ac41780507968b6fa8e5"
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+# guard control: laneproof.Proof.open_answers.scope [0]
+# stamp: RUN-20260921T010158Z
+# path: vp/laneproof.py  symbol: Proof.open_answers
+# edit: the twin-adopts-full clause returns True unconditionally, so any open record answers any ask
+# node: tests/test_laneproof.py::test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set
+
+## 1. BASELINE (unmutated) -- a red proves nothing unless this is green
+1 passed in 1.40s
+
+## 2. MUTATED -- exactly one edit applied
+1 failed in 0.24s
+observed: AssertionError: targeted: adopts nothing else
+
+## 3. pytest output (mutated run, tail)
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______ test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set _______
+
+tmp_path = PosixPath('/private/var/folders/cx/txbx4n6j6yv4x30f2v11_pd80000gn/T/pytest-of-dhairyabajaria/pytest-52/test_d117_an_open_pipeline_is_0')
+
+    def test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set(tmp_path):
+        """D117 (§136): D81/D93 re-poll matched by sha alone, so under D113 a twin
+        adopted a sibling twin's open pipeline that never ran its files (5 VERIFIED
+        on borrowed answers).  Now: equal `only` only (full for full, one scoped set
+        for the identical set); a twin ask may adopt an open FULL run; a scoped set
+        never answers another scoped set or a full ask.  Ledger rows carry `only`."""
+        wt, base, cand = repo(tmp_path)
+        circle = FakeCircle({"jobs": [{"id": "j2", "name": "lint", "status": "success", "job_number": 1}],
+                             "failed_tests": {}, "workflows": [{"id": "w1", "status": "success"}]})
+        p = make_proof(tmp_path, circle, FakeExec({}))
+        ledger = tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        a = "twin:3:platform/tests/test_a.py"
+        b = "twin:3:platform/tests/test_b.py"
+        rows = [{"ts": "2026-09-20T17:11:00.000Z", "proof_id": "proof-A-HOSTED-1", "pipeline_id": "1001", "account": "gha",
+                 "sha": cand, "status": "triggered", "only": a},
+                {"ts": "2026-09-20T17:12:00.000Z", "proof_id": "proof-FULL-1", "pipeline_id": "1002", "account": "gha",
+                 "sha": cand, "status": "triggered", "only": None}]
+        ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        assert p.triggered_pipeline(cand, only=a)["pipeline_id"] == "1001"
+        got = p.triggered_pipeline(cand, only=b)
+        assert got["pipeline_id"] == "1002", "a sibling's scoped run is never adopted; the open FULL run is"
+        assert p.triggered_pipeline(cand)["pipeline_id"] == "1002", "a full ask takes the full run only"
+>       assert p.triggered_pipeline(cand, only="targeted:3:platform/tests/test_b.py") is None, "targeted: adopts nothing else"
+E       AssertionError: targeted: adopts nothing else
+E       assert {'ts': '2026-09-20T17:12:00.000Z', 'proof_id': 'proof-FULL-1', 'pipeline_id': '1002', 'account': 'gha', ...} is None
+E        +  where {'ts': '2026-09-20T17:12:00.000Z', 'proof_id': 'proof-FULL-1', 'pipeline_id': '1002', 'account': 'gha', ...} = triggered_pipeline('85b1ce50210dd6f08b82ac6585dbc0222671b3c6', only='targeted:3:platform/tests/test_b.py')
+E        +    where triggered_pipeline = <laneproof.Proof object at 0x1095e1760>.triggered_pipeline
+
+/Users/dhairyabajaria/Claude Code/Calling New/dispatcher/vp/tests/test_laneproof.py:1078: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_laneproof.py::test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set
+1 failed in 0.24s
+

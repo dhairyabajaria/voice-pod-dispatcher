@@ -1,0 +1,22 @@
+# controls for test_guard_registry.py itself
+# stamp: RUN-20260921T010432Z
+# question: can the meta-test fail? A guard about vacuous guards that cannot
+#           redden would be the exact defect it exists to catch.
+# method:   mirror dispatcher/ to scratch, mutate ONLY guard_registry.json,
+#           run tests/test_guard_registry.py, record the summary line.
+#           The live registry is never touched.
+
+MUTATION                         verdict      pytest summary
+clause 1 (symbol resolves)       RED (good)   2 failed, 16 passed in 1.59s
+clause 2 (source hash)           RED (good)   1 failed, 17 passed in 1.33s
+clause 3 (node collects)         RED (good)   1 failed, 17 passed in 0.99s
+clause 4 (log reachable)         RED (good)   1 failed, 17 passed in 1.18s
+clause 5 (distinct observed)     RED (good)   1 failed, 17 passed in 1.22s
+non-empty registry               RED (good)   1 failed, 6 skipped in 0.02s
+edit is unambiguous              RED (good)   1 failed, 17 passed in 1.32s
+
+7 of 7 mutations reddened. Note the "non-empty registry" row: with guards=[]
+every parametrized clause SKIPS (6 skipped) and only the non-empty assertion
+fires -- which is why that assertion exists and is not redundant.
+
+unmutated baseline: 18 passed in 0.78s
