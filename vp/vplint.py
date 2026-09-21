@@ -50,6 +50,40 @@ import vpschema  # noqa: E402
 REQUIRED_KEYS = ("item", "title", "group", "base_sha", "owned_files", "test_paths",
                  "proof_kind", "max_rounds")
 LIST_KEYS = ("depends_on", "releases", "owned_files", "forbidden_files", "test_paths")
+
+# D139: the packet header is a CLOSED vocabulary.  Nothing rejected an unknown
+# key, so `twin_scopes:` or `twin_scope: ful` parsed fine, was read by nobody,
+# and the packet silently kept the default -- a fail-open on a header whose whole
+# purpose is to override a default.  That matters now that `twin_scope: full` is
+# load-bearing: a typo does not fail, it quietly restores the scoped twin the
+# header was written to refuse.
+#
+# Derived from what actually CONSUMES a key, not from what packets happen to
+# contain -- a vocabulary read off the corpus blesses every typo already in it
+# ([[a-validity-check-needs-the-whole-vocabulary]]).  Two sources:
+#   - read by the driver: measured by grep over dispatcher/vp/*.py, 2026-09-21;
+#   - read by humans: `security_review` is a review-policy field (04-REVIEW-POLICY.md,
+#     BULK-RULING-2026-09-18.md) carried by 81 packets and deliberately not in the
+#     driver.  It is legitimate and must not be flagged.
+# Adding a header key means adding it here, which is the point: the failure mode
+# being closed is a key that no code reads.
+KNOWN_KEYS = frozenset((
+    # present in all 170 packets
+    "item", "title", "group", "base_sha", "depends_on", "releases", "critical",
+    "owned_files", "forbidden_files", "test_paths", "proof_kind", "max_rounds",
+    "max_minutes_build", "reviewer_model", "owner_needed", "v13_kind",
+    "scheduler_task", "closes", "template", "runner_role", "hosted_owed", "owner_gate",
+    # optional, driver-read
+    "parent_contract", "coverage_targets", "review_base", "proof_paths",
+    "proof_workers", "twin_scope",
+    # optional, policy-read (no driver consumer, by design)
+    "security_review",
+))
+
+# lanedriver.py:1542 tests `str(hdr.get("twin_scope") or "").strip().lower() == "full"`
+# and falls through to the SCOPED twin on anything else.  So "full" is the only
+# value that does anything, and every other spelling is a silent no-op.
+TWIN_SCOPE_VALUES = ("full",)
 KINDS = ("invariant", "test", "negative", "forbidden", "evidence")
 _BENCH_RE = re.compile(r"^\s*-\s+(B\d+)\s+\[(\w+)\]\s+(.+)$")
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -169,6 +203,17 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
         if k in hdr and not isinstance(hdr[k], list):
             out.append("ERROR header: %s must be a list" % k)
             hdr[k] = []
+    for k in sorted(set(hdr) - KNOWN_KEYS):
+        out.append("ERROR header: unknown key %r -- no code reads it, so it is a typo or a "
+                   "new key that must be added to vplint.KNOWN_KEYS. Nothing else will "
+                   "report it: an unread key parses cleanly and silently keeps the default"
+                   % k)
+    if "twin_scope" in hdr:
+        v = str(hdr.get("twin_scope") or "").strip().lower()
+        if v not in TWIN_SCOPE_VALUES:
+            out.append("ERROR header: twin_scope %r is not one of %s -- lanedriver only acts on "
+                       "'full' and falls through to the SCOPED twin on anything else, so this "
+                       "silently does nothing" % (hdr.get("twin_scope"), "|".join(TWIN_SCOPE_VALUES)))
     base = str(hdr.get("base_sha", ""))
     if not _SHA40.match(base):
         out.append("ERROR header: base_sha must be 40 lowercase hex, got %r" % base)

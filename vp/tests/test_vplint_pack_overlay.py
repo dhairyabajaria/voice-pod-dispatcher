@@ -108,3 +108,50 @@ def test_the_live_pack_checker_requires_the_standing_line():
                                               "closes: []\nrunner_role: builder\nhosted_owed: false\nowner_gate: none\n"))
         out = vplint.lint_packet(d / "PACKET.md", d / "BENCHMARK.md", packets_dir=str(packs))
         assert any("One shell command per bash call" in o for o in out), out
+
+
+def test_d139_an_unknown_header_key_is_rejected_instead_of_silently_ignored(tmp_path):
+    """D139: the packet header had no closed vocabulary, so a misspelled key
+    parsed cleanly, was read by nobody, and left the packet on the default.
+
+    That is a fail-open on a field whose only purpose is to OVERRIDE a default.
+    `twin_scope: full` is load-bearing -- it forces an unscoped hosted twin, and
+    R-SEC-CALLERS-AND-SEED-ROUTE needed it to answer a [hosted] row at all. A
+    typo in it does not fail loudly; it silently restores the scoped twin the
+    header was written to refuse, and the packet burns its round budget on a row
+    it cannot answer.
+
+    The baseline assertion is the control: the fixture must lint clean, or a
+    vocabulary that rejects everything would pass this test for the wrong
+    reason."""
+    good = _packet(tmp_path / "good")
+    assert not [ln for ln in vplint.lint_packet(str(good / "PACKET.md"), str(good / "BENCHMARK.md"))
+                if "unknown key" in ln], "the unmutated fixture must be clean"
+
+    for spelling in ("twin_scopes", "twn_scope", "proof_scope"):
+        d = _packet(tmp_path / spelling, PACKET.replace("proof_kind: platform",
+                                                        "%s: full\nproof_kind: platform" % spelling))
+        out = vplint.lint_packet(str(d / "PACKET.md"), str(d / "BENCHMARK.md"))
+        assert any("unknown key" in ln and spelling in ln for ln in out), (
+            "%s is read by no code and must be rejected, not ignored: %r" % (spelling, out))
+
+
+def test_d139_twin_scope_must_carry_a_value_lanedriver_actually_acts_on(tmp_path):
+    """D139: `lanedriver._twin_scope_only` (:1542) tests
+    `str(hdr.get("twin_scope") or "").strip().lower() == "full"` and falls
+    through to the SCOPED twin on anything else. So every spelling but "full" is
+    a silent no-op, and a wrong value is indistinguishable from omitting the key.
+
+    "full" itself must stay accepted -- a check that rejected the one working
+    value would be worse than no check at all."""
+    ok = _packet(tmp_path / "full", PACKET.replace("proof_kind: platform",
+                                                   "twin_scope: full\nproof_kind: platform"))
+    assert not [ln for ln in vplint.lint_packet(str(ok / "PACKET.md"), str(ok / "BENCHMARK.md"))
+                if "twin_scope" in ln], "twin_scope: full is the working value and must pass"
+
+    for bad in ("ful", "FULL-SUITE", "true", "yes"):
+        d = _packet(tmp_path / ("bad-" + bad), PACKET.replace(
+            "proof_kind: platform", "twin_scope: %s\nproof_kind: platform" % bad))
+        out = vplint.lint_packet(str(d / "PACKET.md"), str(d / "BENCHMARK.md"))
+        assert any("twin_scope" in ln and "is not one of" in ln for ln in out), (
+            "twin_scope: %s does nothing in lanedriver and must be rejected: %r" % (bad, out))
