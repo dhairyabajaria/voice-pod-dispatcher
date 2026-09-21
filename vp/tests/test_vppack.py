@@ -1732,3 +1732,102 @@ def test_d145_a_not_in_scope_section_never_supplies_the_parent():
         "unanticipated negative headings still leak -- deliberate: the alternative "
         "(whitelisting trusted sections) turns every unanticipated POSITIVE heading "
         "into a fatal PACKET_NO_PARENT")
+
+
+# -- D163: a product verdict is not adopted across items when nothing scopes it ----------------
+
+def _fp(proof_id, nodes, **kw):
+    rec = {"proof_id": proof_id, "status": "FAIL_PRODUCT", "route": "gha", "pipeline_id": "p1",
+           "kind": "platform", "paths": [], "only": None, "failed_nodes": list(nodes), "ts": "1"}
+    rec.update(kw)
+    return rec
+
+
+def test_d163_proof_task_recovers_the_item_from_a_proof_id():
+    """D163. `pid` is built as `proof-<task>-<attempt[-15:]>`, and some records
+    carry a further `-p<sha>` leg, so both tails come off.
+
+    The empty return is load-bearing: one `reused_from` in run-v13-20260917 is a
+    free-text provenance note ("Fixer 2026-09-19T19:14:17Z: the per-atte..."),
+    not a proof id at all. It must decline to parse rather than be mistaken for
+    an item."""
+    from lanedriver import LaneDriver as D
+
+    assert D.proof_task("proof-L34-ERROR-KIND-PRIVACY-HOSTED-R1-60920T210858201") \
+        == "L34-ERROR-KIND-PRIVACY-HOSTED-R1"
+    assert D.proof_task("proof-L06-HOSTED-R3-60919T182758282-p722a0b89") == "L06-HOSTED-R3"
+    assert D.proof_task("proof-L04-FLOOR-PROOF-BRANCH-HOSTED-R1-60920T172722305") \
+        == "L04-FLOOR-PROOF-BRANCH-HOSTED-R1"
+    assert D.proof_task("Fixer 2026-09-19T19:14:17Z: the per-attempt record") == ""
+    assert D.proof_task(None) == "" and D.proof_task("") == ""
+
+
+def test_d163_unattributable_for_names_the_four_real_cases_and_no_others():
+    """D163's predicate, against the exact population measured in
+    run-v13-20260917. Eighteen records carry reused_from/restored_by; twelve are
+    PASS and stay reusable, and of the six FAIL_PRODUCT ones only four are this
+    defect.
+
+    The two that are NOT are the reason the predicate is what it is:
+      * L06-HOSTED-R3 reusing its OWN earlier record -- same item, so the
+        partition it inherits was computed against its own base and is valid;
+      * a record whose provenance is free text, which names no item to compare.
+
+    A predicate that flagged either would refuse reuses that are sound, and
+    would cost a real pipeline each time."""
+    from lanedriver import LaneDriver as D
+
+    # the four
+    assert D.unattributable_for(
+        "L34-ERROR-KIND-PRIVACY-HOSTED-R1",
+        _fp("proof-L04-FLOOR-HOSTED-R2-60920T210540342", ["a::t"] * 3265)) == "L04-FLOOR-HOSTED-R2"
+    assert D.unattributable_for(
+        "L33-HOSTED-R2", _fp("proof-L19-HOSTED-R2-60920T210555466", ["a::t"])) == "L19-HOSTED-R2"
+    assert D.unattributable_for(
+        "L04-FLOOR-HOSTED-R2",
+        _fp("proof-L04-FLOOR-PROOF-BRANCH-HOSTED-R1-60920T172722305", ["a::t"])) \
+        == "L04-FLOOR-PROOF-BRANCH-HOSTED-R1", "a longer item id is not the same item"
+    assert D.unattributable_for(
+        "R-COVERAGE-RELATIVE-FILES-HOSTED-R1",
+        _fp("proof-L29-ENROLL-FENCE-HOSTED-R2-60920T210000000", ["a::t"] * 11)) \
+        == "L29-ENROLL-FENCE-HOSTED-R2"
+
+    # ... and the two that are not
+    assert D.unattributable_for(
+        "L06-HOSTED-R3", _fp("proof-L06-HOSTED-R3-60919T182758282-p722a0b89", ["a::t"] * 62)) == "", \
+        "the same item's own earlier record: its partition IS against this base"
+    assert D.unattributable_for(
+        "L06-HOSTED-R3", _fp("Fixer 2026-09-19T19:14:17Z: restored", ["a::t"] * 62)) == "", \
+        "free-text provenance names no item to compare against"
+
+
+def test_d163_a_green_full_run_is_still_adopted_by_anyone():
+    """D163's load-bearing control, and the reason the predicate is not simply
+    'adopted from another item'.
+
+    A PASS on this exact tree is green for everyone and there is nothing to
+    attribute -- twelve of the eighteen adopted records in run-v13-20260917 are
+    exactly that, and they are the whole point of D79 reuse. Refusing them would
+    trigger a real pipeline per item for an answer already in hand."""
+    from lanedriver import LaneDriver as D
+
+    green = _fp("proof-L04-FLOOR-HOSTED-R2-60920T210540342", [])
+    green["status"] = "PASS"
+    assert D.unattributable_for("L34-ERROR-KIND-PRIVACY-HOSTED-R1", green) == ""
+    # a FAIL_PRODUCT that somehow carries no red nodes has nothing to mis-attribute
+    assert D.unattributable_for("L34-X", _fp("proof-L04-FLOOR-HOSTED-R2-60920T1", [])) == ""
+
+
+def test_d163_a_scoped_record_is_left_to_the_d140_filter():
+    """D163 control: a record that declares what it ran can be re-scoped, and
+    D140 is what does it. This branch is only for the case where NOTHING scopes
+    the verdict. Both spellings of a scope count -- `only` and `paths` -- which
+    is the narrowing the box-run population forced earlier tonight."""
+    from lanedriver import LaneDriver as D
+
+    scoped = _fp("proof-L04-FLOOR-HOSTED-R2-60920T210540342", ["a::t"],
+                 only="twin:3:platform/tests/test_a.py")
+    assert D.unattributable_for("L34-X", scoped) == ""
+    with_paths = _fp("proof-L04-FLOOR-HOSTED-R2-60920T210540342", ["a::t"],
+                     paths=["platform/tests/test_a.py"])
+    assert D.unattributable_for("L34-X", with_paths) == ""

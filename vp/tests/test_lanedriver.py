@@ -2121,6 +2121,55 @@ def test_d76_memory_stop_pauses_every_claim_below_20_percent(tmp_path):
     assert drv._guards() is True
 
 
+def test_d163_reuse_refuses_another_items_unscoped_product_verdict_at_the_call_site(tmp_path):
+    """D163 at the site that does the work, not just against the predicate.
+
+    `_reusable_proof` keys on (sha, kind, paths), so one item's answer is copied
+    wholesale onto another's attempt. For a PASS that is sound. For a
+    FAIL_PRODUCT it is not: `partition_red_nodes(wt, BASE, cand, ...)` splits the
+    reds against the record OWNER's base, and a different item has a different
+    base, so the inherited split was computed for somebody else's diff.
+
+    Measured in run-v13-20260917: L34-ERROR-KIND-PRIVACY-HOSTED-R1 inherited 3265
+    reds from L04-FLOOR-HOSTED-R2 this way.
+
+    Refusing the reuse rather than adopting-and-stripping is the deliberate part:
+    a stripped record would be filed as FAIL_INFRA, the retry would find this
+    same record still sitting there, and the item would strip it again forever.
+    Falling through triggers a real run against this item's own base."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()})
+    proofs = env.run_root / "proofs"
+    proofs.mkdir(exist_ok=True)
+    sha = "c" * 40
+
+    def rec(pid, **kw):
+        d = {"proof_id": pid, "sha": sha, "kind": "platform", "paths": [], "only": None,
+             "route": "gha", "pipeline_id": "p-" + pid, "status": "FAIL_PRODUCT",
+             "failed_nodes": ["platform/tests/test_x.py::test_x"],
+             "ts": "2026-09-20T21:05:40.342Z"}
+        d.update(kw)
+        (proofs / (pid + ".json")).write_text(json.dumps(d))
+
+    rec("proof-L04-FLOOR-HOSTED-R2-60920T210540342")
+    mine = "L34-ERROR-KIND-PRIVACY-HOSTED-R1"
+
+    assert drv._reusable_proof(sha, "platform", [], task=mine) is None, (
+        "another item's unscoped product verdict must not be adopted")
+    # the same record is still this item's own answer when the item IS its owner
+    assert drv._reusable_proof(sha, "platform", [], task="L04-FLOOR-HOSTED-R2") is not None
+    # ... and without a task the call behaves exactly as it did before D163, so
+    # every other caller and test is untouched
+    assert drv._reusable_proof(sha, "platform", []) is not None
+
+    # a green from another item is still adopted: that is what D79 reuse is FOR
+    (proofs / "proof-L04-FLOOR-HOSTED-R2-60920T210540342.json").unlink()
+    rec("proof-L04-FLOOR-HOSTED-R3-60920T210540999", status="PASS", failed_nodes=[])
+    got = drv._reusable_proof(sha, "platform", [], task=mine)
+    assert got and got["status"] == "PASS", got
+
+
 def test_d79_reusable_proof_picks_a_real_answer_for_the_same_sha_kind_and_paths(tmp_path):
     """D79 (Architect, 2026-09-19 19:0xZ): the round loop re-proved the same
     sha every round and on CircleCI that is a NEW pipeline per round

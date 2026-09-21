@@ -5618,7 +5618,7 @@ class LaneDriver(object):
             self.log("PROOF %s scope: %d path(s) from proof_paths, workers=%s%s%s"
                      % (task, len(paths), workers, ", only=%s (one hosted job/leg, D98)" % only if only else "",
                         ", order=final (platform-order rendered, D100)" if order else ""))
-        prior = self._reusable_proof(cand, pkind, paths, exclude=pid, only=only, order=order)
+        prior = self._reusable_proof(cand, pkind, paths, exclude=pid, only=only, order=order, task=task)
         if prior is not None:
             # D79: the same sha + kind + paths already has a real answer (a CircleCI
             # pipeline or a completed box run, PASS/FAIL_PRODUCT): reuse it, never
@@ -6086,7 +6086,69 @@ class LaneDriver(object):
                 found.append(rec)
         return max(found, key=lambda r: str(r.get("ts") or "")) if found else None
 
-    def _reusable_proof(self, sha, kind, paths, exclude=None, only=None, order=False):
+    #: D163: the trailing segments `pid = "proof-<task>-<attempt15>"` and its
+    #: `-p<sha>` variant append, stripped to recover the task a record belongs to.
+    PROOF_ID_TAIL_RE = re.compile(r"-(?:p[0-9a-f]{6,}|\d+T\d+)$")
+
+    @classmethod
+    def proof_task(cls, proof_id):
+        """the task a proof record belongs to, from its proof_id, or "".
+
+        `pid` is built as `proof-<task>-<attempt[-15:]>` and some records carry a
+        further `-p<sha>` leg, so both tails come off and whatever is left is the
+        task.  Returns "" for anything that does not start with `proof-`, which is
+        how a free-text provenance string (one `reused_from` in this run reads
+        "Fixer 2026-09-19T19:14:17Z: the per-atte...") declines to be parsed
+        instead of being mistaken for an item id."""
+        pid = str(proof_id or "")
+        if not pid.startswith("proof-"):
+            return ""
+        pid = pid[len("proof-"):]
+        for _ in range(2):
+            pid = cls.PROOF_ID_TAIL_RE.sub("", pid, count=1)
+        return pid
+
+    @classmethod
+    def unattributable_for(cls, task, rec):
+        """D163: would reusing `rec` charge `task` reds that were never partitioned
+        against ITS base?
+
+        D79 reuse keys on (sha, kind, paths), so one item's answer can be copied
+        wholesale onto another's attempt.  For a PASS that is sound and valuable:
+        a green full run on this exact tree is green for everyone, and there is
+        nothing to attribute.  For a FAIL_PRODUCT it is not, because
+        `laneproof.partition_red_nodes(wt, BASE, cand, ...)` splits the reds into
+        touched and untouched files **between the record owner's base and cand**.
+        A different item has a different base, so the split it inherits was
+        computed for somebody else's diff and its `failed_nodes` mean nothing here.
+
+        Measured 2026-09-21 over the 535 records in run-v13-20260917: 18 carry
+        `reused_from`/`restored_by`.  Twelve are PASS and stay reusable.  Of the
+        six FAIL_PRODUCT ones, four are cross-item and are exactly this defect --
+        L34-ERROR-KIND-PRIVACY-HOSTED-R1 inherited 3265 reds from L04-FLOOR-HOSTED-R2,
+        L33-HOSTED-R2 inherited 1260 from L19-HOSTED-R2, L04-FLOOR-HOSTED-R2
+        inherited 3265 from L04-FLOOR-PROOF-BRANCH-HOSTED-R1, and
+        R-COVERAGE-RELATIVE-FILES-HOSTED-R1 inherited 11 from
+        L29-ENROLL-FENCE-HOSTED-R2.  The remaining two are NOT this defect and the
+        predicate must leave them alone: one reuses the same item's own earlier
+        record (L06-HOSTED-R3 from L06-HOSTED-R3-...-p722a0b89) and one names no
+        parseable item at all.
+
+        Scope: only a record with neither `only` nor `paths`.  A scoped record
+        declares what it ran, so D140's filter can answer for it; this is about
+        the case where nothing does.  D140 does not reach here -- none of the 18
+        adopted records is a `twin:` ask.
+        """
+        if str(rec.get("status")) != "FAIL_PRODUCT" or not rec.get("failed_nodes"):
+            return ""
+        if (rec.get("only") or None) or (rec.get("paths") or None):
+            return ""
+        owner = cls.proof_task(rec.get("proof_id"))
+        if not owner or owner == str(task):
+            return ""
+        return owner
+
+    def _reusable_proof(self, sha, kind, paths, exclude=None, only=None, order=False, task=None):
         """D79: the newest real answer already recorded for sha + kind + paths --
         a circleci record with a pipeline_id, or a box record -- with status
         PASS/FAIL_PRODUCT; None otherwise (FAIL_INFRA/UNKNOWN/CANCELLED/BLOCKED_*
@@ -6128,6 +6190,19 @@ class LaneDriver(object):
             if [str(x) for x in (rec.get("paths") or [])] != want:
                 continue
             if rec.get("status") not in self.REUSABLE_STATUSES:
+                continue
+            owner = self.unattributable_for(task, rec) if task else ""
+            if owner:
+                # D163: do not adopt another item's product verdict when nothing
+                # scopes it.  Refusing the REUSE (rather than keeping it and
+                # stripping the nodes) is deliberate: a stripped record would be
+                # written as FAIL_INFRA, the retry would find this same record
+                # still sitting there, and the item would strip it again forever.
+                # Falling through triggers a real run for this item's own base.
+                self.log("PROOF REUSE refused for %s: %s is %s's full-suite verdict with %d red "
+                         "node(s) partitioned against ITS base, and carries no only= or paths to "
+                         "re-scope by (D163)"
+                         % (task, rec.get("proof_id"), owner, len(rec.get("failed_nodes") or [])))
                 continue
             if route in laneproof.HOSTED_ROUTES and not rec.get("pipeline_id"):
                 continue
