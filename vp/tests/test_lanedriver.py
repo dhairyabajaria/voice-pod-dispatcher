@@ -5855,3 +5855,94 @@ def test_d192_the_announcement_set_survives_a_reload(tmp_path, monkeypatch):
     assert drv._fallback_live() == set()
     drv._fallback_live().add("x")
     assert drv._fallback_live() == {"x"}, "and it persists once created"
+
+
+def test_d193_an_exception_strikes_out_to_a_terminal_state_like_every_other_path(tmp_path, monkeypatch):
+    """D193: `_task_thread`'s generic handler counted to 3/3 and alerted STUCK but
+    never wrote a terminal state, so the row stayed RUNNING with its claim ACTIVE
+    forever.  Measured on R-RELEASE-MANIFEST-PRODUCER (2026-09-21T20:51-20:54Z):
+    FAIL 1/3, 2/3, 3/3, ALERT STUCK, then state RUNNING, output_sha None, claim
+    still ACTIVE holding its evidence path, and no COMPLETE line at all.
+
+    A row wedged at RUNNING is invisible to every red/INVALID_EVIDENCE sweep, and
+    `retry-packet` correctly refuses a non-terminal row -- so the only symptom is
+    a row quietly doing nothing.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    done, alerts = [], []
+    monkeypatch.setattr(drv, "_complete",
+                        lambda task, attempt, outcome, tdir, **kw: done.append((task, outcome, kw)))
+    monkeypatch.setattr(drv, "alert", lambda kind, msg, *a, **kw: alerts.append(kind))
+    monkeypatch.setattr(drv, "_run_attempt",
+                        lambda *a, **k: (_ for _ in ()).throw(lanedriver.ControlError("worktree add failed")))
+
+    for _ in range(lanedriver.FAIL_CAP):
+        drv._task_thread("T", "T-a1", {}, {}, None, "opencode", "b" * 40)
+
+    assert len(done) == 1, "completes once, at the cap -- not on every strike: %r" % (done,)
+    task, outcome, kw = done[0]
+    assert (task, outcome) == ("T", "INVALID_EVIDENCE"), done
+    assert "3 consecutive runner failures" in kw["reason"] and "ControlError" in kw["reason"], kw
+    assert "worktree add failed" in kw["reason"], "the cause travels into the row: %r" % kw
+    assert alerts[-1] == "STUCK", alerts
+
+
+def test_d193_below_the_cap_nothing_is_completed(tmp_path, monkeypatch):
+    """The strikes before the last one must still be retryable -- completing early
+    would turn a transient worktree collision into a dead row.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    done = []
+    monkeypatch.setattr(drv, "_complete", lambda *a, **k: done.append(a))
+    monkeypatch.setattr(drv, "_run_attempt",
+                        lambda *a, **k: (_ for _ in ()).throw(lanedriver.ControlError("boom")))
+
+    for _ in range(lanedriver.FAIL_CAP - 1):
+        drv._task_thread("T", "T-a1", {}, {}, None, "opencode", "b" * 40)
+
+    assert done == [], "no terminal state before the cap: %r" % (done,)
+
+
+def test_d193_a_failure_to_complete_is_logged_not_swallowed(tmp_path, monkeypatch):
+    """The handler must never kill the daemon, but a silent failure here is the
+    one that leaves no trace anywhere -- the row stays wedged AND nothing says so.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    logs = []
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    monkeypatch.setattr(drv, "log", lambda m: logs.append(m))
+    monkeypatch.setattr(drv, "_complete",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("scheduler down")))
+    monkeypatch.setattr(drv, "_run_attempt",
+                        lambda *a, **k: (_ for _ in ()).throw(lanedriver.ControlError("boom")))
+
+    for _ in range(lanedriver.FAIL_CAP):
+        drv._task_thread("T", "T-a1", {}, {}, None, "opencode", "b" * 40)   # must not raise
+
+    assert any("could not record the failure" in m and "scheduler down" in m for m in logs), logs
+
+
+def test_d193_the_release_of_the_slot_still_happens_on_every_path(tmp_path, monkeypatch):
+    """The `finally` was already correct and must stay so: whatever the handler
+    does, the server slot and the live-set entry are given back.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    released = []
+    monkeypatch.setattr(drv, "_release", lambda server, runner: released.append((server, runner)))
+    monkeypatch.setattr(drv, "_complete", lambda *a, **k: None)
+    monkeypatch.setattr(drv, "_run_attempt",
+                        lambda *a, **k: (_ for _ in ()).throw(lanedriver.ControlError("boom")))
+    with drv._lock:
+        drv._live["T"] = {"x": 1}
+
+    drv._task_thread("T", "T-a1", {}, {}, "go2", "opencode", "b" * 40)
+
+    assert released == [("go2", "opencode")], released
+    assert "T" not in drv._live

@@ -5277,9 +5277,43 @@ class LaneDriver(object):
         except Exception as exc:          # never kill the daemon
             self.log("EXC %s: %s: %s" % (task, type(exc).__name__, exc))
             try:
-                self.note_failure(task, attempt, "%s: %s" % (type(exc).__name__, exc))
-            except Exception:
-                pass
+                count = self.note_failure(task, attempt, "%s: %s" % (type(exc).__name__, exc))
+                if count >= FAIL_CAP:
+                    # D193: strike out like every other failure path.  This one
+                    # counted to 3/3 and alerted STUCK but never wrote a terminal
+                    # state, so the row stayed RUNNING with its claim ACTIVE --
+                    # forever.  Measured on R-RELEASE-MANIFEST-PRODUCER
+                    # (2026-09-21T20:51-20:54Z): FAIL 1/3, 2/3, 3/3, ALERT STUCK,
+                    # then state RUNNING, output_sha None, claim
+                    # claim-r-release-manifest-producer-a28c422cdbe1 still ACTIVE
+                    # holding control/evidence/.../REGRADE.md, and no COMPLETE
+                    # line at all.
+                    #
+                    # The asymmetry was with its own sibling, not with anything
+                    # exotic: the in-band path 130 lines below does exactly this
+                    # (`count = note_failure(...); if count >= FAIL_CAP:
+                    # _complete(... "INVALID_EVIDENCE" ...)`).  An exception
+                    # escaping `_run_attempt` is no less a failed attempt than a
+                    # failed outcome returned from inside it, and the row it
+                    # leaves behind is worse: a row wedged at RUNNING is
+                    # invisible to every red/INVALID_EVIDENCE sweep, and
+                    # `retry-packet` correctly refuses a non-terminal row, so the
+                    # only visible symptom is a row that is quietly doing nothing.
+                    #
+                    # `_complete` is also what releases the claim (it calls
+                    # `control.complete`), which matters as much as the state:
+                    # without it the next attempt contends with its own stale
+                    # claim on the same evidence paths.
+                    tdir = self._turn_dir(task, attempt)
+                    self._complete(task, attempt, "INVALID_EVIDENCE", tdir,
+                                   evidence=[tdir / "record.json"],
+                                   reason="%d consecutive runner failures: %s: %s"
+                                          % (count, type(exc).__name__, str(exc)[:300]))
+            except Exception as exc2:     # noqa: BLE001 -- still never kill the daemon
+                # but never silently: a failure to record the failure is the one
+                # that leaves no trace anywhere
+                self.log("EXC %s: could not record the failure (%s: %s)"
+                         % (task, type(exc2).__name__, exc2))
         finally:
             self._release(server, runner)
             with self._lock:
