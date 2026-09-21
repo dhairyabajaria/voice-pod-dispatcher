@@ -743,6 +743,44 @@ class Proof(object):
             failed, errors = circle_failed_nodes(res["failed_tests"])
             flake = None
             collected = None
+            outside = []
+            # D140: open_answers() lets a twin: ask adopt an open FULL run, and that
+            # adoption is sound -- a full run really does execute the twin's paths.
+            # What was NOT sound is keeping the full run's whole failure set as the
+            # twin's answer.  Measured 2026-09-21: L26-HOSTED-R3 asked for 6
+            # platform billing/export files and was charged 6 nodes, none of them in
+            # its scope, including a portal node from a vp/portal job.  Four twins
+            # adopted one pipeline and every one of them inherited the same six.
+            # twin_job()'s own contract says "its record answers the twin's own ask
+            # only"; this is where that gets enforced.
+            try:
+                spec = vpgha_overlay.scoped_spec(only) if only else None
+            except ValueError:
+                spec = None
+            if spec and failed:
+                scope_paths = spec[2]
+                inside = [n for n in failed if self.node_in_scope(n, scope_paths)]
+                outside = [n for n in failed if not self.node_in_scope(n, scope_paths)]
+                if outside:
+                    self.log("PROOF %s %s scope filter: %d of %d red node(s) are outside only=%s "
+                             "and are not this ask's to answer (D140): %s"
+                             % (task, pid, len(outside), len(failed), only[:60],
+                                ", ".join(str(n)[:60] for n in outside[:4])))
+                    failed = inside
+                    errors = {k: v for k, v in (errors or {}).items()
+                              if self.node_in_scope(k, scope_paths)}
+                    # Downgrading the verdict needs to know the scope was actually RUN.
+                    # An adopted FULL run executed everything, so "nothing of mine
+                    # failed" means mine passed.  Without that we only know the nodes
+                    # were not ours, not that ours ran -- absence of a failure is not
+                    # evidence of execution -- so the status stands.
+                    adopted_full = bool(prior) and not (prior.get("only") or None)
+                    infra = [r for r in (cls.get("reds") or []) if r.get("kind") != "product"]
+                    if status == "FAIL_PRODUCT" and not inside and adopted_full and not infra:
+                        status = "PASS"
+                        self.log("PROOF %s %s every red was outside this ask's scope and the "
+                                 "adopted run was FULL (so the scope did run) -> PASS (D140)"
+                                 % (task, pid))
             if only and vpgha_overlay.scoped_spec(only) and status == "PASS":
                 # D118b (§137): a scoped job that collected nothing is no answer
                 # (the twin job rendered `uv run pytest` over portal .test.tsx files:
@@ -789,6 +827,7 @@ class Proof(object):
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                    "paths": paths, "only": only, "order": bool(order), "host": host,
                    "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
+                   "out_of_scope_failed": outside,
                    "flake_suspect": flake, "tests_collected": collected,
                    "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
@@ -890,6 +929,27 @@ class Proof(object):
         if rec_only == only:
             return True
         return bool(only and str(only).startswith("twin:") and not rec_only)
+
+    @staticmethod
+    def node_in_scope(node, paths):
+        """D140: is a junit node id inside a scoped ask's own path list?
+
+        Spellings differ on the two sides and always have: the spec says
+        `platform/tests/test_x.py` while the node says `tests/test_x.py`,
+        because the job runs with `platform/` as its working directory.  Compare
+        the file parts on a path boundary in both directions -- never a bare
+        substring, which would let `tests/test_export.py` swallow
+        `tests/test_export_formats.py`."""
+        f = str(node).split("::", 1)[0].strip().lstrip("./")
+        if not f:
+            return False
+        for p in paths or ():
+            p = str(p).strip().lstrip("./")
+            if not p:
+                continue
+            if f == p or f.endswith("/" + p) or p.endswith("/" + f):
+                return True
+        return False
 
     @staticmethod
     def _open_rank(rec, only):

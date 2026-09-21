@@ -1223,3 +1223,129 @@ def test_d135_run_circleci_reserves_its_host_and_does_not_increment_again():
     assert "max(0, self.host_active.get(host, 0) - 1)" in src, (
         "the release path is gone: a reserved slot that is never freed is the "
         "same fleet-shrinking bug from the other direction")
+
+
+def _open_full_record(run_root, cand, pipeline_id="pipe-206", proof_id="proof-full"):
+    """an OPEN full-suite record for `cand`: what open_answers() lets a twin adopt"""
+    d = run_root / "proofs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ("%s.json" % proof_id)).write_text(json.dumps({
+        "status": "UNKNOWN", "route": "circleci", "proof_id": proof_id, "sha": cand,
+        "pipeline_id": pipeline_id, "account": "3", "only": None, "ts": "2026-09-21T01:38:00Z"}))
+
+
+def test_d140_a_twin_adopting_a_full_run_is_not_charged_that_run_s_other_failures(tmp_path):
+    """D140: `open_answers` deliberately lets a `twin:` ask adopt an open FULL
+    run, and that adoption is sound -- a full run really does execute the twin's
+    paths. What was not sound is keeping the full run's WHOLE failure set as the
+    twin's answer.
+
+    Measured 2026-09-21 on pipeline 35551631471: four twins adopted one full run
+    and every one of them was charged the same six nodes. L26-HOSTED-R3 asked
+    for six platform billing/export files and was handed a portal node from a
+    `vp/portal` job. `twin_job()`'s own docstring says its record "answers the
+    twin's own ask only"; nothing enforced it.
+
+    The status downgrade is gated on the adopted run being FULL, because that is
+    what makes "none of mine failed" mean "mine passed" -- absence of a failure
+    is not evidence of execution."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle(pipeline([
+        ("portal/src/routes/Settings.test.tsx", "Settings members panel > saves business hours"),
+        ("platform/tests/test_campaign_admission_db.py", "test_a_two_role_multi_action_launch"),
+        ("platform/tests/test_l17_reply_fence_derivation_db.py", "test_withdrawing_the_consent_grant"),
+    ]))
+    ex = FakeExec({})
+    logs = []
+    p = make_proof(tmp_path, circle, ex, logs=logs)
+    _open_full_record(tmp_path / "run", cand)
+
+    only = "twin:3:platform/tests/test_billing_control.py,platform/tests/test_export_formats.py"
+    rec = p.run("L26-HOSTED-R3", "proof-twin", wt, base, cand, "platform",
+                ["platform/tests/test_billing_control.py"], only=only)
+
+    assert rec["failed_nodes"] == [], (
+        "a twin must not be charged nodes outside its own only= scope: %r" % rec["failed_nodes"])
+    assert len(rec["out_of_scope_failed"]) == 3, rec["out_of_scope_failed"]
+    assert any("Settings.test.tsx" in str(n) for n in rec["out_of_scope_failed"])
+    assert rec["status"] == "PASS", (
+        "the adopted run was FULL, so it ran this twin's paths and none of them failed: %s"
+        % rec["status"])
+    assert any("outside only=" in m for m in logs)
+
+
+def test_d140_an_in_scope_red_still_fails_the_twin(tmp_path):
+    """D140 control. The filter must not become a way for a twin to pass while
+    its own files are red -- that would turn a real verdict into an unfailable
+    one, which is worse than the bug. One node inside the scope, and the twin
+    fails on exactly that node and no other."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle(pipeline([
+        ("portal/src/routes/Settings.test.tsx", "Settings members panel > saves business hours"),
+        ("platform/tests/test_billing_control.py", "test_the_twins_own_file_is_red"),
+    ]))
+    p = make_proof(tmp_path, circle, FakeExec({}))
+    _open_full_record(tmp_path / "run", cand)
+
+    only = "twin:3:platform/tests/test_billing_control.py"
+    rec = p.run("L26-HOSTED-R3", "proof-twin", wt, base, cand, "platform",
+                ["platform/tests/test_billing_control.py"], only=only)
+
+    assert rec["failed_nodes"] == [
+        "platform/tests/test_billing_control.py::test_the_twins_own_file_is_red"], rec["failed_nodes"]
+    assert rec["status"] == "FAIL_PRODUCT", rec["status"]
+    assert [str(n) for n in rec["out_of_scope_failed"]] == [
+        "portal/src/routes/Settings.test.tsx::Settings members panel > saves business hours"]
+
+
+def test_d140_scope_matching_compares_path_parts_not_substrings():
+    """D140: the two sides spell the same file differently -- the spec says
+    `platform/tests/test_x.py`, the junit node says `tests/test_x.py`, because
+    the job runs with platform/ as its working directory. Matching has to work
+    in both directions.
+
+    The last case is the one that matters: a bare substring test would let
+    `test_export.py` swallow `test_export_formats.py`, silently widening every
+    scope it is applied to."""
+    ok = laneproof.Proof.node_in_scope
+    assert ok("tests/test_x.py::case", ["platform/tests/test_x.py"])
+    assert ok("platform/tests/test_x.py::case", ["tests/test_x.py"])
+    assert ok("platform/tests/test_x.py::case", ["platform/tests/test_x.py"])
+    assert not ok("src/routes/Settings.test.tsx::case", ["platform/tests/test_x.py"])
+    assert not ok("tests/test_export_formats.py::case", ["platform/tests/test_export.py"])
+    assert not ok("tests/test_x.py::case", [])
+
+
+def test_d140_adopting_a_scoped_run_filters_but_does_not_downgrade(tmp_path):
+    """D140 gate control.
+
+    Filtering the node list is always right -- those nodes are not this ask's to
+    answer however the run was produced. Turning FAIL_PRODUCT into PASS is only
+    right when something PROVED this twin's paths actually ran, and the only
+    thing that proves it is an adopted FULL run.
+
+    Here the twin adopts an open run with the IDENTICAL scope (which
+    open_answers allows on an exact match). Everything red is outside that
+    scope, so nothing is charged -- but `adopted_full` is false, so the verdict
+    stands. "Not my failure" and "I passed" are different claims, and only one
+    of them is supported. Deleting the `adopted_full` gate reds this and nothing
+    else."""
+    wt, base, cand = repo(tmp_path)
+    only = "twin:3:platform/tests/test_billing_control.py"
+    circle = FakeCircle(pipeline([
+        ("portal/src/routes/Settings.test.tsx", "Settings members panel > saves business hours"),
+    ]))
+    p = make_proof(tmp_path, circle, FakeExec({}))
+    d = (tmp_path / "run" / "proofs")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "proof-scoped.json").write_text(json.dumps({
+        "status": "UNKNOWN", "route": "circleci", "proof_id": "proof-scoped", "sha": cand,
+        "pipeline_id": "pipe-206", "account": "3", "only": only, "ts": "2026-09-21T01:38:00Z"}))
+
+    rec = p.run("L26-HOSTED-R3", "proof-twin", wt, base, cand, "platform",
+                ["platform/tests/test_billing_control.py"], only=only)
+
+    assert rec["failed_nodes"] == [], rec["failed_nodes"]
+    assert len(rec["out_of_scope_failed"]) == 1, rec["out_of_scope_failed"]
+    assert rec["status"] != "PASS", (
+        "the adopted run was scoped, so nothing established that these paths ran: %s" % rec["status"])
