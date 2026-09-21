@@ -299,10 +299,42 @@ def test_superseded_by_pure():
          "X-R3": {"state": "READY"}, "X-FIX-1": {"state": "REPAIR_REQUIRED"}, "X-FIX-2": {"state": "VERIFIED"},
          "XY": {"state": "REPAIR_REQUIRED"}, "X-HOSTED": {"state": "READY"}, "Y-R1": {"state": "RUNNING"},
          "Y": {"state": "CLAIMED"}}
-    assert LaneDriver.superseded_by("X-R2", t) == ["X", "X-R1"], "root and lower retries only"
+    # D161: X-R3 is in the list now.  This assertion used to read ["X", "X-R1"]
+    # -- "root and lower retries only" -- which is precisely the defect: an
+    # accepted R2 left the already-dispatched R3 stranded forever.
+    assert LaneDriver.superseded_by("X-R2", t) == ["X", "X-R1", "X-R3"], (
+        "the root and EVERY other retry, whichever side of the accepted index")
     assert LaneDriver.superseded_by("X-FIX-2", t) == ["X", "X-FIX-1", "X-R1", "X-R3"], "a fix supersedes every retry"
     assert LaneDriver.superseded_by("Y-R1", t) == [], "a CLAIMED root is left alone (F8)"
     assert LaneDriver.superseded_by("X", t) == [] and LaneDriver.superseded_by("XY", t) == []
+    # the kind distinction survives the index going away: a plain retry still
+    # never retires a -FIX- row, whichever way the two are numbered
+    assert "X-FIX-1" not in LaneDriver.superseded_by("X-R2", t)
+    assert "X-FIX-1" not in LaneDriver.superseded_by("X-R1", t)
+
+
+def test_d161_an_accepted_early_retry_retires_the_later_ones_too():
+    """D161, measured on L06 in run-v13-20260917: R1 went VERIFIED at
+    2026-09-20T21:53 and R12 was dispatched at 2026-09-21T00:37, about three
+    hours later.  The old rule retired only STRICTLY lower-numbered siblings, so
+    every attempt numbered above the accepted one stayed live forever -- 11 of
+    136 rows stranded that way.
+
+    R1..R12 are attempts at the SAME work.  Once one is accepted the rest are
+    pointless whichever way they are numbered.
+
+    The two exclusions that must survive: RUNNING/CLAIMED rows are still left
+    alone (F8), and they are excluded by the RETIRABLE state check, never by an
+    index rule."""
+    from lanedriver import LaneDriver
+    t = {"L06": {"state": "REPAIR_REQUIRED"}, "L06-R1": {"state": "VERIFIED"},
+         "L06-R2": {"state": "REPAIR_REQUIRED"}, "L06-R11": {"state": "READY"},
+         "L06-R12": {"state": "RUNNING"}, "L06-R13": {"state": "BLOCKED"}}
+
+    got = LaneDriver.superseded_by("L06-R1", t)
+
+    assert got == ["L06", "L06-R11", "L06-R13", "L06-R2"], got
+    assert "L06-R12" not in got, "a RUNNING sibling is still left alone (F8)"
 
 
 def test_verified_retry_retires_the_superseded_base_row(tmp_path):

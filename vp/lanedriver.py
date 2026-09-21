@@ -2661,15 +2661,19 @@ class LaneDriver(object):
     @classmethod
     def superseded_by(cls, task, tasks, states=None):
         """rows that a VERIFIED `task` = <ID>-R<n> / <ID>-FIX-<n> supersedes:
-        <ID> itself, every <ID>-R<m> with m < n (for -FIX-<n>: every -R<m> and
-        every -FIX-<m> with m < n) that exists and sits in a retirable state.
-        RUNNING/CLAIMED rows are left alone (F8), accepted ones are not rows to
-        retire."""
+        <ID> itself and every OTHER <ID>-R<m>, whatever m is (for -FIX-<n>: every
+        -R<m> and every other -FIX-<m>), that exists and sits in a retirable
+        state.  RUNNING/CLAIMED rows are left alone (F8), accepted ones are not
+        rows to retire.
+
+        D161: the index no longer narrows this.  It used to read `m < n`, which
+        stranded every higher-numbered sibling whenever an earlier attempt was
+        accepted after later ones had already been dispatched."""
         m = cls.SUPERSEDE_RE.match(task)
         if not m:
             return []
         root = m.group("root")
-        n = int(m.group("r") or m.group("f"))
+        # D161: the index is no longer read -- only the KIND still decides anything.
         is_fix = m.group("f") is not None
         out = []
         for t, row in tasks.items():
@@ -2681,11 +2685,26 @@ class LaneDriver(object):
                 mm = cls.SUPERSEDE_RE.match(t)
                 if not mm or mm.group("root") != root:
                     continue
-                k = int(mm.group("r") or mm.group("f"))
-                if mm.group("f") is not None:
-                    if not is_fix or k >= n:
-                        continue
-                elif not is_fix and k >= n:
+                # D161: retire siblings on BOTH sides of the accepted index.
+                #
+                # This used to compare indices -- `k >= n` in both arms -- so only
+                # STRICTLY LOWER-numbered siblings were retired.  When an earlier
+                # attempt is accepted after later ones have already been dispatched,
+                # every higher-numbered sibling becomes permanently unreachable by
+                # supersession: measured on L06, R1 went VERIFIED at 2026-09-20T21:53
+                # and R12 was dispatched at 2026-09-21T00:37, about three hours later,
+                # with 11 of 136 rows left stranded that way.
+                #
+                # The index carried no meaning worth keeping.  R1..R12 are attempts at
+                # the SAME work; once any one of them is accepted the rest are pointless
+                # whichever way they are numbered, and "which attempt was accepted" is
+                # recorded by the closer, not by an ordering rule here.
+                #
+                # What is still a real distinction is KIND, so that arm stays: a -FIX-<n>
+                # supersedes both retries and other fixes, while a plain -R-<n> never
+                # retires a -FIX- row.  The RUNNING/CLAIMED exclusion is untouched -- it
+                # lives in the RETIRABLE state check below, never here (F8).
+                if mm.group("f") is not None and not is_fix:
                     continue
             if (row or {}).get("state") in (states or cls.RETIRABLE):
                 out.append(t)
