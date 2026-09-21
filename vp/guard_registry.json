@@ -33,11 +33,11 @@
       "source_sha256": "04acf5d5685b1f27ef68c722bec1816f1bdb59305b8442858c2019b4393a152e"
     },
     {
-      "guard_id": "lanedriver.LaneDriver._pick_server.spread",
+      "guard_id": "lanedriver.LaneDriver._choose_server.spread",
       "path": "vp/lanedriver.py",
-      "symbol": "LaneDriver._pick_server",
-      "base_sha": "1bdb60f",
-      "why": "D134: first-fit over sorted names never spreads, because max_concurrent 100 against a driver cap of 15 means capacity never runs out and the first name absorbs everything. The fleet reads as three servers and behaves as one.",
+      "symbol": "LaneDriver._choose_server",
+      "base_sha": "d0d85ad",
+      "why": "D134: first-fit over sorted names never spreads, because max_concurrent 100 against a driver cap of 15 means capacity never runs out and the first name absorbs everything. The fleet reads as three servers and behaves as one.  Re-pointed at _choose_server by D138 (d0d85ad): the selection moved there so that _reserve_server can choose and count under one lock. _pick_server is now a two-line wrapper -- guarding it would have guarded the wrapper, not the spread property, and both controls' edits live in the body that moved.",
       "controls": [
         {
           "edit": "least-loaded selection replaced by first-fit over the sorted names (the pre-D134 body)",
@@ -45,8 +45,8 @@
           "_edit_new": "        for name in sorted(self.servers):\n            srv = self.servers.get(name)\n            if srv and not self._parked(srv) and srv[\"active\"] < srv[\"max_concurrent\"]:\n                return name\n        return None",
           "node": "tests/test_lanedriver.py::test_d134_an_unpinned_role_spreads_across_the_fleet_and_a_pin_still_wins",
           "observed": "AssertionError: ['go1', 'go1', 'go1']",
-          "log": "guard-controls/lanedriver_LaneDriver__pick_server_spread/RUN-20260921T010236Z.log",
-          "ts": "RUN-20260921T010236Z"
+          "log": "guard-controls/lanedriver_LaneDriver__choose_server_spread/RUN-20260921T014827Z.log",
+          "ts": "RUN-20260921T014827Z"
         },
         {
           "edit": "an explicit server: pin is ignored, so a placement decision silently becomes a hint",
@@ -54,11 +54,11 @@
           "_edit_new": "        want = None\n        if want:",
           "node": "tests/test_lanedriver.py::test_d134_an_unpinned_role_spreads_across_the_fleet_and_a_pin_still_wins",
           "observed": "AssertionError: assert 'go2' == 'go1'",
-          "log": "guard-controls/lanedriver_LaneDriver__pick_server_spread/RUN-20260921T010237Z.log",
-          "ts": "RUN-20260921T010237Z"
+          "log": "guard-controls/lanedriver_LaneDriver__choose_server_spread/RUN-20260921T014835Z.log",
+          "ts": "RUN-20260921T014835Z"
         }
       ],
-      "source_sha256": "08016b2ebc2d9004128e4c760a90404252f3e017ee94ac562d1a66c2d00ba6a2"
+      "source_sha256": "71b7a62f96f64362687a6bd37394f5c5b30f67479144dcc65c06ceab8292fb28"
     },
     {
       "guard_id": "lanedriver.LaneDriver._check_role_variants.undeclared",
