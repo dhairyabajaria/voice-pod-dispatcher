@@ -4586,3 +4586,116 @@ def test_d164_held_out_phrasings_record_where_the_property_test_still_ends():
         assert D.job_status_row([line]) == "", (
             "this one is a KNOWN miss; if a change makes it pass, move it to `caught` "
             "and re-measure the false positives over all 169 hosted rows: %s" % line)
+
+
+# -- D166: `reload` must not write its marker where nothing is watching --------------------------
+
+def test_d166_reload_refuses_a_directory_that_is_not_a_run_root(tmp_path):
+    """D166, from a real 14-minute idle window the OWNER caught.
+
+    The run root is `roster_path.parent` (lanedriver.py:483), so the --roster
+    argument IS the run-root selector and no flag overrides it for this verb.
+    Passing the PACK roster instead of the RUN roster that `init-run` copies to
+    `<run_root>/roster.json` writes RELOAD into the pack directory, where
+    nothing is watching.
+
+    Three arms did exactly that between 09:33Z and 10:36Z on 2026-09-21. Each
+    printed `"status": "REQUESTED"` and a marker path, each was truthful, and
+    none reached the driver. The evidence was already on screen: read_heartbeat
+    returned None, so the command printed pid/active/code_version as null three
+    times and carried on. [[a-refusal-must-name-the-place]]"""
+    from lanedriver import reload_target_problem
+
+    pack = tmp_path / "v13-pack"
+    pack.mkdir()
+    (pack / "roster-v13.json").write_text("{}")
+    problem = reload_target_problem(pack)
+    assert problem, "a directory with no heartbeat and no reloads.jsonl is not a run root"
+    assert str(pack) in problem, "the refusal must name the place it refused"
+    assert "roster.json" in problem and "init-run" in problem, (
+        "and must say what to pass instead: %s" % problem)
+
+    # the discriminator is the FILENAME: init-run copies the pack roster to
+    # <run_root>/roster.json under that exact name, and a pack directory never
+    # holds a file called roster.json. A freshly created run root with no
+    # heartbeat and no reloads.jsonl yet is still a run root -- the existing
+    # suite caught a first version of this guard that refused exactly that.
+    fresh = tmp_path / "run-fresh"
+    fresh.mkdir()
+    (fresh / "roster.json").write_text("{}")
+    assert reload_target_problem(fresh) == "", (
+        "a run root that init-run has just created has no heartbeat and no "
+        "reloads.jsonl, and a correct arm against it must not be refused")
+
+
+def test_d166_a_run_root_whose_driver_is_down_is_still_the_right_place(tmp_path):
+    """D166's discriminator. "Not a run root" and "a run root whose driver is
+    down" are different facts and only the first is an operator mistake.
+
+    A run root that has reloaded before is the right destination even with no
+    heartbeat -- the marker is read when the driver returns. Refusing here would
+    block a legitimate arm during a restart."""
+    from lanedriver import reload_target_problem
+
+    root = tmp_path / "run-v13"
+    root.mkdir()
+    (root / "reloads.jsonl").write_text('{"n": 1}\n')
+    assert reload_target_problem(root) == ""
+
+    fresh = tmp_path / "run-heartbeat-only"
+    fresh.mkdir()
+    (fresh / "driver.heartbeat").write_text('{"pid": 4242, "active": 0, "ts": "2026-09-21T10:00:00Z"}')
+    assert reload_target_problem(fresh) == "", "a heartbeat alone identifies a run root too"
+
+
+def test_d166_reload_reports_a_stale_heartbeat_instead_of_three_nulls(tmp_path):
+    """D166's second half. Writing the marker is correct when the driver is
+    merely down; reporting it as an ordinary REQUESTED over three null fields is
+    what made three dead arms read as three live ones."""
+    import io
+    from contextlib import redirect_stdout
+
+    import lanedriver
+
+    root = tmp_path / "run-v13"
+    root.mkdir()
+    (root / "reloads.jsonl").write_text('{"n": 1}\n')
+
+    class FakeDrv(object):
+        run_root = root
+        roster_path = root / "roster.json"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = lanedriver.cmd_reload(FakeDrv(), type("A", (), {"reason": "D166 test", "cancel": False})())
+    assert rc == 0
+    out = json.loads(buf.getvalue())
+    assert out["status"] == "REQUESTED"
+    assert out["driver"]["heartbeat_fresh"] is False
+    assert "NO FRESH HEARTBEAT" in out["note"], out["note"]
+    assert (root / "RELOAD").exists(), "the marker is still written -- it is the right place"
+
+
+def test_d166_reload_refuses_with_exit_2_and_writes_no_marker(tmp_path):
+    """The refusal has to be actionable by a script, not just readable: a
+    non-zero exit, and no marker left behind to be found later and mistaken for
+    a pending reload."""
+    import io
+    from contextlib import redirect_stdout
+
+    import lanedriver
+
+    pack = tmp_path / "v13-pack"
+    pack.mkdir()
+
+    class FakeDrv(object):
+        run_root = pack
+        roster_path = pack / "roster-v13.json"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = lanedriver.cmd_reload(FakeDrv(), type("A", (), {"reason": "x", "cancel": False})())
+    assert rc == 2
+    out = json.loads(buf.getvalue())
+    assert out["status"] == "REFUSED" and str(pack) in out["reason"]
+    assert not (pack / "RELOAD").exists(), "a refused arm must leave nothing behind"

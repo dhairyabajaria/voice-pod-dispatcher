@@ -7450,7 +7450,59 @@ def cmd_verify(drv, args):
     return 0 if rep["ok"] else 1
 
 
+def reload_target_problem(run_root):
+    """D166: why `reload` must not write a marker into `run_root`, or "".
+
+    The run root is derived as `roster_path.parent` (:483), so the roster
+    argument IS the run-root selector and there is no flag that overrides it for
+    this verb. Passing the PACK roster (`v13-pack/roster-v13.json`) instead of
+    the RUN roster (`<run_root>/roster.json`, which `init-run` copies there)
+    silently writes `RELOAD` into the pack directory, where nothing is watching.
+
+    Measured 2026-09-21: three arms did exactly that between 09:33Z and 10:36Z.
+    Each printed `"status": "REQUESTED"` and a marker path, each was truthful,
+    and none of them reached the driver -- 14+ minutes of idle time at
+    `active == 0` with no reload, found by the owner. The evidence was already
+    on screen and already being read: `read_heartbeat` returned None, so the
+    command printed `"pid": null, "active": null, "code_version": null` three
+    times. Acting on what it already knew is the whole fix.
+
+    Two levels, because "not a run root" and "a run root whose driver is down"
+    are different facts and only the first is an operator mistake:
+
+      * neither a heartbeat nor a `reloads.jsonl` -> this is not a run root at
+        all. Refuse and name the path.
+      * a `reloads.jsonl` but no fresh heartbeat -> it IS a run root and the
+        driver is not reporting. Proceed; the marker is read when it returns.
+        `cmd_reload` says so out loud instead of printing nulls.
+    """
+    root = Path(run_root)
+    # `roster.json` is the primary identifier and the one that makes this safe
+    # for a run root that has never reloaded: `init-run` copies the pack's
+    # roster-v13.json to <run_root>/roster.json under that exact name, and the
+    # pack directory never contains a file called `roster.json`. The existing
+    # suite caught a first version of this guard that had only the other two
+    # tests and refused test_reload_cli_writes_the_marker -- a CORRECT
+    # invocation against a freshly created run root with no heartbeat and no
+    # reloads.jsonl yet.
+    if ((root / "roster.json").exists() or read_heartbeat(root) is not None
+            or (root / "reloads.jsonl").exists()):
+        return ""
+    return ("%s is not a live run root: it has no roster.json, no driver.heartbeat and no "
+            "reloads.jsonl, "
+            "so a RELOAD marker written there would be read by nothing. The run root is "
+            "derived from the --roster path's own directory, so pass the RUN roster "
+            "(<run_root>/roster.json, which `init-run` copies there), not the pack's "
+            "roster-v13.json." % root)
+
+
 def cmd_reload(drv, args):
+    problem = reload_target_problem(drv.run_root)
+    if problem:
+        print(json.dumps({"status": "REFUSED", "reason": problem,
+                          "run_root": str(drv.run_root), "roster": str(drv.roster_path)},
+                         indent=2))
+        return 2
     f = drv.run_root / RELOAD_FILE
     if getattr(args, "cancel", False):
         was = f.exists()
@@ -7467,11 +7519,20 @@ def cmd_reload(drv, args):
     f.write_text(json.dumps({"reason": args.reason, "requested_at": utc_ms(), "by": "cli"}) + "\n",
                  encoding="utf-8")
     hb = read_heartbeat(drv.run_root)
+    note = ("applied when active == 0; watch driver.log for 'RELOAD ok' / RELOAD_FAILED "
+            "and driver.heartbeat code_version")
+    if not (hb or {}).get("fresh"):
+        # D166: a run root with no fresh heartbeat is still the right place for
+        # the marker -- but saying "REQUESTED" over three null fields is how an
+        # arm that reached nobody reads as an arm that worked.
+        note = ("NO FRESH HEARTBEAT at %s: the marker is written and will be read when a driver "
+                "comes back, but nothing is running there now. Confirm a 'RELOAD ok' line before "
+                "treating this as live. %s" % (drv.run_root, note))
     print(json.dumps({"status": "REQUESTED", "marker": str(f),
                       "driver": {"pid": (hb or {}).get("pid"), "active": (hb or {}).get("active"),
-                                 "code_version": (hb or {}).get("code_version")},
-                      "note": "applied when active == 0; watch driver.log for 'RELOAD ok' / RELOAD_FAILED "
-                              "and driver.heartbeat code_version"}, indent=2))
+                                 "code_version": (hb or {}).get("code_version"),
+                                 "heartbeat_fresh": bool((hb or {}).get("fresh"))},
+                      "note": note}, indent=2))
     return 0
 
 
