@@ -4873,7 +4873,27 @@ class LaneDriver(object):
                             "claim base %s; the pin does not describe what it builds on (D130)"
                             % (task, pin[:12], base[:12]), task)
 
-    STACK_HOLD_S = 600
+    # D196: 600 -> 60.  These holds cover TWIN_BASE_WAIT / STACK_REQUIRED /
+    # STACKED_BASE_MISSING / TWIN_PARENT_OUTPUT / BASE_INVARIANT, and the hold is
+    # keyed on `_ready_key(row)` = "ready:state:attempt_id:claim_id".  None of
+    # those three fields changes when the AWAITED CONDITION clears -- a stacked
+    # base appearing does not touch the row's state, attempt or claim -- so
+    # `_backed_off` cannot pop the entry early and the row waits out the full
+    # hold after its blocker is gone.  Measured cost is (times a condition became
+    # satisfiable) x (~300s mean latency at hold 600), not the total time spent
+    # in holds: roughly 50-100 minutes across tonight's critical path.  Advisor
+    # caught and corrected their own inflated first figure (20.5 row-hours, which
+    # had totalled time in holds that were never satisfiable).
+    #
+    # THIS IS A MITIGATION, NOT THE FIX.  The fix is to make the key encode what
+    # is being waited FOR (the awaited base sha), so the hold self-clears the
+    # moment it appears instead of being re-polled.  That is a change to
+    # `_ready_key`, which D29 shows is delicate -- a key built on `updated_at`
+    # re-fired every 5s -- so it wants its own packet and its own control, not a
+    # late-night constant edit.  Lowering the poll interval costs only CPU and
+    # log churn re-evaluating _stacked_base/_twin_union_base; it cannot change
+    # correctness, because every hold re-checks the real condition when it wakes.
+    STACK_HOLD_S = 60
 
     def _unstacked_deps(self, row, tasks, plan):
         """D32 (Advisor gap 2): scheduler-level depends_on rows that are

@@ -5968,3 +5968,28 @@ def test_d193_the_release_of_the_slot_still_happens_on_every_path(tmp_path, monk
 
     assert released == [("go2", "opencode")], released
     assert "T" not in drv._live
+
+
+def test_d196_a_stack_hold_cannot_self_clear_because_the_key_ignores_the_blocker():
+    """D196: pins WHY the hold interval had to be lowered rather than left alone.
+
+    `note_hold` keys on `_ready_key(row)` = "ready:state:attempt_id:claim_id".
+    When the awaited condition clears -- a stacked base appears -- none of those
+    three fields changes, so `_backed_off` sees the SAME key, keeps the entry and
+    the row waits out the remaining hold with nothing left blocking it.
+
+    If someone later makes the key encode the awaited base (the real fix), this
+    test is the one that should start failing, and the constant can go back up.
+    """
+    row = {"state": "READY", "attempt_id": "T-a1", "claim_id": "claim-1"}
+    before = lanedriver.LaneDriver._ready_key(row)
+    # the blocker clearing is a change to the BASE, not to the row's identity
+    row_after_base_appeared = dict(row)   # state/attempt/claim are untouched by it
+    assert lanedriver.LaneDriver._ready_key(row_after_base_appeared) == before, \
+        "the ready key is blind to the awaited condition -- that is the defect D196 mitigates"
+    # only a state/attempt/claim change invalidates it
+    assert lanedriver.LaneDriver._ready_key({**row, "state": "CLAIMED"}) != before
+    assert lanedriver.LaneDriver._ready_key({**row, "attempt_id": "T-a2"}) != before
+    assert lanedriver.LaneDriver._ready_key({**row, "claim_id": "claim-2"}) != before
+    # and the hold interval is the poll interval, so it bounds the wasted wait
+    assert lanedriver.LaneDriver.STACK_HOLD_S == 60
