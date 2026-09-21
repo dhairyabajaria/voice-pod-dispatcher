@@ -3700,3 +3700,65 @@ def test_d142_a_wedged_server_stays_parked_and_a_healthy_one_unparks_and_cleans_
               (env.run_root / "probes" / "probes.jsonl").read_text().splitlines()]
     assert probes[-1]["verb"] == "POST" and probes[-1]["ok"] is True
     assert probes[-2]["verb"] == "POST" and probes[-2]["ok"] is False
+
+
+# -- D146: a scoped pass must not look like a full pass ------------------------
+
+def _write_proof(run_root, proof_id, status="PASS", only=None, pipeline_id="p1"):
+    d = run_root / "proofs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ("%s.json" % proof_id)).write_text(json.dumps({
+        "proof_id": proof_id, "status": status, "only": only, "route": "gha",
+        "pipeline_id": pipeline_id, "sha": "a" * 40}), encoding="utf-8")
+    return d / ("%s.json" % proof_id)
+
+
+def test_d146_a_scoped_pass_and_a_full_pass_are_distinguishable(tmp_path, monkeypatch):
+    """The spec's own control: verify the SAME item twice, once scoped and once
+    full, and require the two to differ in a machine-readable field.  Before this,
+    both were the same token -- a row proven over four files and a row proven over
+    everything were indistinguishable to the union builder.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    rr = env.run_root
+
+    _write_proof(rr, "proof-ITEM-60921T000001", only=None)
+    full = drv.proof_scope_for("ITEM")
+    assert full["class"] == "full" and full["only"] is None
+
+    (rr / "proofs" / "proof-ITEM-60921T000001.json").unlink()
+    _write_proof(rr, "proof-ITEM-60921T000002", only="twin:3:platform/tests/test_x.py")
+    scoped = drv.proof_scope_for("ITEM")
+    assert scoped["class"] == "scoped"
+    assert scoped["only"] == "twin:3:platform/tests/test_x.py", "the scope is retained, not just a flag"
+    assert full != scoped, (
+        "the same item proven two different ways must not produce identical records -- "
+        "if these match, the feature is absent no matter what the code says")
+
+
+def test_d146_absence_of_a_passing_proof_is_never_reported_as_full(tmp_path, monkeypatch):
+    """`full` is a claim about coverage. Defaulting an unknown to it is how a row
+    with no passing proof at all would acquire the strongest possible label."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    assert drv.proof_scope_for("ITEM") is None, "no record at all"
+    _write_proof(env.run_root, "proof-ITEM-60921T000003", status="FAIL_PRODUCT", only=None)
+    assert drv.proof_scope_for("ITEM") is None, "a failing record proves no scope"
+    _write_proof(env.run_root, "proof-ITEM-60921T000004", status="BLOCKED_CAP", only=None)
+    assert drv.proof_scope_for("ITEM") is None, "a held record proves no scope"
+
+
+def test_d146_scope_lookup_does_not_prefix_match_a_longer_task_id(tmp_path, monkeypatch):
+    """`proof-L20-*` also matches `proof-L20-HOSTED-R3-*`.  Reading a twin's scope
+    as its parent's is the D145 bug in a second id vocabulary, and it would report
+    a scope for a task that has no passing proof of its own."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    _write_proof(env.run_root, "proof-L20-HOSTED-R3-60921T000005", only=None)
+    assert drv.proof_scope_for("L20") is None, (
+        "L20 has no passing proof of its own; L20-HOSTED-R3's must not be read as its")
+    assert (drv.proof_scope_for("L20-HOSTED-R3") or {}).get("class") == "full"

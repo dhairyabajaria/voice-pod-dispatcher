@@ -1849,6 +1849,46 @@ class LaneDriver(object):
             self.alert("PREFLIGHT_RED", "%s: %d of its parent's test nodes are red at %s (pipeline %s): %s"
                        % (twin, len(reds), tip[:12], rec.get("pipeline_id"), ", ".join(reds)[:400]), twin)
 
+    PROOF_SCOPE_FULL = "full"
+    PROOF_SCOPE_SCOPED = "scoped"
+
+    def proof_scope_for(self, task):
+        """D146 (PROOF-SCOPE spec Part A): the scope of the PASSing proof behind
+        `task`, derived from the record's `only` field and never from prose.
+
+        `only` empty/null is a FULL suite; anything else is a scoped run.  Returns
+        None when no PASSing record exists -- **absence is not `full`**, which is
+        exactly the conflation the spec exists to remove: today a row verified by a
+        four-file scoped run and a row verified by a full suite are the same token
+        to the union builder, so the ledger cannot answer "was this proven over
+        everything, or over four files?"
+
+        Matched with an exact `proof-<task>-<stamp>` regex, never a prefix glob:
+        `proof-L20-*` also matches `proof-L20-HOSTED-R3-*`, and a prefix match
+        across two id vocabularies is the D145 bug one file over.
+        """
+        pat = re.compile(r"^proof-%s-\d+T\d+$" % re.escape(task))
+        best = None
+        for f in (self.run_root / "proofs").glob("proof-%s-*.json" % task):
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if rec.get("status") != "PASS" or not pat.match(str(rec.get("proof_id") or "")):
+                continue
+            try:
+                ts = f.stat().st_mtime
+            except OSError:
+                continue
+            if best is None or ts > best[0]:
+                best = (ts, rec)
+        if best is None:
+            return None
+        only = best[1].get("only")
+        return {"class": self.PROOF_SCOPE_FULL if not only else self.PROOF_SCOPE_SCOPED,
+                "only": only or None, "proof_id": best[1].get("proof_id"),
+                "pipeline_id": best[1].get("pipeline_id")}
+
     def _canary_proof(self, c, tasks):
         """the newest proof record of the canary's rows (proofs/proof-<row>-*.json), or None"""
         rows = [t for t in tasks if self._is_canary_row(t, c)]
@@ -2475,8 +2515,19 @@ class LaneDriver(object):
             union_sha = self.head_sha(wt)
         finally:
             self.git(["-C", str(self.trunk), "worktree", "remove", "--force", str(wt)])
+        # D146 requirement 4: scoped members stay legitimate, but the union says how
+        # many it has -- a full-suite claim about the union's tree must not be
+        # assemblable from scoped parts without that being visible (the union-104
+        # mistake).  Derived per member from its own proof record, never assumed.
+        for m in merged:
+            m["proof_scope"] = self.proof_scope_for(m["task"])
+        scoped = [m["task"] for m in merged
+                  if (m.get("proof_scope") or {}).get("class") == self.PROOF_SCOPE_SCOPED]
+        unknown = [m["task"] for m in merged if not m.get("proof_scope")]
         rec = {"union": uid, "n": n, "base_sha": base, "branch": branch, "for": [for_task],
-               "members": merged, "ts": utc_ms()}
+               "members": merged, "ts": utc_ms(),
+               "scoped_members": sorted(scoped), "scoped_member_count": len(scoped),
+               "unknown_scope_members": sorted(unknown)}
         if conflict:
             self.git(["-C", str(self.trunk), "branch", "-D", branch])
             rec.update({"status": "CONFLICT", "conflict": conflict})
