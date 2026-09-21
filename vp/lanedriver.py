@@ -6123,7 +6123,84 @@ class LaneDriver(object):
                 "review_benchmark": head + "".join(lines), "packet_benchmark": packet_benchmark,
                 "proofs": proofs}
 
-    PROOF_FIELDS = ("proof_id", "kind", "route", "status", "paths", "failed_nodes", "log")
+    # D170: `only` is in this list because it was the field whose ABSENCE hid the
+    # defect below.  A scoped proof was written into .vp/PROOFS.json as `paths: []`
+    # with no scope field at all -- indistinguishable, to any reader, from a
+    # full-suite pass.  Two sessions measuring this population disagreed 31 vs 2
+    # partly because of it.
+    PROOF_FIELDS = ("proof_id", "kind", "route", "status", "only", "paths", "failed_nodes", "log")
+
+    SCOPE_TAIL_RE = re.compile(r"-(?:R\d+|FIX-\d+|V13|HOSTED(?:-(?:DELIVERY-[1-5][AB]?|O[1-9]|CIRCLECI))?)$")
+
+    @classmethod
+    def task_root(cls, task):
+        """`L30-REGISTRY-DISCOVERY-HOSTED-R2` -> `L30-REGISTRY-DISCOVERY`: the item a
+        task belongs to, with twin and generation suffixes stripped repeatedly."""
+        cur, prev = str(task or ""), None
+        while cur != prev:
+            prev, cur = cur, cls.SCOPE_TAIL_RE.sub("", cur)
+        return cur
+
+    # D170: the three answers a consumer may get about what an entry's proof RAN.
+    # UNKNOWN is not a failure mode, it is the honest answer for an entry written
+    # before `only` was carried -- 1487 of them across 14 artifacts, 14 of which are
+    # SEALED, so those bytes never change and UNKNOWN is their permanent answer.
+    SCOPE_SCOPED, SCOPE_FULL, SCOPE_UNKNOWN = "scoped", "full", "unknown"
+
+    @classmethod
+    def entry_scope(cls, entry):
+        """D170: what a .vp/PROOFS.json entry says its proof RAN -- by construction.
+
+        The rule that must never be re-derived by a reader: an entry with NO `only`
+        key cannot express scope at all, so it is UNKNOWN, never full.  Before D170
+        `PROOF_FIELDS` carried `paths` but not `only`, so an `only`-scoped proof was
+        written as `paths: []` with no scope field -- byte-identical, in the
+        artifact, to a full-suite pass.  Measured: 287 entries across 13 of 14
+        artifacts are scoped proofs that read as full that way.  A coverage
+        predicate keyed on "falsy only -> full run" would not have failed against
+        those; it would have answered FULL for the entire population, unanimously.
+
+        Note the two tests are deliberately different and must stay that way:
+        KEY PRESENCE decides unknown-vs-known, TRUTHINESS decides scoped-vs-full.
+        Collapsing them either way reintroduces a defect we have already paid for --
+        using presence for scope mislabels the 79 records whose `only` is explicitly
+        null, and using truthiness for knownness turns every legacy entry into a
+        full-suite pass, which is the bug this function exists to end.
+        """
+        entry = entry or {}
+        if entry.get("paths"):
+            return cls.SCOPE_SCOPED            # a targeted file list is a scope
+        if "only" not in entry:
+            return cls.SCOPE_UNKNOWN           # the artifact could not say; do NOT assume
+        return cls.SCOPE_SCOPED if (entry.get("only") or None) else cls.SCOPE_FULL
+
+    @classmethod
+    def proof_answers(cls, task, rec):
+        """D170: may this record stand as `task`'s proof in .vp/PROOFS.json?
+
+        `_review_proofs` binds by SHA alone and `best()` ranks PASS first, so where
+        members share an output sha the cross-bound record is preferentially the
+        green one.  D163 gave `_reusable_proof` exactly this guard; this path never
+        got it.  Measured over all 14 PROOFS.json artifacts: 197 of 1179 bound
+        entries name a different root, and 172 of those are bound to a record that
+        is SCOPED -- its own `only`/`paths` says it answers one other ask.
+        `LINT-TYPECHECK-TRUNK-HOSTED` carried, as its proof, a PASS whose `only` ran
+        L17's registry test.
+
+        Three arms, in order:
+          1. same root (itself, its hosted twin, another generation) -> yes;
+          2. else a FULL-SUITE record (no only, no paths) -> yes.  D113: a full run
+             really did execute this member's files.  25 live bindings depend on
+             this arm and a bare owner check would unbind every one of them, which
+             would read as a regression rather than a fix;
+          3. else no -- the record's own fields say it answers somebody else.
+        """
+        if not rec:
+            return False
+        owner = cls.proof_task(rec.get("proof_id"))
+        if not owner or cls.task_root(owner) == cls.task_root(task):
+            return True
+        return not (bool(rec.get("only") or None) or bool(rec.get("paths") or None))
 
     def _proof_index(self):
         """sha -> [proof records] from RUN_ROOT/proofs/proof-*.json (laneproof._write)"""
@@ -6150,7 +6227,13 @@ class LaneDriver(object):
         members = [str(m.get("task")) for m in ((union or {}).get("members") or []) if m.get("task")]
         member_sha = {str(m.get("task")): m.get("output_sha") for m in ((union or {}).get("members") or [])}
 
-        def best(recs):
+        def best(recs, task=None):
+            # D170: filter BEFORE ranking.  Ranking first and filtering after would
+            # still let a cross-bound PASS displace the member's own honest record.
+            if task is not None:
+                # LaneDriver.<fn>, as at the other class-level call sites: this
+                # function is also reached unbound via a SimpleNamespace stub.
+                recs = [r for r in (recs or []) if LaneDriver.proof_answers(task, r)]
             if not recs:
                 return None
             ranked = sorted(recs, key=lambda r: (r.get("status") == "PASS", str(r.get("ts") or "")))
@@ -6159,7 +6242,7 @@ class LaneDriver(object):
         entries = []
         for t in list(dict.fromkeys(members + list(targets))):
             sha = (tasks.get(t) or {}).get("output_sha") or member_sha.get(t)
-            rec = best(idx.get(sha)) if sha else None
+            rec = best(idx.get(sha), task=t) if sha else None
             e = {"task": t, "output_sha": sha}
             e.update({k: (rec or {}).get(k) for k in self.PROOF_FIELDS})
             # D168: carry the classification member_scope already computed, mapped by

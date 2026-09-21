@@ -4865,3 +4865,128 @@ def test_d168_a_member_that_cannot_be_classified_is_scored_not_excused(tmp_path,
     assert drv.scope_scored(e["scope"]) is True, (
         "and its recorded label must not be one the exempt set names: %r" % e["scope"])
     assert "Proof scope: 1 of 1 scored, 0 exempt" in drv.scope_summary([e]), drv.scope_summary([e])
+
+
+def test_d170_a_scoped_proof_and_a_full_proof_are_distinguishable_in_the_artifact(tmp_path, monkeypatch):
+    """The control that matters. Asserting `"only" in entry` would prove the schema
+    changed; it would NOT prove the artifact can express scope. These two records
+    are byte-identical in a pre-D170 PROOFS.json -- both land as `paths: []` with no
+    scope field -- so the property is that they must now come out DIFFERENT.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    sha = "a" * 40
+
+    _write_proof(env.run_root, "proof-SCOPEDONE-60921T000201",
+                 only="twin:3:platform/tests/test_x.py")
+    _write_proof(env.run_root, "proof-FULLONE-60921T000202", only=None)
+
+    state = {"tasks": {"SCOPEDONE": {"output_sha": sha, "kind": "builder"},
+                       "FULLONE": {"output_sha": sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": t, "output_sha": sha}
+                                        for t in ("SCOPEDONE", "FULLONE")]}
+    by = {e["task"]: e for e in drv._review_proofs([], state, union, sha)["entries"]}
+
+    assert by["SCOPEDONE"]["only"] == "twin:3:platform/tests/test_x.py", (
+        "the artifact must carry the scope verbatim: %r" % by["SCOPEDONE"])
+    assert not (by["FULLONE"]["only"] or None)
+
+    scoped_view = {k: by["SCOPEDONE"][k] for k in ("only", "paths")}
+    full_view = {k: by["FULLONE"][k] for k in ("only", "paths")}
+    assert scoped_view != full_view, (
+        "a scoped proof and a full proof are still indistinguishable in the artifact: "
+        "%r vs %r -- the field exists but carries nothing" % (scoped_view, full_view))
+
+    assert drv.entry_scope(by["SCOPEDONE"]) == drv.SCOPE_SCOPED
+    assert drv.entry_scope(by["FULLONE"]) == drv.SCOPE_FULL
+
+
+def test_d170_an_entry_that_cannot_express_scope_is_unknown_by_construction(tmp_path, monkeypatch):
+    """Permanent, not interim. 14 of the 14 archived PROOFS.json copies are SEALED --
+    their bytes never change, so no backfill can ever reach them and "empty paths
+    means unknown" has to hold by construction rather than by anyone remembering it.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    legacy = {"task": "L04", "proof_id": "proof-L30-X-60918T104640", "status": "PASS", "paths": []}
+    assert "only" not in legacy
+    assert drv.entry_scope(legacy) == drv.SCOPE_UNKNOWN, (
+        "a legacy entry cannot express scope, so it must read UNKNOWN -- reading it as "
+        "full is the defect, applied to every entry written before D170")
+
+    # the two tests are different on purpose; collapsing either way is a known defect
+    assert drv.entry_scope({"only": None, "paths": []}) == drv.SCOPE_FULL, (
+        "an explicitly null `only` IS a full run -- 79 raw records carry exactly that, "
+        "and reading key-presence as scope mislabels every one of them")
+    assert drv.entry_scope({"only": "twin:3:a.py", "paths": []}) == drv.SCOPE_SCOPED
+    assert drv.entry_scope({"paths": ["platform/tests/test_a.py"]}) == drv.SCOPE_SCOPED, (
+        "a targeted paths list is a scope even with no `only` key at all")
+    assert drv.entry_scope({}) == drv.SCOPE_UNKNOWN
+    assert drv.entry_scope(None) == drv.SCOPE_UNKNOWN
+
+
+def test_d170_a_member_is_never_bound_to_another_items_scoped_proof(tmp_path, monkeypatch):
+    """_review_proofs binds by SHA alone and best() ranks PASS first, so where members
+    share an output sha the cross-bound record is preferentially the GREEN one.
+    Measured over 14 artifacts: 197 of 1179 bound entries named a different root and
+    172 of those were bound to a record whose own `only` answers one other ask.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    sha = "a" * 40
+
+    # MINE is red on its own scoped proof; THEIRS is a green scoped proof at the SAME
+    # sha. Before D170 the PASS sorted to the top and became MINE's proof.
+    _write_proof(env.run_root, "proof-MINE-60921T000301", status="FAIL_PRODUCT",
+                 only="twin:3:platform/tests/test_mine.py")
+    _write_proof(env.run_root, "proof-THEIRS-60921T000302", status="PASS",
+                 only="twin:3:platform/tests/test_theirs.py")
+
+    state = {"tasks": {"MINE": {"output_sha": sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": "MINE", "output_sha": sha}]}
+    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+         if x["task"] == "MINE"][0]
+    assert e["proof_id"] == "proof-MINE-60921T000301", (
+        "MINE was handed another item's scoped PASS: %r" % e["proof_id"])
+    assert e["status"] == "FAIL_PRODUCT"
+
+    # the guard must filter BEFORE ranking: with only the foreign PASS available the
+    # member gets NOTHING, never the foreign record
+    (env.run_root / "proofs" / "proof-MINE-60921T000301.json").unlink()
+    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+         if x["task"] == "MINE"][0]
+    assert e["proof_id"] is None, "a foreign scoped PASS was bound: %r" % e["proof_id"]
+    assert drv.entry_scope(e) == drv.SCOPE_FULL or e["proof_id"] is None
+
+
+def test_d170_a_full_suite_run_is_still_adoptable_across_items(tmp_path, monkeypatch):
+    """The negative control, and the arm a bare owner check would have broken. D113:
+    a FULL run really did execute this member's files, so another item's full-suite
+    record is legitimate evidence. 25 live bindings depend on this -- unbinding them
+    would read as a regression, not a fix.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    sha = "a" * 40
+
+    _write_proof(env.run_root, "proof-SOMEONEELSE-60921T000401", status="PASS", only=None)
+    state = {"tasks": {"MINE": {"output_sha": sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": "MINE", "output_sha": sha}]}
+    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+         if x["task"] == "MINE"][0]
+    assert e["proof_id"] == "proof-SOMEONEELSE-60921T000401", (
+        "a full-suite run must stay adoptable across items (D113): %r" % e)
+
+    # and the twin/generation arm: a member's own hosted twin is not a foreign item
+    assert drv.proof_answers("L30-REGISTRY-DISCOVERY",
+                             {"proof_id": "proof-L30-REGISTRY-DISCOVERY-HOSTED-R2-60921T000001",
+                              "only": "twin:3:a.py"}) is True
+    assert drv.proof_answers("L04",
+                             {"proof_id": "proof-L30-REGISTRY-DISCOVERY-60918T104640917",
+                              "paths": ["platform/tests/rls/test_l30_privilege_matrix_static.py"]}) is False, (
+        "the live L04 <- L30 case must be refused")

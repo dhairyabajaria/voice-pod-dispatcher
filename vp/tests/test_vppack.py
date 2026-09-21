@@ -620,11 +620,15 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     assert all(e["proof_id"] is None and e["output_sha"] is None for e in plan["proofs"]["entries"])
     # with records: the newest PASS at the member's output sha wins over an older FAIL / a newer non-PASS
     sha6, sha7 = "6" * 40, "7" * 40
-    for pid, sha, status, ts in (("proof-L06-1", sha6, "FAIL_INFRA", "2026-09-19T01:00:00.000Z"),
-                                 ("proof-L06-2", sha6, "PASS", "2026-09-19T02:00:00.000Z"),
-                                 ("proof-L06-3", sha6, "UNKNOWN", "2026-09-19T03:00:00.000Z"),
-                                 ("proof-L07-1", sha7, "FAIL_PRODUCT", "2026-09-19T02:00:00.000Z"),
-                                 ("proof-TIP-1", "c" * 40, "PASS", "2026-09-19T04:00:00.000Z")):
+    # D170: proof ids are `proof-<task>-<ts>` in the real corpus -- all 471 of them.
+    # These were `proof-L06-1`, which parses to the task `L06-1`, so the owner guard
+    # correctly refused to hand L06 a proof belonging to something else. Realistic
+    # ids rather than a looser guard: `-1` is a shape no driver writes.
+    for pid, sha, status, ts in (("proof-L06-60919T010000", sha6, "FAIL_INFRA", "2026-09-19T01:00:00.000Z"),
+                                 ("proof-L06-60919T020000", sha6, "PASS", "2026-09-19T02:00:00.000Z"),
+                                 ("proof-L06-60919T030000", sha6, "UNKNOWN", "2026-09-19T03:00:00.000Z"),
+                                 ("proof-L07-60919T020000", sha7, "FAIL_PRODUCT", "2026-09-19T02:00:00.000Z"),
+                                 ("proof-TIP-60919T040000", "c" * 40, "PASS", "2026-09-19T04:00:00.000Z")):
         (drv.run_root / "proofs" / (pid + ".json")).write_text(json.dumps(
             {"proof_id": pid, "sha": sha, "status": status, "ts": ts, "kind": "platform", "route": "box",
              "paths": ["platform/tests/test_%s.py" % pid[6:9].lower()], "failed_nodes": ["x::y"] if "FAIL" in status else [],
@@ -633,16 +637,22 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     union = {"union": "union-9", "members": [{"task": "L06", "output_sha": sha6}, {"task": "L07", "output_sha": sha7}]}
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, state, union=union)
     by = {e["task"]: e for e in plan["proofs"]["entries"]}
-    assert by["L06"]["proof_id"] == "proof-L06-2" and by["L06"]["status"] == "PASS" and by["L06"]["log"] == "/logs/proof-L06-2.log"
-    assert by["L07"]["proof_id"] == "proof-L07-1" and by["L07"]["failed_nodes"] == ["x::y"]
+    assert (by["L06"]["proof_id"] == "proof-L06-60919T020000" and by["L06"]["status"] == "PASS"
+            and by["L06"]["log"] == "/logs/proof-L06-60919T020000.log")
+    assert by["L07"]["proof_id"] == "proof-L07-60919T020000" and by["L07"]["failed_nodes"] == ["x::y"]
     assert by["L42"]["proof_id"] is None and by["L99"]["proof_id"] is None
-    assert by["<union tip>"]["proof_id"] == "proof-TIP-1" and plan["proofs"]["union"] == "union-9"
+    assert by["<union tip>"]["proof_id"] == "proof-TIP-60919T040000" and plan["proofs"]["union"] == "union-9"
     assert "4 member record(s), 2 with a proof" in plan["review_benchmark"]
     # D168 adds `scope` + `proof_required` to every member entry. The exact-set check
     # stays exact on purpose: it is what stops the entry shape drifting silently, so a
     # new field is a deliberate edit here rather than a superset test that notices nothing.
+    # D170 adds `only` to PROOF_FIELDS. Kept exact rather than relaxed to a superset:
+    # the absence of `only` from this list is precisely what made 287 scoped proofs
+    # read as full-suite passes, so the shape of this list is load-bearing and a
+    # change to it should be a deliberate edit here.
     assert set(plan["proofs"]["entries"][0]) == (
         {"task", "output_sha", "scope", "proof_required"} | set(LaneDriver.PROOF_FIELDS))
+    assert "only" in LaneDriver.PROOF_FIELDS
     # and the stub path is the fail-closed one: this caller has no member_scope, so every
     # MEMBER entry must come back SCORED rather than quietly exempt
     mem = [e for e in plan["proofs"]["entries"] if e["task"] != "<union tip>"]
