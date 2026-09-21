@@ -1042,6 +1042,17 @@ class LaneDriver(object):
         integrator and probe are all pinned; the six unpinned roles are codex /
         agy / claude and never touch these servers).  Removing those pins is the
         other half, and it only spreads once this is in."""
+        with self._lock:
+            return self._choose_server(rcfg)
+
+    def _choose_server(self, rcfg):
+        """D138: the selection itself.  CALLER MUST HOLD `self._lock`.
+
+        Split out of `_pick_server` so that `_reserve_server` can choose and
+        count under ONE acquisition.  Reading `active` in one critical section
+        and incrementing it in a later one is the D135 defect
+        (`laneproof.pick_host`) in a second file: every racer reads the same
+        counts and every racer picks the same name."""
         want = rcfg.get("server")
         if want:
             srv = self.servers.get(want)
@@ -1051,6 +1062,43 @@ class LaneDriver(object):
         free = [(srv["active"], name) for name, srv in sorted(self.servers.items())
                 if not self._parked(srv) and srv["active"] < srv["max_concurrent"]]
         return min(free)[1] if free else None
+
+    def _reserve_server(self, rcfg):
+        """D138: choose a server AND take its slot under one lock.
+
+        `_pick_server` is only safe where the caller increments `active` before
+        the next caller reads it -- true of the dispatch loop, which picks at
+        :4321 and acquires at :4355 in the same serial iteration.  It is NOT
+        true of the grader picks, which run on per-task threads and never
+        acquired at all: `_try_acquire` covers the builder turn only, and
+        `_turn` does no accounting.  So N tasks reaching their grader step
+        together read identical counts and select the same name -- and since
+        ties break on the sorted name, that is one server taking N simultaneous
+        new-session creations.  Measured signature of exactly that on an
+        opencode server: every concurrent session failing with "Session not
+        found" and 0-byte output while a sibling server at the same concurrency
+        was clean.
+
+        Returns the server name with its slot already held, or None when the
+        fleet has nothing free.  The caller MUST pair a non-None return with
+        `_release_server` in a `finally`."""
+        with self._lock:
+            name = self._choose_server(rcfg)
+            if name is not None:
+                self.servers[name]["active"] += 1
+            return name
+
+    def _release_server(self, name):
+        """D138: give back a slot taken by `_reserve_server`.
+
+        Clamped at 0 like `_release`: a slot released twice must not drive the
+        count negative and hand the server unlimited apparent capacity."""
+        if not name:
+            return
+        with self._lock:
+            srv = self.servers.get(name)
+            if srv:
+                srv["active"] = max(0, srv["active"] - 1)
 
     # -- backoff --------------------------------------------------------------------
 
@@ -4976,17 +5024,29 @@ class LaneDriver(object):
                                               self._base_of(wt), build_outcome=outcome)
                 if prec is None:
                     return pout, None            # FAIL_INFRA/UNKNOWN: retry the proof alone later
-            gserver = self._pick_server(gcfg) if grunner == "opencode" else None
+            # D138: reserve, do not merely pick.  This runs on a per-task thread, so
+            # every task reaching its grader step at the same moment used to read the
+            # same counts and choose the same name.  A reserved slot also makes the
+            # grader VISIBLE to the balancer -- unreserved grader turns left a server
+            # advertising only its builder count while carrying N graders.
+            gserver = self._reserve_server(gcfg) if grunner == "opencode" else None
+            greserved = gserver is not None
             if grunner == "opencode" and gserver is None:
-                gserver = server
+                gserver = server                 # fleet full: ride the builder's slot, unreserved
             try:
                 fpath.unlink()
             except OSError:
                 pass
             self._repack(wt, task, rnd, "grade")
-            gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
-                              JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, rnd,
-                              expect_fence=True)
+            try:
+                gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
+                                  JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, rnd,
+                                  expect_fence=True)
+            finally:
+                # every return below this point is an early one; releasing anywhere but
+                # a finally leaks the slot upward and the server looks permanently loaded
+                if greserved:
+                    self._release_server(gserver)
             if gout.status != STATUS_DONE:
                 return gout, None
             self._merge_proof_findings(fpath, prec)
@@ -5786,12 +5846,19 @@ class LaneDriver(object):
         self._write_review_result(wt, task, attempt, head, self._base_of(wt), packet, gate_ok, gate_msg, rp)
         gcfg = self.roles.get("grader") or {}
         grunner = gcfg.get("runner", "opencode")
-        gserver = self._pick_server(gcfg) if grunner == "opencode" else None
+        # D138: same reservation as the round path -- this also runs per-task.
+        gserver = self._reserve_server(gcfg) if grunner == "opencode" else None
+        greserved = gserver is not None
         if grunner == "opencode" and gserver is None:
-            gserver = server
+            gserver = server                     # fleet full: ride the builder's slot, unreserved
         fpath = wt / ".vp" / "FINDINGS.json"
-        gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
-                          JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, 1, expect_fence=True)
+        try:
+            gout = self._turn(task, attempt, row, gserver, grunner, gcfg, wt, tdir, "grader",
+                              JUNIOR_PROMPT, fpath, validate_findings_recomputed, None, 1,
+                              expect_fence=True)
+        finally:
+            if greserved:
+                self._release_server(gserver)
         if gout.status != STATUS_DONE:
             return gout, None
         self._defer_rows(task, fpath, wt)

@@ -3485,3 +3485,108 @@ def test_d136_a_twin_is_still_blocked_by_its_own_hosted_row(tmp_path):
     drv.packet_for = lambda task, _p=monkey: _p if task.endswith("-HOSTED") else None
     assert drv._exempt_rows("L02-HOSTED", wt) == set(), \
         "a twin must still be blocked by its own [hosted] row"
+
+
+def test_d138_concurrent_grader_picks_spread_instead_of_all_choosing_one_server(tmp_path):
+    """D138: `_pick_server` read `active` under no lock, and the ONLY writer was
+    `_try_acquire` -- which the dispatch loop calls for the builder turn alone.
+    The grader picks run on per-task threads and never acquired anything, so N
+    tasks reaching their grader step together read identical counts and every
+    one of them selected the same name.  Ties break on the sorted name, so that
+    name is the first server, every time.
+
+    This is the D135 defect (`laneproof.pick_host`) in a second file, and the
+    measured signature on the opencode side is a server failing every one of ~10
+    concurrent sessions with "Session not found" and 0-byte output while a
+    sibling at the same concurrency stayed clean.
+
+    CONTROL (first block): the old shape is `_pick_server` with no increment,
+    which is what the grader sites did.  It needs no timing window at all --
+    without a writer, every concurrent reader returns the same answer forever.
+    That block reds the moment `_pick_server` starts counting, which is the
+    point: it pins WHY reserving is needed, not merely that it works."""
+    servers = {"go1": {"url": "http://127.0.0.1:1", "max_concurrent": 100, "xdg_data_home": str(tmp_path / "x1")},
+               "go2": {"url": "http://127.0.0.1:2", "max_concurrent": 100, "xdg_data_home": str(tmp_path / "x2")},
+               "go3": {"url": "http://127.0.0.1:3", "max_concurrent": 100, "xdg_data_home": str(tmp_path / "x3")}}
+    env = Env(tmp_path, roster_extra={"servers": servers})
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+
+    n = 12
+
+    def race(fn):
+        barrier, out, lock = threading.Barrier(n), [], threading.Lock()
+
+        def one():
+            barrier.wait()
+            name = fn()
+            with lock:
+                out.append(name)
+
+        threads = [threading.Thread(target=one) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return out
+
+    # CONTROL: the old grader shape -- pick, never count.  All 12 land on go1.
+    picked = race(lambda: drv._pick_server({}))
+    assert len(picked) == n
+    assert set(picked) == {"go1"}, (
+        "the unreserved pick is supposed to collapse onto one server -- if this spread, the "
+        "control no longer reproduces the bug D138 fixes: %r" % sorted(set(picked)))
+
+    for srv in drv.servers.values():
+        srv["active"] = 0
+
+    # D138: choose and count under one lock, so each racer sees the last one's slot.
+    taken = race(lambda: drv._reserve_server({}))
+    assert len(taken) == n
+    assert None not in taken
+    counts = {name: taken.count(name) for name in servers}
+    assert max(counts.values()) <= -(-n // len(servers)), counts
+    # the reservation is real: `active` must equal what was handed out
+    assert {name: drv.servers[name]["active"] for name in servers} == counts
+
+    # releasing returns the slots, and a double release must not go negative and
+    # hand the server unlimited apparent capacity
+    for name in taken:
+        drv._release_server(name)
+    assert {name: drv.servers[name]["active"] for name in servers} == {n: 0 for n in servers}
+    drv._release_server("go1")
+    assert drv.servers["go1"]["active"] == 0
+
+
+def test_d138_both_grader_sites_reserve_and_release_rather_than_pick(tmp_path):
+    """D138 call-site pin.  `_reserve_server` is atomic by construction, so a
+    race test against it can never fail -- it cannot tell the fix from the bug.
+    The defect lives at the CALL SITES, so that is where the assertion has to
+    bite ([[call-site-mutation-must-bite]]): reverting either grader site to
+    `_pick_server` reds this and nothing else.
+
+    The `finally` clause is asserted too, not just the release.  Both grader
+    blocks return early on a non-DONE turn, so a release placed inline leaks the
+    slot upward on every failed grade until the server looks permanently full --
+    a starvation bug that no functional test would show."""
+    import inspect
+
+    sites = ("_build_pipeline", "_review_packet_finish")
+    checked = 0
+    for name in sites:
+        fn = getattr(lanedriver.LaneDriver, name, None)
+        assert fn is not None, (
+            "%s is gone -- this pin names its call sites by hand, so a rename silently empties "
+            "the loop and the test passes while guarding nothing" % name)
+        src = inspect.getsource(fn)
+        assert "gserver" in src, (
+            "%s no longer dispatches a grader turn; re-point this pin at whatever does" % name)
+        assert "_reserve_server(gcfg)" in src, (
+            "%s picks its grader server without reserving a slot -- concurrent tasks will "
+            "all choose the same name" % name)
+        assert "_pick_server(gcfg)" not in src, (
+            "%s still uses the unreserved pick for its grader" % name)
+        assert "finally:" in src and "_release_server(gserver)" in src, (
+            "%s must release the grader slot in a finally -- it returns early on a non-DONE "
+            "turn, and an inline release leaks the slot on every failed grade" % name)
+        checked += 1
+    assert checked == len(sites)
