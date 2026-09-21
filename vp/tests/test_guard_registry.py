@@ -109,6 +109,16 @@ def test_clause_4_every_control_log_exists_and_is_non_empty_where_the_row_names_
         assert " failed" in text, (
             "%s: %s records no pytest failure line -- a control that did not redden is not "
             "evidence that the guard bites" % (guard["guard_id"], ctl["log"]))
+        # "exists on my disk" is NOT "ships". dispatcher/.gitignore carries a
+        # blanket `*.log` which silently swallowed every one of these on the
+        # first commit attempt -- the WA-03 defect reproduced here, in the very
+        # file written to prevent it. An ignored log satisfies every check
+        # above and still cannot be reached from a clean clone.
+        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "--", str(log)],
+                                 cwd=str(gc.DISPATCHER), capture_output=True, text=True)
+        assert tracked.returncode == 0, (
+            "%s: %s is not tracked by git -- it exists locally and would NOT ship. Check "
+            "`git check-ignore -v` on it." % (guard["guard_id"], ctl["log"]))
 
 
 @pytest.mark.parametrize("guard", [g for g in GUARDS if len(g["controls"]) > 1],
