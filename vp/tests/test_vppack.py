@@ -638,7 +638,19 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     assert by["L42"]["proof_id"] is None and by["L99"]["proof_id"] is None
     assert by["<union tip>"]["proof_id"] == "proof-TIP-1" and plan["proofs"]["union"] == "union-9"
     assert "4 member record(s), 2 with a proof" in plan["review_benchmark"]
-    assert set(plan["proofs"]["entries"][0]) == {"task", "output_sha"} | set(LaneDriver.PROOF_FIELDS)
+    # D168 adds `scope` + `proof_required` to every member entry. The exact-set check
+    # stays exact on purpose: it is what stops the entry shape drifting silently, so a
+    # new field is a deliberate edit here rather than a superset test that notices nothing.
+    assert set(plan["proofs"]["entries"][0]) == (
+        {"task", "output_sha", "scope", "proof_required"} | set(LaneDriver.PROOF_FIELDS))
+    # and the stub path is the fail-closed one: this caller has no member_scope, so every
+    # MEMBER entry must come back SCORED rather than quietly exempt
+    mem = [e for e in plan["proofs"]["entries"] if e["task"] != "<union tip>"]
+    assert len(mem) == 4 and all(e["proof_required"] is True and e["scope"] == "?" for e in mem)
+    assert "Proof scope: 4 of 4 scored, 0 exempt (not-required)" in plan["review_benchmark"]
+    tip = [e for e in plan["proofs"]["entries"] if e["task"] == "<union tip>"][0]
+    assert tip["scope"] == "-" and tip["proof_required"] is True, (
+        "every entry carries the same fields; the tip is scored, never exempt")
     # D73 (§33): the head names the registered candidate and says the records are bound to it
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40,
                                           {"tasks": {}, "candidate": {"sha": "5deac821" + "0" * 32}})

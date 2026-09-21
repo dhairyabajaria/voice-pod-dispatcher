@@ -4699,3 +4699,169 @@ def test_d166_reload_refuses_with_exit_2_and_writes_no_marker(tmp_path):
     out = json.loads(buf.getvalue())
     assert out["status"] == "REFUSED" and str(pack) in out["reason"]
     assert not (pack / "RELOAD").exists(), "a refused arm must leave nothing behind"
+
+
+def test_d168_the_ledger_cell_and_the_recorded_field_come_from_one_mapping(tmp_path, monkeypatch):
+    """The ask was "carry the computed value through, do not reimplement it". A second
+    copy of the (class, basis) -> label mapping would agree today and disagree the
+    first time a kind is added to only one of them, and nothing would report the
+    split. This pins the cell and the recorded field to the SAME function.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    rr = env.run_root
+
+    _write_proof(rr, "proof-SC-60921T000101", only="twin:3:platform/tests/test_a.py")
+    _write_proof(rr, "proof-FU-60921T000102", only=None)
+    _write_proof(rr, "proof-BX-HOSTED-60921T000103", only=None)
+
+    shapes = (("SC", "builder"), ("FU", "builder"), ("BX", "builder"),
+              ("PR", "probe"), ("NK", "builder"), ("NK", None))
+    for task, kind in shapes:
+        cell = drv._ledger_scope(task, {"state": "VERIFIED", "kind": kind})
+        carried = drv.scope_label(drv.member_scope(task, kind))
+        assert cell == carried, (
+            "the ledger cell and the carried field disagree for %s/%s: %r vs %r -- "
+            "the mapping has been copied instead of shared" % (task, kind, cell, carried))
+
+    # and the six really are six: a shared mapping that collapsed them would pass
+    # the loop above while destroying the distinction it exists to carry
+    assert len({drv.scope_label(drv.member_scope(t, k)) for t, k in shapes}) == 6
+
+
+def test_d168_an_unrecognised_or_absent_scope_label_is_scored_not_exempt(tmp_path, monkeypatch):
+    """Fails CLOSED. The failure this prevents is silent: a member that drops out of
+    the denominator looks exactly like a member that never owed a proof.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    assert drv.scope_scored("not-required") is False, "the one exempt label must be exempt"
+    for label in ("full", "scoped:platform/tests/test_a.py", "full via BX-HOSTED",
+                  "no-proof-in-run", "no-kind", "?", "-", "", "NOT-REQUIRED",
+                  " not-required", "not_required", None):
+        assert drv.scope_scored(label) is True, (
+            "%r must be SCORED: anything the closed set does not name exactly stays in "
+            "the denominator" % (label,))
+
+    assert drv.SCOPE_EXEMPT_LABELS == ("not-required",), (
+        "the exempt set is closed; widening it is a decision, not a detail")
+
+
+def test_d168_an_unknown_kind_is_scored_although_its_ledger_cell_says_not_required(tmp_path, monkeypatch):
+    """The deliberate divergence. member_scope files an unknown kind under
+    `not_required` because "I don't know" is not "it failed" (D148) -- right for a
+    ledger CELL. Carrying that into a SCORE would drop the row from the count on the
+    strength of not knowing, which is the fail-open shape this field exists to expose.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    unknown = drv.member_scope("NK", None)
+    assert unknown["class"] == "not_required" and unknown["basis"] == "kind_unknown"
+    assert drv.scope_label(unknown) == "no-kind"
+    assert drv.scope_scored("no-kind") is True, (
+        "an unknown kind must be SCORED -- exempting it excuses a row for being "
+        "unclassifiable, which is exactly the hole the field is meant to show")
+
+    known = drv.member_scope("PR", "probe")
+    assert known["class"] == "not_required" and known["basis"] == "kind"
+    assert drv.scope_scored(drv.scope_label(known)) is False, (
+        "a kind the config says never owed a proof IS exempt -- the two not_required "
+        "bases must not collapse into one answer")
+
+
+def test_d168_proofs_json_carries_the_scope_and_whether_a_proof_is_owed(tmp_path, monkeypatch):
+    """Runtime criteria are judged from .vp/PROOFS.json, so the exemption has to be
+    IN the artifact a reviewer reads, not re-derived by whoever reads it.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    rr = env.run_root
+    sha = "a" * 40
+
+    _write_proof(rr, "proof-FULLROW-60921T000104", only=None)
+    _write_proof(rr, "proof-SCOPEDROW-60921T000105", only="twin:3:platform/tests/test_b.py")
+
+    state = {"tasks": {"FULLROW": {"output_sha": sha, "kind": "builder"},
+                       "SCOPEDROW": {"output_sha": sha, "kind": "builder"},
+                       "PROBEROW": {"output_sha": sha, "kind": "probe"}}}
+    union = {"union": "u1", "members": [{"task": t, "output_sha": sha}
+                                        for t in ("FULLROW", "SCOPEDROW", "PROBEROW")]}
+    out = drv._review_proofs([], state, union, sha)
+    by = {e["task"]: e for e in out["entries"] if e["task"] != "<union tip>"}
+
+    assert set(by) == {"FULLROW", "SCOPEDROW", "PROBEROW"}
+    for t, e in by.items():
+        assert "scope" in e and "proof_required" in e, "%s carries neither field: %r" % (t, e)
+
+    assert by["FULLROW"]["scope"] == "full" and by["FULLROW"]["proof_required"] is True
+    assert by["SCOPEDROW"]["scope"].startswith("scoped:") and by["SCOPEDROW"]["proof_required"] is True
+    assert by["PROBEROW"]["scope"] == "not-required" and by["PROBEROW"]["proof_required"] is False
+
+    # the recorded field must equal the shared mapping, not a value assembled here
+    for t, e in by.items():
+        assert e["scope"] == drv.scope_label(drv.member_scope(t, (state["tasks"][t] or {}).get("kind")))
+
+
+def test_d168_the_summary_names_every_exempt_member(tmp_path, monkeypatch):
+    """"k exempt" with no names is unreadable: the reader cannot tell an exemption
+    from a member that was dropped without re-deriving all of it.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    mem = [{"task": "A", "proof_required": True},
+           {"task": "ZED", "proof_required": False},
+           {"task": "B", "proof_required": True},
+           {"task": "MID", "proof_required": False}]
+    line = drv.scope_summary(mem)
+    assert line.startswith("Proof scope: 2 of 4 scored, 2 exempt (not-required): "), line
+    assert "MID" in line and "ZED" in line, "every exempt member is named: %r" % line
+    assert line.index("MID") < line.index("ZED"), "named in a stable order"
+    assert line.endswith("\n")
+
+    assert drv.scope_summary([{"task": "A", "proof_required": True}]) == (
+        "Proof scope: 1 of 1 scored, 0 exempt (not-required)\n"), "no empty list when none are exempt"
+    assert drv.scope_summary([]) == "Proof scope: 0 of 0 scored, 0 exempt (not-required)\n"
+
+    # a member whose field is MISSING must be scored, not exempt.  `not
+    # e.get("proof_required")` passes every other assertion in this test and fails
+    # only this one -- which is the whole point of writing it.
+    assert drv.scope_summary([{"task": "A"}]) == "Proof scope: 1 of 1 scored, 0 exempt (not-required)\n", (
+        "a missing field must not read as an exemption")
+    assert drv.scope_summary([{"task": "A", "proof_required": None}]) == (
+        "Proof scope: 1 of 1 scored, 0 exempt (not-required)\n"), "nor a null one"
+
+
+def test_d168_a_member_that_cannot_be_classified_is_scored_not_excused(tmp_path, monkeypatch):
+    """The fail-open hole a mutation found and the rest of this suite missed: when
+    member_scope raises, the entry still has to be WRITTEN, and whatever it is
+    written as decides whether the row stays in the denominator. Labelling it
+    "not-required" there excuses a member for being unclassifiable -- silently, and
+    only on the path where something already went wrong.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    sha = "a" * 40
+
+    def boom(*a, **k):
+        raise RuntimeError("proofs dir unreadable")
+
+    drv.member_scope = boom
+    state = {"tasks": {"BROKEN": {"output_sha": sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": "BROKEN", "output_sha": sha}]}
+    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+         if x["task"] == "BROKEN"][0]
+
+    assert e["proof_required"] is True, (
+        "a member we could not classify must stay in the denominator: %r" % e)
+    assert drv.scope_scored(e["scope"]) is True, (
+        "and its recorded label must not be one the exempt set names: %r" % e["scope"])
+    assert "Proof scope: 1 of 1 scored, 0 exempt" in drv.scope_summary([e]), drv.scope_summary([e])

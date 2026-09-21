@@ -2024,18 +2024,31 @@ class LaneDriver(object):
             sc = self.member_scope(tid, row.get("kind")) or {}
         except Exception:  # noqa: BLE001 -- render never takes the tick down
             return "?"
-        cls, basis = sc.get("class"), sc.get("basis")
-        scoped = cls == self.PROOF_SCOPE_SCOPED
+        return self.scope_label(sc)
+
+    # D168: ONE mapping from a member_scope dict to the label.  It was inline here;
+    # .vp/PROOFS.json needs the same answer, and a second copy of a five-branch
+    # mapping is a drift waiting to happen -- the two agree today and disagree the
+    # first time a kind is added to only one of them.
+    SCOPE_EXEMPT_LABELS = ("not-required",)
+
+    @classmethod
+    def scope_label(cls, sc):
+        """D147/D148: a member_scope dict -> the closed label the ledger cell and
+        .vp/PROOFS.json both carry."""
+        sc = sc or {}
+        klass, basis = sc.get("class"), sc.get("basis")
+        scoped = klass == cls.PROOF_SCOPE_SCOPED
         if basis == "inherited":
             return "%s via %s" % ("scoped" if scoped else "full", sc.get("from"))
         if scoped:
             # `only` is a path list; a pipe would break the markdown row it sits in
             only = str(sc.get("only") or "").replace("|", "/")
             return "scoped:%s" % (only[:48] + ("..." if len(only) > 48 else ""))
-        if cls == self.PROOF_SCOPE_FULL:
+        if klass == cls.PROOF_SCOPE_FULL:
             return "full"
-        if cls == "not_required":
-            return "no-kind" if sc.get("basis") == "kind_unknown" else "not-required"
+        if klass == "not_required":
+            return "no-kind" if basis == "kind_unknown" else "not-required"
         # D148: NOT "unproven".  The ledger spans the whole run history, including
         # 47 rows verified before this run kept proofs at all (every one of them
         # updated before the earliest proof record here).  Over that population the
@@ -2043,6 +2056,40 @@ class LaneDriver(object):
         # in the union record, where the members are the rows being assembled NOW
         # and `owed a proof` is answerable.
         return "no-proof-in-run"
+
+    @classmethod
+    def scope_summary(cls, mem):
+        """D168: the one line a reviewer reads to know what the proof count covered.
+
+        A member that owes no proof must be NAMED, not netted out of the denominator.
+        An exemption nobody can see reads exactly like a member that was dropped, and
+        the reader cannot tell which without re-deriving the classification -- which
+        is the whole reason the field exists.
+        """
+        mem = list(mem or ())
+        # fails CLOSED here too: only an explicit False is an exemption.  `not
+        # e.get(...)` would read a member whose field is MISSING as exempt, which is
+        # the same silent drop this line exists to prevent, one layer up.
+        exempt = sorted(str(e.get("task")) for e in mem if e.get("proof_required") is False)
+        return "Proof scope: %d of %d scored, %d exempt (not-required)%s\n" % (
+            len(mem) - len(exempt), len(mem), len(exempt),
+            ": " + ", ".join(exempt) if exempt else "")
+
+    @classmethod
+    def scope_scored(cls, label):
+        """D168: does this member still owe a proof?  Fails CLOSED -- only an exact
+        member of SCOPE_EXEMPT_LABELS is exempt, so an unrecognised or absent label
+        is SCORED and stays in the denominator instead of vanishing from it.
+
+        `no-kind` is deliberately NOT exempt.  member_scope files an unknown kind
+        under `not_required` because "I don't know" is not "it failed" (D148), which
+        is the right answer for a ledger CELL; carrying it into a SCORE would drop
+        the row from the count on the strength of not knowing -- the fail-open shape
+        this field exists to make visible.  The cell and the score want different
+        answers from the same classification, so the split lives here rather than in
+        member_scope, which keeps its one meaning.
+        """
+        return str(label or "") not in cls.SCOPE_EXEMPT_LABELS
 
     def _canary_proof(self, c, tasks):
         """the newest proof record of the canary's rows (proofs/proof-<row>-*.json), or None"""
@@ -6063,6 +6110,7 @@ class LaneDriver(object):
         head += "%s (.vp/PROOFS.json: %d member record(s), %d with a proof%s)\n" % (
             PROOFS_RULE, len(mem), sum(1 for e in mem if e.get("proof_id")),
             "; union tip proof present" if len(mem) != len(proofs["entries"]) else "")
+        head += LaneDriver.scope_summary(mem)
         reg = (state.get("candidate") or {}).get("sha")
         if reg:
             # D73 (§33): REVIEW-JUNIOR-S3-F5-R2 failed 5 rows by reading the registered
@@ -6114,11 +6162,31 @@ class LaneDriver(object):
             rec = best(idx.get(sha)) if sha else None
             e = {"task": t, "output_sha": sha}
             e.update({k: (rec or {}).get(k) for k in self.PROOF_FIELDS})
+            # D168: carry the classification member_scope already computed, mapped by
+            # the same scope_label the ledger cell uses -- never a second derivation.
+            # "?" on failure is deliberate: it is not in SCOPE_EXEMPT_LABELS, so a
+            # member we could not classify is SCORED, not quietly excused.
+            # LaneDriver.<fn>, not self.<fn>: these three are class-level mappings, and
+            # _review_proofs is also called unbound against a SimpleNamespace stub
+            # (test_vppack.py:609).  A `self.` hop would make adding a helper here
+            # break a caller that never asked for one.
+            try:
+                sc = self.member_scope(t, (tasks.get(t) or {}).get("kind") or e.get("kind"))
+                e["scope"] = LaneDriver.scope_label(sc)
+            except Exception:  # noqa: BLE001 -- a review render never takes the tick down
+                e["scope"] = "?"
+            e["proof_required"] = LaneDriver.scope_scored(e["scope"])
             entries.append(e)
         tip = best(idx.get(cand)) if cand else None
         if tip:
             e = {"task": "<union tip>", "output_sha": cand}
             e.update({k: tip.get(k) for k in self.PROOF_FIELDS})
+            # D168: the tip is not a union member, so the exemption question does not
+            # apply to it -- but it gets the fields anyway, scored.  A list whose rows
+            # have two different shapes is where a consumer's .get() quietly returns
+            # None and the row falls out of whatever it was being counted for.
+            e["scope"] = "-"
+            e["proof_required"] = LaneDriver.scope_scored(e["scope"])
             entries.append(e)
         return {"generated": utc_ms(), "subject_sha": cand, "union": (union or {}).get("union"),
                 "rule": PROOFS_RULE, "entries": entries}
