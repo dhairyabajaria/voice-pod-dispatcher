@@ -120,3 +120,39 @@ def test_the_precondition_control_aborts_when_it_cannot_fail(tmp_path):
 
     rc = vpsubset.main(["--run-root", str(tmp_path), "--trunk", "/nonexistent-trunk"])
     assert rc == 1, "a control that cannot fail must abort the run"
+
+
+def test_the_header_lets_a_reader_regenerate_and_pin_the_corpus(tmp_path):
+    """Architect 2's condition: the output must self-declare as derived -- name
+    the generator, the regenerate command, and the input tip it came from, so a
+    reader knows in one line it is a snapshot and not a source.
+
+    The input tip matters more here than usual: the run root is NOT a git repo,
+    so the input set has no commit of its own to cite. Without a digest there is
+    no way to say WHICH corpus state a verdict came from."""
+    _rec(tmp_path, "proof-A", only=None, sha="a" * 40)
+    _rec(tmp_path, "proof-B", sha="b" * 40)
+    doc = _deriver(tmp_path).build()
+
+    assert "vpsubset.py" in doc["regenerate"] and "--run-root" in doc["regenerate"]
+    assert "--verify" in doc["regenerate"], "a reader must be told how to CHECK, not only rewrite"
+    assert doc["input_tip"]["records"] == 2
+    assert len(doc["input_tip"]["digest"]) == 64
+
+
+def test_the_input_tip_moves_when_the_corpus_moves_and_not_otherwise(tmp_path):
+    """A tip that does not change when the inputs change pins nothing, and one
+    that changes on re-derivation cannot be compared across runs. Both halves are
+    asserted -- the second is the one a `generated_at` would have broken."""
+    _rec(tmp_path, "proof-A", only=None, sha="a" * 40)
+    first = _deriver(tmp_path).build()["input_tip"]
+    assert _deriver(tmp_path).build()["input_tip"] == first, "unstable under re-derivation"
+
+    _rec(tmp_path, "proof-B", sha="b" * 40)                       # a record ADDED
+    after_add = _deriver(tmp_path).build()["input_tip"]
+    assert after_add != first and after_add["records"] == 2
+
+    _rec(tmp_path, "proof-B", sha="c" * 40)                       # a record ALTERED
+    after_edit = _deriver(tmp_path).build()["input_tip"]
+    assert after_edit != after_add, "an edited record must move the tip"
+    assert after_edit["records"] == 2, "an edit is not an addition"

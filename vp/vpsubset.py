@@ -161,6 +161,19 @@ class Deriver:
 
     # -- output -------------------------------------------------------------
 
+    def input_tip(self, recs):
+        """A single content-addressed value identifying the exact corpus this was
+        derived from.
+
+        The run root is not a git repo, so the input set has no commit of its own
+        to cite -- which is precisely why a reader needs SOMETHING to pin it. This
+        digests the sorted (path, sha256) pairs, so it changes if any record is
+        added, removed, or altered, and is stable under re-derivation."""
+        h = hashlib.sha256()
+        for path, _rec, digest in recs:
+            h.update(("%s %s\n" % (path, digest)).encode("utf-8"))
+        return {"records": len(recs), "digest": h.hexdigest()}
+
     def build(self):
         recs = self.records()
         overlay = self.overlay_commits(recs)
@@ -181,6 +194,11 @@ class Deriver:
                          "Never hand-edit a verdict here; change the rule in vpsubset.py and "
                          "re-derive, so the change is reviewable as code.",
             "generator": {"name": "vp/vpsubset.py", "sha256": sha256_file(__file__)},
+            "regenerate": ("python vp/vpsubset.py --run-root %s --trunk %s --out "
+                           "<run-root>/subset-backfill/subset-verdicts.json   "
+                           "(add --verify to check an existing file instead of writing one)"
+                           % (self.run_root, self.trunk)),
+            "input_tip": self.input_tip(recs),
             "workflow_inputs": {c: v["sha256"] for c, v in sorted(self.workflows.items())},
             "entries": entries,
         }
