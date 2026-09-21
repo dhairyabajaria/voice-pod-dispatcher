@@ -1067,6 +1067,12 @@ class Proof(object):
             # never has to guess which dialect the artifact speaks.
             #
             # No git, no I/O: every branch is decided by `only` and `prior`.
+            #
+            # `covered` answers "did the run do what was ASKED", never "was the ask
+            # SUFFICIENT" -- that is D113's question, about twin scope.  A record can
+            # be honestly `covered` and still a false green when the scope it faithfully
+            # ran omitted a file its contract owns.  Do not rename these values to
+            # anything that reads as proof.
             if str(only or "").startswith("preflight:"):
                 # never citable as a row verdict (Advisor, 2026-09-21), whatever it
                 # covers.  A value of its own, so the selector refuses it by KIND and

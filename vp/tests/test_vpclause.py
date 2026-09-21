@@ -121,6 +121,14 @@ def test_the_l28_split_classifies_as_the_ruling_says_it_should():
     assert c13.status == vc.OK and not vc.twin_answerable(c13)
 
 
+# The live pack is edited by other sessions while this suite runs, so this number
+# moves for two unrelated reasons: rows being MIGRATED (the census actually
+# changing, which `absent == hosted` catches) and the pack simply GROWING (a new
+# packet, which means nothing). Kept as an explicit named constant so bumping it
+# is an obvious one-line edit rather than a hunt through an assertion message.
+EXPECTED_HOSTED = 169
+
+
 def test_every_live_hosted_row_is_absent_today_so_the_census_starts_at_the_whole_corpus():
     """The migration's starting number, asserted rather than assumed: nothing in
     the pack carries a kind yet, so every hosted row is ABSENT/WARN and the prose
@@ -151,9 +159,26 @@ def test_every_live_hosted_row_is_absent_today_so_the_census_starts_at_the_whole
                 absent += 1
             elif vc.lint_severity(c) == "ERROR":
                 errors.append((f.split("/")[-2], m.group(1), c.reason))
-    assert hosted == 168, (
-        "the hosted population moved; D164's numbers are quoted against 168 "
-        "(a `[box]` row in L17-REGISTRY-REPLY-PINS also contains the string "
-        "'[hosted]', which is why a loose grep says 169): got %d" % hosted)
+    # The CENSUS PROPERTY first: it is the one that means something changed
+    # substantively. The count tripwire below fires for a second, much duller
+    # reason -- the pack simply growing -- and asserting the count first made a
+    # new packet look like a migration. (2026-09-21: hosted went 168 -> 169 when
+    # R-DB-CREDENTIAL-FILE-CUSTODY was added; every row was still ABSENT, so
+    # nothing about the census had moved at all.)
     assert absent == hosted, "%d of %d rows already carry a kind" % (hosted - absent, hosted)
     assert errors == [], errors
+    # The expected count is a deliberate tripwire and its remedy is to UPDATE it,
+    # not to delete it. The message now says which of the two causes it is, and
+    # names the recently-touched packets, so the next person does not have to
+    # re-derive that the pack grew.
+    if hosted != EXPECTED_HOSTED:
+        import os
+        recent = sorted(((os.path.getmtime(f), f.split("/")[-2]) for f in files),
+                        reverse=True)[:5]
+        raise AssertionError(
+            "the hosted population is %d, not %d. Every row is still ABSENT, so this is "
+            "the pack GROWING, not rows being migrated -- bump EXPECTED_HOSTED. "
+            "(A `[box]` row in L17-REGISTRY-REPLY-PINS also contains the string "
+            "'[hosted]', which is why a loose grep reads one higher than this test.) "
+            "Most recently touched packets: %s"
+            % (hosted, EXPECTED_HOSTED, ", ".join(n for _t, n in recent)))

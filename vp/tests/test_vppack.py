@@ -1178,7 +1178,21 @@ def test_idle_with_rows_awaiting_a_ruling_alerts_once_per_idle_stretch(tmp_path)
     drv._owed_rulings_check({"REPAIR_REQUIRED": 1, "INVALID_EVIDENCE": 2}, {"A": {"state": "REPAIR_REQUIRED"}})
     lines = [json.loads(l) for l in (env.run_root / "alerts.jsonl").read_text().splitlines()
              if json.loads(l).get("kind") == "OWED_RULINGS"]
-    assert len(lines) == 1 and "3 row(s)" in lines[0]["text"] and "A, B" in lines[0]["text"]
+    # D178: the alert now counts PROBLEMS, not attempts -- 64 owed rows in the
+    # live run were 19 distinct problems, a 3.4x over-report that was read as
+    # "48 stale ancestors never auto-retired". Measured: ZERO had a VERIFIED
+    # successor, so retiring them would have deleted the attempt depth instead
+    # of fixing anything.
+    #
+    # D178a: this fixture is ALSO the case where the two sources disagree --
+    # `counts` says 3 owed while the task map holds 2 owed rows (C is VERIFIED).
+    # The pre-D178 text quoted "3 row(s)" beside a list of two and made that
+    # invisible. Both numbers are now named, and the disagreement is stated.
+    assert len(lines) == 1, lines
+    txt = lines[0]["text"]
+    assert "2 problem(s) across 2 row(s)" in txt, txt
+    assert "frontier counts 3" in txt and "the two views disagree" in txt, txt
+    assert "A, B" in txt, txt
     # nothing owed, or not idle long enough: silent
     drv._owed_rulings_check({"VERIFIED": 5}, {})
     drv2 = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner(), "claude": FakeRunner()})

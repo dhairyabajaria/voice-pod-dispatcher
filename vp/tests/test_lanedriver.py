@@ -5242,3 +5242,209 @@ def test_d177_a_refused_regrade_holds_the_row_and_never_fails_it(tmp_path):
         "nothing MATCHES the status: an unhandled status falls through the generic "
         "paths and strikes the task three times into STUCK")
     assert "note_hold" in caller[i:i + 900], "the handler must hold, not complete"
+
+
+def test_d178_owed_rulings_counts_problems_not_attempts():
+    """D178. The alert counted ROWS, so 64 rows read as 64 problems when they
+    were 19 -- a 3.4x over-report -- and then truncated the flat list at 500
+    chars so the tail was invisible anyway.
+
+    It was read as "48 stale ancestors that never get auto-retired", and the
+    proposed fix was to retire them. Measured against run-state.json: ZERO of
+    the 64 had a VERIFIED successor, so auto-retire had skipped nothing, and 45
+    were standing because their OWN successors were still failing. Retiring
+    would have turned "this has failed six times" into "one open row"."""
+    from vp.lanedriver import LaneDriver
+
+    rows = (["REVIEW-JUNIOR-S3-F2"] + ["REVIEW-JUNIOR-S3-F2-R%d" % i for i in range(1, 6)]
+            + ["L19-HOSTED"] + ["L19-HOSTED-R%d" % i for i in range(1, 4)]
+            + ["SEC-REVIEW-S3-FIXSET", "SEC-REVIEW-S3-FIXSET-FIX-1"]
+            + ["L31-HOSTED-CIRCLECI"])
+    out = LaneDriver._owed_rulings_summary(rows)
+
+    assert "4 problem(s) across 13 row(s)" in out, out
+    # the depth is the point: it must SHOW six attempts, not hide or delete them
+    assert "REVIEW-JUNIOR-S3-F2 x6" in out, out
+    assert "L19-HOSTED x4" in out, out
+    assert "SEC-REVIEW-S3-FIXSET x2" in out, out
+    # deepest first -- the chain that has resisted most attempts leads
+    assert out.index("REVIEW-JUNIOR-S3-F2 x6") < out.index("L19-HOSTED x4") < out.index("SEC-REVIEW-S3-FIXSET x2"), out
+    # a lone row carries no count suffix, and is not mistaken for a root with 1 try
+    assert "L31-HOSTED-CIRCLECI," in out or out.endswith("L31-HOSTED-CIRCLECI"), out
+    assert "L31-HOSTED-CIRCLECI x1" not in out, out
+    # no attempt id leaks: the summary names problems, and the -Rn rows are the count
+    assert "-R1" not in out and "-R5" not in out, out
+
+
+def test_d178_the_summary_drops_whole_problems_rather_than_truncating_a_name():
+    """The old alert cut the flat row list mid-string at 500 chars, so the tail
+    was both invisible AND unparseable. Overflow must drop whole entries and say
+    how many it dropped, never leave a half-written task id that reads as a real
+    one."""
+    from vp.lanedriver import LaneDriver
+
+    rows = ["LANE-%03d-HOSTED-WITH-A-DELIBERATELY-LONG-NAME" % i for i in range(60)]
+    out = LaneDriver._owed_rulings_summary(rows)
+
+    assert "60 problem(s) across 60 row(s)" in out, out
+    assert "more problem(s)" in out, out
+    named = [x.strip() for x in out.split("deepest first: ")[1].split(", ")]
+    for piece in named:
+        if piece.startswith("..."):
+            continue
+        assert piece in rows, "truncated mid-name: %r" % piece
+
+
+def test_d178_grouping_uses_the_same_root_rule_as_retirement():
+    """One spelling of "what is a retry of what". A second regex here would
+    drift from SUPERSEDE_RE and the alert would disagree with the retirement it
+    is reporting on."""
+    import inspect
+    from vp.lanedriver import LaneDriver
+
+    src = inspect.getsource(LaneDriver._owed_rulings_summary)
+    assert "SUPERSEDE_RE" in src, "the summary grew its own root regex"
+    assert LaneDriver._owed_rulings_summary(["A-FIX-2", "A-R1", "A"]).startswith("1 problem(s)"), (
+        "-FIX-<n> and -R<n> must fold into the same root, as retirement folds them")
+
+
+def test_d176_covered_is_documented_as_never_meaning_proven():
+    """Architect 2, 2026-09-21: a machine-written verdict field that invites the
+    wrong reading is more dangerous than no field at all.
+
+    `covered` answers "did the run do what was ASKED". It says nothing about
+    whether the ask was SUFFICIENT -- that is D113's question. A record can be
+    legitimately `covered` and still a false green, and one is:
+    L17-REPLY-FENCE-LOCK-CLOSED-HOSTED-CIRCLECI ran its `only` file faithfully
+    while its `only` never named platform/tests/test_campaign_release_pins.py,
+    which contract L17 owns. Reading `covered` as `proven` is how it passed.
+
+    Pinned as a test because the distinction lives in prose, and prose is what
+    gets trimmed. Both the WRITER and the SELECTOR must carry it: a reader who
+    finds only one of the two halves has no reason to look for the other."""
+    import inspect
+    from vp import laneproof
+    from vp.lanedriver import LaneDriver
+
+    sel = inspect.getsource(inspect.getmodule(LaneDriver))
+    i = sel.find("SUBSET_CITABLE = (")
+    assert i != -1
+    near = sel[max(0, i - 1600):i]
+    assert "never means" in near.lower() or "never mean" in near.lower(), (
+        "the selector no longer says `covered` is not `proven`")
+    assert "D113" in near, "the selector no longer points at the question it does NOT answer"
+
+    wrt = inspect.getsource(laneproof.Proof.run_circleci)
+    assert "D113" in wrt, "the writer no longer says which question it does NOT answer"
+    assert "sufficient" in wrt.lower(), wrt[:0] or "the writer lost the ask-sufficiency caveat"
+
+    doc = inspect.getdoc(LaneDriver.subset_citable) or ""
+    assert "sufficient" in doc.lower(), (
+        "subset_citable's own docstring must say True is necessary, not sufficient")
+
+
+def _scope_drv(tmp_path, contracts, pack=None):
+    """a LaneDriver wired just enough for _contract_owned_test_files"""
+    from vp.lanedriver import LaneDriver
+
+    class _Ctl:
+        def __init__(self, cs):
+            self._cs = cs
+
+        def contract(self, cid, row=None):
+            if cid not in self._cs:
+                raise KeyError(cid)
+            return self._cs[cid]
+
+    drv = LaneDriver.__new__(LaneDriver)
+    drv.control = _Ctl(contracts)
+    drv.pack = pack or {}
+    drv.log = lambda *a, **k: None
+    return drv
+
+
+def test_d113b_the_contract_owned_test_files_reach_the_twin_scope(tmp_path):
+    """D113b. A contract declares what it owns in lane-contracts.json
+    `owned_paths`, and _twin_scope_paths never opened that file. Measured
+    2026-09-21: 17 scoped twins ran a scope omitting a file their contract owns,
+    including four L17 rows missing test_campaign_release_pins.py on an
+    otherwise-VERIFIED row.
+
+    Not the "packet grew later" case and it cannot be: the code never read this
+    source, so no edit history could explain the miss."""
+    (tmp_path / "platform" / "tests").mkdir(parents=True)
+    (tmp_path / "platform" / "tests" / "test_campaign_release_pins.py").write_text("", encoding="utf-8")
+
+    drv = _scope_drv(tmp_path, {"L17": {"id": "L17", "owned_paths": [
+        "inbound reply routing campaign/run resolution",          # prose, not a path
+        "platform/core/journeys/agent_release.py",                # a real path, not a test
+        "platform/tests/test_campaign_release_pins.py",           # the one that matters
+    ]}})
+
+    got = drv._contract_owned_test_files("L17", tmp_path)
+    assert got == ["platform/tests/test_campaign_release_pins.py"], got
+
+
+def test_d113b_prose_and_absent_files_never_reach_pytest(tmp_path):
+    """`owned_paths` is a human-maintained list mixing paths with prose ("CI
+    collection manifests", "exact F401 offending file"). Handing it to pytest as
+    written would error the job into FAIL_INFRA, which reads as a candidate
+    failure rather than a scope bug."""
+    (tmp_path / "platform" / "tests").mkdir(parents=True)
+    drv = _scope_drv(tmp_path, {"L04": {"id": "L04", "owned_paths": [
+        ".circleci/config.yml", "CI collection manifests", "exact F401 offending file",
+        "platform/tests/test_gone.py",                            # named but NOT on disk
+    ]}})
+    assert drv._contract_owned_test_files("L04", tmp_path) == []
+
+    # and a contract the catalog does not have must not raise: a proof that dies
+    # on a missing catalog entry turns a scope gap into an infra red
+    assert drv._contract_owned_test_files("NO-SUCH-CONTRACT", tmp_path) == []
+    assert drv._contract_owned_test_files(None, tmp_path) == []
+
+
+def test_d113b_a_contract_owning_a_non_platform_test_forces_the_full_pipeline(tmp_path):
+    """The accepted cost, pinned. L04 owns deploy/tests/test_ci_collection_floor.py,
+    and _twin_scope_only refuses ANY non-platform/ path -- so honouring the
+    contract sends those twins to the FULL pipeline rather than widening the
+    scoped job.
+
+    That is the point, not a regression: a deploy/ test cannot run in a
+    platform-scoped twin, so a scoped PASS there could never have answered the
+    criterion. Architect 2 accepted the scheduling cost explicitly on
+    2026-09-21. Pinned so nobody 'optimises' it back by filtering the path out."""
+    (tmp_path / "deploy" / "tests").mkdir(parents=True)
+    (tmp_path / "deploy" / "tests" / "test_ci_collection_floor.py").write_text("", encoding="utf-8")
+
+    drv = _scope_drv(tmp_path, {"L04": {"id": "L04", "owned_paths": [
+        "deploy/tests/test_ci_collection_floor.py"]}})
+
+    got = drv._contract_owned_test_files("L04", tmp_path)
+    assert got == ["deploy/tests/test_ci_collection_floor.py"], got
+    assert not got[0].startswith("platform/"), (
+        "the non-platform path must survive this far -- it is what _twin_scope_only "
+        "sees and refuses, and dropping it here would silently restore the scoped "
+        "PASS that could not answer the criterion")
+
+
+def test_d113b_does_not_reuse_the_prose_pattern_and_says_why():
+    """My first version DID reuse TEST_FILE_RE, on the reasoning that one notion
+    of "is a test file" cannot drift. The test above caught it: TEST_FILE_RE is
+    anchored to `(platform|agent|portal)/` and silently returned NOTHING for
+    L04's deploy/tests/test_ci_collection_floor.py -- the single case the whole
+    change exists for.
+
+    The anchor is right where it lives: TEST_FILE_RE scans free PROSE, where an
+    unanchored path pattern matches anything path-shaped. `owned_paths` is a
+    structured field, so the anchor protects nothing and only drops real files.
+    The guard here is stronger instead: looks like a test file AND exists on
+    disk. Pinned with its reason so nobody re-unifies them for tidiness."""
+    import inspect
+    from vp.lanedriver import LaneDriver
+
+    src = inspect.getsource(LaneDriver._contract_owned_test_files)
+    assert "TEST_FILE_RE" not in src.split('"""')[2], (
+        "the contract reader is using the prose pattern again -- it is suite-anchored "
+        "and drops every non-platform/agent/portal path, incl. the L04 deploy/ case")
+    doc = inspect.getdoc(LaneDriver._contract_owned_test_files) or ""
+    assert "deploy/" in doc, "the reason the two patterns differ is no longer recorded"

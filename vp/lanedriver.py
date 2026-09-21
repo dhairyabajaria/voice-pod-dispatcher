@@ -48,7 +48,7 @@ import time
 import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import laneproof  # noqa: E402
@@ -1494,6 +1494,55 @@ class LaneDriver(object):
     # sibling test_campaign_legacy_reconciliation.py the parent listed
     BARE_TEST_RE = re.compile(r"(?<![\w./-])(test_[\w-]+\.(?:py|ts|tsx))(?=::|[`'\"\s,;)]|$)")
 
+    def _contract_owned_test_files(self, cid, wt):
+        """the test files a CONTRACT declares in lane-contracts.json
+        `owned_paths`, filtered to real files present in `wt`.
+
+        This does NOT reuse TEST_FILE_RE, and the difference is deliberate.
+        TEST_FILE_RE is anchored to `(platform|agent|portal)/` because it scans
+        free PROSE, where an unanchored path pattern would match anything that
+        looks like one.  `owned_paths` is a STRUCTURED field whose entries are
+        already meant to be paths, so the suite anchor is not protecting
+        anything here -- it would only drop the very case this exists for.  L04
+        owns `deploy/tests/test_ci_collection_floor.py`, and reusing
+        TEST_FILE_RE silently returned nothing for it.
+
+        The false-positive guard is stronger than a prefix guess instead: an
+        entry must look like a test file AND exist in the worktree.  Prose like
+        "CI collection manifests" or "exact F401 offending file" fails both.
+
+        A contract may own a test OUTSIDE platform/ -- L04 owns
+        deploy/tests/test_ci_collection_floor.py -- and _twin_scope_only refuses
+        any non-platform path, so honouring the contract sends those twins to
+        the FULL pipeline instead of widening the scoped job.  That is intended:
+        a deploy/ test cannot run in a platform-scoped twin, so a scoped PASS
+        there was never able to answer the criterion.  The scheduling cost was
+        accepted explicitly (Architect 2, 2026-09-21)."""
+        if not cid:
+            return []
+        try:
+            owned = (self.control.contract(str(cid)) or {}).get("owned_paths") or []
+        except Exception as exc:  # noqa: BLE001 -- a missing catalog must not fail the proof
+            self.log("PROOF twin scope: contract %s unreadable (%s: %s); its owned files are not in scope"
+                     % (cid, type(exc).__name__, str(exc)[:120]))
+            return []
+        out = []
+        for x in owned:
+            x = str(x).strip()
+            name = PurePosixPath(x).name
+            if not (name.startswith("test_") and PurePosixPath(x).suffix in (".py", ".ts", ".tsx")):
+                continue
+            if wt is not None and not (Path(wt) / x).exists():
+                # absent at this base: drop it rather than hand pytest a path
+                # that errors the job into FAIL_INFRA, which reads as a
+                # candidate failure rather than the scope gap it is (D123)
+                continue
+            out.append(x)
+        if out:
+            self.log("PROOF twin scope: contract %s owns %d test file(s): %s (D113b)"
+                     % (cid, len(out), ", ".join(sorted(set(out)))))
+        return out
+
     def _named_test_files(self, text, wt):
         """every test file a row names, as repo-relative paths that exist in wt:
         TEST_FILE_RE's full paths, plus D120's bare basenames resolved under
@@ -1597,6 +1646,24 @@ class LaneDriver(object):
             if cpk is None and cid and str(cid).endswith("-V13"):
                 cpk = self.pack.get(str(cid)[:-4])
             paths += [str(x) for x in ((cpk or {}).get("test_paths") or [])]
+            # D113b: the contract's OWN declaration of what it owns lives in
+            # lane-contracts.json `owned_paths`, which the line above never
+            # reaches -- a contract packet is a different object from a contract,
+            # and 23 contracts here (L04, RECOVERY-JUNIOR-T3R3, ...) have no
+            # packet at all, so `cpk` is None and the contract contributed
+            # NOTHING, silently.  Measured 2026-09-21: 17 scoped twins ran a
+            # scope that omitted a test file their contract owns, including the
+            # four L17 rows that missed platform/tests/test_campaign_release_pins.py
+            # on an otherwise-VERIFIED row.
+            #
+            # This is not the "packet grew later" case and cannot be: the code
+            # never read this source, so no edit history could explain the miss.
+            #
+            # `owned_paths` is a list humans maintain and mixes real paths with
+            # prose ("CI collection manifests", "exact F401 offending file"), so
+            # it is filtered to things that are test files AND exist in the
+            # worktree -- never handed to pytest as written.
+            paths += self._contract_owned_test_files(cid, wt)
         paths += [str(x) for x in (cfg.get("extra_paths") or [])]
         return sorted(set(x for x in paths if x.strip()))
 
@@ -6340,6 +6407,25 @@ class LaneDriver(object):
     # looked at this yet" from "someone looked and could not tell".  That is the
     # same collapse behind D170 (`only` missing read as full) and D175 (a ledger
     # row's missing `only` read as full) -- twice in one night, one layer apart.
+    #
+    # `covered` NEVER MEANS `proven`.  This field answers exactly one question --
+    # "did the run do what was ASKED?" -- and says nothing about whether the ask
+    # was sufficient.  Those are different defects with different owners:
+    #
+    #     D176 (this field)   did the run do what was asked?
+    #     D113 (twin scope)   was the ask enough to answer the criterion?
+    #
+    # A record can be legitimately `covered` AND a false green, when the scope it
+    # faithfully executed omitted a file the contract owns.  That is not
+    # hypothetical: L17-REPLY-FENCE-LOCK-CLOSED-HOSTED-CIRCLECI is `covered` on
+    # this field, correctly -- its `only` file really did run -- while its `only`
+    # never named platform/tests/test_campaign_release_pins.py, which contract L17
+    # owns.  Reading `covered` as `proven` is how that row passed review.
+    #
+    # So a citable record is a NECESSARY condition for a member's proof, never a
+    # sufficient one.  Anything asserting sufficiency has to check the ask too.
+    # (Architect 2, 2026-09-21: a machine-written verdict field that invites the
+    # wrong reading is more dangerous than no field at all.)
     SUBSET_CITABLE = ("full", "covered")
 
     @classmethod
@@ -6351,9 +6437,13 @@ class LaneDriver(object):
 
     @classmethod
     def subset_citable(cls, rec):
-        """May this record stand as a row's proof at all?  Fails CLOSED: anything
+        """May this record stand as a row's proof AT ALL?  Fails CLOSED: anything
         that is not a positively established verdict refuses, including a value
-        this version does not recognise."""
+        this version does not recognise.
+
+        "At all" is the whole claim.  True here means the run did what it was
+        asked; it does NOT mean the ask was sufficient, and it is therefore never
+        on its own a reason to pass a criterion.  See SUBSET_CITABLE above."""
         return cls.subset_state(rec) in cls.SUBSET_CITABLE
 
     def _proof_index(self):
@@ -7080,8 +7170,56 @@ class LaneDriver(object):
             return
         rows = sorted(t for t, r in tasks.items() if r.get("state") in ("REPAIR_REQUIRED", "INVALID_EVIDENCE"))
         self.alert_once("owed-rulings:%s" % self._idle_since, "OWED_RULINGS",
-                        "idle %d min with %d row(s) awaiting a ruling (REPAIR_REQUIRED/INVALID_EVIDENCE): %s"
-                        % (idle_s // 60, owed, ", ".join(rows)[:500]))
+                        "idle %d min: %s" % (idle_s // 60, self._owed_rulings_summary(rows, owed)))
+
+    @classmethod
+    def _owed_rulings_summary(cls, rows, owed=None):
+        """D178: report the owed rows grouped by ROOT, deepest chain first.
+
+        64 rows measured on 2026-09-21 were 19 distinct problems -- the alert
+        over-reported 3.4x because it counted attempts rather than problems, and
+        then truncated the flat list at 500 chars so the tail was invisible
+        anyway.  Advisor read that as "48 stale ancestors that never get
+        auto-retired" and proposed retiring them.  Measured: ZERO of the 64 had
+        a VERIFIED successor, so auto-retire had skipped nothing (it already
+        fires on VERIFIED, and RETIRABLE already contains both owed states);
+        45 were standing because their OWN successors were still failing.
+
+        Retiring them would have turned "REVIEW-JUNIOR-S3-F2 has failed six
+        times" into "one open row".  The attempt depth is the most important
+        fact about these chains -- three roots had exhausted R5 -- so this
+        SHOWS the depth instead of deleting it.  Grouping is the fix; retirement
+        was the wrong remedy for a real symptom.
+
+        Uses SUPERSEDE_RE, the same root rule retirement uses: a second spelling
+        of "what is a retry of what" would drift away from the first one.
+        """
+        by_root = {}
+        for t in rows:
+            m = cls.SUPERSEDE_RE.match(t)
+            by_root.setdefault(m.group("root") if m else t, []).append(t)
+        # deepest chain first: those have resisted the most attempts
+        order = sorted(by_root.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        parts, shown = [], 0
+        for root, ts in order:
+            piece = "%s x%d" % (root, len(ts)) if len(ts) > 1 else root
+            if shown + len(piece) > 460:
+                parts.append("... +%d more problem(s)" % (len(order) - len(parts)))
+                break
+            parts.append(piece)
+            shown += len(piece) + 2
+        # D178a: `owed` comes from the FRONTIER counts and `rows` from the task
+        # map -- two sources that can disagree.  The pre-D178 text quoted the
+        # counts number while listing the task-map rows, so a disagreement was
+        # invisible: it read "3 row(s)" beside a list of two.  Name both when
+        # they differ rather than silently preferring one; a mismatch here means
+        # the frontier and the task view have drifted, which is worth seeing.
+        seen = len(rows)
+        count = ("%d row(s)" % seen if owed is None or int(owed) == seen
+                 else "%d row(s) (frontier counts %d -- the two views disagree)" % (seen, int(owed)))
+        return ("%d problem(s) across %s awaiting a ruling "
+                "(REPAIR_REQUIRED/INVALID_EVIDENCE), deepest first: %s"
+                % (len(by_root), count, ", ".join(parts)))
 
     def _frontier_actions(self, state, fr):
         acted = 0
