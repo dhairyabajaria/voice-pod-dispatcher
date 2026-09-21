@@ -1811,6 +1811,26 @@ def test_a_malformed_roster_edit_is_rejected_not_fatal(tmp_path):
 
 
 @pytest.mark.skipif(_V13_PACK_SKIP_REASON is not None, reason=str(_V13_PACK_SKIP_REASON))
+def test_d194_claude_max_is_bounded_one_to_eight_not_pinned_to_two(tmp_path):
+    """D194: the owner raised claude_max 2 -> 8 for the D192 Sonnet builder
+    fallback.  The lint bounds it (D75's shape for codex_max) instead of
+    pinning it, so 8 is legal, 2 still is, and only out-of-range is an ERROR."""
+    import vplint
+    r = json.loads((CONTROL_DIR / "v13-pack" / "roster-v13.json").read_text())
+
+    def errs(v):
+        r["concurrency"]["claude_max"] = v
+        return [m for m in vplint.lint_roster_v13(r) if m.startswith("ERROR") and "claude_max" in m]
+
+    for legal in (1, 2, 8):
+        assert errs(legal) == [], "claude_max %s is inside the 1..8 bound" % legal
+    for bad in (0, 9, 20, "8", None):
+        assert errs(bad), "claude_max %r is outside the bound and must ERROR" % (bad,)
+    # the message names the new bound, not the retired pin
+    assert "claude_max 1..8" in errs(9)[0] and "claude_max 2 required" not in errs(9)[0]
+
+
+@pytest.mark.skipif(_V13_PACK_SKIP_REASON is not None, reason=str(_V13_PACK_SKIP_REASON))
 def test_item10_pack_roster_v13_boots_the_driver_and_lints_clean(tmp_path):
     import vplint
     src = CONTROL_DIR / "v13-pack" / "roster-v13.json"
@@ -1912,7 +1932,9 @@ def test_pack4a_init_run_copies_lints_and_snapshots_the_roster(tmp_path):
     # same content again: no new snapshot; an edit: roster.2.json
     assert lanedriver.main(["init-run", "--source", str(src)]) == 0
     assert not (run_root / "roster.2.json").exists()
-    r["concurrency"]["claude_max"] = 1
+    # D194: claude_max is bounded 1..8, so 1 is now legal; 9 is the out-of-range
+    # value that still exercises "a lint error refuses init-run".
+    r["concurrency"]["claude_max"] = 9
     src.write_text(json.dumps(r, indent=2))
     assert lanedriver.main(["init-run", "--source", str(src)]) == 2, "lint error (claude_max) refuses"
     assert (run_root / "roster.json").read_bytes() != src.read_bytes()

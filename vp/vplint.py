@@ -645,11 +645,22 @@ def lint_roster_v13(r):
                        % (kind, bfb["runner"], " AND model %s" % bfb.get("model") if same_model else ""))
     conc = n.get("concurrency") or {}
     # D75 (2026-09-19): the owner raised codex_max from the plan's 3 to 20;
-    # the lint now bounds it (1..20) instead of pinning it; claude_max stays 2
-    cm = conc.get("codex_max")
-    if not isinstance(cm, int) or not 1 <= cm <= 20 or conc.get("claude_max") != 2:
-        out.append("ERROR roster: concurrency.codex_max 1..20 / claude_max 2 required; got %s / %s"
-                   % (cm, conc.get("claude_max")))
+    # the lint now bounds it (1..20) instead of pinning it.
+    # D194 (2026-09-22): the owner raised claude_max 2 -> 8 so the D192 builder
+    # fallback (claude/claude-sonnet-5) does not queue behind the two slots the
+    # `ruling` role already holds, and asked for "the lint pin" to move with it.
+    # Bounded 1..8 rather than re-pinned to 8, on D75's reasoning: a pin makes
+    # every later owner decision a code change, and a bound still catches the
+    # typo the pin was there for.
+    # This is a RUNNER cap, and it is not the binding one: _try_acquire
+    # (lanedriver.py:1096) tests `len(self._live) >= self.max_tasks` BEFORE the
+    # runner cap on the next line, so concurrency.max_tasks_in_flight (15)
+    # ceilings the fleet no matter what this number says.
+    cm, clm = conc.get("codex_max"), conc.get("claude_max")
+    if (not isinstance(cm, int) or not 1 <= cm <= 20
+            or not isinstance(clm, int) or not 1 <= clm <= 8):
+        out.append("ERROR roster: concurrency.codex_max 1..20 / claude_max 1..8 required; got %s / %s"
+                   % (cm, clm))
     proof = n.get("proof") or {}
     if proof.get("box_slots") != 1 or proof.get("shm_reap") is not True:
         out.append("ERROR roster: proof.box_slots 1 and proof.shm_reap true required")
