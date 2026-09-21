@@ -4805,7 +4805,10 @@ def test_d168_proofs_json_carries_the_scope_and_whether_a_proof_is_owed(tmp_path
 
     # the recorded field must equal the shared mapping, not a value assembled here
     for t, e in by.items():
-        assert e["scope"] == drv.scope_label(drv.member_scope(t, (state["tasks"][t] or {}).get("kind")))
+        # D174: pass the row, exactly as _review_proofs does.  A mirror test that
+        # calls the function differently from production stops being a mirror.
+        assert e["scope"] == drv.scope_label(drv.member_scope(
+            t, (state["tasks"][t] or {}).get("kind"), row=state["tasks"][t] or {}))
 
 
 def test_d168_the_summary_names_every_exempt_member(tmp_path, monkeypatch):
@@ -5013,3 +5016,60 @@ def test_d172_the_rule_the_reviewer_reads_names_the_fields_that_decide_scope():
     # The same rule is stated twice: this string (the packet head) and REVIEW_PROMPT
     # (the reviewer's system prompt). Fixing one copy of two is how a rule returns.
     assert "scope" in REVIEW_PROMPT and "D170" in REVIEW_PROMPT
+
+
+
+def test_d174_integrated_non_dynamic_rows_are_exempt_from_proof_EXISTENCE_only(tmp_path, monkeypatch):
+    """D174 / exemption (0b), Architect 2026-09-21.
+
+    F5-R5 marked 25 members UNKNOWN that owe no proof record at all: they were
+    proved and merged before v13 existed.  The exemption was real and ruled, but
+    it lived in a document the grader cannot read -- the same hole as the scope
+    field, one layer down, and unenforceable for exactly the same reason.
+
+    The basis is BOTH conjuncts: `state == "INTEGRATED"` AND not `dynamic`.
+    Verified program-wide by the Architect: exactly 25 non-dynamic INTEGRATED
+    tasks, matching all 25 non-dynamic F5-R5 members by name, no extras and no
+    misses.  Rejected alternatives are recorded in member_scope's comment so they
+    are not re-proposed -- `v13_kind` is null on all 687 rows and would exempt
+    everything.
+
+    This test pins the PREDICATE.  Membership against the live 25 is a one-shot
+    audit, deliberately not pinned here: a unit test naming 25 rows goes stale
+    the first time one changes state, and a stale guard gets deleted rather than
+    fixed."""
+    from vp.lanedriver import LaneDriver
+
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    exempt = drv.member_scope("ROW", "builder", row={"state": "INTEGRATED"})
+    assert exempt["class"] == "not_required" and exempt["basis"] == "integrated_not_dynamic"
+    assert LaneDriver.scope_scored(LaneDriver.scope_label(exempt)) is False
+
+    # both conjuncts load-bearing, or the basis is wider than the ruling
+    dyn = drv.member_scope("ROW", "builder", row={"state": "INTEGRATED", "dynamic": True})
+    assert dyn["class"] == "unproven", "a dynamic twin is NOT exempt: %r" % dyn
+    ver = drv.member_scope("ROW", "builder", row={"state": "VERIFIED"})
+    assert ver["class"] == "unproven", "only INTEGRATED is exempt: %r" % ver
+    assert drv.member_scope("ROW", "builder")["class"] == "unproven", (
+        "no row at all must stay scored -- fail CLOSED, never exempt by omission")
+
+
+def test_d174_the_packet_states_WHY_a_member_is_exempt():
+    """D174, Architect's second requirement: the reason goes in the packet text,
+    not only in the rule.
+
+    A packet that says "3 exempt" and stops is one reader away from being
+    rewritten as "skip integrated rows" -- which would take the owned_paths
+    criterion with it.  (0b) exempts from the EXISTENCE check only.  An exemption
+    is a deleted check; this sentence is what keeps it to exactly one."""
+    from vp.lanedriver import LaneDriver
+
+    mem = [{"task": "A", "proof_required": False, "scope_basis": "integrated_not_dynamic"},
+           {"task": "B", "proof_required": True, "scope_basis": None}]
+    out = LaneDriver.scope_summary(mem)
+    assert "1 of 2 scored, 1 exempt" in out
+    assert "EXISTENCE check only" in out, out
+    assert "owned_paths criterion is still scored" in out, out

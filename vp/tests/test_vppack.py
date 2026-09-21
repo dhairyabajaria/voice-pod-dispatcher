@@ -650,8 +650,11 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     # the absence of `only` from this list is precisely what made 287 scoped proofs
     # read as full-suite passes, so the shape of this list is load-bearing and a
     # change to it should be a deliberate edit here.
+    # D174 adds `scope_basis`: the REASON an entry is exempt travels with the
+    # entry, so the packet can say why rather than only that.  Exact on purpose,
+    # as above -- a new field is a deliberate edit here.
     assert set(plan["proofs"]["entries"][0]) == (
-        {"task", "output_sha", "scope", "proof_required"} | set(LaneDriver.PROOF_FIELDS))
+        {"task", "output_sha", "scope", "scope_basis", "proof_required"} | set(LaneDriver.PROOF_FIELDS))
     assert "only" in LaneDriver.PROOF_FIELDS
     # and the stub path is the fail-closed one: this caller has no member_scope, so every
     # MEMBER entry must come back SCORED rather than quietly exempt

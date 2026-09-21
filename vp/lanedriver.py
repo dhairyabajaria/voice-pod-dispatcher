@@ -1975,7 +1975,7 @@ class LaneDriver(object):
                 "only": only or None, "proof_id": best[1].get("proof_id"),
                 "pipeline_id": best[1].get("pipeline_id")}
 
-    def member_scope(self, task, kind=None):
+    def member_scope(self, task, kind=None, row=None):
         """D147: why a member has the scope it has -- or legitimately has none.
 
         D146 shipped one bucket for "no passing proof record" and it fired on 4 of
@@ -2008,6 +2008,26 @@ class LaneDriver(object):
             twin = self.proof_scope_for(suffix)
             if twin:
                 return dict(twin, basis="inherited", **{"from": suffix})
+        # D174, exemption (0b) (Architect, 2026-09-21): a row that is already
+        # INTEGRATED and is not a dynamic twin was proved and merged before v13
+        # existed.  It owes no proof RECORD, and F5-R5 marked 25 such members
+        # UNKNOWN only because the exemption lived in a ruling document the
+        # grader cannot read -- the same hole as the scope field, one layer down.
+        #
+        # The basis is `not row["dynamic"] and row["state"] == "INTEGRATED"`.
+        # Rejected alternatives, recorded so they are not re-proposed: `v13_kind`
+        # is null on all 687 task rows (it is packet frontmatter, not a task
+        # field) and would exempt EVERYTHING; a sha cutoff breaks when the base
+        # moves; a literal list goes stale.
+        #
+        # EXISTENCE ONLY.  This exempts a member from "where is your proof
+        # record", never from its lane-contracts owned_paths criterion -- that
+        # step is what catches a proper-subset coverage claim, and a blanket skip
+        # would delete it.  An exemption is a deleted check; this one deletes
+        # exactly one.
+        row = row or {}
+        if row.get("state") == "INTEGRATED" and not row.get("dynamic"):
+            return {"class": "not_required", "basis": "integrated_not_dynamic", "kind": kind}
         return {"class": "unproven", "basis": "none", "kind": kind}
 
     def _twin_ids(self, task):
@@ -2037,6 +2057,10 @@ class LaneDriver(object):
         if row.get("state") != "VERIFIED":
             return "-"
         try:
+            # D174: no row= here ON PURPOSE.  This cell returns "-" for anything
+            # that is not VERIFIED (:2037), so an INTEGRATED row never reaches
+            # this line and exemption (0b) cannot apply.  Passing the row would
+            # read as coverage it does not have.
             sc = self.member_scope(tid, row.get("kind")) or {}
         except Exception:  # noqa: BLE001 -- render never takes the tick down
             return "?"
@@ -2073,6 +2097,17 @@ class LaneDriver(object):
         # and `owed a proof` is answerable.
         return "no-proof-in-run"
 
+    # D174: the exemption REASON belongs in the packet text, not only in the rule.
+    # A packet that says "3 exempt" and nothing more is one reader away from being
+    # rewritten as "skip integrated rows", which would take the owned_paths
+    # criterion with it.
+    SCOPE_BASIS_WHY = {
+        "integrated_not_dynamic": ("already INTEGRATED and not a dynamic twin: exempt from the proof-record "
+                                   "EXISTENCE check only -- its lane-contracts owned_paths criterion is "
+                                   "still scored"),
+        "kind": "its kind never owed a proof (proof.require_for_kinds)",
+    }
+
     @classmethod
     def scope_summary(cls, mem):
         """D168: the one line a reviewer reads to know what the proof count covered.
@@ -2087,9 +2122,15 @@ class LaneDriver(object):
         # e.get(...)` would read a member whose field is MISSING as exempt, which is
         # the same silent drop this line exists to prevent, one layer up.
         exempt = sorted(str(e.get("task")) for e in mem if e.get("proof_required") is False)
-        return "Proof scope: %d of %d scored, %d exempt (not-required)%s\n" % (
+        out = "Proof scope: %d of %d scored, %d exempt (not-required)%s\n" % (
             len(mem) - len(exempt), len(mem), len(exempt),
             ": " + ", ".join(exempt) if exempt else "")
+        for basis in sorted({str(e.get("scope_basis") or "") for e in mem
+                             if e.get("proof_required") is False}):
+            why = cls.SCOPE_BASIS_WHY.get(basis)
+            if why:
+                out += "  exempt because %s.\n" % why
+        return out
 
     @classmethod
     def scope_scored(cls, label):
@@ -2740,6 +2781,12 @@ class LaneDriver(object):
         # assemblable from scoped parts without that being visible (the union-104
         # mistake).  Derived per member from its own proof record, never assumed.
         for m in merged:
+            # D174: no row= here either, and this one IS a judgement call.  The
+            # ruling that created exemption (0b) was about how a REVIEW grades a
+            # member, not about how a union counts its parts.  UNION_MEMBER_STATES
+            # includes INTEGRATED, so passing the row would silently move members
+            # out of the union's `unproven` tally as a side effect of a review
+            # change.  Flagged for a ruling rather than widened quietly.
             m["proof_scope"] = self.member_scope(m["task"], m.get("kind"))
         def _of(cls):
             return sorted(m["task"] for m in merged
@@ -6270,10 +6317,15 @@ class LaneDriver(object):
             # (test_vppack.py:609).  A `self.` hop would make adding a helper here
             # break a caller that never asked for one.
             try:
-                sc = self.member_scope(t, (tasks.get(t) or {}).get("kind") or e.get("kind"))
+                sc = self.member_scope(t, (tasks.get(t) or {}).get("kind") or e.get("kind"),
+                                       row=tasks.get(t) or {})
                 e["scope"] = LaneDriver.scope_label(sc)
+                # D174: the BASIS travels with the entry.  "exempt" without a
+                # reason is the thing that gets simplified back into a blanket
+                # skip by the next reader.
+                e["scope_basis"] = sc.get("basis")
             except Exception:  # noqa: BLE001 -- a review render never takes the tick down
-                e["scope"] = "?"
+                e["scope"], e["scope_basis"] = "?", "error"
             e["proof_required"] = LaneDriver.scope_scored(e["scope"])
             entries.append(e)
         tip = best(idx.get(cand)) if cand else None
@@ -6284,7 +6336,7 @@ class LaneDriver(object):
             # apply to it -- but it gets the fields anyway, scored.  A list whose rows
             # have two different shapes is where a consumer's .get() quietly returns
             # None and the row falls out of whatever it was being counted for.
-            e["scope"] = "-"
+            e["scope"], e["scope_basis"] = "-", "union_tip"
             e["proof_required"] = LaneDriver.scope_scored(e["scope"])
             entries.append(e)
         return {"generated": utc_ms(), "subject_sha": cand, "union": (union or {}).get("union"),
