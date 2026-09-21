@@ -3409,3 +3409,79 @@ def test_d134_an_unpinned_role_spreads_across_the_fleet_and_a_pin_still_wins(tmp
     drv.servers["go1"]["max_concurrent"] = 0
     assert drv._pick_server({}) is None
     assert drv._pick_server({"server": "go2"}) is None
+
+
+def grader_fails_on(ids):
+    """PASS everywhere except an explicit FAIL on `ids` -- the shape a grader
+    produces when it reads a [hosted] row, looks for the hosted record, finds
+    none, and writes FAIL rather than UNKNOWN."""
+    def fn(spec, abort_flag=None):
+        wt = Path(spec.cwd)
+        head = git(wt, "rev-parse", "HEAD")
+        all_ids = [l.split()[1] for l in (wt / ".vp" / "BENCHMARK.md").read_text().splitlines()
+                   if l.startswith("- B")]
+        lines = [{"id": i, "kind": "evidence",
+                  "verdict": "FAIL" if i in ids else "PASS",
+                  "evidence": "platform/a.py:1",
+                  "note": "no hosted record exists at this sha" if i in ids else "ok"}
+                 for i in all_ids]
+        Path(spec.out_path).write_text(json.dumps({"item": spec.item, "attempt": 1, "commit": head,
+                                                   "lines": lines, "all_pass": False}))
+        return TurnOutcome(STATUS_DONE, "", session_id="ses_g", record_path=spec.out_path,
+                           usage={"tokens_in": 10, "tokens_out": 5, "cost": 0.001}, runner="fake")
+    return fn
+
+
+def test_d136_a_hosted_row_the_grader_FAILS_does_not_block_the_parent(tmp_path, monkeypatch):
+    """D136: a [hosted] row belongs to the twin, so it must not block the parent
+    HOWEVER THE GRADER PHRASED IT.
+
+    The exemption used to filter `unknown` only, which left the policy at the
+    grader's discretion. 2026-09-21: R-SEC-CALLERS-AND-SEED-ROUTE's B10 asks for
+    a full canary-gated run; its grader correctly observed that no such record
+    exists and wrote FAIL instead of UNKNOWN; the parent then burned all three
+    rounds with `fails=['B10']` and nothing else -- REPAIR_REQUIRED for a row its
+    own rounds structurally cannot answer, on a packet whose real work was done.
+
+    The control is `grader_fails_on` rather than `grader_unknown_on`: under the
+    old code the UNKNOWN path already passed, so only a FAIL distinguishes the fix.
+    """
+    _with_hosted_row(monkeypatch)
+    env = Env(tmp_path)
+    env.activate()
+    runner = by_role({"builder": result_ok, "grader": grader_fails_on({"B9"}), "probe": result_ok})
+    drv = env.driver({"opencode": runner, "codex": FakeRunner(), "claude": FakeRunner()})
+    settle(drv, 6)
+    rows = env.rows()
+    assert rows["L02"]["state"] == "VERIFIED", rows["L02"]
+    harvest = json.loads(next((env.run_root / "turns" / "L02").glob("*/harvest.json")).read_text())
+    assert "B9" in (harvest.get("hosted_owed") or []), harvest
+    assert "HOSTED_OWED" in (env.run_root / "OWNER-ALERTS.md").read_text()
+    # one build, not three: the parent must not burn its rounds on the twin's row
+    assert len([s for s in runner.calls if s.item == "L02" and s.role == "builder"]) == 1
+
+
+def test_d136_a_twin_is_still_blocked_by_its_own_hosted_row(tmp_path):
+    """The other half, and the reason the exemption is keyed on `_exempt_rows`
+    rather than on the tag: on a TWIN the hosted rows are the SUBJECT (D37), so
+    `_exempt_rows` returns the empty set and a FAIL there must still block.
+    Without this, D136 would silently make every hosted twin unfailable -- the
+    exact vacuous-guard shape the row exists to prevent."""
+    env = Env(tmp_path)
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+    wt = tmp_path / "wt"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / ".vp" / "BENCHMARK.md").write_text(
+        "- B1 [invariant] [box] a box row\n"
+        "- B10 [invariant] [hosted] the full suite is green at the candidate sha\n")
+    # a parent exempts its [hosted] rows ...
+    assert drv.hosted_rows(wt) == {"B10"}
+    assert drv._exempt_rows("L02", wt) == {"B10"}
+
+    # ... a twin exempts nothing, because the row is what it exists to answer
+    class _Twin(dict):
+        pass
+    monkey = _Twin({"id": "L02-HOSTED", "twin_of": "L02"})
+    drv.packet_for = lambda task, _p=monkey: _p if task.endswith("-HOSTED") else None
+    assert drv._exempt_rows("L02-HOSTED", wt) == set(), \
+        "a twin must still be blocked by its own [hosted] row"

@@ -4993,7 +4993,16 @@ class LaneDriver(object):
             self._defer_rows(task, fpath, wt)
             _doc, fails, unknown = findings_verdicts(fpath)
             hosted = self._exempt_rows(task, wt)
-            owed = [u for u in unknown if u in hosted]
+            # D136: a [hosted] row is the TWIN's to answer, so it must not block the
+            # parent however the grader phrased it.  Exempting only UNKNOWN left the
+            # policy at the grader's discretion: R-SEC-CALLERS-AND-SEED-ROUTE's B10
+            # asks for a full canary-gated run, its grader correctly observed that no
+            # such record exists and wrote FAIL rather than UNKNOWN, and the parent
+            # burned all 3 rounds on a row its own rounds structurally cannot answer
+            # (2026-09-21, rounds 2 and 3 were `fails=['B10']` and nothing else).
+            fails, hosted_failed = ([f for f in fails if f not in hosted],
+                                    [f for f in fails if f in hosted])
+            owed = [u for u in unknown if u in hosted] + hosted_failed
             blocking = [u for u in unknown if u not in hosted]
             if owed:
                 self.alert_once("hosted-owed:%s" % task, "HOSTED_OWED",
@@ -5788,6 +5797,10 @@ class LaneDriver(object):
         self._defer_rows(task, fpath, wt)
         _doc, fails, unknown = findings_verdicts(fpath)
         hosted = self._exempt_rows(task, wt)
+        # D136: same exemption as the round path -- a [hosted] FAIL on a parent is
+        # owed to the twin, not charged here. `hosted` is empty on a twin, so a
+        # twin's own [hosted] FAIL still blocks, which is the point of the row.
+        fails = [f for f in fails if f not in hosted]
         blocking = [u for u in unknown if u not in hosted]
         ev = [wt / ".vp" / "REVIEW.json", wt / ".vp" / "RESULT.json", fpath, tdir / "record.json", packet]
         if fails or blocking:
