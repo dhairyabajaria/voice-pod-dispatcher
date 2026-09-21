@@ -130,7 +130,13 @@ def test_the_l28_split_classifies_as_the_ruling_says_it_should():
 # amendment (12 new hosted rows). Verified independently with this test's own
 # regex before bumping: strict 181, loose 182, the one divergence being the
 # L17-REGISTRY-REPLY-PINS B10 `[box]` row whose TEXT contains '[hosted]'.
-EXPECTED_HOSTED = 181
+# 2026-09-21: 181 -> 184 as the pack kept growing (201 packets now). Every row is
+# still ABSENT, so this is growth, not migration -- the census has not started
+# moving yet. Verified independently with this test's own regex before bumping:
+# strict 184, loose 185, the one divergence still being that same
+# L17-REGISTRY-REPLY-PINS B10 `[box]` row. Confirmed pre-existing by running
+# this test at dispatcher e9fbfe2 (before D194): fails there identically.
+EXPECTED_HOSTED = 184
 
 
 def test_every_live_hosted_row_is_absent_today_so_the_census_starts_at_the_whole_corpus():

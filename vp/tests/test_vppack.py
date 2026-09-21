@@ -1691,15 +1691,20 @@ def test_d72_ruled_sticky_exclusion_keeps_a_member_out_of_every_integration_unio
 
 def test_d75_codex_max_is_bounded_not_pinned():
     """D75: the owner raised concurrency.codex_max 3 -> 20 (2026-09-19); the
-    roster lint bounds it to 1..20 (claude_max still pinned at 2) instead of
-    refusing every value but 3, which had rejected the edit."""
+    roster lint bounds it to 1..20 instead of refusing every value but 3, which
+    had rejected the edit.  D194 (2026-09-21) gave claude_max the same treatment
+    -- bounded 1..8, no longer pinned to 2 -- so the companion assertion below
+    now names the bound rather than the retired pin."""
     def msgs(cm, clm=2):
         r = {"run": {"scheduler": "x"}, "concurrency": {"codex_max": cm, "claude_max": clm}}
         return [m for m in vplint.lint_roster_v13(r) if "codex_max" in m]
     assert msgs(20) == [] and msgs(3) == [] and msgs(1) == []
     assert any("codex_max 1..20" in m for m in msgs(21))
     assert any("codex_max 1..20" in m for m in msgs(0))
-    assert any("claude_max 2" in m for m in msgs(3, 3))
+    # D194: claude_max 3 is legal now, so the old "claude_max 2" pin message is
+    # gone; 9 is out of the 1..8 bound and is what must still be refused.
+    assert msgs(3, 3) == [], "claude_max 3 is inside the D194 bound"
+    assert any("claude_max 1..8" in m for m in msgs(3, 9))
 
 
 def test_d98_a_twin_header_never_carries_proof_only():
