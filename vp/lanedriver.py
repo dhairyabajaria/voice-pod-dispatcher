@@ -1139,6 +1139,28 @@ class LaneDriver(object):
                             "roles.%s.fallback names runner 'opencode', but the fallback only "
                             "fires because no opencode server is free; ignored" % kind)
             return None
+        # D197: and refuse a runner this driver never initialised.  The three
+        # checks above validate the SHAPE of the fallback, not that its runner
+        # exists: `runner_state` is built from exactly opencode/codex/claude/agy
+        # (:634-635), so a typo'd or retired name passes every check here and
+        # then KeyErrors at `self.runner_state[runner]` in `_try_acquire`
+        # (:1098) -- inside the dispatch loop, on the fallback path, i.e. only
+        # once the fleet is already parked and cover is what we are short of.
+        # No deadlock (the `with` releases), but it throws mid-loop.
+        #
+        # vplint already rejects this (D192 added `fr not in RUNNERS`), so it
+        # cannot pass a lint gate -- but a roster edit reaches the running
+        # driver through `_reload_roster_if_changed`, which applies the roster
+        # without failing on lint ERRORs (the live roster carries 10 standing
+        # ones and reloads fine).  Lint is the gate for a roster someone lints;
+        # this is the one for a roster someone edits.
+        known = getattr(self, "runner_state", None) or {}
+        if fb["runner"] not in known:
+            self.alert_once("fallback-unknown-runner:%s" % kind, "ROSTER",
+                            "roles.%s.fallback names runner %r, which this driver never "
+                            "initialised (known: %s); ignored"
+                            % (kind, fb["runner"], ", ".join(sorted(known)) or "none"))
+            return None
         if not fb.get("model"):
             self.alert_once("fallback-nomodel:%s" % kind, "ROSTER",
                             "roles.%s.fallback names no model; ignored" % kind)

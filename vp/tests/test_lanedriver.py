@@ -5993,3 +5993,46 @@ def test_d196_a_stack_hold_cannot_self_clear_because_the_key_ignores_the_blocker
     assert lanedriver.LaneDriver._ready_key({**row, "claim_id": "claim-2"}) != before
     # and the hold interval is the poll interval, so it bounds the wasted wait
     assert lanedriver.LaneDriver.STACK_HOLD_S == 60
+
+
+def test_d197_a_fallback_naming_an_uninitialised_runner_is_refused(tmp_path, monkeypatch):
+    """D197: the D192 checks validate the fallback's SHAPE, not that its runner
+    exists. `runner_state` is built from exactly opencode/codex/claude/agy, so a
+    typo'd or retired name passed every check and then KeyErrored at
+    `self.runner_state[runner]` in `_try_acquire` -- mid dispatch loop, on the
+    fallback path, i.e. only once the fleet was already parked.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    alerts = []
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    monkeypatch.setattr(drv, "alert_once", lambda k, kind, msg, *a, **kw: alerts.append((kind, msg)))
+
+    for bad in ("codx", "gpt", "Claude", "opencode-go", "", None):
+        alerts[:] = []
+        rcfg = {"runner": "opencode", "model": "m",
+                "fallback": {"runner": bad, "model": "some-model"}}
+        assert drv._role_fallback("builder", rcfg) is None, bad
+        if bad:                      # "" / None are refused earlier, by the shape check
+            assert alerts and alerts[0][0] == "ROSTER", bad
+            assert "never initialised" in alerts[0][1], bad
+
+    # the real runners still work -- the guard refuses the unknown, not the fallback
+    for good in ("codex", "claude", "agy"):
+        rcfg = {"runner": "opencode", "model": "m",
+                "fallback": {"runner": good, "model": "some-model"}}
+        got = drv._role_fallback("builder", rcfg)
+        assert got and got["runner"] == good, good
+
+
+def test_d197_the_uninitialised_runner_would_have_keyerrored_in_try_acquire(tmp_path):
+    """Pins the consequence, so the guard is not mistaken for defensive noise:
+    `_try_acquire` indexes runner_state directly, so the refused name is exactly
+    the input that used to throw."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    assert set(drv.runner_state) == {"opencode", "codex", "claude", "agy"}
+    with pytest.raises(KeyError):
+        drv._try_acquire(None, "codx")
+    assert drv._try_acquire(None, "codex") in (True, False)   # a real runner does not throw
