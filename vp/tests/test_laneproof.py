@@ -6,6 +6,7 @@ box-green = PASS + TRUNK finding.  Fake pipeline JSON, fake vpproof, real git.""
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1621,3 +1622,81 @@ def test_d143_refusing_on_cap_gives_the_reserved_host_slot_back(tmp_path):
     assert rec["status"] == "BLOCKED_CAP" and "max_full_in_flight 1" in rec["reason"]
     assert not any((p.host_active or {}).values()), (
         "the refusal leaked a host slot: %r" % (p.host_active,))
+
+
+# -- D157: a verdict must always carry its cause ------------------------------
+
+
+def test_d157_a_fail_infra_record_never_has_a_none_reason():
+    """The source half. `reason` was a conditional chain ending in None for any
+    status but CANCELLED / collected-0 / unscoped, so a plain FAIL_INFRA carried
+    no cause at all -- and the consumer rendered it as an empty string, giving
+    fourteen owed rows a blocker that ended in a bare colon.
+
+    Nothing was ever missing from the record: reds/failed_nodes/pipeline_id were
+    all populated, and the PROOF log line prints the real cause from the same
+    values. This asserts the record says out loud what it already knew.
+    """
+    cls = {"reds": [{"job": "vp/platform-shards-3", "kind": "product", "status": "failed"},
+                    {"job": "vp/platform-coverage", "kind": "infra",
+                     "reason": "infrastructure_fail", "status": "infrastructure_fail"}]}
+    why = laneproof.Proof._derived_reason("FAIL_INFRA", cls, [], "35569998113",
+                                          "twin:3:platform/tests/test_x.py")
+    assert why, "a FAIL_INFRA record with two red jobs must state a cause"
+    assert "vp/platform-coverage" in why and "infra" in why, why
+    assert "35569998113" in why
+    assert not why.rstrip().endswith(":"), why
+
+    # PASS is the one status that legitimately has no reason
+    assert laneproof.Proof._derived_reason("PASS", cls, [], "1", None) is None
+
+
+def test_d157_a_record_with_nothing_to_derive_says_so():
+    """The arm that matters most for the NEXT bug. If the cause genuinely cannot
+    be derived, the record must say which fields were checked -- an empty string
+    is indistinguishable from the formatting bug this replaces."""
+    why = laneproof.Proof._derived_reason("FAIL_INFRA", {"reds": []}, [], None, None)
+    assert why and "no derivable cause" in why
+    assert "reds" in why and "failed_nodes" in why, (
+        "name the fields that were consulted: %r" % why)
+
+
+def test_d157_the_derived_reason_survives_junk_reds():
+    """classify() is not this function's to trust. Non-dict entries must not
+    raise out of the proof path -- the D140b ValueError already showed what an
+    exception here costs."""
+    cls = {"reds": [None, "oops", 17, {"job": "vp/portal", "kind": "infra"}]}
+    why = laneproof.Proof._derived_reason("FAIL_INFRA", cls, ["a/b.py::t"], "9", None)
+    assert "vp/portal" in why and "1 red job" in why
+    assert "1 red node" in why
+
+
+def test_d157_the_reason_chain_cannot_fall_back_to_none():
+    """Pin the CALL SITE, not the helper.
+
+    The three tests above call `_derived_reason` directly, so they prove the
+    helper and say nothing about whether the record ever uses it. Measured:
+    reverting the chain's terminal to `None` left all three green -- the exact
+    defect back in place, suite clean. The record-building path here needs a
+    live CircleCI run to exercise, so this reads the source instead, which is
+    the same technique already used on `run_circleci` elsewhere in this file.
+    """
+    import inspect
+
+    src = inspect.getsource(laneproof.Proof.run_circleci)
+    code = re.sub(r"#.*", "", src)
+    # NOT code.find('"reason":') -- run_circleci builds several records and the
+    # FIRST match is the BLOCKED_CAP one, a different chain entirely. Anchor on
+    # text unique to the chain under test. (Same repeated-idiom trap that made an
+    # unscoped mutation measure the wrong function in D155.)
+    anchor = "not an answer to a scoped ask (D140b)"
+    assert code.count(anchor) == 1, (
+        "expected exactly one D140b chain, found %d -- re-point this pin"
+        % code.count(anchor))
+    i = code.find(anchor)
+    chain = code[i:i + 400]
+    assert "_derived_reason" in chain, (
+        "the `reason` chain no longer ends in _derived_reason -- a status it does "
+        "not name explicitly will carry no cause again")
+    assert not re.search(r"if\s+unscoped\s+else\s+None\s*\)", chain), (
+        "the chain falls back to None: that is the original defect")

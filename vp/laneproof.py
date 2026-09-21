@@ -590,6 +590,46 @@ class Proof(object):
         with self._lock:
             self._release_host_locked(host)
 
+    @staticmethod
+    def _derived_reason(status, cls, failed, pipeline_id, only):
+        """D157: a non-PASS record must always be able to say WHY.
+
+        `reason` fell through to None for every status but the three named at
+        its call site, and lanedriver renders it as `str(rec.get("reason") or
+        "")` -- so a plain FAIL_INFRA produced a blocker ending in a bare colon
+        with nothing after it. Fourteen owed rows carried that: a verdict with
+        no cause, unactionable by anyone, including the session that wrote it.
+
+        Nothing was missing from the record. `reds`, `failed_nodes`,
+        `pipeline_id` and `jobs` were all present, and the PROOF log line just
+        below prints the real cause from these same values. This only ever
+        needed to say out loud what the record already knew.
+        """
+        if status == "PASS":
+            return None
+        reds = [r for r in (cls.get("reds") or []) if isinstance(r, dict)]
+        parts = []
+        for r in reds[:6]:
+            why = str(r.get("reason") or r.get("status") or "")[:40]
+            parts.append("%s(%s%s)" % (r.get("job"), r.get("kind") or "?",
+                                       ":" + why if why else ""))
+        bits = []
+        if parts:
+            bits.append("%d red job(s): %s" % (len(reds), ", ".join(parts)))
+        if failed:
+            bits.append("%d red node(s): %s"
+                        % (len(failed), ", ".join(str(n)[:60] for n in failed[:3])))
+        if only:
+            bits.append("only=%s" % str(only)[:60])
+        if pipeline_id:
+            bits.append("pipeline %s" % pipeline_id)
+        if not bits:
+            # Name what was looked at. "Nothing to derive from" is itself
+            # information; an empty string is not.
+            return ("%s with no derivable cause: reds, failed_nodes, only and "
+                    "pipeline_id were all empty" % status)
+        return "%s: %s" % (status, "; ".join(bits))
+
     def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None, order=False):
         cc = self.circle_cfg()
         host = None if only else self.reserve_host(cc)   # D135: choose+take atomically
@@ -938,7 +978,8 @@ class Proof(object):
                    "reason": ("circleci pipeline %s cancelled: not an answer (D79b)" % pipeline_id
                               if status == "CANCELLED" else
                               "scoped job collected 0 tests: not an answer (D118b)" if collected == 0 else
-                              "%s: not an answer to a scoped ask (D140b)" % unscoped if unscoped else None),
+                              "%s: not an answer to a scoped ask (D140b)" % unscoped if unscoped else
+                              self._derived_reason(status, cls, failed, pipeline_id, only)),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
             self._write(pid, rec)

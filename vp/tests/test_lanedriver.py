@@ -4248,3 +4248,45 @@ def test_d153_sweep_step_takes_a_state_view_like_every_other_step(tmp_path):
             "%s is gone -- this pin names the convention's members by hand, so a "
             "rename silently empties it" % name)
         assert list(inspect.signature(fn).parameters)[1] == "state", name
+
+
+# -- D157: no TurnOutcome detail may end in a bare colon ----------------------
+
+
+def test_d157_a_reasonless_proof_never_yields_a_detail_ending_in_a_colon():
+    """The consumer half, and the reason it exists separately from the source
+    fix: part one only repairs the statuses that exist TODAY. The next status
+    that forgets to set `reason` would silently produce a bare colon again --
+    which is exactly how fourteen rows ended up with an unactionable verdict.
+
+    Driven with reason=None, the shape that actually occurred.
+    """
+    rec = {"status": "FAIL_INFRA", "reason": None, "pipeline_id": "35569998113",
+           "route": "gha",
+           "reds": [{"job": "vp/platform-coverage", "kind": "infra"}],
+           "failed_nodes": []}
+    why = lanedriver.LaneDriver._proof_detail_fallback(rec, "FAIL_INFRA")
+    detail = "proof %s %s: %s" % ("proof-X", "FAIL_INFRA", why[:200])
+    assert not re.search(r":\s*$", detail), detail
+    assert "vp/platform-coverage" in detail
+
+    # and when there is nothing at all, it names what it checked
+    bare = {"status": "FAIL_INFRA", "reason": None, "reds": [], "failed_nodes": [],
+            "pipeline_id": None, "route": "gha"}
+    why2 = lanedriver.LaneDriver._proof_detail_fallback(bare, "FAIL_INFRA")
+    assert not re.search(r":\s*$", "x: " + why2)
+    assert "no reason recorded" in why2 and "failed_nodes" in why2
+
+
+def test_d157_the_empty_reason_shape_is_gone_from_the_call_site():
+    """Pin the call site, not just the helper. `str(rec.get("reason") or "")`
+    was the whole defect -- the helper cannot prevent it being reintroduced one
+    line above."""
+    import inspect
+    src = inspect.getsource(lanedriver.LaneDriver._grade_proof) \
+        if hasattr(lanedriver.LaneDriver, "_grade_proof") else None
+    whole = Path(lanedriver.__file__).parent.joinpath("lanedriver.py").read_text(encoding="utf-8")
+    code = re.sub(r"#.*", "", whole)          # a comment quoting the old shape is not the bug
+    assert 'str(rec.get("reason") or "")[:200]' not in code, (
+        "the bare-colon shape is back at the TurnOutcome call site")
+    assert "_proof_detail_fallback" in code

@@ -2051,7 +2051,8 @@ class LaneDriver(object):
                         "%s proof %s is not a real answer: status %s, pipeline_id %s, route %s: %s -- hold stays; "
                         "Architect decides (the driver never retries the canary)"
                         % (c["task"], rec.get("proof_id"), status or "?", pipeline, rec.get("route"),
-                           str(rec.get("reason") or "")[:200]), c["task"])
+                           (str(rec.get("reason") or "").strip()
+                            or self._proof_detail_fallback(rec, status))[:200]), c["task"])
 
     def _twin_slot_full(self, task):
         """§19 throughput: a CIRCLECI twin is one pipeline; never more of them
@@ -5602,9 +5603,38 @@ class LaneDriver(object):
             return outcome, rec
         # FAIL_INFRA / UNKNOWN / CANCELLED: not the candidate's fault -- retry the
         # proof alone after the backoff (proof-pending.json keeps the head)
+        # D157: never emit a detail that ends in a bare colon. `reason` was None
+        # for a plain FAIL_INFRA, `or ""` emptied it, and fourteen owed rows got a
+        # verdict with no cause. laneproof now always derives one; this is the
+        # second half, because part one only fixes the statuses that exist TODAY
+        # -- the next status that forgets to set `reason` would silently do this
+        # again. If there is genuinely nothing, say which fields were checked.
+        why = str(rec.get("reason") or "").strip()
+        if not why:
+            why = self._proof_detail_fallback(rec, status)
         return vprunners.TurnOutcome("PROOF_" + str(status), "proof %s %s: %s"
-                                     % (pid, status, str(rec.get("reason") or "")[:200]),
+                                     % (pid, status, why[:200]),
                                      runner="proof"), None
+
+    @staticmethod
+    def _proof_detail_fallback(rec, status):
+        """D157: last resort when a proof record carries no `reason`.
+
+        Names the fields that were consulted and found empty, so the next reader
+        knows the cause was looked for and was not there -- as opposed to a bare
+        colon, which is indistinguishable from a formatting bug (and was one).
+        """
+        reds = [r for r in (rec.get("reds") or []) if isinstance(r, dict)]
+        if reds:
+            return "%d red job(s): %s" % (
+                len(reds), ", ".join("%s(%s)" % (r.get("job"), r.get("kind") or "?")
+                                     for r in reds[:5]))
+        nodes = rec.get("failed_nodes") or []
+        if nodes:
+            return "%d red node(s): %s" % (len(nodes),
+                                           ", ".join(str(n)[:60] for n in nodes[:3]))
+        return ("no reason recorded; reds, failed_nodes and errors were all empty "
+                "(pipeline %s, route %s)" % (rec.get("pipeline_id"), rec.get("route")))
 
     PROOF_LOG_CAP = 2 * 1024 * 1024
 
