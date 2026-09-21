@@ -405,7 +405,11 @@ def test_quota_parks_the_role_and_never_fails_the_task(tmp_path):
     assert rows["L00"]["state"] == "RUNNING" and len(oc.calls) == 1
     # park lifts (probe answers) -> adopted, same attempt, completes
     drv.servers["go2"]["parked_until"] = 0.0
+    # D142: the unpark gate probes session CREATION, so stubbing the bare read is no
+    # longer enough to answer it.  Both, so the test says "this server is healthy"
+    # rather than "this server passes whichever check the driver happens to use".
     drv._http_ok = lambda *a, **k: True
+    drv._session_roundtrip_ok = lambda *a, **k: True
     settle(drv)
     rows = env.rows()
     assert rows["L00"]["state"] == "VERIFIED"
@@ -3590,3 +3594,109 @@ def test_d138_both_grader_sites_reserve_and_release_rather_than_pick(tmp_path):
             "turn, and an inline release leaks the slot on every failed grade" % name)
         checked += 1
     assert checked == len(sites)
+
+
+# -- D142: the unpark probe must exercise the verb that actually fails ----------
+
+class _FakeResp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _WedgedServer:
+    """The 2026-09-21T02:41Z outage, reproduced.
+
+    The real wedge served `GET /config` and `GET /session` with 200 in 9-28 ms on
+    all three servers while `POST /session` timed out.  Reads healthy, creation
+    dead -- which is precisely the shape a GET probe cannot see.
+    """
+
+    def __init__(self, post_ok=False):
+        self.post_ok = post_ok
+        self.calls = []
+
+    def __call__(self, req, timeout=None):
+        method = (getattr(req, "method", None) or "GET").upper()
+        url = getattr(req, "full_url", None) or str(req)
+        self.calls.append((method, url))
+        if method == "GET":
+            return _FakeResp(200, b"[]")
+        if method == "POST":
+            if not self.post_ok:
+                raise TimeoutError("timed out")
+            return _FakeResp(200, b'{"id": "ses_probe1"}')
+        if method == "DELETE":
+            return _FakeResp(200, b"{}")
+        raise AssertionError("unexpected verb %r" % method)
+
+
+def test_d142_the_old_unpark_predicate_cannot_see_a_wedged_server(tmp_path, monkeypatch):
+    """Control + fix in one: the window is real, and only the new probe observes it.
+
+    The first assertion is the control.  It reproduces the pre-D142 gate against a
+    server that is genuinely broken and shows it returning True -- if that ever
+    starts failing, this window has closed and the rest of the test proves nothing.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    url = "http://127.0.0.1:4102/session"
+    wedged = _WedgedServer(post_ok=False)
+    monkeypatch.setattr(lanedriver.urllib.request, "urlopen", wedged)
+
+    assert drv._http_ok(url) is True, (
+        "control: a wedged opencode server still answers GET /session, which is why "
+        "the pre-D142 unpark gate passed vacuously and the fleet park-looped")
+
+    assert drv._session_roundtrip_ok(url) is False, "the fix must see what the control cannot"
+    assert "POST /session" in drv._probe_detail and "TimeoutError" in drv._probe_detail, (
+        "the detail names the operation that failed: %r" % drv._probe_detail)
+    assert [m for m, _ in wedged.calls] == ["GET", "POST"], (
+        "no session was created, so nothing needs deleting: %r" % wedged.calls)
+
+
+def test_d142_a_wedged_server_stays_parked_and_a_healthy_one_unparks_and_cleans_up(
+        tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    drv.fake_runners = False
+
+    def arm_park():
+        srv = drv.servers["go2"]
+        srv["park_reason"] = "opencode request failed: POST /session: timed out"
+        srv["park_status"] = "DEGRADED"
+        srv["parked"] = False
+        srv["parked_until"] = 0.0
+
+    wedged = _WedgedServer(post_ok=False)
+    monkeypatch.setattr(lanedriver.urllib.request, "urlopen", wedged)
+    arm_park()
+    drv._maybe_unpark()
+    assert drv.servers["go2"]["park_reason"], (
+        "a server that cannot create a session must stay parked -- unparking it is the loop")
+
+    healthy = _WedgedServer(post_ok=True)
+    monkeypatch.setattr(lanedriver.urllib.request, "urlopen", healthy)
+    arm_park()
+    drv._maybe_unpark()
+    assert not drv.servers["go2"]["park_reason"], "a server that creates a session unparks"
+
+    verbs = [m for m, _ in healthy.calls]
+    assert verbs == ["POST", "DELETE"], "create then delete, nothing else: %r" % healthy.calls
+    assert healthy.calls[1][1].endswith("/session/ses_probe1"), (
+        "the probe deletes the session it created, not something else: %r" % healthy.calls[1][1])
+
+    probes = [json.loads(l) for l in
+              (env.run_root / "probes" / "probes.jsonl").read_text().splitlines()]
+    assert probes[-1]["verb"] == "POST" and probes[-1]["ok"] is True
+    assert probes[-2]["verb"] == "POST" and probes[-2]["ok"] is False

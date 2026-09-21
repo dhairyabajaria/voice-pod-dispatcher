@@ -249,7 +249,14 @@ def test_http_runner_model_mismatch_and_prompt_refused(tmp_path):
 
 def test_http_runner_server_down_is_degraded_not_crash(tmp_path):
     out = OpenCodeHttpRunner(poll_s=0.05).run(spec_for(tmp_path, "http://127.0.0.1:1"))
-    assert out.status == "DEGRADED" and "unreachable" in out.detail
+    assert out.status == "DEGRADED"
+    # D142: the detail must name the operation, not diagnose the box.  The old wording
+    # ("server unreachable") was asserted here, and on 2026-09-21 it was flatly wrong --
+    # every server answered reads in milliseconds while POST /session hung, and three
+    # sessions chased box health for an hour on the strength of this sentence.
+    assert "POST /session" in out.detail, out.detail
+    assert "unreachable" not in out.detail, (
+        "a failed request is not evidence the server is unreachable: %r" % out.detail)
 
 
 # -- CLI fallback: watchdog kills the hung child on info.error -------------------------------

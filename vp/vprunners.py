@@ -940,7 +940,11 @@ class OpenCodeHttpRunner(object):
                 base["usage"]["reset_minutes"] = mins
                 return finish(stt, "prompt_async -> %s %s" % (st, txt))
         except _HttpDown as exc:
-            return finish(STATUS_DEGRADED, "server unreachable: %s" % str(exc)[:200])
+            # D142: never claim unreachability.  The 2026-09-21 wedge answered every
+            # read in milliseconds while POST /session hung, so "server unreachable"
+            # sent three sessions hunting box health for an hour.  _HttpDown already
+            # carries "<METHOD> <path>: <reason>" -- say that and nothing more.
+            return finish(STATUS_DEGRADED, "opencode request failed: %s" % str(exc)[:200])
 
         # 3. poll
         deadline = start_mono + float(spec.timeout_s or 2700)

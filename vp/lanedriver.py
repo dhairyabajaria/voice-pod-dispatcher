@@ -907,7 +907,7 @@ class LaneDriver(object):
     def _maybe_unpark(self):
         for name, srv in self.servers.items():
             if srv["park_reason"] and not self._parked(srv):
-                ok = self.probe(name, srv["url"] + "/session", "unpark")
+                ok = self.probe(name, srv["url"] + "/session", "unpark", verb="POST")
                 if ok:
                     self.log("UNPARK %s" % name)
                     srv["park_reason"] = srv["park_status"] = None
@@ -918,7 +918,7 @@ class LaneDriver(object):
                 self.log("UNPARK runner %s" % name)
                 st["park_reason"] = st["park_status"] = None
 
-    def probe(self, server, url, why="probe"):
+    def probe(self, server, url, why="probe", verb="GET"):
         """F14: every liveness probe leaves a record under probes/ — a JSON line
         per probe in probes/probes.jsonl plus the latest verdict per server in
         probes/<server>.json — so an empty probes/ can no longer hide a dead box."""
@@ -926,9 +926,11 @@ class LaneDriver(object):
         self._probe_detail = ""
         if self.fake_runners:
             ok, self._probe_detail = True, "fake runners: network probe skipped"
+        elif verb == "POST":
+            ok = self._session_roundtrip_ok(url)
         else:
             ok = self._http_ok(url)
-        rec = {"ts": utc_ms(), "server": server, "url": url, "why": why, "ok": ok,
+        rec = {"ts": utc_ms(), "server": server, "url": url, "why": why, "verb": verb, "ok": ok,
                "detail": self._probe_detail, "ms": int((time.monotonic() - t0) * 1000),
                "tick": self.tick_count}
         pdir = self.run_root / "probes"
@@ -995,6 +997,60 @@ class LaneDriver(object):
                             "so the role runs on an unintended config silently (D132)"
                             % (", ".join(roles), model, variant,
                                ", ".join(declared[model]) or "none"))
+
+    def _session_roundtrip_ok(self, url, timeout=20.0):
+        """D142: ask the question the failure can actually answer.
+
+        A wedged opencode server keeps serving `GET /session` in single-digit
+        milliseconds while `POST /session` -- session *creation* -- hangs.  The
+        unpark gate probed the GET, so it passed vacuously every time, the driver
+        unparked straight back into the wedge, and the fleet park-looped until a
+        human restarted it (2026-09-21T02:41Z; all three servers measured at
+        `GET /config` 200 in 9-28ms while parked "unreachable").  A liveness probe
+        is only worth its round trip if the sickness can make it fail.
+
+        Create a session and delete it again.  The create is the question; the
+        delete is why we can afford to ask it on every unpark check.
+        """
+        try:
+            req = urllib.request.Request(
+                url, data=b"{}", method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status, raw = resp.status, resp.read()
+        except Exception as exc:  # noqa: BLE001 -- any failure is "not ok" with its reason
+            self._probe_detail = "POST /session: %s: %s" % (type(exc).__name__, str(exc)[:160])
+            return False
+        if status != 200:
+            self._probe_detail = "POST /session -> HTTP %s" % status
+            return False
+        try:
+            sid = (json.loads(raw.decode("utf-8", "replace")) or {}).get("id")
+        except (ValueError, AttributeError):
+            sid = None
+        if not sid:
+            # 200 with no id is not a working server; treating it as one is how the
+            # GET probe failed in the first place.
+            self._probe_detail = "POST /session -> 200 without a session id"
+            return False
+        self._probe_detail = "POST /session -> 200 %s" % sid
+        self._session_delete(url.rstrip("/") + "/" + str(sid), timeout)
+        return True
+
+    def _session_delete(self, url, timeout=20.0):
+        """Best effort cleanup: a probe that could not tidy up still answered.
+
+        Appended to the detail rather than swallowed -- a server that creates but
+        cannot delete leaks a session per unpark check, and we want that visible in
+        probes.jsonl before it becomes the next outage.
+        """
+        try:
+            req = urllib.request.Request(url, method="DELETE",
+                                         headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout):
+                pass
+        except Exception as exc:  # noqa: BLE001
+            self._probe_detail += " (probe session not deleted: %s)" % type(exc).__name__
 
     def _http_ok(self, url, timeout=5.0):
         try:
@@ -3833,7 +3889,7 @@ class LaneDriver(object):
             self.write_activation_record()
             for name, srv in self.servers.items():
                 if not srv.get("parked"):
-                    self.probe(name, srv["url"] + "/session", "startup")
+                    self.probe(name, srv["url"] + "/session", "startup", verb="POST")
             self._check_role_variants()          # D132
         self._seal_step()
         self._render_step()
