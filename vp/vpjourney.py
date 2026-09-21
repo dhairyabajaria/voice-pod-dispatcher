@@ -253,6 +253,7 @@ class Journey(object):
         self._pack_loaded = 0.0
         self.pack_lint = []
         self.proofs = {}           # proof_id -> proof json
+        self.pass_by_task = {}     # D150: task -> newest PASSing proof (rebuilt each refresh)
         self._proof_seen = set()
         self.catalog_ids = []
         self.errors = []
@@ -364,6 +365,40 @@ class Journey(object):
                 # suite -- the union-104 shape (see LEDGER.md's scope column, D148).
                 self.proofs[p["proof_id"]] = {k: p.get(k) for k in
                                               ("proof_id", "status", "route", "sha", "ts", "kind", "counts", "rc", "account", "pipeline_id", "branch", "only")}
+        self._index_passing_proofs()
+
+    def _index_passing_proofs(self):
+        """D150: newest PASSing proof per task, built ONCE per refresh.
+
+        The roots table needs a scope per root, and a root owns several rows.
+        Scanning every proof for every root is ~600 x 760 per refresh; this is
+        one pass over the proofs instead, and the roots then do a dict lookup.
+        """
+        best = {}
+        for pid, p in self.proofs.items():
+            if p.get("status") != "PASS":
+                continue
+            body = pid[len("proof-"):] if pid.startswith("proof-") else pid
+            task = body.rsplit("-", 1)[0]
+            prev = best.get(task)
+            if prev is None or (p.get("ts") or "") > (prev.get("ts") or ""):
+                best[task] = p
+        self.pass_by_task = best
+
+    def rows_scope(self, rows):
+        """D150: what the newest PASS across these rows actually ran.
+
+        A root's evidence may sit on its hosted twin rather than the primary row,
+        so this asks the whole row set rather than one row -- the same reason
+        LaneDriver.member_scope consults twins.  `-` when no row has a PASS:
+        that is "nothing to report here", never a full-suite claim.
+        """
+        best = None
+        for t in rows or ():
+            p = getattr(self, "pass_by_task", {}).get(t)
+            if p and (best is None or (p.get("ts") or "") > (best.get("ts") or "")):
+                best = p
+        return proof_scope_label(best) if best else "-"
 
     # -- identity ------------------------------------------------------------------
 
@@ -483,6 +518,10 @@ class Journey(object):
             twins = [t for t in rows if (self.pack.get(self.packet_of(t) or "") or {}).get("twin_of") == rid
                      or re.search(r"-HOSTED(-[A-Z0-9]+)?(-R\d+)?$", t)]
             r["hosted_state"] = st[max(twins, key=lambda t: (st[t] != "CANCELLED", last_ts(t) or "", t))] if twins else None
+            # D150: scope beside the verdict on the roots table, not only inside the
+            # journey detail.  The badge is what people read; a VERIFIED root whose
+            # newest PASS is `scoped:` is not evidence outside that path list.
+            r["proof_scope"] = self.rows_scope(rows)
             r["done"] = st[primary] in DONE_STATES
             r["settled"] = r["done"] and not open_rows
             r["owed"] = r["state"] in OWED_STATES

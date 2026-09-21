@@ -152,7 +152,7 @@ class Dash(object):
     @staticmethod
     def root_row(r):
         return {k: r.get(k) for k in ("id", "kind", "title", "state", "primary_row", "primary_state",
-                                       "hosted_state", "open_rows", "superseded_open", "attempts",
+                                       "hosted_state", "proof_scope", "open_rows", "superseded_open", "attempts",
                                        "latest_row", "latest_ts", "settled", "done", "owed", "rows", "states")}
 
     def freshness(self, now):
@@ -550,7 +550,7 @@ th{color:var(--mut);font-weight:500;font-size:11px}tr.click{cursor:pointer}tr.cl
 <section class="wide"><h2>Roots <span class="src">events/*.json grouped by root work item; click a row for its journey</span></h2>
 <div class="filters"><select id="fkind"><option value="">all kinds</option><option>catalog</option><option>packet</option><option>orphan</option></select>
 <select id="fstate"><option value="">all states</option></select><input id="fq" placeholder="filter id/title"><label><input type="checkbox" id="fopen"> only not settled</label><span class="mut small" id="rootcount"></span></div>
-<table id="roots"><thead><tr><th>root</th><th>kind</th><th>state</th><th>primary</th><th>hosted</th><th>open rows</th><th>attempts</th><th>last event</th><th>title</th></tr></thead><tbody></tbody></table></section>
+<table id="roots"><thead><tr><th>root</th><th>kind</th><th>state</th><th>primary</th><th>hosted</th><th title="what the newest PASSing proof actually ran: full suite, or that path list and nothing outside it">scope</th><th>open rows</th><th>attempts</th><th>last event</th><th>title</th></tr></thead><tbody></tbody></table></section>
 <section class="wide"><h2>Recent alerts</h2><table id="recent"><thead><tr><th>ts</th><th>severity</th><th>kind</th><th>task</th><th>repeat/fam</th><th>streak</th><th>why</th><th>text</th></tr></thead><tbody></tbody></table></section>
 <section class="wide"><h2>Verify <span class="src">vpjourney.verify: events vs run-state vs LEDGER.md vs control.jsonl spans</span></h2><div id="verify"></div></section>
 </main>
@@ -558,6 +558,14 @@ th{color:var(--mut);font-weight:500;font-size:11px}tr.click{cursor:pointer}tr.cl
 <script>
 const $=s=>document.querySelector(s);const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const st=s=>`<span class="b s-${esc(s)}">${esc(s||'-')}</span>`;
+// D150: what the newest PASSing proof actually RAN, beside the verdict badge.
+// A scoped pass is warn-coloured, not green: it is a real pass over a real path
+// list, and evidence for nothing outside it.  `-` stays muted -- no PASS to
+// report is not a claim, and must never read as a full-suite guarantee.
+const scopeCell=v=>{const t=v||'-';
+  if(t==='-')return '<span class=mut>-</span>';
+  if(t==='full suite')return '<span class="s-VERIFIED">full suite</span>';
+  return `<span style="color:var(--warn)" title="${esc(t)}">${esc(t.slice(0,40))}${t.length>40?'…':''}</span>`;};
 function age(s){if(s==null)return '?';s=Math.floor(s);if(s<90)return s+'s';if(s<5400)return Math.floor(s/60)+'m';if(s<172800)return Math.floor(s/3600)+'h'+String(Math.floor(s%3600/60)).padStart(2,'0')+'m';return Math.floor(s/86400)+'d'+Math.floor(s%86400/3600)+'h'}
 let SNAP=null;
 async function load(){try{const r=await fetch('/api/snapshot');SNAP=await r.json();render()}catch(e){$('#err').textContent='fetch failed: '+e}}
@@ -580,7 +588,7 @@ function renderRoots(){const roots=SNAP.roots||[];const sel=$('#fstate');if(sel.
  const order={RUNNING:0,CLAIMED:0,REPAIR_REQUIRED:1,INVALID_EVIDENCE:1,BLOCKED:2,WAITING_DEPENDENCY:3,READY:3,VERIFIED:4,INTEGRATED:5,CANCELLED:6};
  rows.sort((a,b)=>(order[a.state]??3)-(order[b.state]??3)||(b.latest_ts||'').localeCompare(a.latest_ts||''));
  $('#rootcount').textContent=rows.length+' of '+roots.length;
- $('#roots tbody').innerHTML=rows.map(r=>`<tr class="click" onclick="openJourney('${esc(r.id)}')"><td><code>${esc(r.id)}</code></td><td>${esc(r.kind)}</td><td>${st(r.state)}</td><td>${st(r.primary_state)}</td><td>${r.hosted_state?st(r.hosted_state):'<span class=mut>-</span>'}</td><td>${(r.open_rows||[]).map(t=>'<code>'+esc(t)+'</code>').join(' ')}${r.superseded_open&&r.superseded_open.length?' <span class="mut small">+'+r.superseded_open.length+' zombie</span>':''}</td><td>${r.attempts}</td><td class="small mut">${esc((r.latest_ts||'').slice(0,19))}</td><td class="small">${esc((r.title||'').slice(0,90))}</td></tr>`).join('');}
+ $('#roots tbody').innerHTML=rows.map(r=>`<tr class="click" onclick="openJourney('${esc(r.id)}')"><td><code>${esc(r.id)}</code></td><td>${esc(r.kind)}</td><td>${st(r.state)}</td><td>${st(r.primary_state)}</td><td>${r.hosted_state?st(r.hosted_state):'<span class=mut>-</span>'}</td><td class="small">${scopeCell(r.proof_scope)}</td><td>${(r.open_rows||[]).map(t=>'<code>'+esc(t)+'</code>').join(' ')}${r.superseded_open&&r.superseded_open.length?' <span class="mut small">+'+r.superseded_open.length+' zombie</span>':''}</td><td>${r.attempts}</td><td class="small mut">${esc((r.latest_ts||'').slice(0,19))}</td><td class="small">${esc((r.title||'').slice(0,90))}</td></tr>`).join('');}
 function renderAlerts(){const a=SNAP.alerts||{};const bs=a.by_severity||{};
  let h=`<div class="kpi"><div><div class="big sev-urgent">${bs.urgent||0}</div><div class="l">urgent</div></div><div><div class="big sev-attention">${bs.attention||0}</div><div class="l">attention</div></div><div><div class="big sev-routine">${bs.routine||0}</div><div class="l">routine</div></div><div><div class="big">${a.backlog_now??'?'}</div><div class="l">rows owed now (events)</div></div></div>`;
  h+=`<div class="mut small">${a.recorded_severity_present?'severity recorded by the driver (D60 live)':'severity computed here; driver not yet writing it (D60 patch pending)'}</div>`;

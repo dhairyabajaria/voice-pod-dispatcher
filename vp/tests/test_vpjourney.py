@@ -333,3 +333,53 @@ def test_d149_the_only_field_survives_the_proof_projection():
              "account", "pipeline_id", "branch", "only")}
     assert kept["only"] == rec["only"], "the projection must carry `only`"
     assert vpjourney.proof_scope_label(kept).startswith("scoped: ")
+
+
+def test_d150_a_root_carries_the_scope_of_its_newest_passing_proof(tmp_path):
+    """D150 (PROOF-SCOPE spec Part A req 2, the board's VERIFIED badge).
+
+    D149 put scope on the proof STEP inside the journey detail. The roots table --
+    the thing people actually scan -- still showed a bare VERIFIED badge. A root's
+    evidence can live on its hosted twin, so the scope is asked of the whole row
+    set, not of the primary row.
+    """
+    run_root = build_run(tmp_path)
+    j = vpjourney.Journey(run_root)
+    j.refresh(control=False)
+    r = j.roots()["P-FIX"]
+    assert "P-FIX-R1" in r["rows"]
+    assert r["proof_scope"] == "full suite", (
+        "the fixture's only PASS has no `only`, so it ran everything: %r" % r["proof_scope"])
+
+    # a root with no PASS at all reports nothing -- never a full-suite claim
+    assert j.roots()["ORPHAN-9"]["proof_scope"] == "-"
+
+    # the NEWEST pass wins, and a scoped one must not read like a full one
+    (run_root / "proofs" / "proof-P-FIX-R1-2.json").write_text(json.dumps(
+        {"proof_id": "proof-P-FIX-R1-2", "status": "PASS", "route": "gha",
+         "sha": "e" * 40, "ts": "2026-09-18T23:59:00Z",
+         "only": "twin:3:platform/tests/test_z.py"}))
+    j2 = vpjourney.Journey(run_root)
+    j2.refresh(control=False)
+    got = j2.roots()["P-FIX"]["proof_scope"]
+    assert got.startswith("scoped: ") and "test_z.py" in got, got
+
+    # a later FAIL does not erase the scope of the pass, nor claim one of its own
+    (run_root / "proofs" / "proof-P-FIX-R1-3.json").write_text(json.dumps(
+        {"proof_id": "proof-P-FIX-R1-3", "status": "FAIL_PRODUCT", "route": "gha",
+         "sha": "f" * 40, "ts": "2026-09-19T23:59:00Z", "only": None}))
+    j3 = vpjourney.Journey(run_root)
+    j3.refresh(control=False)
+    assert j3.roots()["P-FIX"]["proof_scope"] == got, (
+        "a FAIL is not evidence, and must not be indexed as the newest PASS")
+
+
+def test_d150_the_dashboard_projection_carries_proof_scope(tmp_path):
+    """vpdash.root_row is an explicit allow-list, exactly like vpjourney's proof
+    projection -- the same place the field was being dropped before D149. Asserted
+    against the real source, which is verified to flip red when the key is removed.
+    """
+    src = (Path(__file__).resolve().parent.parent / "vpdash.py").read_text(encoding="utf-8")
+    block = src.split("def root_row", 1)[1].split("}", 1)[0]
+    assert '"proof_scope"' in block, "vpdash.root_row drops proof_scope"
+    assert '"proof_scope"' not in block.replace('"proof_scope"', ""), "control: the check can fail"
