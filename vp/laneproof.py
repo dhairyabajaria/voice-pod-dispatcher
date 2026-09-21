@@ -981,7 +981,8 @@ class Proof(object):
             # trip be told apart from an unanswered run.  Narrows only
             # FAIL_INFRA -> FAIL_PRODUCT, and only when the provider can prove it.
             status = self._guard_reclassify(task, pid, cls, status, runner)
-            failed, errors = circle_failed_nodes(res["failed_tests"])
+            # D195: pass the jobs so each node is rooted by the job that produced it
+            failed, errors = circle_failed_nodes(res["failed_tests"], jobs=res.get("jobs"))
             flake = None
             collected = None
             outside = []

@@ -179,14 +179,63 @@ PROMPT_OF_ROLE = {"builder": BUILDER_PROMPT, "junior": JUNIOR_PROMPT,
                   "final": FINAL_PROMPT}
 _VITEST_FILE_RE = re.compile(r"\.(tsx?|jsx?|mjs|cjs)$")
 
+# D195: the root a job's tests live under, recovered from the JOB NAME.
+#
+# Every CI job runs pytest with its own package as the working directory, so the
+# junit it uploads is rootless in BOTH directions and identically so -- measured
+# on proof-R-VOICE-CONTEXT-BUDGET-HOSTED-60921T215122091:
+#     vp/agent            classname='tests.test_authority_drain' file='tests/test_authority_drain.py'
+#     vp/platform-shards-3 classname='tests.test_reply_path'     file='tests/test_reply_path.py'
+# Nothing in the payload says which package produced it.  The node id was then
+# compared against a scoped ask by `laneproof.node_in_scope`, which matches path
+# suffixes in BOTH directions -- so a rootless `tests/test_x.py` matches
+# `platform/tests/test_x.py` and `agent/tests/test_x.py` equally well, and an
+# agent red could be charged to a platform row.
+#
+# Exposed population, measured: exactly 3 basenames exist under both roots --
+# test_recording_opt_out.py, test_observability.py,
+# test_journey_action_outbound_admission.py (agent/tests 68 files,
+# platform/tests 518, intersection 3).
+#
+# The job number was always available here and was thrown away (`for _job, ...`).
+# The fix is to root the node by the job that produced it, never by searching the
+# tree for a matching basename.
+_JOB_ROOTS = {"agent": "agent/", "platform": "platform/", "portal": "portal/"}
+_KNOWN_ROOTS = ("agent/", "platform/", "portal/")
 
-def circle_failed_nodes(failed_tests):
+
+def job_root(name):
+    """'vp/agent' -> 'agent/', 'vp/platform-shards-3' -> 'platform/', else None.
+
+    None for every job that does not run one package's test suite
+    (`deploy-contracts`, `lint-and-typecheck`, `required-gate`, `combine-coverage`,
+    `collected-test-floor`, `supply-chain-*`): those get no prefix and keep the
+    pre-D195 spelling exactly.  Matching on the FIRST segment is deliberate --
+    `supply-chain-audit-agent` must NOT resolve to agent/."""
+    key = str(name or "").strip()
+    if key.startswith("vp/"):
+        key = key[3:]
+    return _JOB_ROOTS.get(key.split("-", 1)[0])
+
+
+def circle_failed_nodes(failed_tests, jobs=None):
     """CircleCI `tests` items (junit xunit1 from pytest: file, classname,
     name, message) -> (sorted node ids, {node: message}).  `file` is the
     repo-relative path when the junit carried it; otherwise the dotted
     classname is unfolded (platform.tests.test_x[.TestFoo] -> path[::TestFoo])."""
     nodes, errors = set(), {}
+    # D195: job_number -> root prefix. Empty when `jobs` is not supplied, which
+    # keeps every pre-D195 caller byte-identical.
+    roots = {}
+    for j in (jobs or ()):
+        if not isinstance(j, dict):
+            continue
+        num = j.get("job_number", j.get("databaseId"))
+        r = job_root(j.get("name"))
+        if num is not None and r:
+            roots[num] = r
     for _job, items in (failed_tests or {}).items():
+        root = roots.get(_job)
         for t in items or []:
             if str(t.get("result") or "failure") not in ("failure", "error"):
                 continue        # skipped/success never become nodes (belt and braces)
@@ -202,6 +251,10 @@ def circle_failed_nodes(failed_tests):
                 klass = [x for x in parts[len(mod):] if x]
                 if klass:
                     name = "::".join(klass + [name]) if name else "::".join(klass)
+            # D195: root the node by the job that produced it. Only when the path
+            # is rootless -- a junit that already carried a rooted path is left alone.
+            if path and root and not path.startswith(_KNOWN_ROOTS):
+                path = root + path
             node = ("%s::%s" % (path, name)) if path and name else (path or name or cls)
             if not node:
                 continue
@@ -2362,7 +2415,8 @@ class Driver(object):
             cls = vpcircle.classify(res["jobs"], res["failed_tests"])
             status = cls["status"]
             workflow_id = (res["workflows"][0].get("id") if res.get("workflows") else None)
-            failed, errors = circle_failed_nodes(res["failed_tests"])
+            # D195: pass the jobs so each node is rooted by the job that produced it
+            failed, errors = circle_failed_nodes(res["failed_tests"], jobs=res.get("jobs"))
             flake = None
             if status == "FAIL_PRODUCT" and failed:
                 # D108: an off-box red in a file NO union item touches is
