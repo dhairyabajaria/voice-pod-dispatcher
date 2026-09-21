@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -146,10 +147,76 @@ jobs:
     name: required / integration
     runs-on: ubuntu-latest
     if: always()
-    needs: [platform, deploy]
+    needs: [platform, platform-shards, platform-coverage, agent, portal, deploy-contracts, supply-chain, deploy]
     steps:
       - run: echo gate
 """
+
+# What MINI_CI's gate requires, in MINI_CI's own job DECLARATION order.  Spelled
+# out here on purpose: asserting rendered output against vpgha_overlay's derived
+# set would compare the derivation with itself and pass however wrong it was.
+# Note the order differs from the gate's `needs` above (which lists portal before
+# deploy-contracts, as trunk's does) -- deriving the order from `needs` instead of
+# from the declaration order fails this list, which is the point of the mismatch.
+EXPECTED_MINI_JOBS = ["platform", "platform-shards", "platform-coverage", "agent",
+                      "deploy-contracts", "portal", "supply-chain"]
+# The same, for the real trunk ci.yml (its declaration order, independently read).
+EXPECTED_TRUNK_JOBS = ["platform", "platform-shards", "platform-coverage", "agent",
+                       "deploy-contracts", "portal", "supply-chain"]
+
+# The overlay's own vocabulary for a test leg (vpgha_overlay.PYTEST_RE): `uv run
+# pytest`, plus `uv run python -m tests.shuffled_runner`, which is pytest.main()
+# with a seed plugin (D99).  Written out here rather than imported -- a test that
+# reuses the module's regex cannot notice the module's regex being wrong.
+# ANCHORED ON THE COMMAND on purpose: `/dev/shm/pytest-platform-shards-${{...}}`
+# is a PATH, and a bare "pytest" count reads FOUR legs in platform-shards where
+# there is one.
+TEST_LEG_RE = re.compile(r"^\s*uv run (?:pytest|python -m tests\.shuffled_runner)\b")
+VITEST_LEG_RE = re.compile(r"^\s*npm run test -- ")
+
+# Rendered jobs that run no test leg of their own, and why.  This is the junit-level
+# twin of vpgha_overlay.EXCLUDED_JOBS: vpgha classifies a non-success job with no
+# junit artifact as FAIL_INFRA and never PASS, so a rendered job that emits nothing
+# is either named here with a reason or is a defect.  Keeping it a table rather than
+# a count is the whole point -- a literal ("== 6") went red when
+# R-CI-PLATFORM-ORDER-JOB moved legs BETWEEN jobs, which is a ci.yml change the
+# overlay handled correctly.
+TRUNK_JOBS_WITHOUT_A_TEST_LEG = {
+    "platform": "lint + mypy + collection floors only -- R-CI-PLATFORM-ORDER-JOB moved its "
+                "coverage run into platform-shards and its order run into platform-order",
+    "platform-coverage": "combines the shards' coverage data; it runs no tests",
+    "supply-chain": "per-component dependency audit; it runs no tests",
+}
+
+
+def _logical_lines(run):
+    """Rendered shell lines, with `\\`-continuations joined -- a leg's flags can
+    sit on the line that started it or on the one after."""
+    out, buf = [], ""
+    for line in str(run or "").split("\n"):
+        buf = (buf + " " + line.strip()) if buf else line
+        if buf.rstrip().endswith("\\"):
+            buf = buf.rstrip()[:-1]
+            continue
+        out.append(buf)
+        buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _junit_legs(job):
+    """(test legs, legs carrying a junit reporter) for one rendered job."""
+    total = witnessed = 0
+    for st in job.get("steps", []):
+        for line in _logical_lines(st.get("run")):
+            if TEST_LEG_RE.match(line):
+                total += 1
+                witnessed += "--junitxml=" in line
+            elif VITEST_LEG_RE.match(line):
+                total += 1
+                witnessed += "--outputFile.junit=" in line
+    return total, witnessed
 
 
 def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
@@ -162,7 +229,7 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
     assert on["workflow_dispatch"]["inputs"]["run_full_suite"] == {"type": "boolean", "default": True}
     assert doc["concurrency"]["cancel-in-progress"] is False and doc["permissions"] == {"contents": "read"}
     jobs = doc["jobs"]
-    assert list(jobs) == list(vpgha_overlay.REQUIRED_JOBS), "only the required jobs, in order; deploy/gate/eval dropped"
+    assert list(jobs) == EXPECTED_MINI_JOBS, "the gated jobs, in ci.yml declaration order; deploy/gate/eval dropped"
     for jid, job in jobs.items():
         assert job["runs-on"] == ["self-hosted", "voicepod"], jid
         assert job["timeout-minutes"] == vpgha_overlay.JOB_TIMEOUT_MIN == 90, "a hung run ends as timed_out (D83f)"
@@ -242,8 +309,46 @@ def test_overlay_renders_the_required_jobs_on_the_fleet_with_junit_per_leg():
 
 
 def test_overlay_refuses_a_ci_yml_missing_a_required_job():
-    with pytest.raises(ValueError, match="deploy-contracts"):
+    """The set is derived from the gate's `needs`, so "ci.yml lacks a required
+    job" can no longer fire -- ci.yml cannot lack a member of its own `needs`.
+    What replaced it still catches this exact ci.yml: a `needs` entry naming a
+    job that is not declared (GitHub rejects such a workflow outright)."""
+    with pytest.raises(ValueError, match=r"needs` names undeclared job\(s\): deploy-contracts"):
         vpgha_overlay.render(MINI_CI.replace("  deploy-contracts:\n", "  deploy-contracts-x:\n"))
+
+
+def test_overlay_classifies_every_ci_yml_job_and_refuses_a_stray():
+    """The failure this exists to stop: a job ADDED to ci.yml is silently absent
+    from every proof.  A hand-copied set can only notice a REMOVAL; nothing
+    noticed `platform-order` appearing (§95 item 1)."""
+    rendered, optional, excluded = vpgha_overlay.classify_jobs(yaml.safe_load(MINI_CI))
+    assert list(rendered) == EXPECTED_MINI_JOBS
+    assert list(optional) == []                      # MINI_CI declares no platform-order
+    assert list(excluded) == ["kb-real-provider-eval", "deploy", "required-checks"]
+    assert len(rendered) + len(optional) + len(excluded) == len(yaml.safe_load(MINI_CI)["jobs"]), \
+        "every job placed exactly once"
+    # a new job nobody has ruled on stops the render and names itself...
+    stray = MINI_CI.replace("  deploy:\n", "  brand-new-suite:\n    runs-on: ubuntu-latest\n"
+                                            "    steps:\n      - run: echo hi\n  deploy:\n")
+    with pytest.raises(ValueError, match="classified nowhere: brand-new-suite"):
+        vpgha_overlay.render(stray)
+    # ...and the SAME ci.yml goes green once the gate requires it, rendering it
+    # in declaration order rather than dropping it (the positive control: without
+    # this half, the test above passes for any reason at all)
+    gated = stray.replace("needs: [platform, platform-shards",
+                          "needs: [brand-new-suite, platform, platform-shards")
+    doc = yaml.safe_load(vpgha_overlay.render(gated))
+    assert list(doc["jobs"]) == EXPECTED_MINI_JOBS + ["brand-new-suite"], \
+        "declared after supply-chain, so rendered last"
+
+
+def test_overlay_refuses_a_ci_yml_that_states_no_gate():
+    with pytest.raises(ValueError, match="declares no 'required-checks' job"):
+        vpgha_overlay.render(MINI_CI.replace("  required-checks:\n", "  renamed-gate:\n"))
+    with pytest.raises(ValueError, match="empty `needs`"):
+        vpgha_overlay.render(MINI_CI.replace(
+            "    needs: [platform, platform-shards, platform-coverage, agent, portal, "
+            "deploy-contracts, supply-chain, deploy]\n", "    needs: []\n"))
 
 
 ORDER_JOB = """
@@ -265,7 +370,7 @@ def test_overlay_renders_platform_order_only_when_present():
     # MINI_CI renders without it and without raising...
     base = yaml.safe_load(vpgha_overlay.render(MINI_CI))
     assert "platform-order" not in base["jobs"]
-    assert list(base["jobs"]) == list(vpgha_overlay.REQUIRED_JOBS)
+    assert list(base["jobs"]) == EXPECTED_MINI_JOBS
     # ...and a ci.yml carrying the job renders it after the required set, on the
     # fleet, with its junit leg, and with `needs` pruned to rendered jobs only
     # (a needs on the dropped `deploy` would make GitHub reject the workflow).
@@ -273,7 +378,7 @@ def test_overlay_renders_platform_order_only_when_present():
     inter = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB))
     assert "platform-order" not in inter["jobs"], "an intermediate canary omits the ~80-min order job"
     doc = yaml.safe_load(vpgha_overlay.render(MINI_CI + ORDER_JOB, order=True))
-    assert list(doc["jobs"]) == list(vpgha_overlay.REQUIRED_JOBS) + ["platform-order"]
+    assert list(doc["jobs"]) == EXPECTED_MINI_JOBS + ["platform-order"]
     job = doc["jobs"]["platform-order"]
     assert job["name"] == "vp/platform-order" and job["runs-on"] == ["self-hosted", "voicepod"]
     assert job["needs"] == ["platform"] and "if" not in job
@@ -338,10 +443,35 @@ def test_overlay_on_tmpfs_asserts_the_shm_size_and_never_remounts(monkeypatch):
 def test_overlay_renders_from_the_real_trunk_ci_yml():
     text = vpgha_overlay.render(CI_YML.read_text(encoding="utf-8"), floor_supports_branch=False)
     doc = yaml.safe_load(text)
-    assert set(doc["jobs"]) == set(vpgha_overlay.REQUIRED_JOBS)
-    assert text.count("--junitxml=") == 6, "platform x2 (coverage + shuffled, D99), shards, agent x2, deploy-contracts"
-    assert text.count("--outputFile.junit=") == 2, "portal's vitest junit: unit run + coverage run (D108)"
+    assert list(doc["jobs"]) == EXPECTED_TRUNK_JOBS, "the real gate needs, read independently"
+    # No hardcoded leg count.  "== 6" was the same stale-copy defect as the old
+    # REQUIRED_JOBS: it went red because R-CI-PLATFORM-ORDER-JOB moved legs between
+    # jobs, a ci.yml change the overlay handled correctly.  What must hold is the
+    # MECHANISM -- a rendered test leg with no junit reporter turns a red suite into
+    # a FAIL_INFRA verdict instead of a failure anyone reads.
+    per_job = {jid: _junit_legs(job) for jid, job in doc["jobs"].items()}
+    assert sum(total for total, _ in per_job.values()) >= 3, \
+        "TEST_LEG_RE matched almost nothing -- every assertion below would pass vacuously"
+    naked = {jid: total - seen for jid, (total, seen) in per_job.items() if total != seen}
+    assert not naked, "rendered test leg(s) with no junit reporter: %s" % naked
+    # every rendered job either emits junit or is named, with a reason, as running
+    # no tests -- the honest form of "the contributing set is the rendered set",
+    # which is FALSE here: three trunk jobs run no tests at all
+    silent = {jid for jid, (total, _) in per_job.items() if not total}
+    assert silent == set(TRUNK_JOBS_WITHOUT_A_TEST_LEG), (
+        "a rendered job started or stopped running tests: %s. A non-success job with no "
+        "junit artifact classifies FAIL_INFRA, never PASS -- give it a junit leg, or add "
+        "it to TRUNK_JOBS_WITHOUT_A_TEST_LEG with a reason."
+        % sorted(silent ^ set(TRUNK_JOBS_WITHOUT_A_TEST_LEG)))
     assert text.count("-n 3 --dist loadfile") == 1 and "-n auto" not in text
+    # the FINAL-canary shape (order=True), derived the same way: the order job is
+    # `uv run python -m tests.shuffled_runner`, a pytest leg that is not spelled
+    # "pytest" -- a leg detector keyed on that word alone would miss it entirely
+    final = yaml.safe_load(vpgha_overlay.render(CI_YML.read_text(encoding="utf-8"), order=True))
+    assert _junit_legs(final["jobs"]["platform-order"]) == (1, 1)
+    naked_final = {jid: t - s for jid, (t, s) in
+                   ((j, _junit_legs(b)) for j, b in final["jobs"].items()) if t != s}
+    assert not naked_final, naked_final
     assert text.count("XDG_RUNTIME_DIR: ${{ runner.temp }}/xdg") == 1
 
 

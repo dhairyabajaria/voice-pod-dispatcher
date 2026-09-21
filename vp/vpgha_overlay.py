@@ -41,13 +41,31 @@ import re
 
 import yaml
 
-REQUIRED_JOBS = ("platform", "platform-shards", "platform-coverage", "agent",
-                 "deploy-contracts", "portal", "supply-chain")
+# The job branch protection gates on.  Its `needs` IS ci.yml's own statement of
+# which jobs a merge is gated on, so the overlay DERIVES the rendered set from it
+# instead of keeping a hand-copy.  A copy can only notice a job ci.yml REMOVES;
+# a job ci.yml ADDS is silently absent from every proof, which is exactly what
+# happened to `platform-order` (§95 item 1).
+GATE_JOB = "required-checks"
+# Every ci.yml job that is NOT rendered needs a reason here.  This table is the
+# only way a job may be dropped: `classify_jobs` refuses a ci.yml with a job it
+# cannot place, so a new job stops the render until someone rules on it rather
+# than vanishing from the proof.
+EXCLUDED_JOBS = {
+    "required-checks": "the gate job itself -- it only aggregates `needs`, it runs nothing",
+    "deploy": "needs GitHub-hosted image builds; never retargeted to the fleet",
+    "kb-real-provider-eval": "workflow_dispatch-only, and it spends real provider keys",
+    "scheduled-deployed-image-scan": "a schedule-driven scan of an already-deployed image, not of this tree",
+    "security-triage": "advisory triage of scanner output; it gates nothing",
+}
 # Required-when-present (§95 item 1, packet R-CI-PLATFORM-ORDER-JOB): rendered
 # when the candidate's ci.yml has the job, no raise when it does not.  D100
 # (§98 item 3): the order job is ~80 min and bounds every canary, so it is
 # rendered only for a FINAL canary (`order=True`: the Architect arms which) or
 # when `only=` names it; intermediate canaries run without it (~40 min).
+# Membership here is checked BEFORE the gate's `needs`, so the job is classified
+# (never "unclassified") whether or not ci.yml gates on it -- `order=`/`only=` is
+# the arming decision, not branch protection.
 OPTIONAL_JOBS = ("platform-order",)
 RUNS_ON = ["self-hosted", "voicepod"]
 # D112 (Architect 2026-09-20, two boxes): a FULL proof is pinned to one host label
@@ -395,6 +413,56 @@ def _subst_steps(steps, old, new):
     return [sub(st) for st in steps]
 
 
+def classify_jobs(ci):
+    """Place every ci.yml job in exactly one bucket, or refuse naming the strays.
+
+    Returns `(rendered, optional, excluded)`.  The rendered SET comes from the
+    gate job's `needs`; the rendered ORDER comes from ci.yml's own job
+    DECLARATION order -- not from the order of `needs`, which differs (trunk
+    lists portal before deploy-contracts in `needs` and declares them the other
+    way round, and inlines platform-order among them).  Callers compare rendered
+    job lists element-wise, so that distinction is load-bearing.
+    """
+    jobs = ci.get("jobs") or {}
+    gate = jobs.get(GATE_JOB)
+    if not isinstance(gate, dict):
+        raise ValueError("ci.yml declares no %r job, so nothing states which jobs gate a merge"
+                         % GATE_JOB)
+    needs = gate.get("needs") or []
+    if isinstance(needs, str):
+        needs = [needs]
+    if not needs:
+        raise ValueError("ci.yml's %r job has an empty `needs`, so nothing states which jobs "
+                         "gate a merge" % GATE_JOB)
+    # This replaces the old "ci.yml lacks required job(s)" raise, which went dead
+    # the moment the set was derived FROM ci.yml (ci.yml cannot lack a member of
+    # its own `needs`).  What still has meaning: a `needs` entry naming a job that
+    # is not declared -- GitHub rejects such a workflow outright, so it is a real
+    # ci.yml defect and the proof must not render past it.
+    dangling = [n for n in needs if n not in jobs]
+    if dangling:
+        raise ValueError("ci.yml's %s `needs` names undeclared job(s): %s"
+                         % (GATE_JOB, ", ".join(dangling)))
+    gated = set(needs)
+    rendered, optional, excluded, unclassified = [], [], [], []
+    for job_id in jobs:                                   # declaration order
+        if job_id in EXCLUDED_JOBS:
+            excluded.append(job_id)
+        elif job_id in OPTIONAL_JOBS:
+            optional.append(job_id)
+        elif job_id in gated:
+            rendered.append(job_id)
+        else:
+            unclassified.append(job_id)
+    if unclassified:
+        raise ValueError(
+            "ci.yml job(s) classified nowhere: %s -- the proof would silently omit them. "
+            "Add each to %s's `needs` in ci.yml to have it measured, to "
+            "vpgha_overlay.OPTIONAL_JOBS, or to vpgha_overlay.EXCLUDED_JOBS with a reason."
+            % (", ".join(unclassified), GATE_JOB))
+    return tuple(rendered), tuple(optional), tuple(excluded)
+
+
 def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_workers=None, shard_stagger_s=None,
                 host=None, exists=None):
     """{job_id: job} for the overlay, derived from a parsed ci.yml; `only`
@@ -403,10 +471,8 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
     `shard_workers` / `shard_stagger_s` tune the shard job (R-TEST-PG-STAGGER)"""
     upload = _upload_action(ci)
     src = ci.get("jobs") or {}
-    missing = [j for j in REQUIRED_JOBS if j not in src]
-    if missing:
-        raise ValueError("ci.yml lacks required job(s): %s" % ", ".join(missing))
-    selected = list(REQUIRED_JOBS) + [j for j in OPTIONAL_JOBS if j in src and (order or only)]
+    required, optional_present, _excluded = classify_jobs(ci)
+    selected = list(required) + (list(optional_present) if (order or only) else [])
     if only and str(only).startswith(PREFLIGHT_PREFIX):
         paths = [x for x in str(only)[len(PREFLIGHT_PREFIX):].split(",") if x.strip()]
         if not paths:
