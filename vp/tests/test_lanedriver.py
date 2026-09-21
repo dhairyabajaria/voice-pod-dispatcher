@@ -4073,7 +4073,7 @@ def test_d153_a_stranded_packet_alerts_and_a_bound_one_stays_quiet(tmp_path):
     sweep must say something, and must NOT say something when the pack is fine
     (an alert that fires on a healthy pack is an alert people turn off)."""
     env, drv = _d153_drv(tmp_path, stranded=True)
-    drv._sweep_step({"L01": {"state": "READY"}})
+    drv._sweep_step({"tasks": {"L01": {"state": "READY"}}})
     alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
     assert "PACKETS_STRANDED" in alerts, alerts
     assert "ORPHAN-1" in alerts
@@ -4081,7 +4081,7 @@ def test_d153_a_stranded_packet_alerts_and_a_bound_one_stays_quiet(tmp_path):
     clean = tmp_path / "clean"
     clean.mkdir()
     env2, drv2 = _d153_drv(clean, stranded=False)
-    drv2._sweep_step({"L01": {"state": "READY"}})
+    drv2._sweep_step({"tasks": {"L01": {"state": "READY"}}})
     p = env2.run_root / "OWNER-ALERTS.md"
     assert "PACKETS_STRANDED" not in (p.read_text() if p.exists() else ""), \
         "a bound pack must not alert"
@@ -4094,7 +4094,7 @@ def test_d153_a_sweep_that_could_not_run_is_not_a_clean_bill(tmp_path):
     anything -- which is exactly the failure this sweep was written to catch in
     other people's guards."""
     env, drv = _d153_drv(tmp_path, stranded=True)
-    drv._sweep_step({})                    # empty run-state -> SweepUnusable
+    drv._sweep_step({"tasks": {}})                    # empty run-state -> SweepUnusable
     alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
     assert "SWEEP_UNUSABLE" in alerts, alerts
     assert "NOT being measured" in alerts
@@ -4111,7 +4111,7 @@ def test_d153_the_sweep_never_takes_the_tick_down(tmp_path):
     drv._sweep_last_mono = None
     orig, vpsweep.sweep_loaded = vpsweep.sweep_loaded, boom
     try:
-        drv._sweep_step({"L01": {"state": "READY"}})   # must not raise
+        drv._sweep_step({"tasks": {"L01": {"state": "READY"}}})   # must not raise
     finally:
         vpsweep.sweep_loaded = orig
     assert "SWEEP failed: RuntimeError: sweep exploded" in drv.log_path.read_text()
@@ -4124,11 +4124,11 @@ def test_d153_it_is_rate_limited_and_logs_every_run_even_when_clean(tmp_path):
     exact confusion that made three other guards on this run unfalsifiable."""
     env, drv = _d153_drv(tmp_path, stranded=False)
     drv.alerts_cfg = dict(drv.alerts_cfg or {}, sweep_every_s=9999)
-    drv._sweep_step({"L01": {"state": "READY"}})
+    drv._sweep_step({"tasks": {"L01": {"state": "READY"}}})
     first = drv.log_path.read_text().count("SWEEP examined=")
     assert first == 1, "a clean sweep must still log that it ran"
     assert "STRANDED=0" in drv.log_path.read_text()
-    drv._sweep_step({"L01": {"state": "READY"}})
+    drv._sweep_step({"tasks": {"L01": {"state": "READY"}}})
     assert drv.log_path.read_text().count("SWEEP examined=") == 1, "not once per tick"
 
 
@@ -4146,7 +4146,7 @@ def test_d153_the_sweep_reads_the_drivers_tasks_not_the_state_file(tmp_path):
                 "blocked_parent": [], "stranded": []}
     orig, vpsweep.sweep_loaded = vpsweep.sweep_loaded, spy
     try:
-        drv._sweep_step({"SENTINEL": {"state": "READY"}})
+        drv._sweep_step({"tasks": {"SENTINEL": {"state": "READY"}}})
     finally:
         vpsweep.sweep_loaded = orig
     assert seen["tasks"] == {"SENTINEL": {"state": "READY"}}, \
@@ -4216,10 +4216,35 @@ def test_d153_the_call_site_passes_tasks_not_the_whole_state_view(tmp_path):
     try:
         drv._pack_step()
     except Exception:
-        drv._sweep_step((drv.control.state_view() or {}).get("tasks") or {})
+        drv._sweep_step(drv.control.state_view() or {})
     finally:
         vpsweep.sweep_loaded = orig
     assert seen.get("tasks") == {"L01": {"state": "READY"}}, (
         "the sweep must receive the TASKS; it got %r" % (seen.get("tasks"),))
     assert "sequence" not in (seen.get("tasks") or {}), \
         "the whole state view leaked through -- every packet would read as stranded"
+
+
+def test_d153_sweep_step_takes_a_state_view_like_every_other_step(tmp_path):
+    """D155. The sibling convention IS the guard.
+
+    Every other periodic step in _pack_step is `_x_step(self, state)` and
+    unwraps `.get("tasks")` itself. _sweep_step took `tasks`, so its call site
+    was the one line there with a different shape -- and that is exactly the
+    line I got wrong, passing the view straight through and calling 62
+    correctly-bound packets stranded.
+
+    Pinning the signature means the next person copying the line above or below
+    it cannot introduce the same defect.
+    """
+    import inspect
+    sig = inspect.signature(lanedriver.LaneDriver._sweep_step)
+    assert list(sig.parameters) == ["self", "state"], (
+        "_sweep_step must take a state view like its siblings, not tasks: %s" % list(sig.parameters))
+    for name in ("_canary_step", "_fleet_step", "_preflight_step", "_closure_sweep",
+                 "_supersede_sweep"):
+        fn = getattr(lanedriver.LaneDriver, name, None)
+        assert fn is not None, (
+            "%s is gone -- this pin names the convention's members by hand, so a "
+            "rename silently empties it" % name)
+        assert list(inspect.signature(fn).parameters)[1] == "state", name

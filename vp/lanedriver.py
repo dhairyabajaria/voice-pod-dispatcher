@@ -2741,7 +2741,7 @@ class LaneDriver(object):
                 retired += self._supersede(t, tasks)
         return retired
 
-    def _sweep_step(self, tasks):
+    def _sweep_step(self, state):
         """D153: periodically ask whether any packet on disk will NEVER become a
         row. Read-only and report-only -- it dispatches nothing and changes no
         state, because the class it finds needs a human to decide the remedy
@@ -2763,6 +2763,11 @@ class LaneDriver(object):
         sweep that cannot run and a sweep that finds nothing print the same
         line, and only one of them is good news.
         """
+        # `state`, not `tasks`, so this method's call site reads exactly like its
+        # five siblings in _pack_step. D154: when it took `tasks` it was the one
+        # line there with a different shape, the view got passed straight through,
+        # and the first live sweep called 62 correctly-bound packets stranded.
+        tasks = (state or {}).get("tasks") or {}
         every = float(self.alerts_cfg.get("sweep_every_s", 900))
         last = getattr(self, "_sweep_last_mono", None)
         if last is not None and time.monotonic() - last < every:
@@ -2817,10 +2822,7 @@ class LaneDriver(object):
         except Exception as exc:  # noqa: BLE001
             self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
         try:
-            # .get("tasks") -- state_view() is {"tasks": {...}, ...}, NOT the tasks.
-            # Passing the view itself made every packet look unbound and fired a
-            # 62-packet false alarm live; see the shape guard in sweep_loaded.
-            self._sweep_step((self.control.state_view() or {}).get("tasks") or {})
+            self._sweep_step(self.control.state_view() or {})
         except Exception as exc:  # noqa: BLE001 -- a report must never stop the tick
             self.log("SWEEP step failed: %s: %s" % (type(exc).__name__, exc))
         try:
