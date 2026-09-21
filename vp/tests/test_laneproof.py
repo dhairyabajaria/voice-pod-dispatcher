@@ -1820,3 +1820,88 @@ def test_d167_end_to_end_the_retention_shape_downgrades_and_the_shard_shape_does
     sharded = verdict("vp/platform-shards-5")
     assert sharded["status"] == "FAIL_PRODUCT", (
         "a shard infra red leaves 'did mine run?' unanswerable: %s" % sharded["status"])
+
+
+def _open_record_measuring(run_root, cand, measured, only=None,
+                           pipeline_id="pipe-207", proof_id="proof-open-ov"):
+    """an OPEN record that also says what its pipeline MEASURED.
+
+    The gha route renders an overlay commit per run, so a source's
+    measured_commit is never `cand`. That gap is the whole point of D173 and the
+    stock `_open_full_record` helper does not carry the field."""
+    d = run_root / "proofs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ("%s.json" % proof_id)).write_text(json.dumps({
+        "status": "UNKNOWN", "route": "circleci", "proof_id": proof_id, "sha": cand,
+        "pipeline_id": pipeline_id, "account": "3", "only": only,
+        "measured_commit": measured, "ts": "2026-09-21T01:38:00Z"}))
+    return proof_id
+
+
+def test_d173_a_twin_that_adopted_a_full_pipeline_records_the_run_not_the_ask(tmp_path):
+    """D173: a scoped ask that ADOPTS an open FULL pipeline was writing three
+    fields about the ASK while naming a pipeline that ran something else.
+
+    Measured over the run-v13 corpus on 2026-09-21: 70 distinct cross-record
+    re-polls (self re-polls excluded -- a round re-polling its own pipeline
+    borrowed nothing). `sha` agreed on all 70; `measured_commit` agreed on NONE,
+    and 62 recorded the borrower's own `cand`, because the re-poll path skips
+    prepare_measured. Architect 2's rule ("both sha and measured_commit must
+    match") was therefore not violated by those 62 so much as UNEVALUABLE on
+    them: the field never held the thing the rule asks about.
+
+    30 of the 70 are also scoped-borrower-from-full-source, the shape that
+    produced L28-HOSTED-R3: `only=twin:3:...` on a record whose pipeline ran the
+    full suite. A grader comparing the two correctly refuses it, and the refusal
+    is the wrong call -- a full green is a strict superset of the ask.
+
+    BOTH scope fields have to move. Every scope consumer reads `paths` FIRST
+    (LaneDriver.entry_scope, proof_answers, _reusable_proof's key), so clearing
+    `only` alone would leave the record reading `scoped:` to all of them and the
+    fix would be inert -- the same half-fix that kept D168/D170 from changing any
+    verdict until D172."""
+    wt, base, cand = repo(tmp_path)
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), FakeExec({}))
+    src = _open_record_measuring(tmp_path / "run", cand, "overlay-full-deadbeef")
+
+    only = "twin:3:platform/tests/test_billing_control.py"
+    paths = ["platform/tests/test_billing_control.py"]
+    rec = p.run("L28-HOSTED-R3", "proof-twin", wt, base, cand, "platform", paths, only=only)
+
+    assert rec["only"] is None, "a record of a FULL run must not claim a narrow one: %r" % rec["only"]
+    assert rec["paths"] == [], (
+        "clearing `only` alone is inert -- entry_scope tests `paths` first: %r" % rec["paths"])
+    assert rec["measured_commit"] == "overlay-full-deadbeef", (
+        "the record must name the commit the adopted pipeline MEASURED, not this ask's cand: %r"
+        % rec["measured_commit"])
+    assert rec["repolled_from"] == src
+    assert rec["borrowed_ask"] == {"only": only, "paths": paths}, (
+        "the ask is provenance, not noise -- dropping it loses what was asked for: %r"
+        % rec.get("borrowed_ask"))
+
+
+def test_d173_a_repoll_of_a_run_with_the_same_scope_keeps_that_scope(tmp_path):
+    """D173 control, and the one that stops the fix becoming a scope eraser.
+
+    Here the adopted pipeline ran exactly this ask's scope, so nothing is
+    borrowed and `only`/`paths` must survive untouched. Without this control the
+    patch would quietly promote every re-polled scoped proof to full -- precisely
+    the false green D170 and D172 exist to prevent.
+
+    It also pins the other half: `measured_commit` is corrected on EVERY re-poll,
+    not only on the 30 that borrowed a wider run. 62 of the 70 corpus cases are
+    this shape."""
+    wt, base, cand = repo(tmp_path)
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), FakeExec({}))
+    only = "twin:3:platform/tests/test_billing_control.py"
+    paths = ["platform/tests/test_billing_control.py"]
+    src = _open_record_measuring(tmp_path / "run", cand, "overlay-scoped-c0ffee", only=only)
+
+    rec = p.run("L28-HOSTED-R4", "proof-own", wt, base, cand, "platform", paths, only=only)
+
+    assert rec["only"] == only and rec["paths"] == paths, (
+        "a re-poll of an identically scoped run must not be widened to full")
+    assert "borrowed_ask" not in rec
+    assert rec["repolled_from"] == src
+    assert rec["measured_commit"] == "overlay-scoped-c0ffee", (
+        "the measured_commit correction applies to every re-poll, not only to borrows")

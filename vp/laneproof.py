@@ -1031,8 +1031,37 @@ class Proof(object):
                                              res["jobs"], res["failed_tests"], cls)
             except Exception as exc:
                 out_dir = "record failed: %s" % exc
+            # D173: this ask may have RE-POLLED a pipeline somebody else triggered
+            # (D81 adoption, :686) instead of triggering its own.  Two fields then
+            # describe the ASK rather than the RUN, and both are wrong:
+            #
+            #   measured_commit -- the re-poll path skips prepare_measured, so
+            #     `measured` is still `cand` while the pipeline actually measured
+            #     the SOURCE's overlay commit.  Measured over tonight's corpus:
+            #     70 cross-record re-polls, sha agrees on all 70, and 62 record
+            #     their own cand as measured_commit.  Architect 2's rule ("both
+            #     sha and measured_commit must match") is not violated by those
+            #     62 so much as unevaluable on them -- the field never held what
+            #     the rule asks about.
+            #
+            #   only/paths -- when the adopted pipeline was a FULL run and this ask
+            #     was scoped (open_answers' twin_adopts_full shape, :1160), the ask's
+            #     scope on a full-run record is self-contradictory and a grader
+            #     comparing the two correctly refuses it (L28-HOSTED-R3).  The
+            #     refusal is the wrong call: a full green is a strict superset.
+            #
+            # BOTH scope fields have to move.  Every scope consumer tests `paths`
+            # FIRST (LaneDriver.entry_scope, proof_answers, _reusable_proof's key),
+            # so clearing `only` alone would leave the record reading `scoped:` to
+            # all of them and the fix would be inert -- the same half-fix that made
+            # D168/D170 change no verdict until D172.
+            repolled = bool(prior)
+            borrowed = repolled and not (prior.get("only") or None) and bool(only or paths)
+            if repolled and prior.get("measured_commit"):
+                measured = prior["measured_commit"]
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
-                   "paths": paths, "only": only, "order": bool(order), "host": host,
+                   "paths": [] if borrowed else paths, "only": None if borrowed else only,
+                   "order": bool(order), "host": host,
                    "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
                    "out_of_scope_failed": outside, "unscoped": unscoped,
                    "flake_suspect": flake, "tests_collected": collected,
@@ -1046,6 +1075,16 @@ class Proof(object):
                               self._derived_reason(status, cls, failed, pipeline_id, only)),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
+            if repolled:
+                # provenance, not decoration: without it a re-polled record cannot be
+                # told from one this ask triggered itself, and the audit for other
+                # rows that took this path has nothing to key on.
+                rec["repolled_from"] = prior.get("proof_id")
+            if borrowed:
+                rec["borrowed_ask"] = {"only": only, "paths": paths}
+                self.log("PROOF %s %s adopted FULL pipeline %s from %s: recorded as full, "
+                         "ask (only=%s) kept as borrowed_ask (D173)"
+                         % (task, pid, pipeline_id, prior.get("proof_id"), str(only)[:60]))
             self._write(pid, rec)
             self.log("PROOF %s %s -> %s (%s pipeline %s, %d red job(s), %d red node(s)%s)"
                      % (task, pid, status, self.hosted_route(), pipeline_id, len(cls["reds"]), len(failed),
