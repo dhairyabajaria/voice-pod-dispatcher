@@ -631,6 +631,48 @@ class Proof(object):
                     "pipeline_id were all empty" % status)
         return "%s: %s" % (status, "; ".join(bits))
 
+    #: D167: jobs that CONSUME other jobs' artifacts and execute no tests of
+    #: their own. An infra red here cannot bear on whether this ask's paths ran,
+    #: so it must not block D140's downgrade.
+    #:
+    #: Read from the candidate's own config to confirm rather than inferred from
+    #: the name: `.circleci/config.yml`'s `combine-coverage` is
+    #: `attach_workspace` then `coverage combine` / `coverage report
+    #: --fail-under` / `check_module_coverage.py`. It runs no pytest. Its GHA
+    #: twin is spelled `vp/platform-coverage`; the two providers are two
+    #: vocabularies for one step, so both spellings are listed rather than
+    #: matched by a substring.
+    #:
+    #: DELIBERATELY MINIMAL, and an allow-list rather than a deny-list so the
+    #: default is to BLOCK. Every other job -- shards especially, because the
+    #: ask's file could have been in one -- keeps blocking, and a job name added
+    #: to the workflow later blocks until someone measures it and adds it here.
+    #: `collected-test-floor` and `lint-and-typecheck` are NOT here on purpose:
+    #: a broken collection step plausibly bears on whether a file ran, and
+    #: neither has a measured case behind it.
+    AGGREGATOR_JOBS = ("vp/platform-coverage", "combine-coverage")
+
+    @classmethod
+    def blocking_infra(cls, reds):
+        """D167: the non-product reds that could bear on whether this ask ran.
+
+        D140's downgrade to PASS needs "nothing of mine failed AND mine really
+        ran". A pipeline-wide `kind != "product"` test made ANY infra red veto
+        that, including one from a job that executes no tests.
+
+        Measured 2026-09-21 on R-RETENTION-BARRIER-CENSUS-DERIVED-HOSTED
+        (pipeline 35569998113, verified independently from driver.log:15698 and
+        the L04-FLOOR-PROOF-BRANCH-HOSTED-R3 record's `only: null`, so
+        `adopted_full` really is True): `inside` was empty, the one product red
+        was L08's, correctly filtered out by D140 -- and the row stayed
+        REPAIR_REQUIRED with `failed_nodes: []` solely because
+        `vp/platform-coverage` was `infrastructure_fail`. That job is
+        `needs: [platform-shards]` and runs `coverage combine` plus gates. It
+        cannot say anything about whether the retention test executed.
+        """
+        return [r for r in (reds or [])
+                if r.get("kind") != "product" and str(r.get("job")) not in cls.AGGREGATOR_JOBS]
+
     def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None, order=False):
         cc = self.circle_cfg()
         host = None if only else self.reserve_host(cc)   # D135: choose+take atomically
@@ -927,7 +969,7 @@ class Proof(object):
                     # were not ours, not that ours ran -- absence of a failure is not
                     # evidence of execution -- so the status stands.
                     adopted_full = bool(prior) and not (prior.get("only") or None)
-                    infra = [r for r in (cls.get("reds") or []) if r.get("kind") != "product"]
+                    infra = self.blocking_infra(cls.get("reds"))
                     if status == "FAIL_PRODUCT" and not inside and adopted_full and not infra:
                         status = "PASS"
                         self.log("PROOF %s %s every red was outside this ask's scope and the "

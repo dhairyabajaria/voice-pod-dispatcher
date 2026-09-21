@@ -1700,3 +1700,123 @@ def test_d157_the_reason_chain_cannot_fall_back_to_none():
         "not name explicitly will carry no cause again")
     assert not re.search(r"if\s+unscoped\s+else\s+None\s*\)", chain), (
         "the chain falls back to None: that is the original defect")
+
+
+# -- D167: an aggregator's infra red cannot veto D140's downgrade -------------------------------
+
+def _reds(*pairs):
+    return [{"job": j, "kind": k, "status": "infrastructure_fail" if k != "product" else "failed"}
+            for j, k in pairs]
+
+
+def test_d167_an_aggregator_that_runs_no_tests_does_not_block_the_downgrade():
+    """D167, measured on R-RETENTION-BARRIER-CENSUS-DERIVED-HOSTED (pipeline
+    35569998113).
+
+    D140's downgrade needs "nothing of mine failed AND mine really ran", and the
+    second half was tested with a pipeline-wide `kind != "product"`, so ANY
+    infra red vetoed it. That row had `inside` empty, its one product red was
+    L08's and correctly filtered, and it stayed REPAIR_REQUIRED with
+    `failed_nodes: []` solely because `vp/platform-coverage` was
+    infrastructure_fail.
+
+    That job is `needs: [platform-shards]` and its steps are `attach_workspace`
+    then `coverage combine` / `coverage report --fail-under` /
+    `check_module_coverage.py` -- read from `.circleci/config.yml`, not inferred
+    from the name. It executes no pytest, so it cannot say whether the retention
+    test ran."""
+    from laneproof import Proof
+
+    assert Proof.blocking_infra(_reds(("vp/platform-coverage", "infra"))) == []
+    assert Proof.blocking_infra(_reds(("combine-coverage", "infra"))) == [], (
+        "the CircleCI spelling of the same step; two providers are two "
+        "vocabularies for one job")
+    # the real shape of that pipeline: one product red (filtered by D140) plus
+    # the aggregator
+    got = Proof.blocking_infra(_reds(("vp/platform-shards-3", "product"),
+                                     ("vp/platform-coverage", "infra")))
+    assert got == [], "neither red can veto: one is product, the other runs no tests"
+
+
+def test_d167_a_shard_infra_red_still_blocks():
+    """D167's load-bearing control. A shard that failed for infrastructure
+    reasons might have been the shard holding this ask's file, so it is exactly
+    the case where "did mine run?" is unanswerable. It must keep blocking."""
+    from laneproof import Proof
+
+    blocked = Proof.blocking_infra(_reds(("vp/platform-shards-3", "infra")))
+    assert len(blocked) == 1 and blocked[0]["job"] == "vp/platform-shards-3"
+    assert len(Proof.blocking_infra(_reds(("platform-shard", "infra")))) == 1, "circleci spelling"
+    assert len(Proof.blocking_infra(_reds(("vp/platform-coverage", "infra"),
+                                          ("vp/platform-shards-5", "infra")))) == 1, (
+        "one exempt job does not excuse the other red beside it")
+
+
+def test_d167_an_unknown_job_name_blocks_by_default():
+    """D167 fails SAFE: the exemption is an allow-list, never a deny-list, so a
+    job added to the workflow later blocks until someone measures it and adds it
+    deliberately. `collected-test-floor` and `lint-and-typecheck` are left out on
+    purpose -- a broken collection step plausibly bears on whether a file ran,
+    and neither has a measured case behind it."""
+    from laneproof import Proof
+
+    for job in ("some-new-job-nobody-has-measured", "collected-test-floor",
+                "lint-and-typecheck", "required-gate", "vp/agent"):
+        assert len(Proof.blocking_infra(_reds((job, "infra")))) == 1, job
+
+
+def test_d167_the_exemption_list_is_closed_and_matched_exactly():
+    """Exact names, never a substring. `coverage` as a substring would exempt a
+    future job whose name merely contains it -- a test job called
+    `coverage-regression-tests` would stop blocking, which is the opposite of
+    what this is for."""
+    from laneproof import Proof
+
+    assert Proof.AGGREGATOR_JOBS == ("vp/platform-coverage", "combine-coverage")
+    for near_miss in ("vp/platform-coverage-2", "coverage", "combine-coverage-extra",
+                      "my-combine-coverage"):
+        assert len(Proof.blocking_infra(_reds((near_miss, "infra")))) == 1, near_miss
+
+
+def test_d167_a_product_red_is_never_infra_whatever_its_job(tmp_path):
+    """D167 must not change which reds are PRODUCT. The `kind != "product"`
+    test stays first, so a product failure in an aggregator job -- however
+    unlikely -- is still a product failure and is handled by D140's scope
+    filter, not by this exemption."""
+    from laneproof import Proof
+
+    assert Proof.blocking_infra(_reds(("vp/platform-coverage", "product"))) == []
+    assert Proof.blocking_infra([]) == [] and Proof.blocking_infra(None) == []
+
+
+def test_d167_end_to_end_the_retention_shape_downgrades_and_the_shard_shape_does_not(tmp_path):
+    """D167 at the call site, both directions, on the real shape.
+
+    The ask is a scoped twin whose own file is green; the pipeline is an adopted
+    FULL run (so `adopted_full` is True); the only reds are another item's
+    product node, filtered by D140, plus one infra red. Whether the verdict
+    downgrades must turn on WHICH job that infra red came from."""
+    wt, base, cand = repo(tmp_path)
+    only = "twin:3:platform/tests/test_mine.py"
+
+    def verdict(infra_job):
+        jobs = [{"id": "j1", "name": "vp/platform-shards-3", "status": "failed", "job_number": 341},
+                {"id": "j2", "name": infra_job, "status": "infrastructure_fail", "job_number": 342}]
+        tests = [{"file": "platform/tests/test_flaky.py", "classname": "platform.tests.test_flaky",
+                  "name": "test_race", "result": "failure", "message": "AssertionError: not mine"}]
+        res = {"jobs": jobs, "failed_tests": {341: tests},
+               "workflows": [{"id": "w1", "status": "failed"}]}
+        p = make_proof(tmp_path / infra_job.replace("/", "_"), FakeCircle(res), FakeExec({}))
+        _open_full_record(tmp_path / infra_job.replace("/", "_") / "run", cand)
+        return p.run("R-RETENTION-HOSTED", "proof-ret", wt, base, cand, "platform",
+                     ["platform/tests/test_mine.py"], only=only)
+
+    aggregated = verdict("vp/platform-coverage")
+    assert aggregated["failed_nodes"] == [], aggregated["failed_nodes"]
+    assert aggregated["status"] == "PASS", (
+        "the only infra red runs no tests, so the adopted full run still proves "
+        "this ask's file ran and passed: %s" % aggregated["status"])
+
+    sharded = verdict("vp/platform-shards-5")
+    assert sharded["status"] == "FAIL_PRODUCT", (
+        "a shard infra red leaves 'did mine run?' unanswerable: %s" % sharded["status"])
