@@ -55,6 +55,7 @@ import laneproof  # noqa: E402
 import vplint     # noqa: E402
 import vpmerge    # noqa: E402
 import vppack     # noqa: E402
+import vpsweep    # noqa: E402
 import vprunners  # noqa: E402
 import vpschema   # noqa: E402
 import vpverify   # noqa: E402
@@ -365,7 +366,7 @@ LEDGER_LEGEND = ("legend: INTEGRATED = box-verified, reviewed and merged into th
                  "A VERIFIED row marked `scoped:` is NOT evidence about any path outside its list")
 
 RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpgha_overlay", "vpgha", "vpdriver", "vp_box_lock", "vpproof", "vpmerge",
-                "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
+                "vprunners", "vppack", "vpsweep", "laneproof", "lanedryrun", "vpalerts")
 HOSTED_TAG_RE = re.compile(r"^-\s*(B\d+)\b.*\[hosted\]", re.M)
 
 KIND_MAP = {"builder": "builder", "design": "builder", "integration": "integrator",
@@ -2740,6 +2741,65 @@ class LaneDriver(object):
                 retired += self._supersede(t, tasks)
         return retired
 
+    def _sweep_step(self, tasks):
+        """D153: periodically ask whether any packet on disk will NEVER become a
+        row. Read-only and report-only -- it dispatches nothing and changes no
+        state, because the class it finds needs a human to decide the remedy
+        (rebind, rewrite the parent contract, or withdraw the packet).
+
+        Why it exists: a packet with no derivable parent sits on disk, lints
+        clean, and no row is ever created. There is nothing to be red. Every
+        other guard in this driver watches rows, so this class is invisible to
+        all of them.
+
+        ONLY `stranded` alerts. `waiting` is normal, `unseen` is a packet placed
+        seconds ago, and `blocked_parent` is usually a superseded chain whose
+        successor already discharged the work (the first live pair,
+        L17-REPLY-WIRING{,-FIX-1}-HOSTED, was exactly that). Alarming on any of
+        those would train people to ignore the word on the newest packets.
+
+        The alert key is the stranded SET, so a newly stranded packet re-alerts
+        while an unchanged set stays quiet. An unusable sweep alerts too: a
+        sweep that cannot run and a sweep that finds nothing print the same
+        line, and only one of them is good news.
+        """
+        every = float(self.alerts_cfg.get("sweep_every_s", 900))
+        last = getattr(self, "_sweep_last_mono", None)
+        if last is not None and time.monotonic() - last < every:
+            return
+        self._sweep_last_mono = time.monotonic()
+        if not self.pack_dir:
+            return
+        try:
+            res = vpsweep.sweep_loaded(
+                self.pack_dir, tasks, roster=self.roster, run_root=self.run_root,
+                driver_log=str(self.log_path), pack=self.pack, lint=self.pack_lint)
+        except vpsweep.SweepUnusable as exc:
+            self.alert_once("sweep:unusable:%s" % str(exc)[:80], "SWEEP_UNUSABLE",
+                            "packet sweep could not run, so 'no stranded packets' is "
+                            "NOT being measured: %s" % str(exc)[:300])
+            return
+        except Exception as exc:  # noqa: BLE001 -- never take the tick down
+            self.log("SWEEP failed: %s: %s" % (type(exc).__name__, exc))
+            return
+        stranded = [r["packet"] for r in res["stranded"]]
+        # logged every time, clean or not: a guard with no durable trace that it
+        # ran cannot be told later from one that never ran
+        self.log("SWEEP examined=%d bound=%d waiting=%d unseen=%d parent-terminal=%d "
+                 "STRANDED=%d%s"
+                 % (res["examined"], len(res["bound"]), len(res["waiting"]),
+                    len(res["unseen"]), len(res["blocked_parent"]), len(stranded),
+                    (" " + json.dumps(stranded)) if stranded else ""))
+        if stranded:
+            self.alert_once(
+                "sweep:stranded:%s" % ",".join(sorted(stranded)), "PACKETS_STRANDED",
+                "%d packet(s) on disk will never become a run-state row and nothing "
+                "will go red for them: %s -- each needs a parent it can derive, or "
+                "withdrawal.\n%s"
+                % (len(stranded), ", ".join(sorted(stranded)[:12]),
+                   "\n".join("  %s: %s" % (r["packet"], r["reason"])
+                             for r in res["stranded"][:12])))
+
     def _pack_step(self):
         every = float(self.alerts_cfg.get("pack_every_s", 300))
         last = self._pack_last_mono
@@ -2756,6 +2816,10 @@ class LaneDriver(object):
             self._supersede_sweep(self.control.state_view())
         except Exception as exc:  # noqa: BLE001
             self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
+        try:
+            self._sweep_step(self.control.state_view() or {})
+        except Exception as exc:  # noqa: BLE001 -- a report must never stop the tick
+            self.log("SWEEP step failed: %s: %s" % (type(exc).__name__, exc))
         try:
             self._canary_step(self.control.state_view() or {})
         except Exception as exc:  # noqa: BLE001

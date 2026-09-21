@@ -23,6 +23,7 @@ sys.path.insert(0, str(VP))
 
 import lanedriver  # noqa: E402
 import vppack  # noqa: E402
+import vpsweep  # noqa: E402
 from vprunners import TurnOutcome, STATUS_DONE  # noqa: E402
 
 PY = sys.executable
@@ -4013,3 +4014,150 @@ def test_d152_the_substitution_is_not_taken_from_the_builders_own_checks(tmp_pat
     drv._fill_noop_commit(liar, tmp_path, "T")
     assert "commit" not in json.loads(liar.read_text()), (
         "checks[] said clean and git said dirty; git wins")
+
+
+# -- D153: the packet sweep, wired into the tick ------------------------------
+
+
+def _d153_drv(tmp_path, stranded=True):
+    """A driver whose pack dir holds one packet that can never bind (`NEW:` id,
+    no lane named in the body, no parent_contract), or one that binds cleanly."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    pack = tmp_path / "PACKETS"
+    pid = "ORPHAN-1" if stranded else "L01"
+    task = "NEW:ORPHAN-1" if stranded else "L01"
+    body = "No lane is named here at all." if stranded else "Body."
+    d = pack / pid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "PACKET.md").write_text(
+        _VPSWEEP_FM.format(id=pid, base="a" * 40, task=task, extra="", body=body),
+        encoding="utf-8")
+    drv.pack_dir = pack
+    drv._load_pack()
+    return env, drv
+
+
+_VPSWEEP_FM = """---
+item: {id}
+title: packet {id}
+group: 1
+base_sha: {base}
+depends_on: []
+releases: []
+critical: false
+owned_files:
+  - control/evidence/{id}/v13/REGRADE.md
+forbidden_files: []
+test_paths: []
+proof_kind: platform
+max_rounds: 2
+max_minutes_build: 20
+reviewer_model: none
+owner_needed: none
+v13_kind: regrade
+scheduler_task: {task}
+{extra}---
+
+## Why
+
+Body for {id}. {body}
+"""
+
+
+def test_d153_a_stranded_packet_alerts_and_a_bound_one_stays_quiet(tmp_path):
+    """The whole point. A packet that can never become a row is invisible to
+    every other guard here -- they all watch rows, and this one has none. So the
+    sweep must say something, and must NOT say something when the pack is fine
+    (an alert that fires on a healthy pack is an alert people turn off)."""
+    env, drv = _d153_drv(tmp_path, stranded=True)
+    drv._sweep_step({"L01": {"state": "READY"}})
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "PACKETS_STRANDED" in alerts, alerts
+    assert "ORPHAN-1" in alerts
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    env2, drv2 = _d153_drv(clean, stranded=False)
+    drv2._sweep_step({"L01": {"state": "READY"}})
+    p = env2.run_root / "OWNER-ALERTS.md"
+    assert "PACKETS_STRANDED" not in (p.read_text() if p.exists() else ""), \
+        "a bound pack must not alert"
+
+
+def test_d153_a_sweep_that_could_not_run_is_not_a_clean_bill(tmp_path):
+    """THE load-bearing arm. A sweep that cannot run and a sweep that finds
+    nothing both print zero stranded. If an unusable sweep returned quietly, the
+    guard would read as green forever on a run where it never once measured
+    anything -- which is exactly the failure this sweep was written to catch in
+    other people's guards."""
+    env, drv = _d153_drv(tmp_path, stranded=True)
+    drv._sweep_step({})                    # empty run-state -> SweepUnusable
+    alerts = (env.run_root / "OWNER-ALERTS.md").read_text()
+    assert "SWEEP_UNUSABLE" in alerts, alerts
+    assert "NOT being measured" in alerts
+    assert "PACKETS_STRANDED" not in alerts, "an unusable sweep must not also claim findings"
+
+
+def test_d153_the_sweep_never_takes_the_tick_down(tmp_path):
+    """It is a report riding the dispatch loop. Anything it raises would stop
+    the driver dispatching, which is infinitely worse than the class it finds."""
+    env, drv = _d153_drv(tmp_path, stranded=True)
+
+    def boom(*a, **kw):
+        raise RuntimeError("sweep exploded")
+    drv._sweep_last_mono = None
+    orig, vpsweep.sweep_loaded = vpsweep.sweep_loaded, boom
+    try:
+        drv._sweep_step({"L01": {"state": "READY"}})   # must not raise
+    finally:
+        vpsweep.sweep_loaded = orig
+    assert "SWEEP failed: RuntimeError: sweep exploded" in drv.log_path.read_text()
+
+
+def test_d153_it_is_rate_limited_and_logs_every_run_even_when_clean(tmp_path):
+    """Two halves. The sweep walks the whole pack, so it must not run every
+    tick. And it must leave a line every time it DOES run: a guard with no
+    durable trace cannot later be told apart from one that never ran -- the
+    exact confusion that made three other guards on this run unfalsifiable."""
+    env, drv = _d153_drv(tmp_path, stranded=False)
+    drv.alerts_cfg = dict(drv.alerts_cfg or {}, sweep_every_s=9999)
+    drv._sweep_step({"L01": {"state": "READY"}})
+    first = drv.log_path.read_text().count("SWEEP examined=")
+    assert first == 1, "a clean sweep must still log that it ran"
+    assert "STRANDED=0" in drv.log_path.read_text()
+    drv._sweep_step({"L01": {"state": "READY"}})
+    assert drv.log_path.read_text().count("SWEEP examined=") == 1, "not once per tick"
+
+
+def test_d153_the_sweep_reads_the_drivers_tasks_not_the_state_file(tmp_path):
+    """The control plane owns run-state.json and may be mid-write. Re-reading it
+    would make the sweep race the writer and disagree with the driver about the
+    very rows it is judging, so the driver hands in the tasks it already holds."""
+    env, drv = _d153_drv(tmp_path, stranded=True)
+    seen = {}
+
+    def spy(pack_dir, tasks, **kw):
+        seen["tasks"] = tasks
+        seen["kw"] = kw
+        return {"examined": 1, "bound": [], "waiting": [], "unseen": [],
+                "blocked_parent": [], "stranded": []}
+    orig, vpsweep.sweep_loaded = vpsweep.sweep_loaded, spy
+    try:
+        drv._sweep_step({"SENTINEL": {"state": "READY"}})
+    finally:
+        vpsweep.sweep_loaded = orig
+    assert seen["tasks"] == {"SENTINEL": {"state": "READY"}}, \
+        "the driver's own state_view must be what is swept"
+    assert seen["kw"].get("run_root") == drv.run_root
+
+
+def test_d153_vpsweep_is_reloadable(tmp_path):
+    """lanedriver now imports vpsweep, so a vpsweep edit that is not in
+    RELOAD_ORDER would need a full driver restart -- the Operator's verb, not
+    mine -- while the reload silently reported `changed=[]` and shipped nothing."""
+    assert "vpsweep" in lanedriver.RELOAD_ORDER
+    src = Path(lanedriver.__file__).parent.joinpath("lanedriver.py").read_text()
+    assert "import vpsweep" in src, (
+        "this pin is only meaningful while the driver actually imports it")

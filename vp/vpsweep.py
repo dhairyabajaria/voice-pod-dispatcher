@@ -184,15 +184,37 @@ def _seen_packet_ids(driver_log, ids):
 
 
 def sweep(pack_dir, run_state_path, roster=None, driver_log=None, run_root=None):
-    """Compare packets on disk against run-state. Raises SweepUnusable rather
-    than returning a clean result it cannot support."""
+    """CLI entry: read run-state off disk, then sweep. Raises SweepUnusable
+    rather than returning a clean result it cannot support."""
+    return sweep_loaded(pack_dir, _load_run_state(run_state_path), roster=roster,
+                        driver_log=driver_log, run_root=run_root)
+
+
+def sweep_loaded(pack_dir, tasks, roster=None, driver_log=None, run_root=None,
+                 pack=None, lint=None):
+    """D153: the same sweep against tasks the CALLER already holds.
+
+    The driver must not re-read run-state.json off disk: the control plane owns
+    that file and may be mid-write, and the driver's own `state_view()` is the
+    authoritative copy anyway. Re-reading would make the in-tick sweep race the
+    writer and disagree with the driver about the very rows it is judging.
+
+    `pack`/`lint` may likewise be passed in when the caller already loaded them
+    (the driver reloads the pack on the same timer), but the emptiness guard
+    below still applies to whatever it is given -- a caller handing in an empty
+    pack gets the same refusal as a caller with an empty directory.
+    """
     roster = roster or {}
     pack_dir = Path(pack_dir)
     if not pack_dir.is_dir():
         raise SweepUnusable("pack dir does not exist: %s" % pack_dir)
-    tasks = _load_run_state(run_state_path)
+    if not isinstance(tasks, dict) or not tasks:
+        raise SweepUnusable("run-state holds no tasks; refusing to report every "
+                            "packet stranded from a state file that says nothing")
 
-    pack, lint = vppack.load_pack(pack_dir)
+    if pack is None:
+        pack, lint = vppack.load_pack(pack_dir)
+    lint = lint or []
     dirs = [d for d in sorted(pack_dir.iterdir()) if d.is_dir()]
     without_packet = [d.name for d in dirs if not (d / "PACKET.md").exists()]
     if not pack:
