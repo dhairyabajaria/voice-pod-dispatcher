@@ -40,8 +40,8 @@
       "integrate": 60,
       "ruling": 20
     },
-    "codex_max": 3,
-    "claude_max": 2,
+    "codex_max": 20,
+    "claude_max": 8,
     "spawn_stagger_s": 2
   },
   "budget": {
@@ -125,7 +125,12 @@
       "agent": "vp-builder",
       "model": "opencode-go/muse-spark-1.3-contributor",
       "variant": "xhigh",
-      "server": "go2"
+      "server": "go2",
+      "fallback": {
+        "runner": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "low"
+      }
     },
     "integrator": {
       "runner": "opencode",
@@ -141,7 +146,7 @@
       "model": "opencode-go/deepseek-v4.1-flash",
       "variant": "high",
       "server": "go2",
-      "max_concurrent": 4
+      "max_concurrent": 20
     },
     "probe": {
       "runner": "opencode",
@@ -149,7 +154,7 @@
       "model": "opencode-go/deepseek-v4.1-flash",
       "variant": "high",
       "server": "go2",
-      "max_concurrent": 4
+      "max_concurrent": 20
     },
     "infra": {
       "runner": "opencode",
@@ -165,7 +170,7 @@
       "sandbox": "workspace-write",
       "schema": "REVIEW_SCHEMA.json",
       "per_union": true,
-      "max_concurrent": 2,
+      "max_concurrent": 20,
       "review_gate_role": "junior"
     },
     "security": {
