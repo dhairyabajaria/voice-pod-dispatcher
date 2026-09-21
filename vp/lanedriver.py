@@ -2087,10 +2087,24 @@ class LaneDriver(object):
             # written.
             #
             # Tested HERE rather than by hoisting the (0b) block wholesale: below,
-            # (0b) sits after the twin-inheritance loop, so an INTEGRATED
-            # non-dynamic row WITH a twin proof still reports `inherited` and keeps
-            # the twin's name. Hoisting would have flattened those to
-            # `integrated_not_dynamic` and thrown away the attribution.
+            # (0b) sits after the twin-inheritance loop, so a row that REACHES
+            # that loop -- i.e. one with a kind, in `owed` -- still reports
+            # `inherited` and keeps the twin's name.  Hoisting would have
+            # flattened those to `integrated_not_dynamic` and thrown away the
+            # attribution.  That is the whole of the claim, and it is narrower
+            # than it first reads: it is about kind-BEARING rows.
+            #
+            # For the kind-None rows this branch serves, the twin loop is not
+            # reached either way -- before D186 they returned `kind_unknown` from
+            # the same place -- so nothing is lost here that was ever had.  But
+            # measured, 20 of these 25 rows DO have a twin proof on disk (D04 ->
+            # D04-HOSTED-R4, L06 -> L06-HOSTED-R1, ...), and for them
+            # `inherited` would be the stronger answer: it asserts a passing
+            # proof covers the row and names where it lives, where
+            # `integrated_not_dynamic` only says nobody has to look.  Consulting
+            # the twin before this return is therefore a real improvement and a
+            # real change -- it moves 20 rows from exempt to scored-as-covered --
+            # so it is filed as a separate decision, not smuggled into this one.
             if pre_v13:
                 return {"class": "not_required", "basis": "integrated_not_dynamic", "kind": None}
             # D148: an unknown kind cannot be said to owe anything.  My first cut
