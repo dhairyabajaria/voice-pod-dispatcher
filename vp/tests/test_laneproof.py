@@ -855,10 +855,21 @@ def test_d93_a_triggered_ledger_row_without_a_proof_record_is_an_open_pipeline(t
     p = make_proof(tmp_path, circle, FakeExec({}), logs=logs)
     ledger = tmp_path / "run" / "proofs" / "circleci-pipelines.jsonl"
     ledger.parent.mkdir(parents=True, exist_ok=True)
+    # D175: the row now records what it ran. `_note_pipeline` has always written
+    # `only` for a real trigger (laneproof.py:196); this fixture omitted it, and a
+    # row that cannot say what it ran is no longer adoptable -- see the control
+    # two lines down, and test_d175_* for why.
     ledger.write_text(json.dumps({"ts": "2026-09-20T09:38:41.652Z", "proof_id": "proof-L06-HOSTED-R7-x",
                                   "pipeline_id": "35502871574", "account": "gha", "sha": cand,
-                                  "status": "triggered"}) + "\n")
+                                  "status": "triggered", "only": None}) + "\n")
     assert p.triggered_pipeline(cand)["pipeline_id"] == "35502871574"
+    # D175 control, inline so D93's recovery path cannot quietly regain the hole:
+    # strip the key and the same row stops being an answer to anything.
+    keyless = dict(json.loads(ledger.read_text().strip()))
+    keyless.pop("only")
+    ledger.write_text(json.dumps(keyless) + "\n")
+    assert p.triggered_pipeline(cand) is None
+    ledger.write_text(json.dumps(dict(keyless, only=None)) + "\n")
     assert p.triggered_pipeline("other-sha") is None
     rec = p.run("L06", "proof-L06-HOSTED-R7-x", wt, base, cand, "platform", [])
     assert rec["status"] == "PASS" and rec["pipeline_id"] == "35502871574"
@@ -1141,11 +1152,26 @@ def test_d117_an_open_pipeline_is_repolled_only_for_the_same_only_set(tmp_path):
                                                          "ts": "2026-09-20T17:13:00.000Z"}))
     assert p.triggered_pipeline(cand, only=a)["pipeline_id"] == "1001"
     assert p.triggered_pipeline(cand, only=b) is None and p.triggered_pipeline(cand) is None
-    # a pre-D117 ledger row (no `only` key) reads as a full run
+    # D175 REVERSES the line that used to live here. It read: "a pre-D117 ledger
+    # row (no `only` key) reads as a full run", and asserted that any twin could
+    # adopt it. That was a deliberate backwards-compatibility affordance for rows
+    # written before `_note_pipeline` carried the field -- and it is the whole
+    # mechanism behind 18 records that took a verdict from a job which ran none of
+    # their tests (2026-09-21; 12 rendered pytest argvs read, 18 of 18 not covered).
+    #
+    # `open_answers` was never bypassed. It was handed a None it cannot tell apart
+    # from "the run was FULL", via the twin_adopts_full branch. Truthiness decides
+    # scoped-vs-full; KEY PRESENCE decides known-vs-unknown.
     ledger.write_text(json.dumps({"ts": "2026-09-20T17:14:00.000Z", "proof_id": "proof-OLD", "pipeline_id": "1003",
                                   "account": "gha", "sha": cand, "status": "triggered"}) + "\n")
-    assert p.triggered_pipeline(cand)["pipeline_id"] == "1003" and p.triggered_pipeline(cand, only=b)["pipeline_id"] == "1003"
+    assert p.triggered_pipeline(cand) is None, "a row that never recorded what it ran answers nothing"
+    assert p.triggered_pipeline(cand, only=b) is None, "and a twin may not adopt it either"
     assert p.triggered_pipeline(cand, only="portal") is None
+    # the same row, once it says it ran a full suite, is adoptable again -- the
+    # refusal is about the missing field, not about old rows.
+    ledger.write_text(json.dumps({"ts": "2026-09-20T17:14:00.000Z", "proof_id": "proof-OLD", "pipeline_id": "1003",
+                                  "account": "gha", "sha": cand, "status": "triggered", "only": None}) + "\n")
+    assert p.triggered_pipeline(cand)["pipeline_id"] == "1003" and p.triggered_pipeline(cand, only=b)["pipeline_id"] == "1003"
     # a live trigger writes `only` into the ledger row
     gha = FakeGha({"jobs": [{"id": "j1", "name": "vp/platform-twin", "status": "success", "job_number": 7}],
                    "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]})
@@ -1905,3 +1931,76 @@ def test_d173_a_repoll_of_a_run_with_the_same_scope_keeps_that_scope(tmp_path):
     assert rec["repolled_from"] == src
     assert rec["measured_commit"] == "overlay-scoped-c0ffee", (
         "the measured_commit correction applies to every re-poll, not only to borrows")
+
+
+
+def _ledger_rows(run_root, rows):
+    """D175 helper.  NOT named `_ledger`: this module already has one with a
+    different signature (:499), and shadowing it silently broke three unrelated
+    d65 tests whose failure said `_ledger() missing 1 required positional
+    argument` -- a name collision reading as a logic regression."""
+    d = run_root / "proofs"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "circleci-pipelines.jsonl", "a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+
+def test_d175_a_ledger_row_that_never_recorded_only_cannot_be_adopted_as_full(tmp_path):
+    """D175: the root cause of the shared-twin-job false greens.
+
+    `ledger_open_pipeline` fed `row.get("only")` to `open_answers`. For a row
+    written before `_note_pipeline` carried the field -- 214 of this run's 352
+    rows -- that is None, and open_answers reads None as "the run was FULL" via
+    the twin_adopts_full branch. So any twin could adopt any SCOPED pipeline.
+
+    Live instance: pipeline 35526024015 was L09-SEED-FIX's scoped twin run. Its
+    triggered row has no `only` key. L16, L17-REGISTRY-REPLY-PINS,
+    L17-REPLY-FENCE-LOCK-CLOSED and L04-FLOOR-PROOF-BRANCH each re-polled it and
+    recorded PASS -- from a job whose pytest command line does not contain a
+    single one of their test files.
+
+    Truthiness decides scoped-vs-full; KEY PRESENCE decides known-vs-unknown."""
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), FakeExec({}))
+    cand = "c" * 40
+    _ledger_rows(tmp_path / "run", [
+        {"ts": "2026-09-20T17:29:36.940Z", "proof_id": "proof-L09-SEED-FIX-HOSTED",
+         "pipeline_id": "35526024015", "account": "gha", "sha": cand, "status": "triggered"}])
+
+    got = p.ledger_open_pipeline(cand, only="twin:3:platform/tests/test_environment_registry.py")
+    assert got is None, (
+        "a row that never recorded what it ran must not be adopted as a full run: %r" % got)
+
+
+def test_d175_a_recorded_full_run_is_still_adoptable(tmp_path):
+    """D175 control, and the one that stops the fix becoming a blanket refusal.
+
+    `only: null` is a RECORDED full run -- the key is there and its value says
+    "no narrowing". Refusing those as well would switch D81 adoption off
+    entirely, which is the exemption-becomes-a-skip mistake with the polarity
+    reversed: a fix that prevents the defect by preventing the feature."""
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), FakeExec({}))
+    cand = "d" * 40
+    _ledger_rows(tmp_path / "run", [
+        {"ts": "2026-09-20T17:29:36.940Z", "proof_id": "proof-FULL-HOSTED",
+         "pipeline_id": "35526024099", "account": "gha", "sha": cand,
+         "status": "triggered", "only": None}])
+
+    got = p.ledger_open_pipeline(cand, only="twin:3:platform/tests/test_environment_registry.py")
+    assert got and got["pipeline_id"] == "35526024099", (
+        "a recorded full run must stay adoptable by a twin (D113): %r" % got)
+
+
+def test_d175_an_identically_scoped_row_is_still_adoptable(tmp_path):
+    """D175 control: equal `only` is the other legitimate adoption, and it must
+    survive the key-presence test unchanged."""
+    p = make_proof(tmp_path, FakeCircle(pipeline([])), FakeExec({}))
+    cand = "e" * 40
+    only = "twin:3:platform/tests/test_environment_registry.py"
+    _ledger_rows(tmp_path / "run", [
+        {"ts": "2026-09-20T17:29:36.940Z", "proof_id": "proof-SAME-HOSTED",
+         "pipeline_id": "35526024100", "account": "gha", "sha": cand,
+         "status": "triggered", "only": only}])
+
+    got = p.ledger_open_pipeline(cand, only=only)
+    assert got and got["pipeline_id"] == "35526024100"

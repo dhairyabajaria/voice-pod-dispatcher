@@ -1279,8 +1279,27 @@ class Proof(object):
                 answered.add(str(row["pipeline_id"]))
         best = None
         for row in rows:
+            # D175: `"only" in row` is the whole fix, and it is a KEY-PRESENCE test
+            # rather than a truthiness one.  `_note_pipeline` records `only` today,
+            # but 214 of this run's 352 ledger rows predate the field, and
+            # `row.get("only")` returns None for them -- which open_answers reads as
+            # "the run was FULL" via the twin_adopts_full branch, so ANY twin could
+            # adopt a SCOPED pipeline.
+            #
+            # That is not hypothetical.  Pipeline 35526024015 was L09-SEED-FIX's
+            # scoped twin run; its triggered row carries no `only` key; four rows
+            # (L16, L17-REGISTRY-REPLY-PINS, L17-REPLY-FENCE-LOCK-CLOSED,
+            # L04-FLOOR-PROOF-BRANCH) re-polled it and recorded PASS from a job whose
+            # command line does not contain their tests.
+            #
+            # Truthiness decides scoped-vs-full; key presence decides known-vs-
+            # unknown.  Collapsing the two is the same defect that made 287 scoped
+            # proofs read as full-suite passes (D170).  A row with `only: null` IS a
+            # recorded full run and stays adoptable -- refusing those too would turn
+            # this into a blanket refusal and switch D81 off.
             if (row.get("sha") == cand and row.get("pipeline_id") and row.get("status") == self.TRIGGERED
-                    and str(row["pipeline_id"]) not in answered and self.open_answers(row.get("only"), only)):
+                    and str(row["pipeline_id"]) not in answered and "only" in row
+                    and self.open_answers(row.get("only"), only)):
                 if best is None or self._open_rank(row, only) > self._open_rank(best, only):
                     best = row
         return best
