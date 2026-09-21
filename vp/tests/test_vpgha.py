@@ -682,3 +682,129 @@ def test_d118b_junit_case_count_counts_every_testcase():
            '<testcase classname="a" name="t3" file="tests/a.py"><skipped/></testcase></testsuite></testsuites>')
     assert vpgha.junit_case_count(xml) == 3
     assert vpgha.junit_case_count("<testsuite/>") == 0
+
+
+# -- D162: the rendered step's own spelling is what decides whether a path runs --
+
+def test_d162_wd_relative_is_the_one_copy_of_the_strip_rule():
+    """D162. `preflight_job` used to inline this three-line expression, so the
+    check in `unrunnable_paths` could only be written as a SECOND copy of it --
+    and a check that re-implements the thing it checks agrees with itself
+    forever. Both now read the same helper.
+
+    The pass-through arm is the deliberate one: a wd-relative spelling is a
+    legitimate form and test_overlay_only_preflight_renders_one_serial_pytest_job
+    pins a mixed-form `only` end to end."""
+    import vpgha_overlay as ov
+
+    assert ov.wd_relative("platform", ["platform/tests/a.py"]) == ["tests/a.py"]
+    assert ov.wd_relative("platform", ["tests/b.py"]) == ["tests/b.py"], (
+        "a wd-relative path passes through unchanged -- deliberate, pinned elsewhere")
+    assert ov.wd_relative("platform", ["agent/tests/x.py"]) == ["agent/tests/x.py"], (
+        "D106's gap: another package's repo-relative path is NOT stripped")
+    assert ov.wd_relative("platform", ["platformish/tests/c.py"]) == ["platformish/tests/c.py"], (
+        "the prefix test is on `wd + '/'`, never a bare substring")
+
+
+def test_d162_unrunnable_paths_names_the_declared_spelling_that_will_not_run():
+    """D162. The rendered step runs `uv run pytest -q <rel>` with
+    `working-directory: platform`, so the file pytest opens is `platform/<rel>`.
+    A repo-relative path from another package resolves to
+    `platform/agent/tests/x.py`, matches nothing, and pytest exits 5 -- which the
+    classifier reads as infrastructure_fail rather than the packet defect it is
+    (D106, run 35518327671).
+
+    The returned spelling is the DECLARED one, because that is the string a
+    packet author would have to change."""
+    import vpgha_overlay as ov
+
+    tree = {"platform/tests/a.py", "platform/tests/b.py", "agent/tests/x.py"}
+    exists = lambda p: p in tree                                        # noqa: E731
+
+    paths = ["platform/tests/a.py", "tests/b.py", "agent/tests/x.py"]
+    got = ov.unrunnable_paths(paths, "platform", exists)
+
+    assert got == ["agent/tests/x.py"], got
+    assert "tests/b.py" not in got, (
+        "the wd-relative form resolves to platform/tests/b.py and runs fine")
+    assert "platform/tests/a.py" not in got
+
+
+def test_d162_a_path_that_exists_in_the_repo_but_not_under_the_wd_is_still_unrunnable():
+    """D162's load-bearing control. `agent/tests/x.py` IS in the tree -- the
+    packet did not invent it -- and it still cannot run, because the step is
+    chdir'd into `platform`. Checking "does this path exist in the repo" instead
+    of "does <wd>/<rel> exist" would clear exactly the case D106 is about, and
+    would be green against every packet that ever declared a real file."""
+    import vpgha_overlay as ov
+
+    tree = {"agent/tests/x.py"}
+    assert ov.unrunnable_paths(["agent/tests/x.py"], "platform", lambda p: p in tree) \
+        == ["agent/tests/x.py"]
+    assert ov.unrunnable_paths(["agent/tests/x.py"], "agent", lambda p: p in tree) == [], (
+        "under working-directory: agent the same path resolves and runs")
+
+
+def test_d162_reports_nothing_when_every_path_resolves():
+    """D162 control: the checker must be silent on the ordinary case, or it would
+    refuse every proof in the fleet."""
+    import vpgha_overlay as ov
+
+    tree = {"platform/tests/a.py", "platform/tests/b.py"}
+    assert ov.unrunnable_paths(["platform/tests/a.py", "tests/b.py"], "platform",
+                               lambda p: p in tree) == []
+
+
+def test_d162_prepare_measured_refuses_paths_the_rendered_step_cannot_find(tmp_path):
+    """D162 end to end, at the place the ruling put it: render time, where the
+    candidate's own tree is in hand and no pipeline has been spent.
+
+    D106 stripped `platform/` and passed everything else through, so a
+    repo-relative path from another package was handed to pytest inside
+    `platform/`, matched nothing, and exited 5 -- which `classify` reads as
+    infrastructure_fail rather than the packet defect it is (run 35518327671).
+
+    `agent/tests/x.py` below EXISTS in the repo. That is the control: a check
+    that asked "is this path in the tree" would clear exactly the case this is
+    about, and would be green against every packet that ever declared a real
+    file. What matters is whether `<working-directory>/<rel>` resolves."""
+    r, _cand, sh = _repo(tmp_path)
+    (r / "platform" / "tests").mkdir()
+    (r / "platform" / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    (r / "agent" / "tests").mkdir(parents=True)
+    (r / "agent" / "tests" / "x.py").write_text("def test_x(): pass\n")
+    sh("add", "-A")
+    sh("commit", "-q", "-m", "tests")
+    cand = sh("rev-parse", "HEAD").stdout.strip()
+    runner = vpgha.Runner()
+
+    # the ordinary case is silent, in both spellings the step accepts
+    assert len(vpgha.prepare_measured(r, cand, runner, only="preflight:platform/tests/test_a.py")) == 40
+    assert len(vpgha.prepare_measured(r, cand, runner, only="preflight:tests/test_a.py")) == 40
+    # ... and a full render, which declares no paths at all, is untouched
+    assert len(vpgha.prepare_measured(r, cand, runner)) == 40
+
+    with pytest.raises(vpgha_overlay.UnrunnablePaths, match="agent/tests/x.py"):
+        vpgha.prepare_measured(r, cand, runner, only="preflight:agent/tests/x.py")
+    assert sh("cat-file", "-e", "%s:agent/tests/x.py" % cand).returncode == 0, (
+        "the refused path is really in the tree: this is about where the step runs, "
+        "not about whether the packet invented a file")
+
+    with pytest.raises(vpgha_overlay.UnrunnablePaths, match="test_missing.py"):
+        vpgha.prepare_measured(r, cand, runner, only="preflight:platform/tests/test_missing.py")
+
+    # a twin: ask goes through the same builder and gets the same refusal
+    with pytest.raises(vpgha_overlay.UnrunnablePaths, match="agent/tests/x.py"):
+        vpgha.prepare_measured(r, cand, runner, only="twin:3:agent/tests/x.py")
+
+
+def test_d162_the_check_is_off_unless_a_caller_supplies_exists(tmp_path):
+    """D162 control: `exists` defaults to None everywhere it was threaded, so
+    every existing caller, test and tool renders exactly what it rendered before.
+    `render(MINI_CI, only="preflight:agent/tests/x.py")` has no tree to consult
+    and must not start guessing."""
+    doc = yaml.safe_load(vpgha_overlay.render(MINI_CI, only="preflight:agent/tests/x.py"))
+    assert list(doc["jobs"]) == ["platform-preflight"]
+    runs = [str(st.get("run", "")) for st in doc["jobs"]["platform-preflight"]["steps"]]
+    assert any("uv run pytest -q agent/tests/x.py" in r for r in runs), (
+        "unchanged without `exists`: D162 refuses, it never rewrites a path")

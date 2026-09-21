@@ -150,7 +150,7 @@ def _git(runner, args, cwd, what, env=None):
     return (res.stdout or "").strip()
 
 
-def render_overlay(wt, cand, runner, only=None, order=False, shard=None, host=None):
+def render_overlay(wt, cand, runner, only=None, order=False, shard=None, host=None, exists=None):
     """vp-proof.yml text for this candidate, from ITS ci.yml and floor script;
     `only` (§95 item 2) narrows the workflow to one job / matrix leg; `order`
     (D100) adds the platform-order job for a final canary"""
@@ -161,7 +161,24 @@ def render_overlay(wt, cand, runner, only=None, order=False, shard=None, host=No
         floor = ""
     shard = shard or {}
     return vpgha_overlay.render(ci_text, vpgha_overlay.floor_supports_branch(floor), only=only, order=order,
-                                shard_workers=shard.get("workers"), shard_stagger_s=shard.get("stagger_s"), host=host)
+                                shard_workers=shard.get("workers"), shard_stagger_s=shard.get("stagger_s"), host=host,
+                                exists=exists)
+
+
+def _tree_exists(runner, wt, sha):
+    """D162: `exists(<repo-relative path>) -> bool` against the CANDIDATE's tree.
+
+    `git cat-file -e <sha>:<path>` answers from the object store, so nothing is
+    checked out and the shared worktree is never touched.  Anything other than a
+    clean success reads as absent -- the check is only ever used to refuse, so
+    failing closed here costs a refusal and never a false clear."""
+    def exists(path):
+        try:
+            _git(runner, ["cat-file", "-e", "%s:%s" % (sha, path)], wt, "overlay")
+            return True
+        except Exception:                                  # noqa: BLE001
+            return False
+    return exists
 
 
 def prepare_measured(wt, cand, runner=None, text=None, only=None, order=False, shard=None, host=None):
@@ -171,8 +188,11 @@ def prepare_measured(wt, cand, runner=None, text=None, only=None, order=False, s
     `git diff --name-only cand measured` is exactly that path."""
     runner = runner or Runner()
     wt = str(wt)
+    # D162: the existence check runs HERE, at render time, because this is where
+    # the candidate's own tree is in hand.  A `text` supplied by the caller is
+    # already rendered, so there is nothing left to check -- that path is tests.
     text = text if text is not None else render_overlay(wt, cand, runner, only=only, order=order, shard=shard,
-                                                        host=host)
+                                                        host=host, exists=_tree_exists(runner, wt, cand))
     with tempfile.TemporaryDirectory(prefix="vp-overlay-") as tmp:
         blob_path = Path(tmp) / "vp-proof.yml"
         blob_path.write_text(text, encoding="utf-8")

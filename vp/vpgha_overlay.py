@@ -257,10 +257,63 @@ PREFLIGHT_PREFIX = "preflight:"
 PREFLIGHT_DROP_RE = re.compile(r"ci_collection_floor\.py|check_module_coverage\.py|tests\.shuffled_runner|uv run pytest\b")
 
 
-def preflight_job(src, paths):
+class UnrunnablePaths(ValueError):
+    """D162: `only` declares test paths the rendered step cannot find at the
+    candidate.  A ValueError so an older caller that only catches ValueError
+    still sees it, and its own class so the proof path can name the cause."""
+
+
+def wd_relative(wd, paths):
+    """repo-relative test paths -> the spelling the rendered step passes to pytest.
+
+    D106: `test_paths` are repo-relative (`platform/tests/x.py`) while the step
+    runs with `working-directory: platform` (run 35518327671: "file or directory
+    not found"), so the prefix comes off.  A path that does NOT start with
+    `<wd>/` is passed through unchanged, and that is deliberate, not an oversight:
+    a wd-relative spelling (`tests/x.py`) is a legitimate form and
+    test_vpgha.py:545 pins a mixed-form `only` end to end.
+
+    D162: factored out of preflight_job so the existence check in
+    `unrunnable_paths` reads the SAME transformation the step will actually get.
+    A second copy of this three-line expression is how the check and the thing it
+    checks drift apart."""
+    return [x[len(wd) + 1:] if x.startswith(wd + "/") else x for x in paths]
+
+
+def unrunnable_paths(paths, wd, exists):
+    """D162: which of `paths` will the rendered step fail to find, given the
+    repository contents `exists(<repo-relative path>) -> bool` at the candidate?
+
+    The rendered step runs `uv run pytest -q <rel>` with `working-directory: wd`,
+    so the file pytest opens is `<wd>/<rel>` -- that one spelling is what this
+    checks, never the declared path.
+
+    The D106 gap this exists for: the strip above only fires for paths that start
+    with `<wd>/`.  Anything else passes through, so a repo-relative path from
+    another package (`agent/tests/x.py`) is handed to pytest inside `platform/`,
+    resolves to `platform/agent/tests/x.py`, matches nothing, and pytest exits 5
+    ("no tests ran") -- which the classifier reads as infrastructure_fail rather
+    than as the packet defect it is.
+
+    Pure, with `exists` injected: the caller holds the worktree and answers from
+    `git cat-file -e <sha>:<path>`, so nothing here needs a checkout.  Returns the
+    DECLARED spellings, because that is what a packet author would have to fix."""
+    rel = wd_relative(wd, paths)
+    return [p for p, r in zip(paths, rel) if not exists("%s/%s" % (wd, r))]
+
+
+def preflight_job(src, paths, exists=None):
     """Fleet-2 (§98): the `platform` job with its suite steps replaced by ONE
     serial `uv run pytest -q <paths>` (the held lane's own test files); setup,
-    lint and typecheck steps are kept.  A signal about the lane, never a verdict."""
+    lint and typecheck steps are kept.  A signal about the lane, never a verdict.
+
+    D162: `exists(<repo-relative path>) -> bool` is optional and OFF by default,
+    so every existing caller and test keeps today's behaviour.  When it is given
+    -- `prepare_measured` supplies it from the candidate's own tree -- a path the
+    rendered step could not find raises `UnrunnablePaths` here, at render time,
+    before a pipeline is spent.  The check lives in this function because this is
+    the one place that holds BOTH `wd` and `paths`; deriving `wd` again anywhere
+    else would be a second copy of the rule."""
     job = dict(src["platform"])
     steps, done = [], False
     for st in job.get("steps") or []:
@@ -269,9 +322,15 @@ def preflight_job(src, paths):
             if not done:
                 done = True
                 wd = st.get("working-directory") or "platform"
-                # D106: test_paths are repo-relative (platform/tests/x.py); the step runs
-                # in the platform dir (run 35518327671: "file or directory not found")
-                rel = [x[len(wd) + 1:] if x.startswith(wd + "/") else x for x in paths]
+                rel = wd_relative(wd, paths)      # D106, D162: one copy of the rule
+                if exists is not None:
+                    bad = unrunnable_paths(paths, wd, exists)
+                    if bad:
+                        raise UnrunnablePaths(
+                            "the rendered step runs in %r, so these declared path(s) resolve to "
+                            "nothing and pytest would exit 5 (\"no tests ran\"), which reads as "
+                            "infrastructure_fail rather than the packet defect it is: %s"
+                            % (wd, ", ".join(bad)))
                 steps.append({"name": "Preflight: the lane's own test files (vp-proof, Fleet-2)",
                               "working-directory": wd, "run": "uv run pytest -q %s" % " ".join(rel)})
             continue
@@ -306,13 +365,13 @@ def scoped_spec(only):
     return None
 
 
-def twin_job(src, paths, workers=None):
+def twin_job(src, paths, workers=None, exists=None):
     """D113 (§114): a released lane's SCOPED twin -- the `platform` job with its
     suite steps replaced by ONE `uv run pytest -q -n <workers> <paths>` over the
     parent's test files plus its contract's; junit as every pytest leg, NO --cov
     (class I, the cross-host coverage combine, cannot touch it), per-worker
     Postgres like a shard leg.  Its record answers the twin's own ask only."""
-    job = preflight_job(src, paths)
+    job = preflight_job(src, paths, exists=exists)
     n = int(workers or TWIN_WORKERS)
     for st in job.get("steps") or []:
         run = str(st.get("run") or "")
@@ -337,7 +396,7 @@ def _subst_steps(steps, old, new):
 
 
 def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_workers=None, shard_stagger_s=None,
-                host=None):
+                host=None, exists=None):
     """{job_id: job} for the overlay, derived from a parsed ci.yml; `only`
     narrows it to one job / matrix leg (select_only); `order` adds the
     optional order-dependence job when the ci.yml has it (D100);
@@ -352,12 +411,12 @@ def render_jobs(ci, floor_supports_branch=False, only=None, order=False, shard_w
         paths = [x for x in str(only)[len(PREFLIGHT_PREFIX):].split(",") if x.strip()]
         if not paths:
             raise ValueError("only=%s names no test paths" % only)
-        selected, src = [PREFLIGHT_JOB], {PREFLIGHT_JOB: preflight_job(src, paths)}
+        selected, src = [PREFLIGHT_JOB], {PREFLIGHT_JOB: preflight_job(src, paths, exists=exists)}
     elif only and scoped_spec(only):
         # D113 "twin:<workers>:<p1,p2,...>" / D114 "targeted:<workers>:<paths>" --
         # one scoped job (the platform job's setup + one pytest -n N), any host
         job_id, workers, paths = scoped_spec(only)
-        selected, src = [job_id], {job_id: twin_job(src, paths, workers)}
+        selected, src = [job_id], {job_id: twin_job(src, paths, workers, exists=exists)}
     elif only:
         selected, src = select_only(src, selected, only)
     out = {}
@@ -442,10 +501,10 @@ permissions:
 
 
 def render(ci_yml_text, floor_supports_branch=False, only=None, order=False, shard_workers=None,
-           shard_stagger_s=None, host=None):
+           shard_stagger_s=None, host=None, exists=None):
     ci = yaml.safe_load(ci_yml_text)
     jobs = render_jobs(ci, floor_supports_branch, only=only, order=order, shard_workers=shard_workers,
-                       shard_stagger_s=shard_stagger_s, host=host)
+                       shard_stagger_s=shard_stagger_s, host=host, exists=exists)
     body = yaml.dump({"jobs": jobs}, Dumper=_Dumper, sort_keys=False, width=200, allow_unicode=True,
                      default_flow_style=False)
     return HEAD + body

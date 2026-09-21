@@ -168,6 +168,7 @@ class Proof(object):
     # D65: every trigger attempt leaves a ledger row; only TRIGGERED rows spend a pipeline
     REFUSED_GATE, REFUSED_CAP, REFUSED_OFF = "refused_gate", "refused_cap", "refused_off"
     REFUSED_OVERLAY = "refused_overlay"            # D83 rule 2: the measured commit is not cand + the workflow
+    REFUSED_PATHS = "refused_paths"                # D162: only= declares paths the rendered step cannot find
     CREDITS_BLOCKED, TRIGGER_FAILED = "credits_blocked", "trigger_failed"
     REPOLLED = "repolled"                          # D81: an open pipeline polled again, not a trigger
 
@@ -739,6 +740,22 @@ class Proof(object):
                             measured = prepare(wt, cand, runner, **kw) if kw else prepare(wt, cand, runner)
                         except getattr(self.circle, "OverlayDirty", ()) as exc:
                             raise self.Refused(self.REFUSED_OVERLAY, str(exc)[:300])
+                        except getattr(vpgha_overlay, "UnrunnablePaths", ()) as exc:
+                            # D162: the rendered step could not find paths this ask
+                            # declared, checked against the candidate's own tree before
+                            # a pipeline was spent.  Its own refusal status, not
+                            # OVERLAY_DIRTY: that one means "the measured commit is not
+                            # cand + the workflow alone" (D83 rule 2) and reusing it
+                            # would put the wrong cause in the record and the alert.
+                            #
+                            # Deliberately NOT given a driver branch of its own: this is
+                            # a packet defect that a retry can never fix, so it falls to
+                            # the generic path and closes the attempt as INVALID_EVIDENCE
+                            # after FAIL_CAP, exactly as OVERLAY_DIRTY does.  The three
+                            # attempts cost no pipelines because the refusal is before
+                            # the trigger.  Flagged to the Architect rather than decided
+                            # here if a held-without-strike shape is wanted instead.
+                            raise self.Refused(self.REFUSED_PATHS, str(exc)[:300])
                         self.log("PROOF %s %s measured commit %s = %s + vp-proof overlay (D83%s%s%s)"
                                  % (task, pid, measured[:12], cand[:12], ", only=%s" % only if only else "",
                                     ", order=final (platform-order rendered, D100)" if order else "",
@@ -811,12 +828,17 @@ class Proof(object):
                     self.log("PROOF %s %s circleci refused (%s) -> box" % (task, pid, exc))
                     return self.run_box(task, pid, wt, cand, kind, paths, base=base)
                 status = {self.REFUSED_GATE: "BLOCKED_GATE", self.REFUSED_CAP: "BLOCKED_CAP",
-                          self.REFUSED_OFF: "BLOCKED_OFF", self.REFUSED_OVERLAY: "OVERLAY_DIRTY"}[exc.status]
+                          self.REFUSED_OFF: "BLOCKED_OFF", self.REFUSED_OVERLAY: "OVERLAY_DIRTY",
+                          self.REFUSED_PATHS: "UNRUNNABLE_PATHS"}[exc.status]
                 rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                        "pipeline_id": None, "account": None, "branch": branch,
                        "reason": "%s: %s" % (self.hosted_route(), str(exc)[:300]), "failed_nodes": [], "ts": utc_ms()}
                 self._write(pid, rec)
                 self.log("PROOF %s %s -> %s: %s" % (task, pid, status, str(exc)[:200]))
+                if status == "UNRUNNABLE_PATHS":
+                    self.alert("PROOF_UNRUNNABLE_PATHS", "%s %s: only=%s declares test path(s) the rendered "
+                               "step cannot find at the candidate; no run triggered: %s"
+                               % (task, pid, str(only)[:60], str(exc)[:300]), task)
                 if status == "OVERLAY_DIRTY":
                     self.alert("PROOF_OVERLAY_DIRTY", "%s %s: the measured commit is not the candidate + "
                                "vp-proof.yml alone (D83 rule 2); no run triggered: %s" % (task, pid, str(exc)[:300]),
