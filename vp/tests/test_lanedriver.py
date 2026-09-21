@@ -3826,3 +3826,72 @@ def test_d147_twin_lookup_does_not_borrow_an_unrelated_row_s_proof(tmp_path, mon
     _write_proof(env.run_root, "proof-L20-HOSTED-60921T000005", only=None)
     assert drv._twin_ids("L20") == ["L20-HOSTED"]
     assert drv.member_scope("L20", "builder")["basis"] == "inherited"
+
+
+def test_d148_a_verified_row_shows_what_its_proof_actually_ran(tmp_path, monkeypatch):
+    """PROOF-SCOPE spec Part A req 2. The union-104 shape was a full-suite claim
+    assembled from scoped parts. D146/D147 made that derivable; this makes it
+    VISIBLE where people read a verdict, so VERIFIED can no longer be misread as
+    "verified against everything".
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    # not VERIFIED -> premature question, and no proof lookup is paid for
+    assert drv._ledger_scope("X", {"state": "RUNNING", "kind": "builder"}) == "-"
+
+    # the load-bearing case: VERIFIED on a SCOPED proof must not read as "verified"
+    _write_proof(env.run_root, "proof-SC-60921T000010", only="twin:3:platform/tests/test_a.py")
+    out = drv._ledger_scope("SC", {"state": "VERIFIED", "kind": "builder"})
+    assert out.startswith("scoped:") and "test_a.py" in out, out
+
+    _write_proof(env.run_root, "proof-FU-60921T000011", only=None)
+    assert drv._ledger_scope("FU", {"state": "VERIFIED", "kind": "builder"}) == "full"
+
+    # evidence filed under the hosted twin keeps BOTH facts: the scope and whose it is
+    _write_proof(env.run_root, "proof-BX-HOSTED-60921T000012", only=None)
+    assert drv._ledger_scope("BX", {"state": "VERIFIED", "kind": "builder"}) == "full via BX-HOSTED"
+
+    assert drv._ledger_scope("PR", {"state": "VERIFIED", "kind": "probe"}) == "not-required"
+
+    # D148, found by projecting this column over all 286 VERIFIED rows before
+    # shipping it: "no proof record here" is NOT an accusation.  47 rows were
+    # verified before this run kept proofs at all, and 14 carry no kind, so an
+    # `UNPROVEN` cell would have fired 61 times with 61 false -- D147's own bug,
+    # one population wider.  The ledger states what it sees; the accusation lives
+    # in the union record, where the rows are the ones being assembled now.
+    assert drv._ledger_scope("NK", {"state": "VERIFIED", "kind": "builder"}) == "no-proof-in-run"
+    assert drv._ledger_scope("NK", {"state": "VERIFIED", "kind": None}) == "no-kind"
+    assert drv.member_scope("NK", None)["class"] == "not_required", (
+        "an unknown kind cannot be said to owe a proof")
+    assert drv.member_scope("NK", None)["basis"] == "kind_unknown", (
+        "and it must stay distinguishable from a kind that genuinely never owed one")
+
+    # the six answers are six answers, not one token wearing hats
+    seen = {drv._ledger_scope(t, {"state": "VERIFIED", "kind": k})
+            for t, k in (("SC", "builder"), ("FU", "builder"), ("BX", "builder"),
+                         ("PR", "probe"), ("NK", "builder"), ("NK", None))}
+    assert len(seen) == 6, seen
+
+
+def test_d148_the_scope_column_cannot_break_the_ledger_table(tmp_path, monkeypatch):
+    """A new column is a chance to emit a row that no longer matches its header.
+    `only` is a path list and a `|` in it would silently shift every later cell.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    _write_proof(env.run_root, "proof-PIPE-60921T000013", only="a.py|b.py")
+    cell = drv._ledger_scope("PIPE", {"state": "VERIFIED", "kind": "builder"})
+    assert "|" not in cell, "a pipe in `only` reaches the markdown row: %r" % cell
+
+    drv.render()
+    text = (env.run_root / "LEDGER.md").read_text()
+    body = text.split("| task |", 1)[1]
+    rows = [l for l in body.splitlines() if l.startswith("|")]
+    assert rows, "no table rows rendered"
+    widths = {l.count("|") for l in rows}
+    assert len(widths) == 1, (
+        "rendered rows disagree on column count %s -- header and body have drifted" % widths)
+    assert "| task | state | scope | kind |" in text, "scope sits beside the verdict, not at the end"

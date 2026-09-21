@@ -356,7 +356,13 @@ RELOAD_FILE = "RELOAD"
 # ledger says what the state means.  A lane's hosted evidence lives on its
 # `<ID>-HOSTED` twin row, never on the INTEGRATED row itself.
 LEDGER_LEGEND = ("legend: INTEGRATED = box-verified, reviewed and merged into the union; "
-                 "hosted evidence is the `<ID>-HOSTED` twin row")
+                 "hosted evidence is the `<ID>-HOSTED` twin row.  scope (D148, VERIFIED rows only) = "
+                 "what the passing proof actually RAN: `full` = whole suite, `scoped:<only>` = that "
+                 "path list and nothing else, `via <twin>` = evidence filed under the hosted twin, "
+                 "`not-required` = this kind never owed a proof, `no-kind` = the row carries no kind, "
+                 "`no-proof-in-run` = no proof record exists in THIS run (47 rows were verified "
+                 "before this run kept proofs; that is not the same as failing one). "
+                 "A VERIFIED row marked `scoped:` is NOT evidence about any path outside its list")
 
 RELOAD_ORDER = ("vpstore", "vpschema", "vplint", "circleaccount", "vpcircle", "vpgha_overlay", "vpgha", "vpdriver", "vp_box_lock", "vpproof", "vpmerge",
                 "vprunners", "vppack", "laneproof", "lanedryrun", "vpalerts")
@@ -1910,7 +1916,13 @@ class LaneDriver(object):
         if own:
             return dict(own, basis="own")
         owed = self.proof_cfg.get("require_for_kinds") or DEFAULT_PROOF_KINDS
-        if kind is not None and kind not in owed:
+        if kind is None:
+            # D148: an unknown kind cannot be said to owe anything.  My first cut
+            # guarded this with `kind is not None` and let it fall through to
+            # `unproven` -- which alarmed on 14 pre-v13 rows that carry no kind at
+            # all.  "I don't know" is not "it failed"; it gets its own basis.
+            return {"class": "not_required", "basis": "kind_unknown", "kind": None}
+        if kind not in owed:
             return {"class": "not_required", "basis": "kind", "kind": kind}
         for suffix in self._twin_ids(task):
             twin = self.proof_scope_for(suffix)
@@ -1928,6 +1940,45 @@ class LaneDriver(object):
             if m:
                 seen[m.group(1)] = True
         return sorted(seen, reverse=True)
+
+    def _ledger_scope(self, tid, row):
+        """D148 (PROOF-SCOPE spec Part A req 2): what a VERIFIED row's proof actually RAN.
+
+        The union-104 shape was a full-suite claim silently assembled from scoped
+        parts.  D146/D147 made that derivable; this makes it VISIBLE at the place
+        people actually read a verdict, so "VERIFIED" can no longer be mistaken for
+        "verified against everything".
+
+        VERIFIED rows only.  For any other state the question is premature, and
+        computing it for all 633 rows would buy an answer nobody can act on --
+        measured: 286 VERIFIED rows cost 0.21s, outside the tick lock, on a 300s
+        timer.  Never raises: a render must not take the tick down (see :3776).
+        """
+        if row.get("state") != "VERIFIED":
+            return "-"
+        try:
+            sc = self.member_scope(tid, row.get("kind")) or {}
+        except Exception:  # noqa: BLE001 -- render never takes the tick down
+            return "?"
+        cls, basis = sc.get("class"), sc.get("basis")
+        scoped = cls == self.PROOF_SCOPE_SCOPED
+        if basis == "inherited":
+            return "%s via %s" % ("scoped" if scoped else "full", sc.get("from"))
+        if scoped:
+            # `only` is a path list; a pipe would break the markdown row it sits in
+            only = str(sc.get("only") or "").replace("|", "/")
+            return "scoped:%s" % (only[:48] + ("..." if len(only) > 48 else ""))
+        if cls == self.PROOF_SCOPE_FULL:
+            return "full"
+        if cls == "not_required":
+            return "no-kind" if sc.get("basis") == "kind_unknown" else "not-required"
+        # D148: NOT "unproven".  The ledger spans the whole run history, including
+        # 47 rows verified before this run kept proofs at all (every one of them
+        # updated before the earliest proof record here).  Over that population the
+        # honest cell is what I can see, not an accusation -- the accusation belongs
+        # in the union record, where the members are the rows being assembled NOW
+        # and `owed a proof` is answerable.
+        return "no-proof-in-run"
 
     def _canary_proof(self, c, tasks):
         """the newest proof record of the canary's rows (proofs/proof-<row>-*.json), or None"""
@@ -3802,14 +3853,15 @@ class LaneDriver(object):
                  "live: %d  parked: %s" % (len(live), json.dumps(parked, sort_keys=True) if parked else "none"),
                  "states: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())),
                  LEDGER_LEGEND, "",
-                 "| task | state | kind | attempt | unlocks | updated | note |",
-                 "| --- | --- | --- | --- | --- | --- | --- |"]
+                 "| task | state | scope | kind | attempt | unlocks | updated | note |",
+                 "| --- | --- | --- | --- | --- | --- | --- | --- |"]
         for tid in sorted(tasks):
             row = tasks[tid]
             note = "LIVE" if tid in live else (row.get("blocker") or {}).get("reason", "") if isinstance(
                 row.get("blocker"), dict) else ""
-            lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
-                tid, row.get("state", "-"), row.get("kind", "-"), row.get("attempt_id") or "-",
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                tid, row.get("state", "-"), self._ledger_scope(tid, row), row.get("kind", "-"),
+                row.get("attempt_id") or "-",
                 "yes" if row.get("unlocks_dependents") else "-", row.get("updated_at", "-"),
                 str(note)[:80]))
         lines += ["", "## Alerts (last 20)", ""]
