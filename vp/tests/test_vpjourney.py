@@ -233,7 +233,11 @@ def test_journey_interleaves_events_turns_and_proofs_with_their_sources(tmp_path
     grader = [s for s in r1["steps"] if s["kind"] == "turn"][0]
     assert grader["effort"] is None                                  # no record on disk: nothing invented
     text = j.render_journey("P-FIX")
-    assert "proof dddddddddd on box -> PASS (passed=3)" in text and "retired -> CANCELLED (closers P-FIX-R1)" in text
+    # D149: the proof line now states what the PASS actually covered, between the
+    # route and the verdict.  A reader must not have to open the record to learn
+    # whether a green means one file or the whole suite.
+    assert "proof dddddddddd on box [full suite] -> PASS (passed=3)" in text
+    assert "retired -> CANCELLED (closers P-FIX-R1)" in text
 
 
 def test_verify_reports_divergence_between_events_state_ledger_and_spans(tmp_path):
@@ -286,3 +290,46 @@ def test_cli(tmp_path, capsys):
     assert "superseded_still_open" in capsys.readouterr().out
     assert vpjourney.main(["--run-root", str(run_root), "journey", "L00"]) == 0
     assert "L00 [catalog] INTEGRATED" in capsys.readouterr().out
+
+
+def test_d149_a_proof_says_what_it_ran_and_a_failure_claims_nothing():
+    """D149 (PROOF-SCOPE spec Part A req 2, board half). The board could show PASS
+    but not whether that PASS covered one file or the whole suite -- the union-104
+    shape. `only` is now carried through and rendered beside the verdict.
+    """
+    full = vpjourney.proof_scope_label({"status": "PASS", "only": None})
+    scoped = vpjourney.proof_scope_label(
+        {"status": "PASS", "only": "twin:3:platform/tests/test_a.py"})
+    assert full == "full suite"
+    assert scoped.startswith("scoped: ") and "test_a.py" in scoped
+    assert full != scoped, "a scoped pass and a full pass must not render alike"
+
+    # absence must never default to the STRONGEST claim -- the D146 mistake
+    assert vpjourney.proof_scope_label({"status": "FAIL_PRODUCT", "only": None}) == "-"
+    assert vpjourney.proof_scope_label({"status": "HELD", "only": None}) == "-"
+    assert vpjourney.proof_scope_label({}) == "-"
+    assert vpjourney.proof_scope_label(None) == "-"
+
+    # `only` is a path list; a pipe would break any table this lands in
+    assert "|" not in vpjourney.proof_scope_label({"status": "PASS", "only": "a.py|b.py"})
+    # and an enormous list must not blow out the row
+    long = vpjourney.proof_scope_label({"status": "PASS", "only": "x/" + "y" * 400 + ".py"})
+    assert len(long) < 100 and long.endswith("..."), long
+
+
+def test_d149_the_only_field_survives_the_proof_projection():
+    """The label is worthless if the field is dropped before it reaches it: the
+    projection in _refresh_proofs is an explicit allow-list, so `only` has to be
+    named there or every proof silently reads as a full suite.  Asserted against
+    the real allow-list read out of the source, not a copy of it -- a copy would
+    agree with itself forever."""
+    src = (Path(__file__).resolve().parent.parent / "vpjourney.py").read_text(encoding="utf-8")
+    block = src.split("self.proofs[p[\"proof_id\"]] =", 1)[1].split("}", 1)[0]
+    assert '"only"' in block, "vpjourney's proof projection dropped `only`"
+    rec = {"proof_id": "proof-X-60921T000001", "status": "PASS", "route": "gha",
+           "only": "twin:3:platform/tests/test_z.py", "sha": "a" * 40}
+    kept = {k: rec.get(k) for k in
+            ("proof_id", "status", "route", "sha", "ts", "kind", "counts", "rc",
+             "account", "pipeline_id", "branch", "only")}
+    assert kept["only"] == rec["only"], "the projection must carry `only`"
+    assert vpjourney.proof_scope_label(kept).startswith("scoped: ")

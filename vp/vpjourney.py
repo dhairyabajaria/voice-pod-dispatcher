@@ -96,6 +96,28 @@ def short(sha):
     return (sha or "")[:10]
 
 
+def proof_scope_label(p):
+    """D149: what a proof RAN, for display beside its verdict.
+
+    `only` empty/absent means the whole suite; anything else is that path list and
+    nothing outside it.  Only a PASS gets a scope at all -- a FAIL or a HELD record
+    ran something, but it is not evidence FOR anything, and labelling it `full`
+    would read as a full-suite guarantee (the D146 default-to-strongest mistake).
+
+    Deliberately a plain function over one record: the driver's own
+    `LaneDriver.member_scope` picks the newest PASS across records and consults
+    hosted twins, which needs the run root.  The board shows a record; the ledger
+    shows a row.  Same vocabulary, different questions -- do not merge them.
+    """
+    if (p or {}).get("status") != "PASS":
+        return "-"
+    only = (p or {}).get("only")
+    if not only:
+        return "full suite"
+    only = str(only).replace("|", "/")
+    return "scoped: %s" % (only[:60] + ("..." if len(only) > 60 else ""))
+
+
 # --------------------------------------------------------------------------
 # incremental readers
 # --------------------------------------------------------------------------
@@ -337,8 +359,11 @@ class Journey(object):
             self._proof_seen.add(name)
             p = self._load_json(d / name)
             if isinstance(p, dict) and p.get("proof_id"):
+                # D149: `only` is what the proof actually RAN.  Without it the board
+                # can show PASS but not whether that PASS covers one file or the whole
+                # suite -- the union-104 shape (see LEDGER.md's scope column, D148).
                 self.proofs[p["proof_id"]] = {k: p.get(k) for k in
-                                              ("proof_id", "status", "route", "sha", "ts", "kind", "counts", "rc", "account", "pipeline_id", "branch")}
+                                              ("proof_id", "status", "route", "sha", "ts", "kind", "counts", "rc", "account", "pipeline_id", "branch", "only")}
 
     # -- identity ------------------------------------------------------------------
 
@@ -581,11 +606,12 @@ class Journey(object):
                 counts = p.get("counts") or {}
                 steps.append({
                     "ts": p.get("ts"), "kind": "proof", "seq": None,
-                    "text": "proof %s on %s -> %s%s" % (
-                        short(p.get("sha")), p.get("route"), p.get("status"),
+                    "text": "proof %s on %s [%s] -> %s%s" % (
+                        short(p.get("sha")), p.get("route"), proof_scope_label(p), p.get("status"),
                         (" (%s)" % ", ".join("%s=%s" % (k, v) for k, v in sorted(counts.items())
                                             if k in ("passed", "failed", "error", "skipped") and v)) if counts else ""),
                     "status": p.get("status"), "route": p.get("route"), "proof_id": p.get("proof_id"),
+                    "scope": proof_scope_label(p),
                     "source": "proofs/%s.json" % p.get("proof_id"),
                 })
             steps.sort(key=lambda s: (s.get("ts") or "", s.get("seq") or 0))
