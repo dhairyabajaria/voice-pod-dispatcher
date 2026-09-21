@@ -3895,3 +3895,121 @@ def test_d148_the_scope_column_cannot_break_the_ledger_table(tmp_path, monkeypat
     assert len(widths) == 1, (
         "rendered rows disagree on column count %s -- header and body have drifted" % widths)
     assert "| task | state | scope | kind |" in text, "scope sits beside the verdict, not at the end"
+
+
+def _d152_rec(tmp, name="a", **over):
+    """One RESULT.json per subdirectory, so each arm below reads its own file."""
+    rec = {"item": "T", "attempt": 1, "base": "b" * 40, "blocked": None,
+           "diff_stat": {"files": 0, "insertions": 0, "deletions": 0},
+           "checks": [], "notes": "nothing to do"}
+    rec.update(over)
+    d = tmp / name
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "RESULT.json"
+    p.write_text(json.dumps(rec), encoding="utf-8")
+    return p
+
+
+def test_d152_a_noop_result_gets_head_and_a_builder_that_owes_a_commit_does_not(tmp_path, monkeypatch):
+    """D152. A hosted twin stacked on its already-VERIFIED parent has nothing to
+    commit; `commit` is binding, so it failed with `commit: missing` and burned
+    all three rounds producing the same record. HEAD is what the 104 accepted
+    no-op records already carry.
+
+    The load-bearing half is the refusal: a builder that skipped a commit it owed
+    self-reports a clean tree exactly as convincingly as one that owed nothing,
+    so the driver must look at git itself.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    HEAD, BASE = "b" * 40, "b" * 40
+
+    calls = []
+
+    def git_clean(args, **kw):
+        calls.append(args)
+        if "status" in args:
+            return 0, "", ""                       # clean tree
+        if "rev-parse" in args:
+            return 0, HEAD + "\n", ""
+        return 0, "", ""
+    drv.git = git_clean
+
+    # 1. the no-op case: HEAD is recorded, and the record says who filled it
+    p = _d152_rec(tmp_path, "noop", base=BASE)
+    drv._fill_noop_commit(p, tmp_path, "T")
+    got = json.loads(p.read_text())
+    assert got["commit"] == HEAD, got
+    assert "D152" in got["notes"] and "clean at base" in got["notes"], (
+        "an accepted record must say which sha the driver filled in and why")
+    assert "nothing to do" in got["notes"], "the builder's own note is kept"
+
+    # 2. THE REFUSAL: a dirty worktree means the commit really is missing
+    def git_dirty(args, **kw):
+        if "status" in args:
+            return 0, " M platform/api/admin.py\n", ""
+        return 0, HEAD + "\n", ""
+    drv.git = git_dirty
+    p2 = _d152_rec(tmp_path, "dirty", base=BASE)
+    drv._fill_noop_commit(p2, tmp_path, "T")
+    assert "commit" not in json.loads(p2.read_text()), "uncommitted work must still fail"
+
+    # 3. a non-zero diff_stat is work that was never committed
+    drv.git = git_clean
+    p3 = _d152_rec(tmp_path, "haswork", base=BASE,
+                   diff_stat={"files": 1, "insertions": 3, "deletions": 0})
+    drv._fill_noop_commit(p3, tmp_path, "T")
+    assert "commit" not in json.loads(p3.read_text())
+
+    # 4. HEAD that is not the declared base: something moved, do not paper over it
+    def git_moved(args, **kw):
+        if "status" in args:
+            return 0, "", ""
+        return 0, "c" * 40 + "\n", ""
+    drv.git = git_moved
+    p4 = _d152_rec(tmp_path, "moved", base=BASE)
+    drv._fill_noop_commit(p4, tmp_path, "T")
+    assert "commit" not in json.loads(p4.read_text())
+
+    # 5. a blocked result keeps its own story
+    drv.git = git_clean
+    p5 = _d152_rec(tmp_path, "blocked", base=BASE, blocked="needs the owner")
+    drv._fill_noop_commit(p5, tmp_path, "T")
+    assert "commit" not in json.loads(p5.read_text())
+
+    # 6. an existing commit is never overwritten
+    p6 = _d152_rec(tmp_path, "already", base=BASE, commit="a" * 40)
+    drv._fill_noop_commit(p6, tmp_path, "T")
+    assert json.loads(p6.read_text())["commit"] == "a" * 40
+
+    # 7. "it changed nothing" must be SAID, not inferred from silence. A record
+    # that omits diff_stat, or nulls it, has not reported a no-op -- it has
+    # reported nothing, and absent must never read as zero. (This arm exists
+    # because the mutation `None -> zero` survived every other assertion here.)
+    for i, missing in enumerate((None, {}, {"files": 0}, {"files": None, "insertions": 0,
+                                                          "deletions": 0})):
+        p7 = _d152_rec(tmp_path, "absent%d" % i, base=BASE, diff_stat=missing)
+        drv._fill_noop_commit(p7, tmp_path, "T")
+        assert "commit" not in json.loads(p7.read_text()), missing
+
+
+def test_d152_the_substitution_is_not_taken_from_the_builders_own_checks(tmp_path, monkeypatch):
+    """The trust boundary, stated as its own control. A record whose `checks[]`
+    swear the tree is clean must still be refused when git disagrees -- otherwise
+    the gate is the builder's word about itself."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    liar = _d152_rec(tmp_path, "liar", base="b" * 40, checks=[
+        {"name": "git-status-clean", "command": "git status --porcelain", "exit": 0,
+         "log": "empty: worktree clean, no modifications"}])
+
+    def git_dirty(args, **kw):
+        if "status" in args:
+            return 0, " M platform/core/tenancy.py\n", ""
+        return 0, "b" * 40 + "\n", ""
+    drv.git = git_dirty
+    drv._fill_noop_commit(liar, tmp_path, "T")
+    assert "commit" not in json.loads(liar.read_text()), (
+        "checks[] said clean and git said dirty; git wins")

@@ -6300,14 +6300,89 @@ class LaneDriver(object):
         self.log("RESULT %s attempt %s -> %d filled by the driver (D96: the round number is ours)"
                  % (task, "missing" if val is None else repr(val)[:40], int(rnd)))
 
+    def _fill_noop_commit(self, path, wt, task):
+        """D152: a builder with genuinely nothing to commit may omit `commit`.
+
+        `commit` is a binding key, so omitting it fails validation with
+        `commit: missing` -- a message that names no remedy. R-DEPLOY-ROLE-
+        PASSWORD-DDL-QUOTED-HOSTED burned all 3 rounds on it, producing an
+        identical record each time: a hosted twin stacked on its already-VERIFIED
+        parent, whose worktree was clean at base because the parent's change was
+        already in it. Its reasoning was recorded and correct -- "no commit
+        needed (RESULT.json is gitignored; empty commits prohibited)" -- and the
+        convention it did not know is to report HEAD.
+
+        Measured 2026-09-21 over all 344 RESULT.json in the run: of 179 records
+        reporting zero changed files, 178 spell it `commit == base` (30 of those
+        tasks are VERIFIED) and EXACTLY ONE omits `commit` -- the row above. So
+        the missing-commit spelling is not a precedented alternative; it is a
+        population of one. What makes this safe is not precedent but that the
+        substitution REWRITES the record into the 178-record spelling, so no
+        downstream reader ever sees a new shape and the set of record shapes
+        that validate is unchanged.
+
+        THE CONDITIONS ARE CHECKED AGAINST GIT, NOT AGAINST THE BUILDER'S OWN
+        `checks[]`. A builder that skipped a commit it owed would self-report a
+        clean tree just as convincingly as one that owed nothing; the whole point
+        of the gate is that the driver looks for itself.
+
+        Substitution is written INTO the record with a note, following the
+        regrade rebind at :5133 -- an accepted record must say what was filled in
+        and by whom, or the next reader cannot tell a builder's sha from ours.
+        """
+        try:
+            rec = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(rec, dict) or str(rec.get("commit") or "").strip():
+            return                                # nothing missing; not ours to touch
+        ds = rec.get("diff_stat") or {}
+
+        def _is_zero(v):
+            # real records spell "nothing changed" as 0, "0" or [] -- anything
+            # else (including absent) must NOT read as zero, or a record that
+            # omitted diff_stat entirely would qualify
+            if isinstance(v, bool) or v is None:
+                return False
+            if isinstance(v, (list, tuple, dict)):
+                return len(v) == 0
+            try:
+                return int(v) == 0
+            except (TypeError, ValueError):
+                return False
+
+        zero = all(_is_zero(ds.get(k)) for k in ("files", "insertions", "deletions"))
+        if not zero or rec.get("blocked"):
+            return                                # it changed something, or it is blocked
+        base = str(rec.get("base") or "").strip()
+        if not base:
+            return                                # `base` is binding too; let it fail honestly
+        rc, out, _ = self.git(["-C", str(wt), "status", "--porcelain"])
+        if rc != 0 or (out or "").strip():
+            return                                # uncommitted work: the commit really is missing
+        head = self.head_sha(wt)
+        if not head or not (head.startswith(base) or base.startswith(head)):
+            return                                # not clean AT BASE: something moved
+        rec["commit"] = head
+        rec["notes"] = ("%s\n[D152: no commit was made and the worktree is clean at base %s "
+                        "(verified by the driver, not from checks[]); HEAD recorded as `commit`]"
+                        % (rec.get("notes") or "", head[:12])).strip()
+        try:
+            Path(path).write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            return
+        self.log("RESULT %s commit missing -> HEAD %s substituted (D152: zero diff, not blocked, "
+                 "worktree clean at base)" % (task, head[:12]))
+
     def _spec(self, role, task, wt, prompt, rcfg, runner, server, sid, out_path, validator,
               timeout_s, tdir, tag, expect_fence, rnd):
         prompt = prompt + self._base_note(role, wt)
         if validator is vpschema.validate_result:
             inner = validator
 
-            def validator(path, _inner=inner, _rnd=rnd, _task=task):
+            def validator(path, _inner=inner, _rnd=rnd, _task=task, _wt=wt):
                 self._fill_attempt(path, _rnd, _task)
+                self._fill_noop_commit(path, _wt, _task)
                 return _inner(path)
         base = dict(variant=rcfg.get("variant"), agent=rcfg.get("agent"), session_id=sid,
                     out_path=str(out_path), timeout_s=timeout_s, log_dir=str(tdir), tag=tag,
