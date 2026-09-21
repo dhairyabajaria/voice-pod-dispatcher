@@ -2894,7 +2894,7 @@ class LaneDriver(object):
         # many it has -- a full-suite claim about the union's tree must not be
         # assemblable from scoped parts without that being visible (the union-104
         # mistake).  Derived per member from its own proof record, never assumed.
-        # D187 (Architect ruling, 2026-09-21): pass row=.  D174 left this
+        # D188 (Architect ruling, 2026-09-21): pass row=.  D174 left this
         # un-widened ON PURPOSE and asked for a ruling rather than deciding it
         # here; this is that ruling, so the old comment is replaced rather than
         # annotated.  An exemption is a property of the ROW, not of the reader:
@@ -6459,7 +6459,7 @@ class LaneDriver(object):
         head += "%s (.vp/PROOFS.json: %d member record(s), %d with a proof%s%s)\n" % (
             PROOFS_RULE, len(mem), sum(1 for e in mem if e.get("proof_id")),
             "; union tip proof present" if len(mem) != len(proofs["entries"]) else "",
-            # D188: say it in the reviewer's own header.  A member dropped for
+            # D189: say it in the reviewer's own header.  A member dropped for
             # circularity is a fact about the review's scope, and the reviewer is
             # the one person who would otherwise wonder where the row went.
             ("; %d member(s) excluded as depending on this review: %s"
@@ -6633,10 +6633,10 @@ class LaneDriver(object):
         the proof record of its VERIFIED attempt (the newest PASS at its output
         sha, else the newest record), plus the union tip's own proof if any.
 
-        D188: `review` is this review's own task id, used to drop members that
+        D189: `review` is this review's own task id, used to drop members that
         depend on it.  Optional and defaulting to None because this function is
         also reached unbound against a SimpleNamespace stub (test_vppack.py:609);
-        omitting it restores the pre-D188 behaviour exactly."""
+        omitting it restores the pre-D189 behaviour exactly."""
         idx = self._proof_index()
         tasks = state.get("tasks") or {}
         members = [str(m.get("task")) for m in ((union or {}).get("members") or []) if m.get("task")]
@@ -6666,7 +6666,7 @@ class LaneDriver(object):
 
         entries, circular = [], []
         for t in list(dict.fromkeys(members + list(targets))):
-            # D188 (Architect ruling, 2026-09-21): a row whose depends_on names
+            # D189 (Architect ruling, 2026-09-21): a row whose depends_on names
             # THIS review cannot be one of its members.  Its output is gated on
             # the review finishing, so at the review's subject sha it has no
             # proof and never can -- REVIEW-JUNIOR-UNION-R4 carried

@@ -5604,8 +5604,8 @@ def test_d113b_does_not_reuse_the_prose_pattern_and_says_why():
     assert "deploy/" in doc, "the reason the two patterns differ is no longer recorded"
 
 
-def test_d187_the_union_tally_and_the_review_grader_classify_a_row_the_same_way(tmp_path, monkeypatch):
-    """D187 (Architect ruling): an exemption is a property of the ROW, not of the
+def test_d188_the_union_tally_and_the_review_grader_classify_a_row_the_same_way(tmp_path, monkeypatch):
+    """D188 (Architect ruling): an exemption is a property of the ROW, not of the
     reader.  D174 left the union tally calling member_scope WITHOUT row= and asked
     for a ruling; this is it.  Two readers disagreeing about the same row is the
     drift D168 already paid for, so the test is a mirror: whatever the review
@@ -5658,7 +5658,7 @@ def test_d187_the_union_tally_and_the_review_grader_classify_a_row_the_same_way(
     assert rec["unproven_members"] == [], rec["unproven_members"]
 
 
-def test_d187_an_unreadable_state_view_gives_the_pre_ruling_answer_not_an_exemption(tmp_path, monkeypatch):
+def test_d188_an_unreadable_state_view_gives_the_pre_ruling_answer_not_an_exemption(tmp_path, monkeypatch):
     """An instrument failure must never read as the fact.  If the state view
     raises, the tally falls back to row={}, which is `pre_v13 False` -- the
     conservative pre-ruling answer.  The failure mode that would matter is the
@@ -5685,8 +5685,8 @@ def test_d187_an_unreadable_state_view_gives_the_pre_ruling_answer_not_an_exempt
         "an unreadable state view must not answer `exempt`: %r" % (sc,))
 
 
-def test_d188_a_member_that_depends_on_the_review_is_excluded_and_said_so(tmp_path, monkeypatch):
-    """D188 (Architect ruling): REVIEW-JUNIOR-UNION-R4 carried
+def test_d189_a_member_that_depends_on_the_review_is_excluded_and_said_so(tmp_path, monkeypatch):
+    """D189 (Architect ruling): REVIEW-JUNIOR-UNION-R4 carried
     {"task": "L42", "status": None} among 69 entries.  L42.depends_on names that
     very review, so its output is gated on the review finishing -- at the review's
     subject sha it has no proof and never can.  An entry that is structurally
@@ -5720,14 +5720,14 @@ def test_d188_a_member_that_depends_on_the_review_is_excluded_and_said_so(tmp_pa
     assert sorted(e["task"] for e in other["entries"] if e["task"] != "<union tip>") == ["L42", "MEMBER"]
     assert other["circular_members"] == []
 
-    # and omitting `review` restores the pre-D188 behaviour exactly, because the
+    # and omitting `review` restores the pre-D189 behaviour exactly, because the
     # unbound SimpleNamespace caller (test_vppack.py:609) passes four positional args
     old = drv._review_proofs([], state, union, sha)
     assert sorted(e["task"] for e in old["entries"] if e["task"] != "<union tip>") == ["L42", "MEMBER"]
     assert old["circular_members"] == []
 
 
-def test_d188_exclusion_reads_depends_on_from_the_packet_when_the_row_lacks_it(tmp_path, monkeypatch):
+def test_d189_exclusion_reads_depends_on_from_the_packet_when_the_row_lacks_it(tmp_path, monkeypatch):
     """The state row is not the only place a dependency is declared -- the pack
     carries it too, and a row that has not been rewired yet has no key at all.
     Reading only the row would make the exclusion depend on which of two stores
