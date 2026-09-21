@@ -1349,3 +1349,112 @@ def test_d140_adopting_a_scoped_run_filters_but_does_not_downgrade(tmp_path):
     assert len(rec["out_of_scope_failed"]) == 1, rec["out_of_scope_failed"]
     assert rec["status"] != "PASS", (
         "the adopted run was scoped, so nothing established that these paths ran: %s" % rec["status"])
+
+
+def test_d141_adopting_an_open_pipeline_does_not_take_an_in_flight_slot(tmp_path):
+    """D141: `circle_active` gates `max_in_flight`, a cap whose purpose is to
+    limit concurrent PIPELINES. But run_circleci increments it before the
+    `if prior:` branch decides whether it will trigger anything, and a D81
+    adoption triggers nothing -- the log says "no new trigger (D81)". So the cap
+    was throttling waiting, which is free, rather than triggering, which costs
+    runners. Four proofs re-polled pipeline 35551631471 on 2026-09-21, and while
+    they waited the counter read full and real triggers were refused
+    BLOCKED_CAP against an idle fleet.
+
+    The observation has to happen DURING the run. The finally always returns the
+    counter to 0, so a before/after assertion passes for the broken code too --
+    an unfailable test. This captures the count from inside poll(), which is
+    exactly when the adopted pipeline is being waited on."""
+    wt, base, cand = repo(tmp_path)
+    seen = {}
+
+    class WatchingCircle(FakeCircle):
+        def poll(self, pipeline_id, interval, deadline_s, runner, account, abort, targets=None):
+            seen["circle_active"] = self.proof.circle_active
+            return FakeCircle.poll(self, pipeline_id, interval, deadline_s, runner, account,
+                                   abort, targets)
+
+    circle = WatchingCircle(pipeline([]))
+    p = make_proof(tmp_path, circle, FakeExec({}))
+    circle.proof = p
+    _open_full_record(tmp_path / "run", cand)
+
+    assert p.circle_active == 0
+    p.run("L26-HOSTED", "proof-adopt", wt, base, cand, "platform", ["platform/tests"])
+
+    assert seen.get("circle_active") == 0, (
+        "an adopted pipeline triggers nothing, so it must hold no in-flight slot while it "
+        "waits -- saw %r during the poll" % seen.get("circle_active"))
+    assert p.circle_active == 0, "and the count must still balance afterwards"
+
+
+def test_d140b_a_malformed_scope_spec_cannot_answer_a_scoped_ask(tmp_path):
+    """D140b: `only` has THREE legitimate forms, not two -- twin:<n>:<paths>,
+    targeted:<n>:<paths>, and a bare workflow job or shard name (§95 item 2,
+    e.g. only="portal"). Only a ValueError is unambiguous: the prefix matched
+    and the body did not. That is a driver bug, and the ask is then scoped to
+    something we cannot derive, so it has not been answered.
+
+    The claim fails closed while the run survives -- FAIL_INFRA, this file's
+    idiom for "not an answer" (D79b cancelled, D118b collected-zero) -- so the
+    driver retries instead of charging the packet a verdict nobody scoped. A
+    record FIELD would not have done: an earlier draft wrote a `scope_filter`
+    label that nothing consumed, so the verdict still landed and still answered
+    the scoped ask. A guard is something that REFUSES
+    ([[gate-on-the-property-not-the-artifact]])."""
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle(pipeline([
+        ("platform/tests/test_something.py", "test_not_this_ask_s_file"),
+    ]))
+    alerts = []
+    p = make_proof(tmp_path, circle, FakeExec({}), alerts=alerts)
+    _open_full_record(tmp_path / "run", cand)
+
+    # `twin:` so open_answers permits adopting the open FULL run (no render, so
+    # the malformed body reaches run_circleci); `x` is not a worker count.
+    rec = p.run("L26-HOSTED", "proof-bad", wt, base, cand, "platform",
+                ["platform/tests/test_billing_control.py"], only="twin:x:platform/tests/a.py")
+
+    assert rec["status"] == "FAIL_INFRA", (
+        "an ask whose scope cannot be derived has not been answered: %s" % rec["status"])
+    assert rec.get("unscoped") and "does not parse" in rec["unscoped"], rec.get("unscoped")
+    assert "not an answer" in (rec.get("reason") or ""), rec.get("reason")
+    assert any(k == "PROOF_SCOPE_UNPARSED" for k, _ in alerts), alerts
+
+
+def test_d140b_a_bare_job_name_only_is_legitimate_and_must_not_be_failed(tmp_path):
+    """D140b control, and the one that caught my own over-reach.
+
+    §95 item 2 allows `only=<job|shard>` -- a bare workflow job name with no
+    prefix and no paths. `scoped_spec` returns None for it, correctly. My first
+    draft read "returns None" as "typo'd prefix" and turned every job-level
+    only= proof into FAIL_INFRA; the existing `test_fleet1_...` and `test_d98_...`
+    caught it immediately.
+
+    This pins the third vocabulary explicitly so the next person tightening this
+    check sees it named rather than rediscovering it from a red suite.
+    [[a-validity-check-needs-the-whole-vocabulary]]"""
+    import vpgha_overlay
+
+    assert vpgha_overlay.scoped_spec("portal") is None
+    assert vpgha_overlay.scoped_spec("platform-shards-3") is None
+    assert vpgha_overlay.scoped_spec("twin:3:a.py") is not None
+    assert vpgha_overlay.scoped_spec("targeted:2:a.py,b.py") is not None
+
+    wt, base, cand = repo(tmp_path)
+    # a bare job-name only= needs a provider that renders the workflow, as
+    # test_fleet1_only_runs_have_their_own_in_flight_cap does
+    green = {"jobs": [{"id": "j1", "name": "vp/portal", "status": "success", "job_number": 7}],
+             "failed_tests": {}, "workflows": [{"id": "1", "status": "success"}]}
+    alerts = []
+    cfg = {"hosted": {"provider": "gha"},
+           "circleci": {"enabled": True, "mode": "all", "kinds": ["platform"], "account": "A1",
+                        "delete_branch_after": True}}
+    p = make_proof(tmp_path, FakeGha(green), FakeExec({}), cfg=cfg, alerts=alerts)
+    rec = p.run("R-X", "proof-job", wt, base, cand, "platform", [], only="portal")
+
+    assert rec["status"] == "PASS", (
+        "a bare job name is a legitimate only= form and must not be treated as "
+        "an underivable scope: %s / %s" % (rec["status"], rec.get("unscoped")))
+    assert rec.get("unscoped") is None
+    assert not [k for k, _ in alerts if k == "PROOF_SCOPE_UNPARSED"], alerts

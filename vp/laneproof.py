@@ -588,10 +588,17 @@ class Proof(object):
         prior = self.triggered_pipeline(cand, only=only)
         with self._lock:
             # Fleet-1: only= runs count against their own cap, never the full-pipeline one
+            # D141: `prior` means D81 adoption -- we re-poll an existing pipeline and
+            # trigger nothing, so taking an in-flight slot throttles waiting rather
+            # than triggering. Only a real trigger takes one, and `took_slot` decides
+            # what the finally gives back.
+            took_slot = not prior
             if only:
-                self.only_active = getattr(self, "only_active", 0) + 1
+                if took_slot:
+                    self.only_active = getattr(self, "only_active", 0) + 1
             else:
-                self.circle_active += 1
+                if took_slot:
+                    self.circle_active += 1
                 # D135: the host slot was already taken by reserve_host() above --
                 # incrementing again here would double-count it and the release
                 # path (one decrement) would leave the host permanently "busy".
@@ -753,10 +760,36 @@ class Proof(object):
             # adopted one pipeline and every one of them inherited the same six.
             # twin_job()'s own contract says "its record answers the twin's own ask
             # only"; this is where that gets enforced.
-            try:
-                spec = vpgha_overlay.scoped_spec(only) if only else None
-            except ValueError:
-                spec = None
+            # D140b: parse `only` ONCE, here, and never call scoped_spec again --
+            # :806 used to call it a second time UNGUARDED, so a malformed spec
+            # raised ValueError out of the proof path entirely.
+            #
+            # `only` has THREE legitimate forms, not two: twin:<n>:<paths>,
+            # targeted:<n>:<paths>, and a bare workflow job or shard name
+            # (§95 item 2, e.g. only="portal"). scoped_spec returning None for
+            # that third form is CORRECT, not a typo -- an earlier draft of this
+            # treated it as an error and turned every job-level only= proof into
+            # FAIL_INFRA. Only a ValueError is unambiguous: the prefix matched
+            # and the body did not, which is a driver bug, and the ask is then
+            # scoped to something we cannot derive.
+            spec, unscoped = None, None
+            if only:
+                try:
+                    spec = vpgha_overlay.scoped_spec(only)
+                except ValueError as exc:
+                    unscoped = "only=%r has a %s prefix but does not parse (%s)" % (
+                        only, only.split(":", 1)[0], exc)
+            if unscoped:
+                # keep the run, refuse the CLAIM: an ask whose scope cannot be
+                # derived has not been answered. FAIL_INFRA is this file's idiom
+                # for "not an answer" (D79b cancelled, D118b collected-zero), so
+                # the driver retries instead of charging the packet a verdict
+                # nobody scoped.
+                status = "FAIL_INFRA"
+                self.log("PROOF %s %s %s -> FAIL_INFRA, not an answer (D140b)" % (task, pid, unscoped))
+                self.alert("PROOF_SCOPE_UNPARSED",
+                           "%s: %s -- the proof ran but cannot answer a scoped ask" % (task, unscoped),
+                           task=task)
             if spec and failed:
                 scope_paths = spec[2]
                 inside = [n for n in failed if self.node_in_scope(n, scope_paths)]
@@ -781,7 +814,7 @@ class Proof(object):
                         self.log("PROOF %s %s every red was outside this ask's scope and the "
                                  "adopted run was FULL (so the scope did run) -> PASS (D140)"
                                  % (task, pid))
-            if only and vpgha_overlay.scoped_spec(only) and status == "PASS":
+            if spec and status == "PASS":        # D140b: the parse above, never a second call
                 # D118b (§137): a scoped job that collected nothing is no answer
                 # (the twin job rendered `uv run pytest` over portal .test.tsx files:
                 # "failed with zero failed tests" / a green empty run) -> FAIL_INFRA
@@ -827,14 +860,15 @@ class Proof(object):
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
                    "paths": paths, "only": only, "order": bool(order), "host": host,
                    "reds": cls["reds"], "failed_nodes": failed, "errors": errors,
-                   "out_of_scope_failed": outside,
+                   "out_of_scope_failed": outside, "unscoped": unscoped,
                    "flake_suspect": flake, "tests_collected": collected,
                    "pipeline_id": pipeline_id, "account": account,
                    "branch": branch, "record_dir": str(out_dir), "ts": utc_ms(),
                    "provider": self.provider(), "measured_commit": measured,
                    "reason": ("circleci pipeline %s cancelled: not an answer (D79b)" % pipeline_id
                               if status == "CANCELLED" else
-                              "scoped job collected 0 tests: not an answer (D118b)" if collected == 0 else None),
+                              "scoped job collected 0 tests: not an answer (D118b)" if collected == 0 else
+                              "%s: not an answer to a scoped ask (D140b)" % unscoped if unscoped else None),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
             self._write(pid, rec)
@@ -845,9 +879,11 @@ class Proof(object):
         finally:
             with self._lock:
                 if only:
-                    self.only_active = max(0, getattr(self, "only_active", 0) - 1)
+                    if took_slot:
+                        self.only_active = max(0, getattr(self, "only_active", 0) - 1)
                 else:
-                    self.circle_active = max(0, self.circle_active - 1)
+                    if took_slot:
+                        self.circle_active = max(0, self.circle_active - 1)
                     if host:
                         self.host_active = dict(getattr(self, "host_active", {}) or {})
                         self.host_active[host] = max(0, self.host_active.get(host, 0) - 1)
