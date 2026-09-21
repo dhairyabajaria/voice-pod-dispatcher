@@ -5129,3 +5129,116 @@ def test_d176_the_writer_decides_the_verdict_from_what_it_ran(tmp_path):
         "the differently-scoped-adoption branch was removed -- D175 makes it rare, "
         "not impossible, and 17 records in this run are exactly that shape")
     assert 'subset = "preflight"' in src
+
+
+def _regrade_drv(tmp_path, monkeypatch):
+    """a LaneDriver with just enough wired to exercise _regrade_reset"""
+    from vp.lanedriver import LaneDriver
+    drv = LaneDriver.__new__(LaneDriver)
+    drv.run_root = tmp_path / "run"
+    drv.worktrees_root = tmp_path / "wt"
+    drv.worktrees_root.mkdir(parents=True, exist_ok=True)
+    calls = []
+
+    def fake_git(argv, log=False):
+        calls.append(list(argv))
+        if "cat-file" in argv:
+            return (0, "", "")
+        if "merge-base" in argv:
+            base, sha = argv[-2], argv[-1]
+            return (0 if sha.startswith(base[:4]) or base == sha else 1, "", "")
+        if "reset" in argv:
+            return (0, "", "")
+        return (0, "", "")
+
+    drv.git = fake_git
+    drv.log = lambda *a, **k: None
+    drv.alert = lambda *a, **k: None
+    drv._calls = calls
+    return drv
+
+
+def _mk_wt(root, task, base):
+    wt = root / task
+    (wt / ".vp").mkdir(parents=True, exist_ok=True)
+    if base is not None:
+        (wt / ".vp" / "BASE").write_text(base, encoding="utf-8")
+    return wt
+
+
+def test_d177_a_regrade_is_not_refused_because_the_union_moved_under_it(tmp_path, monkeypatch):
+    """D177. A regrade deliberately re-grades an OLDER commit, but the guard
+    measured descent against the FRESH worktree's base -- the current stacked
+    union tip. When the union moves between R0 and R1 the regrade sha can never
+    descend from it, so the regrade is refused BY CONSTRUCTION.
+
+    Observed, not theorised: at 2026-09-21T12:19Z both
+    R-RETENTION-BARRIER-CENSUS-DERIVED-HOSTED-R1 (aca1c0fd) and
+    R-WA03-OUTBOUND-REVOKE-RACE-DB-HOSTED-R1 (2d8e7882) were refused against
+    ee96ecc2 and closed INVALID_EVIDENCE (driver.log:17017/17025, LEDGER.md:711/713).
+
+    Direction is unchanged (`--is-ancestor base sha`); only the OPERAND widens to
+    include the base the sha actually belongs to."""
+    drv = _regrade_drv(tmp_path, monkeypatch)
+    old_base, new_base = "aca1c0fd" + "0" * 32, "ee96ecc2" + "0" * 32
+    _mk_wt(drv.worktrees_root, "ROW-HOSTED", old_base)
+    wt = _mk_wt(drv.worktrees_root, "ROW-HOSTED-R1", new_base)
+
+    why = drv._regrade_reset("ROW-HOSTED-R1", wt,
+                             {"sha": old_base, "retry_of": "ROW-HOSTED"})
+    assert why is None, "a regrade at the regraded row's own base must be accepted: %s" % why
+
+
+def test_d177_a_sha_outside_every_base_is_still_refused(tmp_path, monkeypatch):
+    """The widening must not become a relaxation: a sha that descends from
+    NEITHER base is still refused, and the message names both so the refusal
+    says where it failed rather than making the reader guess."""
+    drv = _regrade_drv(tmp_path, monkeypatch)
+    _mk_wt(drv.worktrees_root, "ROW-HOSTED", "aaaa1111" + "0" * 32)
+    wt = _mk_wt(drv.worktrees_root, "ROW-HOSTED-R1", "bbbb2222" + "0" * 32)
+
+    why = drv._regrade_reset("ROW-HOSTED-R1", wt,
+                             {"sha": "cccc3333" + "0" * 32, "retry_of": "ROW-HOSTED"})
+    assert why, "a sha outside every base must still be refused"
+    assert "aaaa1111" in why and "bbbb2222" in why, why
+
+
+def test_d177_a_pruned_worktree_refuses_rather_than_skipping_the_check(tmp_path, monkeypatch):
+    """POSITIVE CONTROL for the empty-string trap. `_base_of` returns "" for a
+    pruned or missing worktree, and the pre-D177 code then ran NO ancestry check
+    at all while still resetting -- an exemption that deleted the check and said
+    nothing. A vacuous pass here is worse than the bug, so assert a REFUSAL."""
+    drv = _regrade_drv(tmp_path, monkeypatch)
+    wt = _mk_wt(drv.worktrees_root, "ROW-HOSTED-R1", None)   # no .vp/BASE anywhere
+
+    why = drv._regrade_reset("ROW-HOSTED-R1", wt,
+                             {"sha": "cccc3333" + "0" * 32, "retry_of": "GONE"})
+    assert why, "no readable base must REFUSE, never pass vacuously"
+    assert "cannot be checked" in why, why
+    assert not any("reset" in c for c in drv._calls), "it must not reset on a refusal"
+
+
+def test_d177_a_refused_regrade_holds_the_row_and_never_fails_it(tmp_path):
+    """D177, and the part that did the real damage. A correct refusal used to
+    complete the task INVALID_EVIDENCE, leaving the row WORSE than the
+    REPAIR_REQUIRED it started from: the refusal did harm that the thing it
+    refused would not have done. Both 12:19Z rows were downgraded that way.
+
+    Assert the shape directly: the pipeline returns no completion at all, and
+    the status is the one the caller holds on."""
+    import inspect
+    from vp.lanedriver import LaneDriver, STATUS_REGRADE_REFUSED
+
+    src = inspect.getsource(LaneDriver._build_pipeline)
+    assert "STATUS_REGRADE_REFUSED, why" in src, "the refusal no longer raises the hold status"
+    assert '"outcome": "INVALID_EVIDENCE", "reason": "REGRADE_REFUSED' not in src, (
+        "the refusal still completes the row INVALID_EVIDENCE -- it is destructive again")
+
+    caller = inspect.getsource(LaneDriver._run_attempt) if hasattr(LaneDriver, "_run_attempt") else ""
+    if not caller:                       # the caller's name may differ; scan the module
+        caller = inspect.getsource(inspect.getmodule(LaneDriver))
+    i = caller.find("STATUS_REGRADE_REFUSED")
+    assert i != -1, (
+        "nothing MATCHES the status: an unhandled status falls through the generic "
+        "paths and strikes the task three times into STUCK")
+    assert "note_hold" in caller[i:i + 900], "the handler must hold, not complete"

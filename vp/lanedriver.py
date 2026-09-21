@@ -133,6 +133,13 @@ FAIL_BACKOFF_S = (60, 120, 300)
 # D18: a proof refused by the shm gate is a BOX condition -- hold the attempt
 # this long, count no failure; heartbeat carries the live segment count
 SHM_HOLD_S = 300.0
+REGRADE_HOLD_S = 900.0          # D177: a refused regrade HOLDS, it never fails the row
+# A lanedriver-internal turn status: produced by _build_pipeline, consumed by
+# _run_attempt, never by a runner -- so it is NOT in vprunners.PARK_STATUSES and
+# must be matched explicitly.  Named rather than spelled inline (the neighbouring
+# "PROOF_BLOCKED_SHM" is a bare literal in both places, which is one typo away
+# from an unhandled status that strikes the task three times into STUCK).
+STATUS_REGRADE_REFUSED = "REGRADE_REFUSED"
 CREDITS_HOLD_S = 1800.0                 # CircleCI plan/credit refusal: hold, no strike, alert once
 GATE_HOLD_S = 600.0                     # D57: our own gate/cap/off refusal at trigger time: hold, no strike
 MEMORY_HOLD_S = 60.0                    # D76: box short of memory: hold, no strike, re-ask about every tick
@@ -5116,6 +5123,18 @@ class LaneDriver(object):
         if outcome.status == STATUS_ABORTED:
             self.log("ABORTED %s %s (attempt stays RUNNING for adoption)" % (task, attempt))
             return
+        if outcome.status == STATUS_REGRADE_REFUSED:
+            # D177: hold, never fail.  A regrade is refused because its SHA is
+            # wrong for this worktree, which is a condition of the request, not
+            # a verdict about the candidate -- so the row keeps whatever state
+            # it already had and somebody fixes the sha.  Placed above the
+            # generic paths deliberately: an unhandled status falls through and
+            # strikes the task three times into STUCK.
+            self.note_hold(task, fkey, outcome.detail, REGRADE_HOLD_S)
+            self.alert_once("regrade-refused:%s" % task, "REGRADE_REFUSED",
+                            "%s: %s -- the row is HELD at its current state, not failed (D177)"
+                            % (task, outcome.detail[:300]), task)
+            return
         if outcome.status in PARK_STATUSES:
             # the role is parked, the attempt stays RUNNING and is adopted
             # after the park lifts; a quota never fails the task
@@ -5402,10 +5421,44 @@ class LaneDriver(object):
         rc, _o, _e = self.git(["-C", str(wt), "cat-file", "-e", sha + "^{commit}"])
         if rc != 0:
             return "regrade sha %s is not a commit" % sha[:12]
-        if base:
-            rc, _o, _e = self.git(["-C", str(wt), "merge-base", "--is-ancestor", base, sha])
-            if rc != 0:
-                return "regrade sha %s does not descend from the base %s" % (sha[:12], base[:12])
+        # D177: measure descent against every base the sha could legitimately
+        # belong to, not just this worktree's.  A regrade re-grades an OLDER
+        # commit; `wt`'s base is the CURRENT stacked union tip, which may have
+        # moved forward since R0, and no commit from before a base can descend
+        # from it.  That made a regrade of a hosted twin unfailable-in-refusal
+        # whenever the union moved between R0 and R1 -- observed on
+        # R-RETENTION-BARRIER-CENSUS-DERIVED-HOSTED-R1 and
+        # R-WA03-OUTBOUND-REVOKE-RACE-DB-HOSTED-R1 at 2026-09-21T12:19Z, both
+        # refused against ee96ecc278a3 and both closed INVALID_EVIDENCE.
+        #
+        # Still the same guard in the same DIRECTION (`--is-ancestor base sha`);
+        # only the operand widens.  Architect 2's refusal of the direction flip
+        # stands.
+        prev_wt = self.worktree_path(regrade["retry_of"]) if regrade.get("retry_of") else None
+        bases = [(n, b) for n, b in (("this row's base", base),
+                                     ("the regraded row's base", self._base_of(prev_wt) if prev_wt else ""))
+                 if b]
+        if bases:
+            ok = None
+            for name, b in bases:
+                rc, _o, _e = self.git(["-C", str(wt), "merge-base", "--is-ancestor", b, sha])
+                if rc == 0:
+                    ok = (name, b)
+                    break
+            if ok is None:
+                return ("regrade sha %s descends from none of its bases (%s)"
+                        % (sha[:12], ", ".join("%s %s" % (n, b[:12]) for n, b in bases)))
+            self.log("REGRADE %s: %s accepted against %s %s"
+                     % (task, sha[:12], ok[0], ok[1][:12]))
+        else:
+            # NOT a silent skip.  `_base_of` returns "" for a pruned or missing
+            # worktree, and the pre-D177 code then ran NO ancestry check at all
+            # while still resetting -- an exemption that deleted the check and
+            # said nothing.  Refuse instead: a regrade whose lineage cannot be
+            # read is exactly the case the guard exists for.
+            return ("regrade sha %s cannot be checked: no readable base for %s%s"
+                    % (sha[:12], task,
+                       " or its regraded row %s" % regrade["retry_of"] if regrade.get("retry_of") else ""))
         rc, _o, err = self.git(["-C", str(wt), "reset", "-q", "--hard", sha], log=True)
         if rc != 0:
             return "reset to %s failed: %s" % (sha[:12], (err or "")[:200])
@@ -5499,10 +5552,16 @@ class LaneDriver(object):
                 # exact commit is proved and graded again, no builder round
                 why = self._regrade_reset(task, wt, regrade)
                 if why:
-                    self.alert("REGRADE_REFUSED", "%s: %s" % (task, why), task)
-                    return (vprunners.TurnOutcome(STATUS_DONE, why, runner="regrade"),
-                            {"outcome": "INVALID_EVIDENCE", "reason": "REGRADE_REFUSED: %s" % why,
-                             "evidence": [tdir / "record.json"]})
+                    # D177: a correct refusal must be a NO-OP.  This used to
+                    # complete the task INVALID_EVIDENCE, which left the row
+                    # WORSE than the REPAIR_REQUIRED it started from -- the
+                    # refusal did damage that the thing it refused would not
+                    # have done.  Two rows lost that way at 2026-09-21T12:19Z
+                    # (R-RETENTION-BARRIER-CENSUS-DERIVED-HOSTED-R1 and
+                    # R-WA03-OUTBOUND-REVOKE-RACE-DB-HOSTED-R1), on a refusal
+                    # that was itself the D177 base bug.  The caller holds the
+                    # attempt instead: no strike, no completion, no state change.
+                    return (vprunners.TurnOutcome(STATUS_REGRADE_REFUSED, why, runner="regrade"), None)
                 self.log("REGRADE %s on %s (build + autofix skipped; retry_of %s)"
                          % (task, regrade["sha"][:12], regrade.get("retry_of")))
                 outcome = vprunners.TurnOutcome(STATUS_DONE, "regrade of %s" % regrade["sha"][:12], runner="regrade")
