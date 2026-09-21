@@ -5333,6 +5333,32 @@ def test_d184_only_a_positive_fact_drops_a_regrade(tmp_path):
     assert "regrade_sha" in json.loads(f.read_text(encoding="utf-8"))
 
 
+def test_d185_unknown_packet_names_the_derivation_not_just_the_symptom():
+    """D185. A hosted twin is synthesized from the parent's [hosted]
+    BENCHMARK.md rows, so it leaves the pack when those rows stop naming a
+    (gate: X) -- no packet deleted, and no diff to find, because the pack is
+    untracked. On 2026-09-21 a bulk edit to 109 of 197 BENCHMARK.md files did
+    that mid-run and "unknown packet X" sent an hour into hunting a code
+    regression that did not exist. The refusal has to name the mechanism."""
+    from vp.lanedriver import LaneDriver
+
+    drv = LaneDriver.__new__(LaneDriver)
+    drv.pack = {"L19": {"id": "L19"}}
+
+    why = drv._unknown_packet_why("L19-HOSTED")
+    assert "L19-HOSTED" in why and "twin" in why.lower()
+    assert "BENCHMARK.md" in why and "(gate: X)" in why, "the derivation must be named: %s" % why
+    assert "untracked" in why, "the reader must be told there is no diff to look for"
+    assert "parent L19 is in the pack" in why
+
+    # a twin whose parent is gone too says so, rather than implying the parent is fine
+    assert "NOT in the pack either" in drv._unknown_packet_why("R-GONE-HOSTED")
+
+    # an ordinary packet id keeps the short form -- no twin story to tell
+    plain = drv._unknown_packet_why("L19")
+    assert "L19/PACKET.md" in plain and "twin" not in plain.lower()
+
+
 def test_d178_owed_rulings_counts_problems_not_attempts():
     """D178. The alert counted ROWS, so 64 rows read as 64 problems when they
     were 19 -- a 3.4x over-report -- and then truncated the flat list at 500

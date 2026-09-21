@@ -3312,6 +3312,27 @@ class LaneDriver(object):
         except (OSError, ValueError):
             return {}
 
+    def _unknown_packet_why(self, pid):
+        """D185: "unknown packet X" names the symptom and hides the mechanism.
+
+        A hosted twin is not a directory -- it is SYNTHESIZED from the parent's
+        [hosted] BENCHMARK.md rows, one per (gate: X) -- so it leaves the pack
+        the moment those rows stop naming a gate, with no packet deleted and
+        nothing to diff, because the pack is untracked. On 2026-09-21 a bulk
+        edit to 109 of 197 BENCHMARK.md files did exactly that mid-run; the
+        refusal said only "unknown packet", and an hour went into looking for a
+        code regression that was not there. Name the derivation, not the symptom."""
+        m = vppack.HOSTED_TWIN_ID_RE.search(str(pid))
+        if not m:
+            return "unknown packet %s: no %s/PACKET.md in the pack" % (pid, pid)
+        parent = str(pid)[:m.start()]
+        return ("unknown packet %s: it is a hosted TWIN, synthesized from %s's [hosted] "
+                "BENCHMARK.md rows rather than read from a packet directory, and parent %s is %s. "
+                "Check those rows still carry a (gate: X): a twin leaves the pack when they stop, "
+                "with no packet deleted and no diff to find (the pack is untracked)"
+                % (pid, parent, parent, "in the pack" if parent in (self.pack or {})
+                   else "NOT in the pack either"))
+
     def request_packet_retry(self, pid, reason, regrade_sha=None):
         """CLI `retry-packet`: ask the loop to re-instantiate a packet whose
         bound dynamic task ended without a real verdict (e.g. RUNNER_CRASH ->
@@ -3319,7 +3340,7 @@ class LaneDriver(object):
         still running or accepted; the loop consumes the marker."""
         p = self.pack.get(pid) if self.pack else None
         if not p:
-            raise ValueError("unknown packet %s" % pid)
+            raise ValueError(self._unknown_packet_why(pid))
         tasks = (self.control.state_view().get("tasks") or {})
         self._pack_restore(tasks)
         cur = {q: t for t, q in self.pack_by_task.items()}.get(pid) or vppack.bound_task(p, tasks)
