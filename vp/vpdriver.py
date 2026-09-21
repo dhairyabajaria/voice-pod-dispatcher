@@ -599,11 +599,24 @@ class Driver(object):
         self.log("ALERT STORE_UNAVAILABLE %s" % text)
         if self.store.alert("STORE_UNAVAILABLE", text):
             return
+        ts = utc_ms()
         line = "- %s **STORE_UNAVAILABLE** — %s (line written by the driver; the store " \
-               "could not record it)\n" % (utc_ms(), text[:500])
+               "could not record it)\n" % (ts, text[:500])
         try:
             with open(self.run_root / "OWNER-ALERTS.md", "a", encoding="utf-8") as fh:
                 fh.write(line)
+        except OSError:
+            pass
+        # D156: and its alerts.jsonl twin. This is the degraded path -- the store
+        # could not record the alert -- but alerts.jsonl is a plain file append
+        # and does not need the store, so there is no reason for this line to be
+        # the one kind of alert that never gets a machine-readable record.
+        # Latent, not observed: STORE_UNAVAILABLE has never fired on this run.
+        try:
+            with open(self.run_root / "alerts.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": ts, "kind": "STORE_UNAVAILABLE", "task": None,
+                                     "text": text[:500], "severity": "unknown",
+                                     "source": "vpdriver-fallback"}, sort_keys=True) + "\n")
         except OSError:
             pass
 

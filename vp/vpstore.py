@@ -299,6 +299,7 @@ class Store:
         self.escalations_path = os.path.join(self.root, "escalations.jsonl")
         self.messages_path = os.path.join(self.root, "messages.jsonl")
         self.violations_path = os.path.join(self.root, "violations.jsonl")
+        self.alerts_path = os.path.join(self.root, "alerts.jsonl")
         self.db = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -873,13 +874,37 @@ class Store:
 
     def alert(self, kind, text, item=None):
         """K-16: one line in OWNER-ALERTS.md, clock-stamped by the store, plus an
-        event.  Never carries a secret value: callers pass account NAMES."""
+        event and an alerts.jsonl record.  Never carries a secret value: callers
+        pass account NAMES.
+
+        D156: alerts.jsonl is written here too. There are two alert writers --
+        this one and LaneDriver.alert -- and only the driver's used to append the
+        jsonl record, so every store-originated alert (in practice
+        BOX_LOCK_REAPED, reached through vp_box_lock's `alert=` callback) landed
+        in OWNER-ALERTS.md with no machine-readable twin. Measured before the
+        fix: 1171 alert lines in the .md against 1163 records in alerts.jsonl,
+        the 8 orphans all BOX_LOCK_REAPED. Nothing was lost -- they are in
+        events.jsonl -- but anything treating alerts.jsonl as the index of
+        OWNER-ALERTS.md was silently short.
+
+        Both lines are queued on `_pending_lines`, so they flush together inside
+        the transaction. Appending the jsonl eagerly here would merely invert the
+        bug: a rolled-back tx would leave a record with no .md line.
+
+        `severity` is "unknown" rather than a guess. Only the driver runs
+        vpalerts.severity, and inventing a value here would make the two writers
+        disagree about a field that decides whether the owner gets paged.
+        """
         ts = now_ts()
         line = f"- {ts} **{kind}**" + (f" `{item}`" if item else "") + f" — {text}\n"
+        rec = {"ts": ts, "kind": kind, "task": item, "text": text,
+               "severity": "unknown", "source": "vpstore"}
         with self.tx():
             self.event("ALERT", item=item, ref=kind, detail={"text": text[:500]})
             self._pending_lines.append((os.path.join(self.root, "OWNER-ALERTS.md"),
                                         line))
+            self._pending_lines.append((self.alerts_path,
+                                        json.dumps(rec, sort_keys=True) + "\n"))
         return ts
 
     def reconcile(self, live_pids=None):
