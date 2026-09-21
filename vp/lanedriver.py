@@ -1889,6 +1889,46 @@ class LaneDriver(object):
                 "only": only or None, "proof_id": best[1].get("proof_id"),
                 "pipeline_id": best[1].get("pipeline_id")}
 
+    def member_scope(self, task, kind=None):
+        """D147: why a member has the scope it has -- or legitimately has none.
+
+        D146 shipped one bucket for "no passing proof record" and it fired on 4 of
+        4 union members, every one a false alarm: three were box rows whose evidence
+        lives under their HOSTED twin's id, and all four were probe-kind rows that
+        never owed a proof at all.  A field that is wrong every time it fires gets
+        ignored within a day, and then it is ignored on the occasion it is right.
+
+        Four outcomes, and only the last is a problem:
+          `scoped` / `full`  -- its own passing proof, scope as recorded
+          `not_required`     -- its kind never owed one (`proof.require_for_kinds`,
+                                the system's OWN rule for who is proved, not a
+                                second hand-made list of probe-ish kinds)
+          `inherited`        -- no proof of its own; its hosted twin has one
+          `unproven`         -- owed a proof and has none
+        """
+        own = self.proof_scope_for(task)
+        if own:
+            return dict(own, basis="own")
+        owed = self.proof_cfg.get("require_for_kinds") or DEFAULT_PROOF_KINDS
+        if kind is not None and kind not in owed:
+            return {"class": "not_required", "basis": "kind", "kind": kind}
+        for suffix in self._twin_ids(task):
+            twin = self.proof_scope_for(suffix)
+            if twin:
+                return dict(twin, basis="inherited", **{"from": suffix})
+        return {"class": "unproven", "basis": "none", "kind": kind}
+
+    def _twin_ids(self, task):
+        """`<task>-HOSTED` and its retry generations, newest first.  Enumerated from
+        what is on disk rather than guessed: a twin may be -HOSTED, -HOSTED-R2, ..."""
+        pat = re.compile(r"^proof-(%s-HOSTED(?:-R\d+)?)-\d+T\d+" % re.escape(task))
+        seen = {}
+        for f in (self.run_root / "proofs").glob("proof-%s-HOSTED*.json" % task):
+            m = pat.match(f.name)
+            if m:
+                seen[m.group(1)] = True
+        return sorted(seen, reverse=True)
+
     def _canary_proof(self, c, tasks):
         """the newest proof record of the canary's rows (proofs/proof-<row>-*.json), or None"""
         rows = [t for t in tasks if self._is_canary_row(t, c)]
@@ -2322,6 +2362,7 @@ class LaneDriver(object):
                 continue                          # trunk carries it
             pid = self.pack_by_task.get(t)
             out.append({"task": t, "packet": pid or t, "output_sha": sha,
+                        "kind": r.get("kind"),          # D147: who owed a proof at all
                         "depth": len(self.pack.get(pid, {}).get("depends_on") or []) if pid else 0})
         return out
 
@@ -2520,14 +2561,22 @@ class LaneDriver(object):
         # assemblable from scoped parts without that being visible (the union-104
         # mistake).  Derived per member from its own proof record, never assumed.
         for m in merged:
-            m["proof_scope"] = self.proof_scope_for(m["task"])
-        scoped = [m["task"] for m in merged
-                  if (m.get("proof_scope") or {}).get("class") == self.PROOF_SCOPE_SCOPED]
-        unknown = [m["task"] for m in merged if not m.get("proof_scope")]
+            m["proof_scope"] = self.member_scope(m["task"], m.get("kind"))
+        def _of(cls):
+            return sorted(m["task"] for m in merged
+                          if (m.get("proof_scope") or {}).get("class") == cls)
+        scoped = _of(self.PROOF_SCOPE_SCOPED)
+        # D147: only `unproven` is alarming.  `not_required` and `inherited` are
+        # correct states, and folding them in here is what made the field cry wolf.
+        unknown = _of("unproven")
         rec = {"union": uid, "n": n, "base_sha": base, "branch": branch, "for": [for_task],
                "members": merged, "ts": utc_ms(),
                "scoped_members": sorted(scoped), "scoped_member_count": len(scoped),
-               "unknown_scope_members": sorted(unknown)}
+               "unproven_members": sorted(unknown),
+               "not_required_members": _of("not_required"),
+               "inherited_scope_members": sorted(
+                   m["task"] for m in merged
+                   if (m.get("proof_scope") or {}).get("basis") == "inherited")}
         if conflict:
             self.git(["-C", str(self.trunk), "branch", "-D", branch])
             rec.update({"status": "CONFLICT", "conflict": conflict})
@@ -5065,6 +5114,11 @@ class LaneDriver(object):
         fpath = wt / ".vp" / "FINDINGS.json"
         outcome, fails, blocking, owed, prec = None, [], [], [], None
         kind = contract.get("kind") or row.get("kind")
+        # D147: fallback deliberately left as the v12 ["integration"].  It is dead in
+        # production -- normalize_roster injects DEFAULT_PROOF_KINDS whenever
+        # run.packets_dir is set (:416), which every v13 roster sets -- and changing it
+        # here flips 12 tests from VERIFIED to RUNNING, i.e. it silently redefines who
+        # owes a proof.  That is a dispatch-behaviour decision, not a Fixer verb.
         needs_proof = kind in (self.proof_cfg.get("require_for_kinds") or ["integration"])
         pending = self._proof_pending(tdir)
         resume_proof = bool(needs_proof and pending and self.head_sha(wt) == pending.get("sha"))

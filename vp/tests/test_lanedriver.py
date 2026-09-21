@@ -3762,3 +3762,67 @@ def test_d146_scope_lookup_does_not_prefix_match_a_longer_task_id(tmp_path, monk
     assert drv.proof_scope_for("L20") is None, (
         "L20 has no passing proof of its own; L20-HOSTED-R3's must not be read as its")
     assert (drv.proof_scope_for("L20-HOSTED-R3") or {}).get("class") == "full"
+
+
+def test_d147_only_a_row_that_owed_a_proof_and_lacks_one_is_alarming(tmp_path, monkeypatch):
+    """D146 shipped one bucket for "no passing proof" and it fired 4/4 on live data,
+    every one a false alarm. A field that is wrong every time it fires gets ignored,
+    and then it is ignored on the occasion it is right.
+
+    The control asserts the separation in both directions: a row that never owed a
+    proof must NOT be alarming, and a row that owed one and lacks it MUST be.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    owed = drv.proof_cfg.get("require_for_kinds") or lanedriver.DEFAULT_PROOF_KINDS
+    assert "builder" in owed and "probe" not in owed, (
+        "control: this test's premise is that `probe` never owes a proof while "
+        "`builder` does -- if the roster changes that, the cases below invert")
+    # D147 control: `require_for_kinds` and the kind on a run-state row are two
+    # closed vocabularies, and they are only USEFUL where they overlap.  My first
+    # cut fell back to ["builder"], a kind NO live row has -- so the alarming
+    # bucket could never fire and the field would have read 0 forever.  A zero you
+    # cannot distinguish from "switched off" is not a measurement.
+    assert set(owed) & set(lanedriver.KIND_MAP), (
+        "require_for_kinds %r shares no kind with KIND_MAP, the vocabulary run-state "
+        "rows actually use -- nothing would ever owe a proof" % (owed,))
+
+    # 1. its own passing proof -> the scope it actually ran, basis "own"
+    _write_proof(env.run_root, "proof-OWN-60921T000001", only="twin:3:platform/tests/test_x.py")
+    own = drv.member_scope("OWN", "builder")
+    assert own["class"] == "scoped" and own["basis"] == "own"
+
+    # 2. a kind that never owed one -> not alarming, and says why
+    nr = drv.member_scope("PROBEROW", "probe")
+    assert nr["class"] == "not_required" and nr["basis"] == "kind", nr
+
+    # 3. no proof of its own, but its HOSTED twin has one -> inherited, not alarming
+    _write_proof(env.run_root, "proof-BOXROW-HOSTED-R2-60921T000002", only=None)
+    inh = drv.member_scope("BOXROW", "builder")
+    assert inh["class"] == "full" and inh["basis"] == "inherited"
+    assert inh["from"] == "BOXROW-HOSTED-R2", inh
+
+    # 4. owed a proof, has none anywhere -> the ONLY alarming outcome
+    bad = drv.member_scope("NAKED", "builder")
+    assert bad["class"] == "unproven" and bad["basis"] == "none", bad
+
+    # the four are genuinely distinct, not four spellings of one answer
+    classes = {own["class"], nr["class"], inh["class"], bad["class"]}
+    assert len(classes) == 4, classes
+
+
+def test_d147_twin_lookup_does_not_borrow_an_unrelated_row_s_proof(tmp_path, monkeypatch):
+    """The inherited arm must not become a second prefix-match. `L20`'s twin is
+    `L20-HOSTED*` and nothing else -- not `L20-EXTRA`, and not `L20-HOSTED-EXTRA`."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    _write_proof(env.run_root, "proof-L20-EXTRA-60921T000003", only=None)
+    _write_proof(env.run_root, "proof-L20-HOSTED-EXTRA-60921T000004", only=None)
+    assert drv._twin_ids("L20") == [], (
+        "only <task>-HOSTED / -HOSTED-R<n> is a twin: %r" % drv._twin_ids("L20"))
+    assert drv.member_scope("L20", "builder")["class"] == "unproven"
+    _write_proof(env.run_root, "proof-L20-HOSTED-60921T000005", only=None)
+    assert drv._twin_ids("L20") == ["L20-HOSTED"]
+    assert drv.member_scope("L20", "builder")["basis"] == "inherited"
