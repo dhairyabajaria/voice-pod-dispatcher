@@ -146,7 +146,7 @@ def test_untouched_red_reruns_on_the_box_green_is_pass_with_trunk_finding(tmp_pa
     rec = p.run("L35", "proof-1", wt, base, cand, "platform", ["platform/tests"])
     assert rec["status"] == "PASS" and rec["route"] == "circleci"
     assert rec["flake_suspect"] == {"nodes": ["platform/tests/test_flaky.py::test_race"],
-                                    "rerun": "PASS", "still_red": []}
+                                    "rerun": "PASS", "still_red": [], "blocking": []}
     assert rec["failed_nodes"] == []
     rerun = next(a for a in ex.calls if "--proof-id" in a and "rerun" in a[a.index("--proof-id") + 1])
     assert "--no-record" in rerun and rerun[rerun.index("--workers") + 1] == "1"
@@ -181,27 +181,81 @@ def test_untouched_red_that_stays_red_on_the_box_is_fail_product(tmp_path):
 
 
 def test_red_in_a_touched_file_is_never_rerun(tmp_path):
+    """D144: the touched-file red is still never re-run and still keeps the verdict
+    red.  What changed is that the untouched red beside it now gets classified
+    instead of being suppressed by its neighbour."""
     wt, base, cand = repo(tmp_path)
     circle = FakeCircle(pipeline([("platform/tests/test_mine.py", "test_mine"),
                                   ("platform/tests/test_flaky.py", "test_race")]))
-    ex = FakeExec({})
+    ex = FakeExec({"rerun": {"status": "PASS", "counts": {"failed_nodes": []}}})
     p = make_proof(tmp_path, circle, ex)
     rec = p.run("L35", "proof-3", wt, base, cand, "platform", [])
-    assert rec["status"] == "FAIL_PRODUCT" and rec["flake_suspect"] is None
-    assert not any("vpproof.py" in " ".join(a) for a in ex.calls), "no box re-run"
-    assert len(rec["failed_nodes"]) == 2
+    assert rec["status"] == "FAIL_PRODUCT", "a touched-file red is never excused by a re-run"
+    assert rec["failed_nodes"] == ["platform/tests/test_mine.py::test_mine"]
+    assert rec["flake_suspect"]["blocking"] == ["platform/tests/test_mine.py::test_mine"]
+    assert rec["flake_suspect"]["nodes"] == ["platform/tests/test_flaky.py::test_race"]
+    rerun = next(a for a in ex.calls if "--proof-id" in a and "rerun" in a[a.index("--proof-id") + 1])
+    assert rerun[rerun.index("--paths") + 1] == "platform/tests/test_flaky.py::test_race", (
+        "only the untouched node may be re-run: %r" % (rerun,))
+    assert "test_mine" not in " ".join(rerun), "the touched file must never reach the re-run"
 
 
 def test_portal_and_over_cap_reds_are_not_rerun(tmp_path):
+    """D144: each red is classified on its own merits, and everything that is not
+    re-runnable lands in `blocking` -- which is what keeps the verdict red."""
     wt, base, cand = repo(tmp_path)
     p = make_proof(tmp_path, FakeCircle({}), FakeExec({}))
     cc = p.circle_cfg()
-    assert p.untouched_red_nodes(wt, base, cand, ["portal/a.test.ts::renders"], cc) is None
-    assert p.untouched_red_nodes(wt, base, cand, ["tests/test_flaky.py::test_race"], cc) == \
-        ["platform/tests/test_flaky.py::test_race"], "junit paths lacking platform/ are normalised"
+    part = lambda f: p.partition_red_nodes(wt, base, cand, f, cc)
+
+    assert part(["portal/a.test.ts::renders"]) == ([], ["portal/a.test.ts::renders"]), \
+        "portal is not a RERUN_KIND: it cannot be re-run, so it blocks"
+    assert part(["tests/test_flaky.py::test_race"]) == \
+        (["platform/tests/test_flaky.py::test_race"], []), "junit paths lacking platform/ are normalised"
+    assert part(["platform/tests/missing.py::x"]) == ([], ["platform/tests/missing.py::x"]), \
+        "a node whose file we cannot find is never silently dropped"
+
+    # over the cap nothing is re-run, and nothing is excused either: every red blocks
     many = ["platform/tests/test_flaky.py::t%d" % i for i in range(11)]
-    assert p.untouched_red_nodes(wt, base, cand, many, cc) is None
-    assert p.untouched_red_nodes(wt, base, cand, ["platform/tests/missing.py::x"], cc) is None
+    rerunnable, blocking = part(many)
+    assert rerunnable == [] and sorted(blocking) == sorted(many)
+
+    # the cap bounds the re-runnable SUBSET, not the whole red set
+    mixed = ["platform/tests/test_flaky.py::t%d" % i for i in range(3)] + \
+        ["portal/a.test.ts::r%d" % i for i in range(9)]
+    rerunnable, blocking = part(mixed)
+    assert len(rerunnable) == 3 and len(blocking) == 9, (
+        "9 portal reds must not suppress the re-run of 3 platform reds (the 2026-09-21 "
+        "measurement: 0/5 proofs with a portal red were re-run, 6/6 without were)")
+
+
+def test_d144_an_unrerunnable_red_keeps_the_verdict_red_even_when_the_rerun_is_green(tmp_path):
+    """The control this change most needs: partial re-run must not become "ignore
+    portal".  One portal red beside a genuinely flaky platform red -- the re-run goes
+    green, and the proof is still RED because nothing re-ran the portal node.
+    """
+    wt, base, cand = repo(tmp_path)
+    circle = FakeCircle(pipeline([("platform/tests/test_flaky.py", "test_race"),
+                                  ("portal/a.test.ts", "renders")]))
+    ex = FakeExec({"rerun": {"status": "PASS", "counts": {"failed_nodes": []}}})
+    alerts = []
+    p = make_proof(tmp_path, circle, ex, alerts=alerts)
+    rec = p.run("L35", "proof-p1", wt, base, cand, "platform", [])
+
+    assert rec["status"] == "FAIL_PRODUCT", (
+        "a green re-run of the platform reds must NEVER pass a proof whose portal red "
+        "was never re-run: %r" % (rec["flake_suspect"],))
+    assert rec["failed_nodes"] == ["portal/a.test.ts::renders"], (
+        "the surviving failure is exactly the node we could not re-run: %r" % rec["failed_nodes"])
+    assert rec["flake_suspect"]["rerun"] == "PASS"
+    assert rec["flake_suspect"]["nodes"] == ["platform/tests/test_flaky.py::test_race"]
+    assert rec["flake_suspect"]["blocking"] == ["portal/a.test.ts::renders"]
+    # the classification is still filed: red in CI, green on the box is a trunk problem
+    # whether or not the verdict flipped -- pre-D144 this evidence was thrown away
+    # precisely when a blocking red made it most valuable
+    assert [a[0] for a in alerts] == ["TRUNK_FLAKE_SUSPECT"]
+    finding = json.loads((tmp_path / "run" / "trunk-findings.jsonl").read_text())
+    assert finding["nodes"] == ["platform/tests/test_flaky.py::test_race"]
 
 
 def test_routing_off_all_overflow_cap_and_in_flight(tmp_path):

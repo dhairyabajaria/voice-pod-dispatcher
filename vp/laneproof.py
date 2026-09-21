@@ -895,17 +895,30 @@ class Proof(object):
                 self.log("PROOF %s %s %s pipeline %s was cancelled (%d job(s)/workflow(s)) -> CANCELLED"
                          % (task, pid, self.hosted_route(), pipeline_id, len(cls["reds"])))
             if status == "FAIL_PRODUCT" and failed:
-                nodes = self.untouched_red_nodes(wt, base, cand, failed, cc)
+                nodes, blocking = self.partition_red_nodes(wt, base, cand, failed, cc)
                 if nodes:
-                    self.log("PROOF %s %s %s %d reds in untouched files -> box re-run"
-                             % (task, pid, self.hosted_route(), len(nodes)))
+                    self.log("PROOF %s %s %s %d red(s) in untouched files -> box re-run%s"
+                             % (task, pid, self.hosted_route(), len(nodes),
+                                "; %d red(s) cannot be re-run and keep the verdict red (D144)"
+                                % len(blocking) if blocking else ""))
                     st2, still = self.box_rerun(pid, cand, wt, nodes)
-                    flake = {"nodes": nodes, "rerun": st2, "still_red": still}
+                    flake = {"nodes": nodes, "rerun": st2, "still_red": still,
+                             "blocking": blocking}
                     if st2 == "PASS":
-                        status, failed, errors = "PASS", [], {}
+                        # green on the box, red in CI: a trunk/environment problem worth
+                        # filing whether or not the verdict flips (D144 -- it used to be
+                        # filed only on the all-clear, so the evidence was lost exactly
+                        # when a blocking red made it most useful)
                         self.file_trunk_finding(task, pid, cand, pipeline_id, nodes)
+                    if st2 == "PASS" and not blocking:
+                        status, failed, errors = "PASS", [], {}
                     else:
-                        self.log("PROOF %s %s box re-run %s: %s" % (task, pid, st2, ", ".join(still)[:200]))
+                        # D144: the re-run CLASSIFIES what it ran; it never excuses what
+                        # it could not.  A node we did not re-run stays a failure.
+                        failed = sorted(set(still) | set(blocking))
+                        errors = {k: v for k, v in (errors or {}).items() if k in set(failed)}
+                        self.log("PROOF %s %s box re-run %s; still red: %s"
+                                 % (task, pid, st2, ", ".join(failed)[:200]))
             try:
                 out_dir = self.circle.record(self.run_root, cand,
                                              {"pipeline_id": pipeline_id, "account": account,
@@ -952,28 +965,48 @@ class Proof(object):
 
     # -- F6 ---------------------------------------------------------------------------------
 
-    def untouched_red_nodes(self, wt, base, cand, failed, cc):
-        """The failed node ids, repo-relative, when EVERY one lives in a file the
-        diff base..cand does not touch, is a pytest kind, and there are at most
-        flake_rerun_max of them; else None."""
+    def partition_red_nodes(self, wt, base, cand, failed, cc):
+        """D144: split the reds into (rerunnable, blocking).
+
+        `rerunnable` are reds we are entitled to re-run on the box because a green
+        there would mean the CI red was environmental and not this candidate's doing:
+        the file exists, `base..cand` does not touch it, and it is a pytest kind we
+        can actually run (RERUN_KINDS -- portal is not one, vitest is not driven here).
+        `blocking` is everything else, and a blocking red can NEVER be excused by a
+        re-run: we did not re-run it, so we know nothing new about it.
+
+        This replaces `untouched_red_nodes`, which answered a coarser question -- "is
+        the WHOLE set re-runnable?" -- and returned None for all of it if any single
+        node was not.  Measured consequence: 0 of 5 proofs carrying one portal red got
+        a re-run, while 6 of 6 without one did.  A single flaky portal node therefore
+        suppressed the re-run for every platform red beside it, and those reds were
+        then graded as real failures with no evidence either way.  Classifying them is
+        the point; excusing them is not, so the verdict still turns on `blocking`.
+
+        The cap now bounds the subset we would actually run, not the whole red set.
+        Over the cap nothing is re-run -- unbounded serial box time is its own outage.
+        """
         cap = int(cc.get("flake_rerun_max", 10))
-        if not failed or len(failed) > cap:
-            return None
+        if not failed:
+            return [], []
         rc, out, _ = self.git(["-C", str(wt), "diff", "--name-only", "%s..%s" % (base, cand)])
         if rc != 0:
-            return None
+            return [], sorted(set(failed))      # no diff, no entitlement to re-run anything
         touched = set(l.strip() for l in out.splitlines() if l.strip())
-        nodes = []
+        rerunnable, blocking = [], []
         for node in failed:
             f = node.split("::", 1)[0]
             rest = node[len(f):]
             full = next((c for c in (f, "platform/" + f) if (Path(wt) / c).exists()), None)
-            if full is None or full in touched:
-                return None
-            if not any(full.startswith(p) for p in RERUN_KINDS.values()):
-                return None
-            nodes.append(full + rest)
-        return sorted(set(nodes))
+            if full is None or full in touched \
+                    or not any(full.startswith(p) for p in RERUN_KINDS.values()):
+                blocking.append(node)
+                continue
+            rerunnable.append(full + rest)
+        rerunnable, blocking = sorted(set(rerunnable)), sorted(set(blocking))
+        if len(rerunnable) > cap:
+            return [], sorted(set(blocking) | set(rerunnable))
+        return rerunnable, blocking
 
     def box_rerun(self, pid, cand, wt, nodes):
         """Serial box re-run of exactly `nodes`, per pytest kind, no record.
