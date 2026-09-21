@@ -233,3 +233,47 @@ def test_a_twin_waiting_on_a_cancelled_parent_is_not_just_waiting(tmp_path):
     res2 = vpsweep.sweep(pack2, rs2, roster2, run_root=tmp_path / "b")
     assert res2["blocked_parent"] == []
     assert "L17-FIX-HOSTED" in {r["packet"] for r in res2["waiting"]}
+
+
+def test_a_state_view_is_not_its_tasks(tmp_path):
+    """D153 live regression. The driver's `control.state_view()` returns
+    {"tasks": {...}, "sequence": ...}. I passed that whole view as `tasks`.
+
+    Every guard passed: it is a dict, it is non-empty. But it contains no task
+    rows, so every packet resolved to nothing and the sweep reported the entire
+    pack stranded -- bound=0, STRANDED=62 on the first live tick, minutes after
+    a CLI run over the same pack said bound=277, STRANDED=0.
+
+    The emptiness check could not catch this because the wrapper IS non-empty.
+    Only the SHAPE of the values discriminates. This is the single most
+    dangerous input the sweep can be handed, because it turns the one guard that
+    watches for silent packets into a 62-line false alarm -- and a guard that
+    cries wolf once gets muted.
+    """
+    pack = tmp_path / "PACKETS"
+    _packet(pack, "L01", "L01")
+    view = {"tasks": {"L01": {"state": "READY"}}, "sequence": 12, "counts": {}}
+    with pytest.raises(vpsweep.SweepUnusable) as exc:
+        vpsweep.sweep_loaded(pack, view)
+    assert "state VIEW" in str(exc.value)
+
+    # the discriminating arm: its OWN "tasks" is accepted, so the guard rejects
+    # the wrapper rather than rejecting everything
+    res = vpsweep.sweep_loaded(pack, view["tasks"])
+    assert [r["packet"] for r in res["bound"]] == ["L01"]
+
+
+def test_sweep_loaded_and_the_cli_agree_on_the_same_inputs(tmp_path):
+    """The refactor's own risk: sweep() and sweep_loaded() drifting apart, so
+    the CLI a human runs and the sweep the driver runs answer differently about
+    the same pack -- which is precisely the confusion the live bug produced."""
+    pack = tmp_path / "PACKETS"
+    _packet(pack, "L01", "L01")
+    _packet(pack, "ORPHAN-1", "NEW:ORPHAN-1", body="No lane named.")
+    tasks = {"L01": {"state": "READY"}}
+    rs = _run_state(tmp_path, tasks)
+    a = vpsweep.sweep(pack, rs)
+    b = vpsweep.sweep_loaded(pack, tasks)
+    for k in ("examined", "bound", "waiting", "stranded", "unseen", "blocked_parent"):
+        assert a[k] == b[k], k
+    assert [r["packet"] for r in b["stranded"]] == ["ORPHAN-1"]

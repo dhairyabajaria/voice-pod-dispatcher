@@ -2817,7 +2817,10 @@ class LaneDriver(object):
         except Exception as exc:  # noqa: BLE001
             self.log("SUPERSEDE sweep failed: %s: %s" % (type(exc).__name__, exc))
         try:
-            self._sweep_step(self.control.state_view() or {})
+            # .get("tasks") -- state_view() is {"tasks": {...}, ...}, NOT the tasks.
+            # Passing the view itself made every packet look unbound and fired a
+            # 62-packet false alarm live; see the shape guard in sweep_loaded.
+            self._sweep_step((self.control.state_view() or {}).get("tasks") or {})
         except Exception as exc:  # noqa: BLE001 -- a report must never stop the tick
             self.log("SWEEP step failed: %s: %s" % (type(exc).__name__, exc))
         try:

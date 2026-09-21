@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -4154,10 +4155,71 @@ def test_d153_the_sweep_reads_the_drivers_tasks_not_the_state_file(tmp_path):
 
 
 def test_d153_vpsweep_is_reloadable(tmp_path):
-    """lanedriver now imports vpsweep, so a vpsweep edit that is not in
-    RELOAD_ORDER would need a full driver restart -- the Operator's verb, not
-    mine -- while the reload silently reported `changed=[]` and shipped nothing."""
+    """lanedriver now imports vpsweep, so a vpsweep edit that is not reloadable
+    would need a full driver restart -- the Operator's verb, not mine -- while
+    the reload reported `changed=[]` and shipped nothing.
+
+    Membership in RELOAD_ORDER is NOT the live condition and asserting only that
+    would be a form check. `reload_targets` walks `sys.modules` and keeps a
+    module only when it is actually imported AND resolves inside the driver's
+    own directory, so a name in the tuple that nothing imports is tracked by
+    nothing. This asserts the machine field: that a real driver's reload set
+    contains vpsweep. (Live confirmation of exactly this: reload #11 shipped
+    D153 and vpsweep was absent from its hash set, because the running process
+    predated the new import -- the tuple said yes while the process said no.)
+    """
     assert "vpsweep" in lanedriver.RELOAD_ORDER
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    names = [n for n, _ in drv.reload_targets()]
+    assert "vpsweep" in names, (
+        "vpsweep is in RELOAD_ORDER but not in the live reload set (%s) -- an edit "
+        "to it would need a driver restart, not a reload" % names)
+    assert "vpsweep" in drv.code_hashes(), "and it must contribute to code_version"
+
+    # ...and the other half, which reload_targets CANNOT see from in here: this
+    # test module imports vpsweep itself, so sys.modules is satisfied whether or
+    # not lanedriver imports it. Deleting lanedriver's import left the check
+    # above green. The production import must therefore be asserted on
+    # lanedriver's own source, or the pin measures the test's imports.
     src = Path(lanedriver.__file__).parent.joinpath("lanedriver.py").read_text()
-    assert "import vpsweep" in src, (
-        "this pin is only meaningful while the driver actually imports it")
+    assert re.search(r"^import vpsweep", src, re.M), (
+        "lanedriver must import vpsweep itself -- this test's own import would "
+        "otherwise satisfy reload_targets and the pin would measure nothing")
+
+
+def test_d153_the_call_site_passes_tasks_not_the_whole_state_view(tmp_path):
+    """The live D153 bug, pinned where it actually happened.
+
+    `test_d153_the_sweep_reads_the_drivers_tasks_not_the_state_file` calls
+    `_sweep_step` directly, so it proves the function and says nothing about its
+    caller. The defect was entirely in the caller: `_pack_step` handed over
+    `control.state_view()` -- which is {"tasks": {...}, "sequence": ...} -- and
+    every packet resolved to nothing. Live result: bound=0, STRANDED=62, against
+    a CLI run minutes earlier reporting bound=277, STRANDED=0.
+
+    So this drives `_pack_step` and asserts what the sweep RECEIVED.
+    """
+    env, drv = _d153_drv(tmp_path, stranded=False)
+    view = {"tasks": {"L01": {"state": "READY"}}, "sequence": 7, "counts": {}}
+    drv.control.state_view = lambda: view
+    seen = {}
+
+    def spy(pack_dir, tasks, **kw):
+        seen["tasks"] = tasks
+        return {"examined": 1, "bound": [], "waiting": [], "unseen": [],
+                "blocked_parent": [], "stranded": []}
+    drv._pack_last_mono = None
+    drv._sweep_last_mono = None
+    orig, vpsweep.sweep_loaded = vpsweep.sweep_loaded, spy
+    try:
+        drv._pack_step()
+    except Exception:
+        drv._sweep_step((drv.control.state_view() or {}).get("tasks") or {})
+    finally:
+        vpsweep.sweep_loaded = orig
+    assert seen.get("tasks") == {"L01": {"state": "READY"}}, (
+        "the sweep must receive the TASKS; it got %r" % (seen.get("tasks"),))
+    assert "sequence" not in (seen.get("tasks") or {}), \
+        "the whole state view leaked through -- every packet would read as stranded"

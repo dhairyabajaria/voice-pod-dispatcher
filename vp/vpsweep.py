@@ -211,6 +211,21 @@ def sweep_loaded(pack_dir, tasks, roster=None, driver_log=None, run_root=None,
     if not isinstance(tasks, dict) or not tasks:
         raise SweepUnusable("run-state holds no tasks; refusing to report every "
                             "packet stranded from a state file that says nothing")
+    # A non-empty dict is not enough. The driver's state_view() is
+    # {"tasks": {...}, "sequence": ...} -- passing THAT satisfies every check
+    # above while containing no task rows at all, so every packet resolves to
+    # nothing and the sweep reports the whole pack stranded. That is exactly
+    # what happened on D153's first live tick: bound=0, STRANDED=62, against a
+    # CLI run minutes earlier that said bound=277, STRANDED=0. The emptiness
+    # guard could not see it because the wrapper IS non-empty. So check the
+    # SHAPE of the values, not just that some exist.
+    rows = [v for v in tasks.values() if isinstance(v, dict) and "state" in v]
+    if not rows:
+        raise SweepUnusable(
+            "none of the %d entries handed in look like task rows (no 'state' field); "
+            "this is probably a state VIEW rather than its 'tasks' -- refusing to "
+            "report every packet stranded from it. keys=%s"
+            % (len(tasks), sorted(tasks)[:8]))
 
     if pack is None:
         pack, lint = vppack.load_pack(pack_dir)
