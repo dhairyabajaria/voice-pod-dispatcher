@@ -6628,15 +6628,25 @@ class LaneDriver(object):
                 idx.setdefault(rec["sha"], []).append(rec)
         return idx
 
-    def _review_proofs(self, targets, state, union, cand, review=None):
+    def _review_proofs(self, targets, state, union, cand, *, review):
         """D77: one entry per union member (and per coverage target), sourced from
         the proof record of its VERIFIED attempt (the newest PASS at its output
         sha, else the newest record), plus the union tip's own proof if any.
 
         D189: `review` is this review's own task id, used to drop members that
-        depend on it.  Optional and defaulting to None because this function is
-        also reached unbound against a SimpleNamespace stub (test_vppack.py:609);
-        omitting it restores the pre-D189 behaviour exactly."""
+        depend on it.  KEYWORD-ONLY AND REQUIRED, deliberately: pass None to mean
+        "no review context", but say so.
+
+        It shipped as `review=None`, justified here by the unbound SimpleNamespace
+        caller in test_vppack.py.  That justification was wrong in a way worth
+        leaving on the record: the stub REPLACES this function, so a default on
+        this parameter protects nothing -- what broke was the CALL SITE's new
+        keyword arriving at a positional-only lambda (TypeError at :6457, caught
+        by the full suite and by nothing narrower).  Once the reason was gone,
+        what remained was a guard that silently stops applying when a caller says
+        nothing: a future call site that forgets `review` would grade a circular
+        member again and send the review back to UNKNOWN with no error anywhere.
+        Required means that fails at the call instead."""
         idx = self._proof_index()
         tasks = state.get("tasks") or {}
         members = [str(m.get("task")) for m in ((union or {}).get("members") or []) if m.get("task")]

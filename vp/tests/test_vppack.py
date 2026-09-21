@@ -606,7 +606,13 @@ def test_review_packet_union_placeholder_resolves_to_covered_rows():
     drv.run_root = wt.parent / "run"
     (drv.run_root / "proofs").mkdir(parents=True)
     drv._proof_index = lambda: LaneDriver._proof_index(drv)
-    drv._review_proofs = lambda *a: LaneDriver._review_proofs(drv, *a)
+    # `**k` as well as `*a`: this stub only exists to bind `drv` as self, so it
+    # must forward EVERYTHING.  Pinned at `*a` it silently pinned the arity too,
+    # and D189 adding a `review=` kwarg at the call site broke here with a
+    # TypeError -- in a file that never mentions _review_proofs' signature.  A
+    # pass-through that cannot pass an argument through is a fake wearing a
+    # forwarder's clothes.
+    drv._review_proofs = lambda *a, **k: LaneDriver._review_proofs(drv, *a, **k)
     drv.PROOF_FIELDS = LaneDriver.PROOF_FIELDS
     plan = LaneDriver._review_packet_plan(drv, "RJU", row, {}, wt, "b" * 40, "c" * 40, {"tasks": {}})
     assert plan["targets"] == ["L42", "L06", "L07", "L99"] and plan["subject"] == "union"

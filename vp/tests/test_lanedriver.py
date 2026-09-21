@@ -4792,7 +4792,7 @@ def test_d168_proofs_json_carries_the_scope_and_whether_a_proof_is_owed(tmp_path
                        "PROBEROW": {"output_sha": sha, "kind": "probe"}}}
     union = {"union": "u1", "members": [{"task": t, "output_sha": sha}
                                         for t in ("FULLROW", "SCOPEDROW", "PROBEROW")]}
-    out = drv._review_proofs([], state, union, sha)
+    out = drv._review_proofs([], state, union, sha, review=None)
     by = {e["task"]: e for e in out["entries"] if e["task"] != "<union tip>"}
 
     assert set(by) == {"FULLROW", "SCOPEDROW", "PROBEROW"}
@@ -4860,7 +4860,7 @@ def test_d168_a_member_that_cannot_be_classified_is_scored_not_excused(tmp_path,
     drv.member_scope = boom
     state = {"tasks": {"BROKEN": {"output_sha": sha, "kind": "builder"}}}
     union = {"union": "u1", "members": [{"task": "BROKEN", "output_sha": sha}]}
-    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+    e = [x for x in drv._review_proofs([], state, union, sha, review=None)["entries"]
          if x["task"] == "BROKEN"][0]
 
     assert e["proof_required"] is True, (
@@ -4889,7 +4889,7 @@ def test_d170_a_scoped_proof_and_a_full_proof_are_distinguishable_in_the_artifac
                        "FULLONE": {"output_sha": sha, "kind": "builder"}}}
     union = {"union": "u1", "members": [{"task": t, "output_sha": sha}
                                         for t in ("SCOPEDONE", "FULLONE")]}
-    by = {e["task"]: e for e in drv._review_proofs([], state, union, sha)["entries"]}
+    by = {e["task"]: e for e in drv._review_proofs([], state, union, sha, review=None)["entries"]}
 
     assert by["SCOPEDONE"]["only"] == "twin:3:platform/tests/test_x.py", (
         "the artifact must carry the scope verbatim: %r" % by["SCOPEDONE"])
@@ -4951,7 +4951,7 @@ def test_d170_a_member_is_never_bound_to_another_items_scoped_proof(tmp_path, mo
 
     state = {"tasks": {"MINE": {"output_sha": sha, "kind": "builder"}}}
     union = {"union": "u1", "members": [{"task": "MINE", "output_sha": sha}]}
-    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+    e = [x for x in drv._review_proofs([], state, union, sha, review=None)["entries"]
          if x["task"] == "MINE"][0]
     assert e["proof_id"] == "proof-MINE-60921T000301", (
         "MINE was handed another item's scoped PASS: %r" % e["proof_id"])
@@ -4960,7 +4960,7 @@ def test_d170_a_member_is_never_bound_to_another_items_scoped_proof(tmp_path, mo
     # the guard must filter BEFORE ranking: with only the foreign PASS available the
     # member gets NOTHING, never the foreign record
     (env.run_root / "proofs" / "proof-MINE-60921T000301.json").unlink()
-    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+    e = [x for x in drv._review_proofs([], state, union, sha, review=None)["entries"]
          if x["task"] == "MINE"][0]
     assert e["proof_id"] is None, "a foreign scoped PASS was bound: %r" % e["proof_id"]
     assert drv.entry_scope(e) == drv.SCOPE_FULL or e["proof_id"] is None
@@ -4980,7 +4980,7 @@ def test_d170_a_full_suite_run_is_still_adoptable_across_items(tmp_path, monkeyp
     _write_proof(env.run_root, "proof-SOMEONEELSE-60921T000401", status="PASS", only=None)
     state = {"tasks": {"MINE": {"output_sha": sha, "kind": "builder"}}}
     union = {"union": "u1", "members": [{"task": "MINE", "output_sha": sha}]}
-    e = [x for x in drv._review_proofs([], state, union, sha)["entries"]
+    e = [x for x in drv._review_proofs([], state, union, sha, review=None)["entries"]
          if x["task"] == "MINE"][0]
     assert e["proof_id"] == "proof-SOMEONEELSE-60921T000401", (
         "a full-suite run must stay adoptable across items (D113): %r" % e)
@@ -5720,11 +5720,16 @@ def test_d189_a_member_that_depends_on_the_review_is_excluded_and_said_so(tmp_pa
     assert sorted(e["task"] for e in other["entries"] if e["task"] != "<union tip>") == ["L42", "MEMBER"]
     assert other["circular_members"] == []
 
-    # and omitting `review` restores the pre-D189 behaviour exactly, because the
-    # unbound SimpleNamespace caller (test_vppack.py:609) passes four positional args
-    old = drv._review_proofs([], state, union, sha)
-    assert sorted(e["task"] for e in old["entries"] if e["task"] != "<union tip>") == ["L42", "MEMBER"]
-    assert old["circular_members"] == []
+    # D189 hardening: `review` is keyword-only and REQUIRED, so a new caller that
+    # forgets it fails at the call instead of silently grading a circular member.
+    # This started as `review=None`, justified in the docstring by the unbound
+    # SimpleNamespace caller -- a justification that was simply wrong (that stub
+    # REPLACES the callee, so a default on the callee protects nothing; see the
+    # TypeError it raised at lanedriver.py:6457).  With the reason gone, what was
+    # left was a guard that stops applying when a caller says nothing, which is
+    # the failure mode the guard exists to prevent.
+    with pytest.raises(TypeError):
+        drv._review_proofs([], state, union, sha)          # no review= at all: that is the point
 
 
 def test_d189_exclusion_reads_depends_on_from_the_packet_when_the_row_lacks_it(tmp_path, monkeypatch):
