@@ -4147,14 +4147,42 @@ class LaneDriver(object):
 
     def reload_targets(self):
         """[(module_name, path)] of the code the running driver executes: the
-        loaded helper modules (RELOAD_ORDER) and lanedriver.py itself, last."""
+        loaded helper modules (RELOAD_ORDER) and lanedriver.py itself, last.
+
+        D158: a name in RELOAD_ORDER that this process never imported is kept
+        by nothing -- `sys.modules.get` returns None and the name is dropped
+        silently. `vpstore` is first in the tuple and is exactly that: only
+        vpctl and vpproof import it, so the driver can never reload it, and an
+        edit to vpstore armed with a reload ships nothing while the reload
+        reports `changed=[]` with no indication why.
+
+        That is the same shape as D154's form check -- the tuple said yes and
+        the process said no -- so the gap is now stated out loud instead of
+        being inferred from a module's absence from a hash set. Warned once per
+        name per process, because reload_targets runs on every code_hashes()
+        call. Not an alert: `vpstore`'s gap is known and permanent, and paging
+        on it every start would be crying wolf.
+        """
         out = []
+        seen = self.__dict__.setdefault("_reload_unresolved", set())
         for name in getattr(self, "reload_modules", RELOAD_ORDER):
             mod = sys.modules.get(name)
             f = getattr(mod, "__file__", None)
             # D74: circleaccount.py lives one level up (dispatcher/), imported by vpcircle
             if f and Path(f).resolve().parent in (self.here, self.here.parent):
                 out.append((name, Path(f).resolve()))
+            elif name not in seen:
+                seen.add(name)
+                if mod is None:
+                    why = ("this process never imported it, so sys.modules has no entry; "
+                           "an edit to it cannot be shipped by `reload` and will need a "
+                           "driver restart (the Operator's verb)")
+                else:
+                    why = ("it resolves to %s, outside the driver's own directories (%s, %s), "
+                           "so it is deliberately not reloadable from here"
+                           % (f, self.here, self.here.parent))
+                self.log("RELOAD_ORDER name %r is not in this driver's reload set: %s"
+                         % (name, why))
         for name in getattr(self, "reload_extra", []):
             mod = sys.modules.get(name)
             if mod is not None and getattr(mod, "__file__", None):

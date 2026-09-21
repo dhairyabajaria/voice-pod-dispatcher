@@ -4037,6 +4037,15 @@ def _d153_drv(tmp_path, stranded=True):
         encoding="utf-8")
     drv.pack_dir = pack
     drv._load_pack()
+    # The driver must have MENTIONED this packet, or the sweep classifies it
+    # `unseen` (newly placed) rather than stranded -- correctly, since a packet
+    # the driver has never scanned may simply have arrived seconds ago.
+    #
+    # This was implicit before D158: driver.log happened to be empty here, so
+    # `_seen_packet_ids` returned None and the unseen bucket was disabled
+    # entirely. D158's startup warnings put content in the log and flipped it,
+    # which is how the gap showed up. The fixture, not the behaviour, was wrong.
+    drv.log("PACK dir changed: +['%s'] -[]" % pid)
     return env, drv
 
 
@@ -4290,3 +4299,75 @@ def test_d157_the_empty_reason_shape_is_gone_from_the_call_site():
     assert 'str(rec.get("reason") or "")[:200]' not in code, (
         "the bare-colon shape is back at the TurnOutcome call site")
     assert "_proof_detail_fallback" in code
+
+
+# -- D158: a RELOAD_ORDER name the process never imported must say so ---------
+
+
+def test_d158_an_unimportable_reload_order_name_is_warned_about_once(tmp_path):
+    """The gap this closes is silent by construction: `sys.modules.get(name)`
+    returns None, the name is dropped, and nothing anywhere says the module is
+    unreloadable. vpstore is first in RELOAD_ORDER and is exactly that -- only
+    vpctl and vpproof import it, so an edit to it armed with a reload ships
+    nothing and the reload reports changed=[] with no indication why.
+
+    Once per name per process: reload_targets runs on every code_hashes() call,
+    so warning unconditionally would bury the log.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    drv.reload_modules = ("vppack", "definitely_not_a_real_module")
+    drv._reload_unresolved = set()
+    drv.log_path.write_text("", encoding="utf-8")
+
+    names = [n for n, _ in drv.reload_targets()]
+    assert "vppack" in names, "a resolvable name must still be kept"
+    assert "definitely_not_a_real_module" not in names
+
+    log = drv.log_path.read_text()
+    assert "definitely_not_a_real_module" in log and "never imported" in log, log
+    assert "driver restart" in log, "say what it would actually take to ship such an edit"
+    assert "vppack" not in log, "a name that resolved must not be warned about"
+
+    drv.reload_targets()
+    drv.reload_targets()
+    assert log.count("definitely_not_a_real_module") == 1 or \
+        drv.log_path.read_text().count("is not in this driver's reload set") == 1, \
+        "warned once per name, not once per code_hashes() call"
+
+
+def test_d158_vpstore_is_the_live_instance_and_is_reported(tmp_path):
+    """Pins the real case, not just a synthetic name. If something later imports
+    vpstore into the driver this test should be REMOVED, not weakened -- the
+    warning going quiet would then be correct."""
+    assert "vpstore" in lanedriver.RELOAD_ORDER, (
+        "the ruling was to keep vpstore in the tuple and make the gap honest, "
+        "not to remove it")
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    drv._reload_unresolved = set()
+    drv.log_path.write_text("", encoding="utf-8")
+    names = [n for n, _ in drv.reload_targets()]
+    log = drv.log_path.read_text()
+    if "vpstore" in names:                      # something now imports it: fine, and better
+        assert "vpstore" not in log
+    else:
+        assert "vpstore" in log and "not in this driver's reload set" in log, log
+
+
+def test_d158_a_module_outside_the_driver_dirs_gets_a_different_reason(tmp_path):
+    """Two distinct failures share one symptom (the name is dropped): never
+    imported, versus imported from somewhere else. A single message for both
+    would send the reader looking in the wrong place."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    drv.reload_modules = ("json",)              # stdlib: imported, but far away
+    drv._reload_unresolved = set()
+    drv.log_path.write_text("", encoding="utf-8")
+    drv.reload_targets()
+    log = drv.log_path.read_text()
+    assert "outside the driver's own directories" in log, log
+    assert "never imported" not in log, "wrong diagnosis for a module that IS imported"
