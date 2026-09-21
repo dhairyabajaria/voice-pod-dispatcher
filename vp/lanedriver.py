@@ -5197,6 +5197,11 @@ class LaneDriver(object):
             # it already had and somebody fixes the sha.  Placed above the
             # generic paths deliberately: an unhandled status falls through and
             # strikes the task three times into STUCK.
+            #
+            # D184: this hold is still unbounded, and deliberately so -- it is
+            # reached only when a regrade COULD be satisfied by some sha, so
+            # there is a fix for a human to make.  The case with no possible
+            # sha is caught earlier, in _regrade_for, and never gets here.
             self.note_hold(task, fkey, outcome.detail, REGRADE_HOLD_S)
             self.alert_once("regrade-refused:%s" % task, "REGRADE_REFUSED",
                             "%s: %s -- the row is HELD at its current state, not failed (D177)"
@@ -5466,19 +5471,83 @@ class LaneDriver(object):
         return outcome, {"outcome": "VERIFIED", "output_sha": head, "tree_sha": self.tree_sha(wt),
                          "evidence": [out_path, tdir / "record.json"]}
 
+    def _unsatisfiable_regrade(self, prev):
+        """D184: True only when `prev` is POSITIVELY known to have produced no
+        output.  A regrade re-grades `retry_of`'s output_sha (the convention
+        holds in 4 of the 5 healthy records: H22-QUOTA-R2, L09-SEED-FIX-R3,
+        L32-BINDINGS-TG-R1, LINT-TYPECHECK-TRUNK-R1), so a retry_of that never
+        produced one cannot be regraded by ANY sha -- whatever was recorded
+        necessarily fell back to an older ancestor, which cannot descend from
+        this row's base.
+
+        Everything unknown answers False.  A missing state view, an absent row
+        or an unreadable field must not read as "no output": that would convert
+        a perfectly good regrade into a retry on an instrument failure.  The
+        drop is irreversible for this attempt, so it happens only on a fact."""
+        try:
+            rows = self.control.state_view().get("tasks") or {}
+        except Exception:  # noqa: BLE001
+            return False
+        row = rows.get(prev)
+        if not isinstance(row, dict) or "output_sha" not in row:
+            return False
+        return not row.get("output_sha")
+
+    def _drop_unsatisfiable_regrade(self, task, f, rec, prev):
+        """Rewrite packets/<pid>.json without the regrade so the attempt runs as
+        an ordinary retry, and record WHY as a field.
+
+        The field is the point.  An alert is a message: read once, by whoever
+        happens to be watching, then gone -- after which every later reader of
+        this record sees a plain retry with no trace that a regrade was asked
+        for and answered with something else.  A fact that changes what the
+        evidence means has to be readable from the record (Architect 2's ruling,
+        2026-09-21).  The alert stays, as notification, never as the record."""
+        sha = rec.pop("regrade_sha")
+        rec["regrade_dropped"] = {
+            "sha": sha, "retry_of": prev, "at": utc_ms(),
+            "why": "%s produced no output_sha, and a regrade re-grades an output: no sha could "
+                   "satisfy this request, so it ran as an ordinary retry instead (D184)" % prev,
+        }
+        try:
+            f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.log("REGRADE_DROP %s: cannot rewrite %s (%s); the regrade stands" % (task, f.name, exc))
+            return False
+        self.clear_failures(task)          # lift any D177 hold now, not in REGRADE_HOLD_S
+        self.alert("REGRADE_DROPPED", "%s: regrade %s dropped -- %s produced no output_sha, so no sha "
+                   "could satisfy it; running as an ordinary retry. Recorded as regrade_dropped on %s"
+                   % (task, sha[:12], prev, f.name), task)
+        self.log("REGRADE_DROPPED %s %s (retry_of %s has no output_sha) -> plain retry" % (task, sha[:12], prev))
+        return True
+
     def _regrade_for(self, task):
         """D21: {"sha", "retry_of"} when the task was instantiated by
-        `retry-packet --regrade <sha>` (packets/<pid>.json), else None."""
+        `retry-packet --regrade <sha>` (packets/<pid>.json), else None.
+
+        D184: a regrade of a retry_of that produced no output is unanswerable by
+        construction, and that is knowable HERE, from the record, without
+        waiting for the refusal.  Left to the refusal it held the attempt at
+        RUNNING every REGRADE_HOLD_S forever -- R-RETENTION-BARRIER-CENSUS-
+        DERIVED-HOSTED-R2 and R-WA03-OUTBOUND-REVOKE-RACE-DB-HOSTED-R2 both sat
+        there on 2026-09-21, and "RUNNING" on the board meant "livelocked".
+        Triggering on the structural precondition rather than on N refusals
+        matters: N conflates "impossible" with "unlucky", and spends N * 900 s
+        rediscovering what the record already states."""
         pid = self.pack_by_task.get(task)
         if not pid:
             return None
+        f = self.run_root / "packets" / ("%s.json" % pid)
         try:
-            rec = json.loads((self.run_root / "packets" / ("%s.json" % pid)).read_text(encoding="utf-8"))
+            rec = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         if rec.get("task") != task or not rec.get("regrade_sha"):
             return None
-        return {"sha": rec["regrade_sha"], "retry_of": rec.get("retry_of")}
+        prev = rec.get("retry_of")
+        if prev and self._unsatisfiable_regrade(prev) and self._drop_unsatisfiable_regrade(task, f, rec, prev):
+            return None
+        return {"sha": rec["regrade_sha"], "retry_of": prev}
 
     def _regrade_reset(self, task, wt, regrade):
         """reset the fresh worktree to the regrade sha (must descend from the

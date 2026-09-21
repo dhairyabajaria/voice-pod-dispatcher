@@ -5244,6 +5244,95 @@ def test_d177_a_refused_regrade_holds_the_row_and_never_fails_it(tmp_path):
     assert "note_hold" in caller[i:i + 900], "the handler must hold, not complete"
 
 
+def _regrade_for_drv(tmp_path, rows, regrade_sha="aca1c0fd9fbb", retry_of="ROW-R1"):
+    """a LaneDriver with just enough wired to exercise _regrade_for, plus the
+    packets/<pid>.json a `retry-packet --regrade` leaves behind"""
+    import threading
+    from vp.lanedriver import LaneDriver
+    drv = LaneDriver.__new__(LaneDriver)
+    drv.run_root = tmp_path / "run"
+    (drv.run_root / "packets").mkdir(parents=True, exist_ok=True)
+    drv.pack_by_task = {"ROW-R2": "ROW"}
+    drv._lock = threading.Lock()
+    drv._fail = {"ROW-R2": {"count": 0, "next_try": 9e9, "key": "k", "stuck": False}}
+    drv.alerts = []
+    drv.alert = lambda kind, text, task=None: drv.alerts.append((kind, text))
+    drv.log = lambda *a, **k: None
+    drv.control = type("C", (), {"state_view": staticmethod(lambda: {"tasks": rows})})()
+    rec = {"task": "ROW-R2", "retry_of": retry_of, "regrade_sha": regrade_sha, "packet": "ROW"}
+    f = drv.run_root / "packets" / "ROW.json"
+    f.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+    return drv, f
+
+
+def test_d184_a_regrade_of_a_row_that_produced_no_output_is_dropped_not_held(tmp_path):
+    """D184. A regrade re-grades `retry_of`'s OUTPUT. When retry_of is
+    INVALID_EVIDENCE it has no output_sha, so whatever sha was recorded fell
+    back to an older ancestor, which cannot descend from this row's base -- the
+    request is unanswerable BY CONSTRUCTION and no sha would fix it.
+
+    Left to the D177 refusal that held the attempt at RUNNING every 900 s
+    forever: R-RETENTION-BARRIER-CENSUS-DERIVED-HOSTED-R2 and
+    R-WA03-OUTBOUND-REVOKE-RACE-DB-HOSTED-R2 both sat there on 2026-09-21, and
+    "RUNNING" on the board meant "livelocked". The precondition is knowable from
+    the record, so it is checked there rather than after N refusals -- N
+    conflates "impossible" with "unlucky"."""
+    drv, f = _regrade_for_drv(tmp_path, {"ROW-R1": {"state": "INVALID_EVIDENCE", "output_sha": None}})
+    assert drv._regrade_for("ROW-R2") is None, "the attempt must run as an ordinary retry"
+    assert drv._fail.get("ROW-R2") is None, "the D177 hold must lift now, not in REGRADE_HOLD_S"
+    assert [k for k, _t in drv.alerts] == ["REGRADE_DROPPED"]
+
+
+def test_d184_the_substitution_is_a_field_on_the_record_not_only_an_alert(tmp_path):
+    """Architect 2's ruling, and the part that is not optional. An alert is a
+    message: read once, by whoever is watching, then gone. Every later reader of
+    this record would otherwise see a plain retry with no trace that a regrade
+    was asked for and answered with something else -- the same failure shape as
+    a FAIL_INFRA whose real reason never reached the board. A fact that changes
+    what the evidence means has to be readable FROM THE RECORD."""
+    drv, f = _regrade_for_drv(tmp_path, {"ROW-R1": {"state": "INVALID_EVIDENCE", "output_sha": None}})
+    drv._regrade_for("ROW-R2")
+    rec = json.loads(f.read_text(encoding="utf-8"))
+    assert "regrade_sha" not in rec, "the unsatisfiable regrade must not stay on the record"
+    dropped = rec["regrade_dropped"]
+    assert dropped["sha"] == "aca1c0fd9fbb" and dropped["retry_of"] == "ROW-R1"
+    assert "no output_sha" in dropped["why"] and dropped["at"]
+    # and the reader can still recover what was originally asked for
+    assert dropped["sha"], "the dropped sha is kept, so the request is reconstructible"
+
+
+def test_d184_a_satisfiable_regrade_is_untouched(tmp_path):
+    """The narrowing matters as much as the fix: a retry_of that DID produce an
+    output can be regraded, so the record stands and the D177 hold keeps its
+    unbounded shape -- there is a sha a human can correct it to."""
+    drv, f = _regrade_for_drv(tmp_path, {"ROW-R1": {"state": "REPAIR_REQUIRED", "output_sha": "b" * 40}})
+    got = drv._regrade_for("ROW-R2")
+    assert got == {"sha": "aca1c0fd9fbb", "retry_of": "ROW-R1"}
+    assert "regrade_sha" in json.loads(f.read_text(encoding="utf-8"))
+    assert drv.alerts == []
+
+
+def test_d184_only_a_positive_fact_drops_a_regrade(tmp_path):
+    """The drop is irreversible for this attempt, so "I could not tell" must
+    never read as "there is no output". Three ways of not knowing -- the row is
+    absent, the field is absent, the state view itself raises -- and none of
+    them may convert a good regrade into a retry."""
+    for label, rows in (("row absent", {}),
+                        ("field absent", {"ROW-R1": {"state": "REPAIR_REQUIRED"}})):
+        drv, f = _regrade_for_drv(tmp_path / label, rows)
+        assert drv._regrade_for("ROW-R2") is not None, "%s must not drop the regrade" % label
+        assert "regrade_sha" in json.loads(f.read_text(encoding="utf-8")), label
+
+    drv, f = _regrade_for_drv(tmp_path / "raises", {"ROW-R1": {"state": "X", "output_sha": None}})
+
+    def boom():
+        raise RuntimeError("state view unavailable")
+
+    drv.control = type("C", (), {"state_view": staticmethod(boom)})()
+    assert drv._regrade_for("ROW-R2") is not None, "an unreadable state view must not drop the regrade"
+    assert "regrade_sha" in json.loads(f.read_text(encoding="utf-8"))
+
+
 def test_d178_owed_rulings_counts_problems_not_attempts():
     """D178. The alert counted ROWS, so 64 rows read as 64 problems when they
     were 19 -- a 3.4x over-report -- and then truncated the flat list at 500
