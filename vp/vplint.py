@@ -618,6 +618,31 @@ def lint_roster_v13(r):
     for kind in ("junior", "final_review", "security_build"):
         if (roles.get(kind) or {}).get("runner") == b:
             out.append("ERROR roster: %s runner equals builder runner (%s): independence lost" % (kind, b))
+    # D192: the same independence question, asked of the runner a role FALLS BACK
+    # to.  Without this the check reads `roles.builder.runner` only, so a
+    # `fallback` naming a review runner passes lint and loses independence at
+    # runtime -- the roster would be validated and the property still broken,
+    # which is worse than no check because it carries a clean bill.
+    for kind, rc in sorted(roles.items()):
+        fb = (rc or {}).get("fallback")
+        if not isinstance(fb, dict):
+            continue
+        fr, fm = fb.get("runner"), fb.get("model")
+        if fr not in RUNNERS:
+            out.append("ERROR roster: kind %s fallback runner %r not in %s" % (kind, fr, list(RUNNERS)))
+        if fr == "opencode":
+            out.append("ERROR roster: kind %s fallback names opencode, but the fallback only fires "
+                       "when no opencode server is free" % kind)
+        if not fm:
+            out.append("ERROR roster: kind %s fallback has no model" % kind)
+    bfb = ((roles.get("builder") or {}).get("fallback") or {})
+    for kind in ("junior", "final_review", "security_build"):
+        rc = roles.get(kind) or {}
+        if bfb.get("runner") and rc.get("runner") == bfb.get("runner"):
+            same_model = rc.get("model") == bfb.get("model")
+            out.append("ERROR roster: builder fallback runner equals %s runner (%s%s): independence "
+                       "lost whenever the fallback fires"
+                       % (kind, bfb["runner"], " AND model %s" % bfb.get("model") if same_model else ""))
     conc = n.get("concurrency") or {}
     # D75 (2026-09-19): the owner raised codex_max from the plan's 3 to 20;
     # the lint now bounds it (1..20) instead of pinning it; claude_max stays 2

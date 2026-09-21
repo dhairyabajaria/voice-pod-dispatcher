@@ -1112,6 +1112,62 @@ class LaneDriver(object):
             if server:
                 self.servers[server]["active"] = max(0, self.servers[server]["active"] - 1)
 
+    def _role_fallback(self, kind, rcfg):
+        """D192: the role config to run `kind` on when the opencode fleet has
+        nothing free, or None to keep waiting.
+
+        The fallback dict REPLACES the role config, it does not merge into it.
+        Merging looked friendlier and is wrong: builder carries `agent`,
+        `variant` and an `opencode-go/...` model, and quietly carrying those
+        into a codex turn would produce a turn configured half for a runner it
+        is not running on.  A fallback states its whole config or it does not
+        run.
+
+        Refuses to fall back onto `opencode`: the trigger IS that no opencode
+        server is free, so such a fallback can only fail the same way one line
+        later, while reading in the roster as though cover exists.
+
+        Announced once per role per park episode, and re-armed when the fleet
+        comes back, because a silent runner substitution is the kind of thing
+        that gets discovered in a verdict weeks later.
+        """
+        fb = rcfg.get("fallback")
+        if not isinstance(fb, dict) or not fb.get("runner"):
+            return None
+        if fb["runner"] == "opencode":
+            self.alert_once("fallback-opencode:%s" % kind, "ROSTER",
+                            "roles.%s.fallback names runner 'opencode', but the fallback only "
+                            "fires because no opencode server is free; ignored" % kind)
+            return None
+        if not fb.get("model"):
+            self.alert_once("fallback-nomodel:%s" % kind, "ROSTER",
+                            "roles.%s.fallback names no model; ignored" % kind)
+            return None
+        key = "fallback:%s:%s" % (kind, fb["runner"])
+        if key not in self._fallback_live():
+            self._fallback_live().add(key)
+            self.alert("RUNNER_FALLBACK",
+                       "%s: no opencode server free; falling back to %s/%s. Turns built this way "
+                       "are NOT independent of a reviewer on the same runner -- check "
+                       "roles.<review kind>.runner before trusting their verdicts."
+                       % (kind, fb["runner"], fb.get("model")))
+        self.log("FALLBACK %s -> %s/%s (opencode fleet has nothing free, D192)"
+                 % (kind, fb["runner"], fb.get("model")))
+        return dict(fb)
+
+    def _fallback_live(self):
+        """D192: which (kind, runner) fallbacks have announced themselves.
+
+        Created lazily via getattr, not in __init__: `hot_reload` re-imports the
+        module and rebinds classes but never re-runs __init__, so a new instance
+        attribute added there does not exist on a live driver after a reload.
+        """
+        got = getattr(self, "_fallback_announced", None)
+        if got is None:
+            got = set()
+            self._fallback_announced = got
+        return got
+
     def _pick_server(self, rcfg):
         """D134: pick the LEAST-LOADED server, not the first one with capacity.
 
@@ -5031,7 +5087,22 @@ class LaneDriver(object):
             runner = rcfg.get("runner", "opencode")
             server = self._pick_server(rcfg) if runner == "opencode" else None
             if runner == "opencode" and server is None:
-                continue
+                # D192: the whole opencode fleet is parked or full, so this role
+                # would wait indefinitely.  A role may name a `fallback` role
+                # config to run on instead.  Before D192 the loop simply
+                # `continue`d here and the roster had no way to say otherwise --
+                # `fallback_order` is a SERVER ordering read only by vplint, and
+                # `zen_fallback` is read by nothing at all, so neither was this.
+                fb = self._role_fallback(kind, rcfg)
+                if fb is None:
+                    continue
+                rcfg, runner, server = fb, fb["runner"], None
+            elif runner == "opencode":
+                # the fleet answered for this kind: re-arm the announcement so a
+                # LATER park episode alerts again instead of staying quiet
+                # because an earlier one already did (D192)
+                self._fallback_live().discard("fallback:%s:%s"
+                                              % (kind, (rcfg.get("fallback") or {}).get("runner")))
             paths = self._claim_paths(contract, row)
             other = self._conflicts(paths, state)
             if other:

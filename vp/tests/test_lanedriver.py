@@ -5749,3 +5749,109 @@ def test_d189_exclusion_reads_depends_on_from_the_packet_when_the_row_lacks_it(t
 
     out = drv._review_proofs([], state, union, sha, review="REVIEW-UNION-R4")
     assert out["circular_members"] == ["L42"], out
+
+
+def test_d192_a_role_falls_back_when_the_opencode_fleet_has_nothing_free(tmp_path, monkeypatch):
+    """D192: before this, the dispatch loop did a bare `continue` when
+    `_pick_server` returned None, so a role whose fleet was parked waited
+    indefinitely with no way for the roster to say otherwise.  `fallback_order`
+    is a SERVER ordering read only by vplint and `zen_fallback` is read by
+    nothing, so neither was this.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    rcfg = {"runner": "opencode", "agent": "vp-builder", "model": "opencode-go/muse",
+            "variant": "xhigh",
+            "fallback": {"runner": "codex", "model": "gpt-5.6-luna", "effort": "xhigh"}}
+
+    got = drv._role_fallback("builder", rcfg)
+
+    assert got == {"runner": "codex", "model": "gpt-5.6-luna", "effort": "xhigh"}, got
+    assert "agent" not in got and "variant" not in got, (
+        "the fallback REPLACES the role config, it does not merge into it -- carrying "
+        "`agent`/`variant`/an opencode-go model into a codex turn would configure the "
+        "turn half for a runner it is not running on: %r" % (got,))
+
+
+def test_d192_no_fallback_key_means_keep_waiting(tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    for rcfg in ({"runner": "opencode", "model": "m"},
+                 {"runner": "opencode", "model": "m", "fallback": None},
+                 {"runner": "opencode", "model": "m", "fallback": "codex"},   # not a dict
+                 {"runner": "opencode", "model": "m", "fallback": {}},
+                 {"runner": "opencode", "model": "m", "fallback": {"model": "x"}}):  # no runner
+        assert drv._role_fallback("builder", rcfg) is None, rcfg
+
+
+def test_d192_a_fallback_onto_opencode_is_refused(tmp_path, monkeypatch):
+    """The trigger IS that no opencode server is free, so such a fallback can
+    only fail the same way one line later while reading in the roster as though
+    cover exists.  Loud, because a roster that claims cover it does not have is
+    worse than one that claims none.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    alerts = []
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    monkeypatch.setattr(drv, "alert_once", lambda k, kind, msg, *a, **kw: alerts.append((kind, msg)))
+    rcfg = {"runner": "opencode", "model": "m",
+            "fallback": {"runner": "opencode", "model": "opencode-go/other"}}
+
+    assert drv._role_fallback("builder", rcfg) is None
+    assert alerts and "only fires because no opencode server is free" in alerts[0][1], alerts
+
+
+def test_d192_a_fallback_without_a_model_is_refused(tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    env.activate()
+    alerts = []
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    monkeypatch.setattr(drv, "alert_once", lambda k, kind, msg, *a, **kw: alerts.append((kind, msg)))
+    rcfg = {"runner": "opencode", "model": "m", "fallback": {"runner": "codex"}}
+
+    assert drv._role_fallback("builder", rcfg) is None
+    assert alerts and "no model" in alerts[0][1], alerts
+
+
+def test_d192_the_substitution_announces_itself_once_per_episode(tmp_path, monkeypatch):
+    """A silent runner substitution is the kind of thing that gets discovered in
+    a verdict weeks later, so it alerts -- and the alert names the independence
+    consequence, because that is the part a reader would otherwise have to
+    re-derive from the roster.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    alerts = []
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    monkeypatch.setattr(drv, "alert", lambda kind, msg, *a, **kw: alerts.append((kind, msg)))
+    rcfg = {"runner": "opencode", "model": "m",
+            "fallback": {"runner": "codex", "model": "gpt-5.6-luna"}}
+
+    for _ in range(3):
+        assert drv._role_fallback("builder", rcfg)["runner"] == "codex"
+
+    assert len(alerts) == 1, "once per episode, not once per claim: %r" % (alerts,)
+    assert alerts[0][0] == "RUNNER_FALLBACK"
+    assert "NOT independent of a reviewer on the same runner" in alerts[0][1], alerts
+
+    # a later park episode alerts again rather than staying quiet
+    drv._fallback_live().discard("fallback:builder:codex")
+    drv._role_fallback("builder", rcfg)
+    assert len(alerts) == 2, alerts
+
+
+def test_d192_the_announcement_set_survives_a_reload(tmp_path, monkeypatch):
+    """hot_reload re-imports the module and rebinds classes but never re-runs
+    __init__, so an instance attribute added there would not exist on a live
+    driver after a reload.  Created lazily for exactly that reason.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+    assert not hasattr(drv, "_fallback_announced"), "not set in __init__"
+    assert drv._fallback_live() == set()
+    drv._fallback_live().add("x")
+    assert drv._fallback_live() == {"x"}, "and it persists once created"
