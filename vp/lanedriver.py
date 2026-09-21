@@ -2070,11 +2070,38 @@ class LaneDriver(object):
         if own:
             return dict(own, basis="own")
         owed = self.proof_cfg.get("require_for_kinds") or DEFAULT_PROOF_KINDS
+        row = row or {}
+        pre_v13 = row.get("state") == "INTEGRATED" and not row.get("dynamic")
         if kind is None:
+            # D186: D174's exemption (0b) sat BELOW this return, so it never once
+            # reached the population it was written for.  Every one of the 25
+            # INTEGRATED non-dynamic rows in run-state carries `kind: None`
+            # (counted: INTEGRATED by (kind is None, dynamic) = {(True, False): 25,
+            # (False, True): 6}) -- they predate v13, which is the same reason they
+            # have no kind AND the reason they owe no record.  So they fell in here
+            # instead, took `no-kind`, which is deliberately NOT in
+            # SCOPE_EXEMPT_LABELS, and every runtime row scored UNKNOWN.  That was
+            # the whole L35 freeze: five junior reviews reporting "no PASS proof
+            # whose scope covers them" (F2-R6: 135 of 137).  An exemption reachable
+            # by nothing is indistinguishable from an exemption that was never
+            # written.
+            #
+            # Tested HERE rather than by hoisting the (0b) block wholesale: below,
+            # (0b) sits after the twin-inheritance loop, so an INTEGRATED
+            # non-dynamic row WITH a twin proof still reports `inherited` and keeps
+            # the twin's name. Hoisting would have flattened those to
+            # `integrated_not_dynamic` and thrown away the attribution.
+            if pre_v13:
+                return {"class": "not_required", "basis": "integrated_not_dynamic", "kind": None}
             # D148: an unknown kind cannot be said to owe anything.  My first cut
             # guarded this with `kind is not None` and let it fall through to
             # `unproven` -- which alarmed on 14 pre-v13 rows that carry no kind at
             # all.  "I don't know" is not "it failed"; it gets its own basis.
+            #
+            # Still not exempt, and that is deliberate (see scope_label): a row
+            # dropped from a SCORE on the strength of not knowing is the fail-open
+            # shape this field exists to expose.  D186 does not widen `no-kind`; it
+            # stops one identifiable population from being misfiled into it.
             return {"class": "not_required", "basis": "kind_unknown", "kind": None}
         if kind not in owed:
             return {"class": "not_required", "basis": "kind", "kind": kind}
@@ -2099,8 +2126,7 @@ class LaneDriver(object):
         # step is what catches a proper-subset coverage claim, and a blanket skip
         # would delete it.  An exemption is a deleted check; this one deletes
         # exactly one.
-        row = row or {}
-        if row.get("state") == "INTEGRATED" and not row.get("dynamic"):
+        if pre_v13:            # D186: computed once, above, so both paths share it
             return {"class": "not_required", "basis": "integrated_not_dynamic", "kind": kind}
         return {"class": "unproven", "basis": "none", "kind": kind}
 

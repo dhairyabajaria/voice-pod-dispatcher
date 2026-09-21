@@ -5057,6 +5057,45 @@ def test_d174_integrated_non_dynamic_rows_are_exempt_from_proof_EXISTENCE_only(t
         "no row at all must stay scored -- fail CLOSED, never exempt by omission")
 
 
+def test_d186_the_d174_exemption_reaches_the_rows_it_was_written_for(tmp_path):
+    """D186. D174's (0b) exemption sat BELOW the `kind is None` return, so it
+    never once fired for its own population: every one of the 25 INTEGRATED
+    non-dynamic rows in run-state carries `kind: None` (counted INTEGRATED by
+    (kind is None, dynamic) = {(True, False): 25, (False, True): 6}). They
+    predate v13 -- which is both why they have no kind and why they owe no
+    record -- so they landed in `kind_unknown`, took the `no-kind` label, which
+    is deliberately NOT exempt, and scored UNKNOWN.
+
+    That was the L35 freeze: five junior reviews reporting no PASS proof covers
+    the runtime rows (F2-R6: 135 of 137). Measured on F1-R5's own PROOFS.json,
+    all 23 `kind_unknown` entries are INTEGRATED non-dynamic, so all 23 move to
+    `not-required` and none stay `no-kind`.
+
+    An exemption reachable by nothing is indistinguishable from one that was
+    never written."""
+    from vp.lanedriver import LaneDriver
+
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner()})
+
+    got = drv.member_scope("ROW", None, row={"state": "INTEGRATED"})
+    assert got["basis"] == "integrated_not_dynamic", (
+        "a kind-None INTEGRATED non-dynamic row must reach D174's exemption: %r" % got)
+    assert LaneDriver.scope_scored(LaneDriver.scope_label(got)) is False
+
+    # the narrowing: D186 must not widen `no-kind` itself, only stop one
+    # identifiable population being misfiled into it
+    for row in ({"state": "VERIFIED"}, {"state": "INTEGRATED", "dynamic": True}, {}):
+        other = drv.member_scope("ROW", None, row=row)
+        assert other["basis"] == "kind_unknown", "%r must stay kind_unknown: %r" % (row, other)
+        assert LaneDriver.scope_scored(LaneDriver.scope_label(other)) is True, (
+            "no-kind stays SCORED -- dropping a row on the strength of not knowing "
+            "is the fail-open shape the field exists to expose")
+    assert drv.member_scope("ROW", None)["basis"] == "kind_unknown", (
+        "no row at all must stay scored -- fail CLOSED, never exempt by omission")
+
+
 def test_d174_the_packet_states_WHY_a_member_is_exempt():
     """D174, Architect's second requirement: the reason goes in the packet text,
     not only in the rule.
