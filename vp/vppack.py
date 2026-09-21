@@ -169,6 +169,42 @@ def bound_task(packet, tasks, bindings=None):
     return b[1] if b[0] != "hold" else None
 
 
+# D145: headings whose body names packets and files to AVOID.  A cite harvested
+# from one of these is the exact opposite of a parent claim -- R-MIG034-AGENTS-ROLE-
+# REFUSAL-DB got parent `L11` because its `## Not in scope` section correctly named
+# `L11-MIGRATION-266-BLOCKING-HOSTED-R2` as a packet it must not collide with.  Naming
+# what you must avoid is what made the driver treat it as your parent.
+_NEGATIVE_SECTION = re.compile(
+    r"^#{1,6}\s*(?:[\d.]+[.)]?\s*)?(?:not\s+in\s+scope|out\s+of\s+scope|non-?goals?"
+    r"|do\s+not\s+(?:touch|edit|modify|change)|forbidden|must\s+not|avoid"
+    r"|explicitly\s+excluded|exclusions?|anti-?goals?)\b", re.I)
+
+
+def _body_without_negative_sections(body):
+    """`body` with every negative section removed: the heading itself through to
+    the next heading at the same or a higher level.
+
+    A blacklist, deliberately, not a whitelist of trusted sections.  `parent_for`
+    falls through to `None` and PACKET_NO_PARENT is fatal, so a whitelist would
+    turn every packet whose cite lives in unanticipated prose into a hard failure.
+    Narrowing only the sections that are definitionally negative preserves every
+    correct inference and removes the one that inverts meaning.
+    """
+    out, skip = [], None
+    for ln in body.splitlines():
+        h = re.match(r"^(#{1,6})\s", ln)
+        if h:
+            lvl = len(h.group(1))
+            if skip is not None and lvl <= skip:
+                skip = None                       # the negative section ended here
+            if skip is None and _NEGATIVE_SECTION.match(ln):
+                skip = lvl
+                continue
+        if skip is None:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def parent_for(packet, tasks, pack, _seen=None):
     """parent_contract_id for a dynamic task, in order of trust: the header's
     `parent_contract`; the existing scheduler_task; a dependency packet's task
@@ -194,7 +230,9 @@ def parent_for(packet, tasks, pack, _seen=None):
     m = re.match(r"^(L\d\d)\b", packet["id"])
     if m and m.group(1) in tasks:
         return m.group(1), "id-prefix"
-    m = re.search(r"\b(L\d\d)\b", packet["body"].split("---", 2)[-1])
+    # D145: never harvest the cite out of a "## Not in scope" style section
+    m = re.search(r"\b(L\d\d)\b",
+                  _body_without_negative_sections(packet["body"].split("---", 2)[-1]))
     if m and m.group(1) in tasks:
         return m.group(1), "body-cite"
     for c in packet["closes"]:

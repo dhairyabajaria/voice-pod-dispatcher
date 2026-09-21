@@ -1660,3 +1660,43 @@ def test_load_pack_gives_the_circleci_twin_no_proof_only(tmp_path):
     pack, lint = vppack.load_pack(tmp_path)[:2]
     assert pack["R-X"]["proof_only"] == "portal" and pack["R-X-HOSTED"]["proof_only"] == ""
     assert "proof_only" not in vppack.twin_packet_text(pack["R-X-HOSTED"], "a" * 40)
+
+
+def test_d145_a_not_in_scope_section_never_supplies_the_parent():
+    """Naming what a packet must AVOID is the opposite of naming its parent.
+
+    R-MIG034-AGENTS-ROLE-REFUSAL-DB was given parent `L11` because its
+    `## Not in scope` section correctly warned against colliding with
+    `L11-MIGRATION-266-BLOCKING-HOSTED-R2`. Measured over the live pack, exactly
+    two packets' first cite came out of such a section -- that one and
+    REVIEW-JUNIOR-UNION -- and both were wrong.
+    """
+    strip = vppack._body_without_negative_sections
+
+    body = ("## Goal\nRefuse a role the agents table must not grant.\n\n"
+            "## Not in scope\n- `L11-MIGRATION-266-BLOCKING-HOSTED-R2`, do not collide.\n")
+    assert "L11" not in strip(body)
+    assert "Refuse a role" in strip(body), "the positive prose must survive"
+
+    # the section ENDS at the next heading of the same or higher level: a cite after
+    # it is still found, or the stripper would swallow the rest of the packet
+    body2 = body + "\n## Steps\nExtend the L07 fence.\n"
+    assert "L07" in strip(body2) and "L11" not in strip(body2)
+    body3 = ("## A\n### Not in scope\n- avoid L11\n### Steps\nextend L07\n")
+    assert "L07" in strip(body3) and "L11" not in strip(body3)
+
+    # a cite in ordinary prose is untouched -- this is a blacklist, not a whitelist,
+    # because parent_for falls through to None and PACKET_NO_PARENT is fatal
+    assert "L07" in strip("## Goal\nThis continues L07's fence.\n")
+
+    # the spellings a packet actually uses for the same idea
+    for heading in ("## Not in scope", "## Out of scope", "## Non-goals", "## NON-GOALS",
+                    "## Do not touch", "## Forbidden", "## Anti-goals", "## 3. Out of Scope"):
+        assert "L11" not in strip("%s\n- avoid L11\n" % heading), heading
+
+    # ...and one it does not: a blacklist cannot be complete, and saying so here is
+    # cheaper than discovering it from a wrong parent
+    assert "L11" in strip("## Things we will not do\n- avoid L11\n"), (
+        "unanticipated negative headings still leak -- deliberate: the alternative "
+        "(whitelisting trusted sections) turns every unanticipated POSITIVE heading "
+        "into a fatal PACKET_NO_PARENT")
