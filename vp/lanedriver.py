@@ -1027,13 +1027,30 @@ class LaneDriver(object):
                 self.servers[server]["active"] = max(0, self.servers[server]["active"] - 1)
 
     def _pick_server(self, rcfg):
+        """D134: pick the LEAST-LOADED server, not the first one with capacity.
+
+        First-fit over `sorted(self.servers)` never spreads: every server carries
+        `max_concurrent: 100` while the driver cap is 15, so capacity never runs
+        out and the first name -- go1 -- absorbs every unpinned role.  The old
+        code read as a fleet and behaved as a single server.
+
+        `want` still wins outright when it has capacity: an explicit
+        `server:` pin in the roster is a placement decision, not a hint, and
+        D134 must not quietly override it.  This is only half the fleet fix --
+        while every opencode role carries `server: go2` nothing reaches the
+        least-loaded branch at all (measured 2026-09-21: builder, grader, infra,
+        integrator and probe are all pinned; the six unpinned roles are codex /
+        agy / claude and never touch these servers).  Removing those pins is the
+        other half, and it only spreads once this is in."""
         want = rcfg.get("server")
-        names = [want] if want else sorted(self.servers)
-        for name in names + [n for n in sorted(self.servers) if n not in names]:
-            srv = self.servers.get(name)
+        if want:
+            srv = self.servers.get(want)
             if srv and not self._parked(srv) and srv["active"] < srv["max_concurrent"]:
-                return name
-        return None
+                return want
+        # ties break on the sorted name, so an idle fleet stays deterministic
+        free = [(srv["active"], name) for name, srv in sorted(self.servers.items())
+                if not self._parked(srv) and srv["active"] < srv["max_concurrent"]]
+        return min(free)[1] if free else None
 
     # -- backoff --------------------------------------------------------------------
 

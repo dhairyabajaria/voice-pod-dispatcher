@@ -3351,3 +3351,61 @@ def test_d132_a_role_asking_for_a_variant_its_model_does_not_declare_is_alerted(
     monkeypatch.setattr(type(drv), "_http_json", lambda self, url, timeout=10.0: None)
     drv._check_role_variants()
     assert (env.run_root / "alerts.jsonl").read_text().strip() == ""
+
+
+def test_d134_an_unpinned_role_spreads_across_the_fleet_and_a_pin_still_wins(tmp_path):
+    """D134: `_pick_server` was first-fit over `sorted(self.servers)`.  Every
+    server carries `max_concurrent: 100` against a driver cap of 15, so capacity
+    never runs out and the FIRST name absorbs every unpinned role -- a fleet that
+    behaves as one server.  Measured 2026-09-21: go1 and go3 sat at 0 active
+    while go2 carried everything.
+
+    The control is the second assertion: under first-fit, go1 has capacity at
+    every step, so an unpinned pick returns "go1" three times and the test reds.
+    A pin must still win outright -- an explicit `server:` is a placement
+    decision, and D134 must not quietly override it."""
+    servers = {"go1": {"url": "http://127.0.0.1:1", "max_concurrent": 100, "xdg_data_home": str(tmp_path / "x1")},
+               "go2": {"url": "http://127.0.0.1:2", "max_concurrent": 100, "xdg_data_home": str(tmp_path / "x2")},
+               "go3": {"url": "http://127.0.0.1:3", "max_concurrent": 100, "xdg_data_home": str(tmp_path / "x3")}}
+    env = Env(tmp_path, roster_extra={"servers": servers})
+    drv = env.driver({"opencode": FakeRunner(), "codex": FakeRunner(), "claude": FakeRunner()})
+
+    # an idle fleet is deterministic: ties break on the sorted name
+    assert drv._pick_server({}) == "go1"
+
+    # CONTROL: each pick loads a server, so the next one must go elsewhere.
+    # First-fit returns "go1" all three times and this list reds.
+    picked = []
+    for _ in range(3):
+        name = drv._pick_server({})
+        picked.append(name)
+        drv.servers[name]["active"] += 1
+    assert picked == ["go1", "go2", "go3"], picked
+    assert [drv.servers[n]["active"] for n in ("go1", "go2", "go3")] == [1, 1, 1]
+
+    # the least-loaded server wins even when a lower-sorted name has capacity
+    drv.servers["go1"]["active"] = 0
+    assert drv._pick_server({}) == "go1"
+    drv.servers["go1"]["active"] = 5
+    drv.servers["go2"]["active"] = 2
+    drv.servers["go3"]["active"] = 4
+    assert drv._pick_server({}) == "go2"
+
+    # a pin wins outright, however loaded it is, while it has capacity
+    assert drv._pick_server({"server": "go1"}) == "go1"
+    assert drv._pick_server({"server": "go3"}) == "go3"
+
+    # a pin at capacity falls back to the least-loaded server, never to first-fit
+    drv.servers["go3"]["max_concurrent"] = 4          # active is already 4
+    assert drv._pick_server({"server": "go3"}) == "go2"
+
+    # a parked server is never picked, pinned or not
+    drv.servers["go2"]["parked_until"] = time.time() + 600
+    drv.servers["go2"]["park_status"] = "QUOTA_WEEKLY"
+    assert drv._pick_server({}) == "go1"
+    assert drv._pick_server({"server": "go2"}) == "go1"
+
+    # nothing available at all is None, not a crash and not an arbitrary name
+    drv.servers["go1"]["max_concurrent"] = 0
+    assert drv._pick_server({}) is None
+    assert drv._pick_server({"server": "go2"}) is None
