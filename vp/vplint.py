@@ -188,6 +188,38 @@ def _git(trunk, args):
         return 127, str(exc)
 
 
+def _in_a_pack(packet_path):
+    """True when this packet sits in a real v13 pack, not a test fixture."""
+    return "03-PACKETS" in Path(packet_path).resolve().parts
+
+
+def _discover_trunk(packet_path):
+    """The trunk repo a packet's base_sha lives in, derived from the packet's path.
+
+    The test_paths existence check below was written correctly but sat behind
+    `--trunk`, which defaults to None and which the usage line does not pass --
+    so in the standard invocation a test path naming a nonexistent file linted
+    clean.  A check that is configured off produces exactly the evidence of no
+    check at all.  check-v13.py solves this by deriving its own TRUNK from its
+    file location; vplint lives in a DIFFERENT repo (dispatcher/) so it cannot,
+    and derives from the packet under test instead:
+
+        .../voice-pod/advisor-plans/outbound-launch/v13-pack/03-PACKETS/<NAME>/PACKET.md
+                  ^ parents[5] of the packet file
+
+    Returns "" when no usable git repo is there, and the caller says so out loud
+    rather than skipping in silence.
+    """
+    p = Path(packet_path).resolve()
+    if len(p.parents) < 6:
+        return ""
+    cand = p.parents[5] / "chief9-recovery"
+    if not (cand / ".git").exists():
+        return ""
+    rc, _ = _git(str(cand), ["rev-parse", "--verify", "HEAD"])
+    return str(cand) if rc == 0 else ""
+
+
 def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
     out = []
     ptxt = Path(packet_path).read_text(encoding="utf-8")
@@ -233,6 +265,22 @@ def lint_packet(packet_path, benchmark_path, trunk=None, packets_dir=None):
     if hdr.get("proof_kind") != "docs" and not tests:
         out.append("ERROR header: test_paths is empty for proof_kind %s"
                    % hdr.get("proof_kind"))
+    if trunk is None:
+        trunk = _discover_trunk(packet_path)
+    # Announce the off-state ONLY for a packet that lives in a real pack, where
+    # a skipped existence check is a hole in a live artifact. A synthetic packet
+    # built in a tmp_path has no trunk by construction and nothing to say about
+    # it -- warning there is noise, and it broke four true tests in
+    # tests/test_vplint_pack_overlay.py that assert lint_packet stays quiet.
+    if _in_a_pack(packet_path):
+        if not trunk:
+            out.append("WARN header: test_paths existence was NOT checked -- no trunk "
+                       "repository could be derived from %s and --trunk was not given. "
+                       "A test path naming a file that does not exist lints clean here."
+                       % packet_path)
+        elif not _SHA40.match(base):
+            out.append("WARN header: test_paths existence was NOT checked -- base_sha "
+                       "%r is not a 40-hex commit, so there is no tree to look in." % base)
     if trunk and _SHA40.match(base):
         for t in tests:
             rc, _ = _git(trunk, ["cat-file", "-e", "%s:%s" % (base, t)])
