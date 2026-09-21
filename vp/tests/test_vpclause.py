@@ -126,7 +126,11 @@ def test_the_l28_split_classifies_as_the_ruling_says_it_should():
 # changing, which `absent == hosted` catches) and the pack simply GROWING (a new
 # packet, which means nothing). Kept as an explicit named constant so bumping it
 # is an obvious one-line edit rather than a hunt through an assertion message.
-EXPECTED_HOSTED = 169
+# 2026-09-21: 169 -> 181 when Architect 2 placed 7 packets + the L28 B12
+# amendment (12 new hosted rows). Verified independently with this test's own
+# regex before bumping: strict 181, loose 182, the one divergence being the
+# L17-REGISTRY-REPLY-PINS B10 `[box]` row whose TEXT contains '[hosted]'.
+EXPECTED_HOSTED = 181
 
 
 def test_every_live_hosted_row_is_absent_today_so_the_census_starts_at_the_whole_corpus():
