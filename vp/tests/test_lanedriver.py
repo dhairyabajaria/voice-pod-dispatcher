@@ -4420,3 +4420,169 @@ def test_d158_a_module_outside_the_driver_dirs_gets_a_different_reason(tmp_path)
     log = drv.log_path.read_text()
     assert "outside the driver's own directories" in log, log
     assert "never imported" not in log, "wrong diagnosis for a module that IS imported"
+
+
+# -- D164: a hosted row that asserts a CI JOB'S OWN STATUS cannot be answered by a twin --------
+
+def test_d164_job_status_row_is_a_property_not_a_spelling():
+    """D164. JOB_ASK_RE is a list of job NAMES and set phrases, so it refuses only
+    rows worded the way earlier rows were worded. L28's B12 is obviously a
+    job-status ask and matched none of them, so L28-HOSTED-R3 ran scoped and
+    failed with "targeted: never a full-suite answer" while the four sibling rows
+    on the SAME borrowed pipeline passed unscoped.
+
+    `CI_CONTEXT_RE` is the other half of the property, not a tie-breaker:
+    "required gate" also names the DEPLOY preflight checklist's gates, and
+    L17-REGISTRY-REPLY-PINS B9 -- a DELIVERY-2A rehearsal host, no CI job at all
+    -- is the one false positive the status pattern alone produces over all 169
+    [hosted] rows in the pack. [[a-heuristic-tuned-against-your-own-labels]]"""
+    from lanedriver import LaneDriver as D
+
+    l28 = ("- B12 [test] [hosted] `platform/tests/test_ops.py` "
+           "(`test_readiness_fails_closed_on_an_unconfigured_deployment`) passes on the exact sha "
+           "inside the hosted platform shard, and the shard, lint and required-gate jobs are green "
+           "— check: job links and status (gate: CIRCLECI).")
+    assert D.job_status_row([l28]) == "required-gate", (
+        "the row this whole item exists for; JOB_ASK_RE matches none of it")
+
+    for line, why in (
+        ("- B8 [hosted] ... — check: CircleCI job status for that sha (gate: CIRCLECI).", "job status"),
+        ("- B8 [hosted] The `lint-and-typecheck` CircleCI job is green — check: job link and status.",
+         "job link"),
+        ("- B6 [hosted] The exact-SHA CircleCI `lint-and-typecheck` and `platform-shard` jobs are "
+         "green including the new completeness test.", "jobs are green"),
+        ("- B9 [hosted] every job in the workflow is accounted for in jobs.json", "jobs.json"),
+    ):
+        assert D.job_status_row([line]), why
+
+    # the false positive the CI conjunct exists to exclude
+    l17 = ("- B9 [invariant] [hosted] On the DELIVERY-2A rehearsal host, `python3 deploy/preflight.py "
+           "--checklist` run from the checked-out candidate prints `ok registry: fresh` and its "
+           "aggregate line no longer names `registry: fresh` among the required gates not green "
+           "— check: the twin's preflight transcript on `voicepod-vps` (gate: DELIVERY-2A).")
+    assert D.job_status_row([l17]) == "", (
+        "a deploy checklist's 'required gates' is not a CI job's status")
+
+
+def test_d164_a_job_as_a_LOCATION_is_not_a_job_status_ask():
+    """D164's load-bearing control, and the reason this is not simply `\\bjob\\b`.
+
+    Measured over the pack: 60 of the 169 [hosted] rows contain the word "job",
+    and 47 of them are not matched by JOB_ASK_RE. Almost all name a job only as
+    the PLACE test nodes ran -- "on the `platform-shard` CircleCI job ... the
+    same nodes pass" -- which a scoped twin answers fine by running those nodes.
+    A bare word test would have refused roughly three times as many rows as the
+    spelling list it replaced, and every extra refusal costs a full pipeline."""
+    from lanedriver import LaneDriver as D
+
+    for line in (
+        "- B9 [hosted] On the `platform-shard` CircleCI job at the union tip, "
+        "`platform/tests/test_x.py::test_y` passes under CircleCI's own Postgres.",
+        "- B7 [hosted] the hosted platform shard runs "
+        "`platform/tests/test_sequence_schema.py::test_pin` green on the exact sha",
+    ):
+        assert D.job_status_row([line]) == "", line[:60]
+
+
+def test_d164_the_conjunction_is_evaluated_within_one_row(tmp_path):
+    """D164: JOB_ASK_RE searches one concatenated blob of every hosted row plus
+    the whole BENCHMARK.md, so a conjunction over that blob would be met by two
+    unrelated rows. A CI token three rows away says nothing about whether THIS
+    row is about CI, so `job_status_row` iterates."""
+    from lanedriver import LaneDriver as D
+
+    split = ["- B1 [hosted] the required gates in deploy/preflight.py are listed (gate: DELIVERY-2A)",
+             "- B2 [hosted] the CircleCI shard runs platform/tests/test_a.py::test_x green"]
+    assert D.job_status_row(split) == "", (
+        "neither row on its own is a job-status ask; only their concatenation looks like one")
+
+
+def test_d164_twin_scope_only_refuses_the_l28_shape(tmp_path):
+    """D164 at the call site. Kept as a second check after JOB_ASK_RE rather than
+    folded into it, so this is a pure widening: nothing the spelling list already
+    refuses becomes allowed."""
+    env = Env(tmp_path)
+    env.activate()
+    proof = FakeProof([])
+    proof.only_active = 0
+    proof.only_cap = lambda: 2
+    proof.circle_cfg = lambda: {"max_in_flight": 1}
+    proof.provider = lambda: "gha"
+    drv = env.driver({"opencode": FakeRunner(default=result_ok), "codex": FakeRunner()}, proof=proof)
+    drv.proof_cfg["circleci"] = {"canary": {"task": "L06-HOSTED", "release_on": ["PASS"]},
+                                 "max_in_flight": 1,
+                                 "twin_scope": {"enabled": True, "contract_from": "parent_contract",
+                                                "workers": 4}}
+    twin = {"id": "L28-HOSTED", "twin_of": "L28", "twin_gate": "CIRCLECI", "proof_only": "",
+            "proof_kind": "platform"}
+    drv.pack.update({"L28-HOSTED": twin,
+                     "L28": {"id": "L28", "test_paths": ["platform/tests/test_ops.py"]}})
+    drv.pack_by_task.update({"L28-HOSTED-R3": "L28-HOSTED"})
+    tasks = {"L28-HOSTED-R3": {"state": "READY"}}
+    wt = tmp_path / "wt-l28"
+    (wt / ".vp").mkdir(parents=True)
+    (wt / "platform" / "tests").mkdir(parents=True)
+    (wt / "platform" / "tests" / "test_ops.py").write_text("")
+    (wt / ".vp" / "BENCHMARK.md").write_text("")
+
+    # without the job-status clause the row is perfectly scopeable: it names a
+    # platform test file the tree has, which is what makes the defect silent
+    twin["hosted_lines"] = ["- B12 [test] [hosted] `platform/tests/test_ops.py` passes on the exact "
+                            "sha inside the hosted platform shard (gate: CIRCLECI)."]
+    assert drv._twin_scope_only("L28-HOSTED-R3", twin, tasks, wt=wt) is not None
+
+    twin["hosted_lines"] = ["- B12 [test] [hosted] `platform/tests/test_ops.py` passes on the exact "
+                            "sha inside the hosted platform shard, and the shard, lint and "
+                            "required-gate jobs are green — check: job links and status "
+                            "(gate: CIRCLECI)."]
+    assert drv._twin_scope_only("L28-HOSTED-R3", twin, tasks, wt=wt) is None
+    log = (env.run_root / "driver.log").read_text()
+    assert "asserts a CI job's own status" in log and "D164" in log, log[-400:]
+
+
+def test_d164_held_out_phrasings_record_where_the_property_test_still_ends():
+    """D164's honest boundary, and the test that stops this becoming a bigger
+    phrase list pretending to be a property test.
+
+    None of the eight rows below appears in the pack or in any other D164 test.
+    They were written to probe the rule from OUTSIDE the set it was derived from,
+    because a rule that only replays the phrasings it was built from measures
+    nothing. Five are caught. **Three are not, and that is recorded here rather
+    than hidden**: the rule is a better approximation of "this row asserts a CI
+    job's own status" than the spelling list it widens, and it is still text
+    matching over prose.
+
+    The three misses share a shape the patterns do not reach: a NEGATIVE or
+    whole-run assertion ("no job is red", "the CI run is green end to end", "the
+    job did not run"). Widening to catch them by adding more alternatives is what
+    this test exists to discourage -- each one trades a miss for a false positive
+    somewhere in the 169 rows, and the measurement for that was done once already
+    ([[a-heuristic-tuned-against-your-own-labels]]).
+
+    The structural fix, if this ever needs to be complete: parse the row's
+    `— check:` clause and decide on what the CHECK names, rather than on the
+    whole sentence. That is a real change to the row grammar and wants its own
+    ruling, so it is named here and not smuggled in.
+
+    If a future widening lands, re-measure against all 169 [hosted] rows first
+    and move rows between the two lists below deliberately."""
+    from lanedriver import LaneDriver as D
+
+    caught = [
+        "- B1 [hosted] the required checks on the PR are all green (gate: CIRCLECI)",
+        "- B2 [hosted] the workflow run concluded success for all jobs (gate: CIRCLECI)",
+        "- B6 [hosted] every job in the workflow reports success (gate: GHA)",
+        "- B7 [hosted] the job conclusion for lint-and-typecheck is success",
+        "- B8 [hosted] jobs.json at the candidate sha lists no failure",
+    ]
+    missed = [
+        "- B3 [hosted] no job in the CI pipeline is red at the candidate sha",
+        "- B4 [hosted] the CI run is green end to end on the exact sha",
+        "- B5 [hosted] the platform-shard job did not run because needs: was skipped",
+    ]
+    for line in caught:
+        assert D.job_status_row([line]), "expected caught: %s" % line
+    for line in missed:
+        assert D.job_status_row([line]) == "", (
+            "this one is a KNOWN miss; if a change makes it pass, move it to `caught` "
+            "and re-measure the false positives over all 169 hosted rows: %s" % line)

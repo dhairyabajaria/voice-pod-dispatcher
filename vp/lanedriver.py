@@ -1585,6 +1585,60 @@ class LaneDriver(object):
                             r"deploy-contracts|supply-chain|vp/(?:platform|agent|portal|deploy)\b|"
                             r"\b(?:agent|portal) (?:job|suite)\b", re.I)
 
+    # D164: the same refusal stated as a PROPERTY instead of a spelling.
+    #
+    # JOB_ASK_RE above is a list of job NAMES and set phrases, so it only refuses
+    # rows that happen to be worded the way earlier rows were worded.  L28's B12
+    # -- "`platform/tests/test_ops.py` (...) passes on the exact sha inside the
+    # hosted platform shard, and the shard, lint and required-gate jobs are green
+    # -- check: job links and status" -- is obviously a job-status ask and matched
+    # none of them, so L28-HOSTED-R3 ran as a scoped twin and failed with its own
+    # proof line, "targeted: never a full-suite answer".  The four sibling rows
+    # that borrowed the SAME pipeline unscoped all passed.
+    #
+    # The property: the row asserts something about a JOB'S OWN STATUS -- a job
+    # link, a jobs.json, "the jobs are green", the required gate -- rather than
+    # about test nodes that merely happen to run inside a job.  A scoped twin
+    # renders one pytest job and can never answer that.
+    #
+    # `and CI_CONTEXT_RE` is not a tie-breaker, it is the other half of the
+    # property: "required gate" also names the DEPLOY preflight checklist's gates.
+    # L17-REGISTRY-REPLY-PINS B9 ("its aggregate line no longer names `registry:
+    # fresh` among the required gates not green", gate DELIVERY-2A) is about a
+    # rehearsal host and no CI job at all, and is the one false positive the
+    # status pattern alone produces over the whole pack.
+    #
+    # Measured 2026-09-21 over all 169 [hosted] rows in 03-PACKETS: JOB_ASK_RE
+    # matches 18, this adds 8 more (ADMISSION-SEED-FIX B8, L11-MIGRATION-266-
+    # BLOCKING B6, L16 B10, L2728-LEAF B8, L28 B12, L29 B13, LINT-TYPECHECK-TRUNK
+    # B7, R-SHARD-SWEEP B6), union 26.  Both rows live-stuck on this tonight --
+    # L28-HOSTED and ADMISSION-SEED-FIX-HOSTED -- are in the 8.
+    #
+    # Deliberately NOT exempting a row that names its own test file, which is
+    # DB_ASK_RE's rule below and would be wrong here: L28's B12 names
+    # `platform/tests/test_ops.py` AND asks about job status, and a twin that
+    # answers half a compound row has not answered it.
+    JOB_STATUS_RE = re.compile(r"job[- ]links?\b|jobs\.json|\bjob (?:status|number|conclusion)\b|"
+                               r"\bjobs? (?:is|are|were) (?:all )?(?:green|passing|successful|success)\b|"
+                               r"\bevery job\b|\ball (?:the )?jobs\b|required[- ]gates?\b|"
+                               r"required[- ]checks?\b", re.I)
+    CI_CONTEXT_RE = re.compile(r"circle\s?ci|\bgha\b|\bCI\b|workflow|pipeline|\bshard\b|\bjobs?\b", re.I)
+
+    @classmethod
+    def job_status_row(cls, lines):
+        """D164: the first hosted row in `lines` that asks about a job's own
+        status, or "".
+
+        Evaluated PER ROW, unlike JOB_ASK_RE's search over one concatenated blob.
+        The conjunction only means anything within a single row: a CI token three
+        rows away says nothing about whether THIS row is about CI."""
+        for line in lines or ():
+            line = str(line)
+            m = cls.JOB_STATUS_RE.search(line)
+            if m and cls.CI_CONTEXT_RE.search(line):
+                return m.group(0)
+        return ""
+
     # D119 (§145): a hosted row that asks for evidence on a LIVE DATABASE while
     # naming no test file of its own cannot be answered by the parent contract's
     # test_paths -- L17-HOSTED-R2 B8/B9 (20:44:19Z) scoped to
@@ -1615,6 +1669,15 @@ class LaneDriver(object):
         if m:
             self.log("PROOF %s scoped twin refused: a hosted row asks for a CI job/step (%r); full pipeline"
                      % (task, m.group(0)))
+            return None
+        # D164: the same refusal by property rather than spelling, per row.  Kept
+        # as a second check rather than folded into JOB_ASK_RE so this is a pure
+        # widening: nothing the spelling list already refuses becomes allowed.
+        hosted_rows = [x for x in text.splitlines() if "[hosted]" in x]
+        hit = self.job_status_row(hosted_rows)
+        if hit:
+            self.log("PROOF %s scoped twin refused: a hosted row asserts a CI job's own status (%r), "
+                     "which one rendered pytest job cannot answer (D164); full pipeline" % (task, hit))
             return None
         stubbed = self._stubbed_seams(text, wt)
         if stubbed:
