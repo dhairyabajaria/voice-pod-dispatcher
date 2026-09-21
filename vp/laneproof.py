@@ -527,20 +527,57 @@ class Proof(object):
         self.log("PROOF circleci account %s blocked for credits for %dh: %s"
                  % (acct, self.CREDIT_BLOCK_S // 3600, why[:160]))
 
+    def _least_loaded_host(self, hosts):
+        """caller holds self._lock"""
+        live = getattr(self, "host_active", {}) or {}
+        return min(hosts, key=lambda h: (int(live.get(h, 0)), hosts.index(h)))
+
     def pick_host(self, cc):
         """D112: the host label (roster proof.circleci.hosts) with the fewest FULL
         proofs in flight, ties by list order; None when no hosts are listed (the
-        shared label).  only=/preflight runs never pin."""
+        shared label).  only=/preflight runs never pin.
+
+        A QUERY ONLY -- it reserves nothing, so two callers racing here both see
+        the same counts and both get the same answer.  Callers that are about to
+        occupy the host must use `reserve_host` instead; see D135."""
         hosts = [str(h) for h in (cc.get("hosts") or []) if str(h).strip()]
         if not hosts:
             return None
         with self._lock:
-            live = dict(getattr(self, "host_active", {}) or {})
-        return min(hosts, key=lambda h: (int(live.get(h, 0)), hosts.index(h)))
+            return self._least_loaded_host(hosts)
+
+    def reserve_host(self, cc):
+        """D135: choose a host AND take its slot under ONE lock.
+
+        2026-09-21 00:53Z: two full pipelines (35549017476, 35549017480) both ran
+        their 15 jobs on voicepod-c -- 30 shard jobs and their per-worker Postgres
+        clusters on that box's single 12G /dev/shm.  The clusters died mid-run
+        (`pgdata/.s.PGSQL.5432: No such file or directory`, `UndefinedFile: could
+        not open file "base/5/..."`) and 3732 nodes reddened across the two runs,
+        none of them a product defect.
+
+        The cause was read-then-increment, not the cap: `pick_host` took the lock,
+        read `host_active`, RELEASED it, and the `+= 1` happened in a later lock
+        block in `run_circleci`.  Two proof threads arriving in that window both
+        read {a: 1, c: 0} and both chose c.  `max_full_in_flight` was 2 and there
+        were 2 hosts, so the per-box guarantee everyone reasoned from -- mine
+        included, when I justified raising the cap to 3 -- never actually held:
+        the pigeonhole argument is about the CAP, and this is about the CHOICE.
+
+        Returns None when no hosts are listed (the shared label), in which case
+        there is no slot to take."""
+        hosts = [str(h) for h in (cc.get("hosts") or []) if str(h).strip()]
+        if not hosts:
+            return None
+        with self._lock:
+            host = self._least_loaded_host(hosts)
+            self.host_active = dict(getattr(self, "host_active", {}) or {})
+            self.host_active[host] = self.host_active.get(host, 0) + 1
+            return host
 
     def run_circleci(self, task, pid, wt, base, cand, kind, paths, abort=None, only=None, order=False):
         cc = self.circle_cfg()
-        host = None if only else self.pick_host(cc)
+        host = None if only else self.reserve_host(cc)   # D135: choose+take atomically
         runner = self.circle_runner or self.circle.Runner()
         branch = "%s%s-%s" % (cc.get("branch_prefix", "vp/proof/"), pid, cand[:12])
         param = cc.get("param") or "run_full_suite"
@@ -555,9 +592,9 @@ class Proof(object):
                 self.only_active = getattr(self, "only_active", 0) + 1
             else:
                 self.circle_active += 1
-                if host:
-                    self.host_active = dict(getattr(self, "host_active", {}) or {})
-                    self.host_active[host] = self.host_active.get(host, 0) + 1
+                # D135: the host slot was already taken by reserve_host() above --
+                # incrementing again here would double-count it and the release
+                # path (one decrement) would leave the host permanently "busy".
         try:
             try:
                 if prior:

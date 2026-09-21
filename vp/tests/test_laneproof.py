@@ -1124,3 +1124,102 @@ def test_d118b_a_scoped_pass_that_collected_zero_tests_is_fail_infra(tmp_path):
     # a full run is not counted (no junit download on green jobs)
     rec = p.run("L20-HOSTED", "proof-L20-3", wt, base, cand, "platform", [])
     assert rec["status"] == "PASS" and rec["tests_collected"] is None
+
+
+def test_d135_two_concurrent_full_proofs_never_reserve_the_same_host(tmp_path):
+    """D135: `pick_host` read `host_active` under the lock, RELEASED it, and the
+    `+= 1` happened in a later lock block -- so two proof threads arriving in that
+    window both read the same counts and both chose the same host.
+
+    2026-09-21 00:53Z it cost two whole pipelines: 35549017476 and 35549017480 each
+    put all 15 jobs on voicepod-c, 30 shard jobs and their per-worker Postgres
+    clusters on one box's 12G /dev/shm. The clusters died mid-run and 3732 nodes
+    reddened across the two runs, not one of them a product defect.
+
+    The cap was 2 and there were 2 hosts, so the per-box guarantee everyone
+    reasoned from never held: the pigeonhole argument is about the CAP, this is
+    about the CHOICE.
+
+    This test must RACE. Called one after another, the old code also returns a, b
+    -- the defect is invisible to a sequential test, which is why it survived.
+    """
+    import threading
+
+    cc = {"hosts": ["voicepod-a", "voicepod-b", "voicepod-c"]}
+    p = make_proof(tmp_path, FakeGha({}), FakeExec({}))
+    p.host_active = {}
+
+    # every thread must be inside pick/reserve at once, or nothing is being raced
+    n = len(cc["hosts"])
+    at_the_gate = threading.Barrier(n)
+    got, lock = [], threading.Lock()
+
+    def claim():
+        at_the_gate.wait(timeout=10)
+        h = p.reserve_host(cc)
+        with lock:
+            got.append(h)
+
+    threads = [threading.Thread(target=claim) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert len(got) == n, "a thread did not finish: %r" % (got,)
+    assert sorted(got) == sorted(cc["hosts"]), (
+        "two full proofs reserved the same host: %r -- this is the 2026-09-21 "
+        "/dev/shm cluster death" % (got,))
+    assert p.host_active == {h: 1 for h in cc["hosts"]}, p.host_active
+
+    # a reservation is a SLOT, so the next caller goes round again rather than
+    # piling onto whichever host happens to sort first
+    assert p.reserve_host(cc) == "voicepod-a"
+    assert p.host_active["voicepod-a"] == 2
+
+    # pick_host stays a pure query: it reports, it never takes
+    before = dict(p.host_active)
+    assert p.pick_host(cc) in ("voicepod-b", "voicepod-c")
+    assert p.host_active == before, "pick_host must not reserve"
+
+    # no hosts listed = the shared label = nothing to reserve
+    assert p.reserve_host({"hosts": []}) is None
+    assert p.pick_host({}) is None
+
+
+def test_d135_run_circleci_reserves_its_host_and_does_not_increment_again():
+    """The defect was at the CALL SITE, not inside the function, so this is the
+    assertion that actually bites.
+
+    `reserve_host` is atomic by construction -- racing it can never fail, so the
+    race test above cannot distinguish the fix from the bug. Measured: with the
+    real window between the two lock acquisitions (`triggered_pipeline` globs and
+    parses every proof record), the old two-phase sequence collided 40/40 and the
+    atomic one 0/40. Reverting `run_circleci` to `pick_host` would restore that
+    exact 40/40 while every other test here stayed green.
+
+    Also guards the other half: `reserve_host` already took the slot, so a second
+    `+= 1` in run_circleci would double-count it, and the single decrement on the
+    release path would leave the host permanently 'busy' -- the host would then
+    never be chosen again and the fleet would quietly shrink.
+    """
+    import inspect
+    src = inspect.getsource(laneproof.Proof.run_circleci)
+    head = src.split("try:", 1)[0]
+    assert "self.reserve_host(cc)" in head, (
+        "run_circleci must RESERVE its host, not merely pick one -- see the "
+        "2026-09-21 /dev/shm cluster death (pipelines 35549017476 and 35549017480 "
+        "both put 15 jobs on voicepod-c)")
+    assert "self.pick_host(" not in src, (
+        "run_circleci is using the query form again: pick_host reserves nothing, "
+        "so two callers in the window both get the same host")
+    # ban the PROPERTY, not the token: the release path legitimately writes
+    # `host_active[host] = max(0, ... - 1)`, so a bare `host_active[host] =` ban
+    # reddens on correct code. Only the INCREMENT is forbidden here.
+    assert "self.host_active.get(host, 0) + 1" not in src, (
+        "run_circleci increments host_active itself -- reserve_host already took "
+        "the slot, so this double-counts and the single decrement on release "
+        "leaves the host permanently 'busy', shrinking the fleet silently")
+    assert "max(0, self.host_active.get(host, 0) - 1)" in src, (
+        "the release path is gone: a reserved slot that is never freed is the "
+        "same fleet-shrinking bug from the other direction")
