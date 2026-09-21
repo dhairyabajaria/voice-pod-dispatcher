@@ -1057,6 +1057,35 @@ class Proof(object):
             # D168/D170 change no verdict until D172.
             repolled = bool(prior)
             borrowed = repolled and not (prior.get("only") or None) and bool(only or paths)
+            # D176: what this record is entitled to answer, decided HERE by the code
+            # that knows what it just ran, rather than re-derived later from a
+            # rendered workflow in git.  Three of tonight's four measurement passes
+            # over this corpus had a reader bug in exactly that re-derivation -- a
+            # missing `only` key read as "full", a missing Twin step read as
+            # "unreadable", a `platform-preflight` step read as "unreadable" -- each
+            # one a reader assuming its own vocabulary was complete.  The writer
+            # never has to guess which dialect the artifact speaks.
+            #
+            # No git, no I/O: every branch is decided by `only` and `prior`.
+            if str(only or "").startswith("preflight:"):
+                # never citable as a row verdict (Advisor, 2026-09-21), whatever it
+                # covers.  A value of its own, so the selector refuses it by KIND and
+                # not by a coverage computation that would come back true and mislead.
+                subset = "preflight"
+            elif not only:
+                subset = "full"
+            elif not repolled:
+                subset = "covered"          # we rendered and ran our own scoped ask
+            elif not (prior.get("only") or None):
+                subset = "covered"          # adopted a FULL run: a strict superset
+            elif (prior.get("only") or None) == only:
+                subset = "covered"          # adopted a run of the identical ask
+            else:
+                # adopted a DIFFERENTLY scoped run.  D175 closed the ledger path that
+                # allowed this, but the value is written rather than assumed
+                # unreachable: 17 records in this run are exactly this shape, and an
+                # invariant worth having is worth recording when it holds.
+                subset = "not_covered"
             if repolled and prior.get("measured_commit"):
                 measured = prior["measured_commit"]
             rec = {"status": status, "route": self.hosted_route(), "proof_id": pid, "sha": cand, "kind": kind,
@@ -1075,6 +1104,7 @@ class Proof(object):
                               self._derived_reason(status, cls, failed, pipeline_id, only)),
                    "jobs": [{"name": j.get("name"), "status": j.get("status"),
                              "job_number": j.get("job_number")} for j in res["jobs"]]}
+            rec["subset_verdict"] = subset
             if repolled:
                 # provenance, not decoration: without it a re-polled record cannot be
                 # told from one this ask triggered itself, and the audit for other

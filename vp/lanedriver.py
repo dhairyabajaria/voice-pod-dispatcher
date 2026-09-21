@@ -6265,6 +6265,38 @@ class LaneDriver(object):
             return True
         return not (bool(rec.get("only") or None) or bool(rec.get("paths") or None))
 
+    # D176: what a record is ENTITLED to answer, written by laneproof at the moment
+    # it knows what it ran (laneproof.py, beside D173's repolled/borrowed block).
+    #
+    # THREE outcomes, not two, and the two refusals stay distinct on purpose:
+    #   "absent"        -- the field was never written.  REFUSE.
+    #   "unresolvable"  -- a backfill ran and could not decide.  REFUSE.
+    #   "full"/"covered"-- positively established.  CITE.
+    # Collapsing the two refusals would cost nothing in safety today and lose the
+    # reason forever -- and, worse, it would put the backfill under pressure to
+    # guess a verdict rather than admit it could not determine one.
+    #
+    # KEY PRESENCE is what separates them.  Every record written before this field
+    # existed answers None to `.get`, so a truthiness test cannot tell "nobody has
+    # looked at this yet" from "someone looked and could not tell".  That is the
+    # same collapse behind D170 (`only` missing read as full) and D175 (a ledger
+    # row's missing `only` read as full) -- twice in one night, one layer apart.
+    SUBSET_CITABLE = ("full", "covered")
+
+    @classmethod
+    def subset_state(cls, rec):
+        """-> "absent" | "unresolvable" | the recorded verdict."""
+        if not rec or "subset_verdict" not in rec:
+            return "absent"
+        return str(rec.get("subset_verdict") or "unresolvable")
+
+    @classmethod
+    def subset_citable(cls, rec):
+        """May this record stand as a row's proof at all?  Fails CLOSED: anything
+        that is not a positively established verdict refuses, including a value
+        this version does not recognise."""
+        return cls.subset_state(rec) in cls.SUBSET_CITABLE
+
     def _proof_index(self):
         """sha -> [proof records] from RUN_ROOT/proofs/proof-*.json (laneproof._write)"""
         idx = {}

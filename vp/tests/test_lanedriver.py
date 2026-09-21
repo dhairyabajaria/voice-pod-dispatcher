@@ -5073,3 +5073,59 @@ def test_d174_the_packet_states_WHY_a_member_is_exempt():
     assert "1 of 2 scored, 1 exempt" in out
     assert "EXISTENCE check only" in out, out
     assert "owned_paths criterion is still scored" in out, out
+
+
+
+def test_d176_a_record_without_the_subset_field_is_refused_and_says_why():
+    """D176: a write-time verdict only governs FUTURE writes. Every record that
+    already exists lacks the field, so a selector reading a missing field as "no
+    problem" would ship, look complete, and protect nothing -- a false green
+    nobody investigates. Measured: 0 of 539 records in run-v13-20260917 carry it.
+
+    Three states, and the two refusals stay distinct. KEY PRESENCE is what
+    separates "nobody has looked at this yet" from "someone looked and could not
+    tell"; a truthiness test collapses them, which is the same collapse behind
+    D170 and D175 -- twice in one night, one layer apart. The second reason also
+    matters for the backfill: if `unresolvable` did not exist as an outcome, the
+    backfill would be under pressure to guess a verdict to keep a record alive."""
+    from vp.lanedriver import LaneDriver
+
+    # absent -- the field-less record, stated explicitly so nobody can later soften
+    # this as noisy without deleting a named case
+    assert LaneDriver.subset_state({}) == "absent"
+    assert LaneDriver.subset_state({"status": "PASS"}) == "absent"
+    assert LaneDriver.subset_state(None) == "absent"
+    assert LaneDriver.subset_citable({"status": "PASS"}) is False, (
+        "a record written before the field existed must NOT be citable")
+
+    # present but undecided -- a DIFFERENT refusal, and it must not read as absent
+    assert LaneDriver.subset_state({"subset_verdict": None}) == "unresolvable"
+    assert LaneDriver.subset_state({"subset_verdict": "unresolvable"}) == "unresolvable"
+    assert LaneDriver.subset_citable({"subset_verdict": "unresolvable"}) is False
+
+    # positively established
+    for ok in LaneDriver.SUBSET_CITABLE:
+        assert LaneDriver.subset_citable({"subset_verdict": ok}) is True, ok
+
+    # everything else refuses, including a value this version does not know
+    for bad in ("not_covered", "preflight", "maybe", ""):
+        assert LaneDriver.subset_citable({"subset_verdict": bad}) is False, bad
+
+
+def test_d176_the_writer_decides_the_verdict_from_what_it_ran(tmp_path):
+    """D176 writer half. Every branch is decided by `only` and `prior` -- no git,
+    no I/O. Three of four measurement passes over this corpus tonight had a bug in
+    exactly the re-derivation this replaces (a missing `only` key read as "full",
+    a missing Twin step read as "unreadable", a `platform-preflight` step read as
+    "unreadable"), each one a reader assuming its own vocabulary was complete."""
+    import inspect
+    from vp import laneproof
+
+    src = inspect.getsource(laneproof.Proof.run_circleci)
+    assert 'rec["subset_verdict"] = subset' in src, "the writer no longer writes the field"
+    # the branch that produced tonight's 17 bad records must stay explicit rather
+    # than be folded away as unreachable now that D175 closed the ledger path
+    assert 'subset = "not_covered"' in src, (
+        "the differently-scoped-adoption branch was removed -- D175 makes it rare, "
+        "not impossible, and 17 records in this run are exactly that shape")
+    assert 'subset = "preflight"' in src
