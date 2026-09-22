@@ -6322,8 +6322,34 @@ class LaneDriver(object):
         if nodes:
             return "%d red node(s): %s" % (len(nodes),
                                            ", ".join(str(n)[:60] for n in nodes[:3]))
-        return ("no reason recorded; reds, failed_nodes and errors were all empty "
-                "(pipeline %s, route %s)" % (rec.get("pipeline_id"), rec.get("route")))
+        # D199 (2026-09-22): D157's message ASSERTED that `errors` was empty without
+        # ever reading it -- a sentence that answers its own check. Read it.
+        errors = rec.get("errors")
+        if errors:
+            if isinstance(errors, dict):
+                body = ", ".join("%s=%s" % (k, str(v)[:60]) for k, v in list(errors.items())[:3])
+            else:
+                body = ", ".join(str(e)[:60] for e in list(errors)[:3])
+            return "%d error(s): %s" % (len(errors), body)
+        # D199: the runner's own verdict sits in `counts.reason`/`counts.rc`, one
+        # level BELOW where D157 looked -- so the record held the cause all along
+        # and the reader was told it had been looked for and was not there.
+        # Measured before writing this: TWELVE distinct proofs took this path, and
+        # every one of them had a cause in `counts` -- 5x "postgres could not
+        # start", 4x pytest rc=5 (no tests collected), 1x rc=4 (usage error),
+        # 2x "rc 0 without [100%] marker". The five postgres ones are a real
+        # box-level fault that stayed invisible for a day behind this string.
+        counts = rec.get("counts")
+        if isinstance(counts, dict):
+            creason = str(counts.get("reason") or "").strip()
+            if creason:
+                return "%s (counts.rc %s, route %s)" % (
+                    creason[:120], counts.get("rc"), rec.get("route"))
+        # Genuinely nothing: name every field consulted, and do not name one that
+        # was not. `rc` is top-level and is cheap to carry, so carry it.
+        return ("no reason recorded; reds, failed_nodes, errors and counts.reason "
+                "were all empty (rc %s, pipeline %s, route %s)"
+                % (rec.get("rc"), rec.get("pipeline_id"), rec.get("route")))
 
     PROOF_LOG_CAP = 2 * 1024 * 1024
 

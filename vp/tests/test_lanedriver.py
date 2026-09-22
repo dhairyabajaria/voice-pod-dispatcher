@@ -4372,6 +4372,56 @@ def test_d157_the_empty_reason_shape_is_gone_from_the_call_site():
     assert "_proof_detail_fallback" in code
 
 
+
+def test_d199_counts_reason_is_surfaced_instead_of_no_reason_recorded():
+    """D157 looked for the cause one level too high. The runner writes its verdict
+    into `counts.reason`/`counts.rc`, and twelve distinct proofs printed "no reason
+    recorded" while their own record held the cause -- five of them a box-level
+    "postgres could not start" that stayed invisible for a day behind that string.
+
+    Driven with the two shapes actually measured on 2026-09-22.
+    """
+    pg = {"status": "FAIL_INFRA", "reason": None, "reds": [], "failed_nodes": [],
+          "errors": {}, "rc": 0, "pipeline_id": None, "route": "box",
+          "counts": {"rc": 1, "reason": "postgres could not start: CalledProcessError"}}
+    why = lanedriver.LaneDriver._proof_detail_fallback(pg, "FAIL_INFRA")
+    assert "postgres could not start" in why, why
+    assert "no reason recorded" not in why
+    assert "counts.rc 1" in why, why
+
+    nocollect = dict(pg, counts={"rc": 5, "reason": "pytest usage/interrupt/no-tests rc"})
+    why2 = lanedriver.LaneDriver._proof_detail_fallback(nocollect, "FAIL_INFRA")
+    assert "no-tests" in why2 and "counts.rc 5" in why2, why2
+
+
+def test_d199_the_errors_field_is_read_not_merely_asserted_empty():
+    """The defect this closes is a sentence that answers its own check: D157's
+    message said "reds, failed_nodes and errors were all empty" while the code
+    never read `errors`. Latent when found -- 0 of 141 FAIL_INFRA records hit it
+    -- which is exactly why it needs a test rather than a measurement."""
+    rec = {"status": "FAIL_INFRA", "reason": None, "reds": [], "failed_nodes": [],
+           "errors": {"shm": "no space left on device"},
+           "pipeline_id": None, "route": "box", "counts": {}}
+    why = lanedriver.LaneDriver._proof_detail_fallback(rec, "FAIL_INFRA")
+    assert "no space left on device" in why, why
+    assert "were all empty" not in why, "claimed empty while errors was populated"
+
+
+def test_d199_the_last_resort_names_only_fields_it_actually_checked():
+    """A fallback that lists a field it did not consult is the original bug in a
+    new costume. Every field named in the final string must be read by the code."""
+    bare = {"status": "FAIL_INFRA", "reason": None, "reds": [], "failed_nodes": [],
+            "errors": {}, "counts": {}, "rc": 3, "pipeline_id": None, "route": "box"}
+    why = lanedriver.LaneDriver._proof_detail_fallback(bare, "FAIL_INFRA")
+    assert "no reason recorded" in why and "counts.reason" in why, why
+    assert "rc 3" in why, "the top-level rc is cheap to carry and was dropped"
+    import inspect
+    src = inspect.getsource(lanedriver.LaneDriver._proof_detail_fallback)
+    body = re.sub(r"#.*", "", src)
+    for field in ("reds", "failed_nodes", "errors", "counts"):
+        assert 'rec.get("%s")' % field in body or 'counts.get(' in body, field
+
+
 # -- D158: a RELOAD_ORDER name the process never imported must say so ---------
 
 
