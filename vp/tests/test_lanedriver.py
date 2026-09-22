@@ -6088,7 +6088,80 @@ def test_d197_the_uninitialised_runner_would_have_keyerrored_in_try_acquire(tmp_
     assert drv._try_acquire(None, "codex") in (True, False)   # a real runner does not throw
 
 
-def test_d198_the_reload_records_the_sha_it_actually_loaded(tmp_path, monkeypatch):
+def test_every_reloading_test_contains_its_module_re_execution():
+    """Guard the population, not the two instances that were found.
+
+    A real `hot_reload()` swaps module objects in `sys.modules` for the whole
+    process. The cost lands on OTHER FILES, so the test that causes it is green
+    and something unrelated goes red -- 13 failures in test_vpstore.py and
+    test_vprunners_v13.py, none of them near the code that caused them. That is
+    unattributable by inspection, and the next test to call hot_reload() without
+    the fixture would reintroduce it in exactly the same undiagnosable shape.
+
+    So the rule is mechanical: if a test calls hot_reload(), it takes
+    `contained_reload`. Checked on the source, because there is no runtime hook
+    that can see a module swap after the fact.
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    blocks = re.split(r"\ndef (?=test_)", src)
+    offenders = []
+    for b in blocks:
+        head = b.split("\n", 1)[0]
+        if not head.startswith("test_"):
+            continue
+        if head.startswith("test_every_reloading_test_contains"):
+            continue                    # this guard NAMES the call in its own prose;
+                                        # a checker that matches its own text reports
+                                        # itself, which is the defect it exists to catch
+        body = re.sub(r"#.*", "", b)
+        if "hot_reload(" in body and "contained_reload" not in head:
+            offenders.append(head.split("(")[0])
+    # the guard must be able to fail: prove it sees the calls at all
+    assert any("hot_reload(" in b for b in blocks), \
+        "no test calls hot_reload -- this guard is measuring nothing"
+    assert not offenders, (
+        "these tests re-exec modules process-wide without containing it; "
+        "add the `contained_reload` fixture: %s" % ", ".join(offenders))
+
+@pytest.fixture
+def contained_reload():
+    """Put back the modules a real `hot_reload()` re-execs.
+
+    D199 follow-up, found by running the full suite rather than this file:
+    `hot_reload()` re-execs every module in `reload_targets()`, and in THIS
+    process that list includes `vpstore`. D158 records that the live driver can
+    never reload vpstore because only vpctl and vpproof import it -- but
+    test_vpstore.py imports it, so under pytest it IS in sys.modules and IS
+    re-executed.
+
+    A re-exec mints a NEW `vpstore.Refused` class. test_vpstore.py bound the OLD
+    one at import time (`from vpstore import Refused`, :25), so its `refuses()`
+    helper catches a class the store no longer raises: the exception escapes and
+    12 of its tests fail, plus one in test_vprunners_v13. Only in a run that
+    collects both files -- which is why each file alone is green and the full
+    suite was 16 red, and why a per-file run could never have caught this.
+
+    The reload stays real; only its blast radius is contained.
+    """
+    names = tuple(lanedriver.RELOAD_ORDER) + ("lanedriver",)
+    # Save the module CONTENTS, not the module objects. hot_reload uses
+    # importlib.reload(), which re-executes a module in its EXISTING namespace:
+    # sys.modules[name] is the same object before and after, while every class
+    # it defines is a brand new object. A first attempt at this fixture saved
+    # and restored sys.modules entries and changed nothing at all, because it
+    # was putting back the very object whose __dict__ had just been replaced.
+    saved = {n: dict(sys.modules[n].__dict__) for n in names if n in sys.modules}
+    try:
+        yield saved
+    finally:
+        for n, d in saved.items():
+            mod = sys.modules.get(n)
+            if mod is not None:
+                mod.__dict__.clear()
+                mod.__dict__.update(d)
+
+
+def test_d198_the_reload_records_the_sha_it_actually_loaded(tmp_path, monkeypatch, contained_reload):
     """D198: the label records the DECISION, the sha records the ARTIFACT.
 
     A reload armed against one commit loads whatever is on disk when it fires.
@@ -6127,7 +6200,7 @@ def test_d198_the_reload_records_the_sha_it_actually_loaded(tmp_path, monkeypatc
     assert not [a for a in alerts if a[0] == "RELOAD_SHA_DRIFT"]
 
 
-def test_d198_a_broken_git_never_fails_the_reload(tmp_path, monkeypatch):
+def test_d198_a_broken_git_never_fails_the_reload(tmp_path, monkeypatch, contained_reload):
     """A diagnostic that can take down the thing it describes is worse than none."""
     env = Env(tmp_path)
     env.activate()
