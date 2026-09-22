@@ -1,13 +1,58 @@
 {
   "$comment": "Voice Pod v9 Junior findings. All keys required. Validated by vpschema.validate_findings.",
   "type": "object",
-  "required": ["item", "attempt", "commit", "lines", "all_pass"],
+  "required": [
+    "item",
+    "attempt",
+    "commit",
+    "lines",
+    "all_pass"
+  ],
   "properties": {
-    "item": {"type": "string"},
-    "attempt": {"type": "integer"},
-    "commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
-    "lines": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "kind", "verdict", "evidence", "note"],
-      "properties": {"kind": {"enum": ["invariant", "test", "negative", "forbidden", "evidence"]}, "verdict": {"enum": ["PASS", "FAIL", "UNKNOWN"]}}}},
-    "all_pass": {"type": "boolean"}
+    "item": {
+      "type": "string"
+    },
+    "attempt": {
+      "type": "integer"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "lines": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "verdict",
+          "evidence",
+          "note"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "invariant",
+              "test",
+              "negative",
+              "forbidden",
+              "evidence"
+            ]
+          },
+          "verdict": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "all_pass": {
+      "type": "boolean"
+    }
   }
 }

@@ -1,16 +1,114 @@
 {
-  "$comment": "Voice Pod v9 Builder result. All keys required. Validated by vpschema.validate_result.",
+  "$comment": "Voice Pod v9 Builder result, validated by vpschema.validate_result. item/attempt/commit/base/blocked are BINDING (exact meaning; attempt may be a digit-string). diff_stat/checks/disputes/notes are your own honest report: keep the shapes below, never fabricate a number or an exit code; a check you could not run keeps exit null and says why in log.",
   "type": "object",
-  "required": ["item", "attempt", "commit", "base", "diff_stat", "checks", "disputes", "blocked", "notes"],
+  "required": [
+    "item",
+    "attempt",
+    "commit",
+    "base",
+    "diff_stat",
+    "checks",
+    "disputes",
+    "blocked",
+    "notes"
+  ],
   "properties": {
-    "item": {"type": "string"},
-    "attempt": {"type": "integer"},
-    "commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
-    "base": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
-    "diff_stat": {"type": "object", "required": ["files", "insertions", "deletions"]},
-    "checks": {"type": "array", "items": {"type": "object", "required": ["name", "command", "exit", "log"]}},
-    "disputes": {"type": "array", "items": {"type": "object", "required": ["line", "reason"]}},
-    "blocked": {"type": ["null", "string"]},
-    "notes": {"type": "string"}
+    "item": {
+      "type": "string"
+    },
+    "attempt": {
+      "type": "integer"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "base": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "diff_stat": {
+      "type": "object",
+      "required": [
+        "files",
+        "insertions",
+        "deletions"
+      ],
+      "$comment": "the three numbers of `git diff --shortstat <base>..<commit>`",
+      "properties": {
+        "files": {
+          "type": "integer",
+          "$comment": "COUNT of changed files (an array of their paths is tolerated and counted)"
+        },
+        "insertions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "command",
+          "exit",
+          "log"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "$comment": "short label; defaults to the command"
+          },
+          "command": {
+            "type": "string"
+          },
+          "exit": {
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ],
+            "$comment": "the integer exit code, or null when NOT EXECUTED here (e.g. the sandbox denies the command); a word such as \"blocked\"/\"not run\" is read as null. Either way `log` must say why. Never fabricate an exit code."
+          },
+          "log": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "disputes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "line",
+          "reason"
+        ],
+        "properties": {
+          "line": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "blocked": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "$comment": "null (or false / \"\") = not blocked; otherwise the reason"
+    },
+    "notes": {
+      "type": "string"
+    }
   }
 }

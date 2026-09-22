@@ -6113,7 +6113,13 @@ def test_every_reloading_test_contains_its_module_re_execution():
             continue                    # this guard NAMES the call in its own prose;
                                         # a checker that matches its own text reports
                                         # itself, which is the defect it exists to catch
-        body = re.sub(r"#.*", "", b)
+        # Strip docstrings as well as comments. Third time tonight that PROSE
+        # satisfied a grep meant for code: the `contained_reload` fixture's own
+        # docstring says "a real hot_reload() re-execs...", which sat inside the
+        # preceding test's block and reported that test as an offender. A checker
+        # that cannot tell a mention from a call reports the documentation.
+        body = re.sub(r'"""(?:.|\n)*?"""', "", b)
+        body = re.sub(r"#.*", "", body)
         if "hot_reload(" in body and "contained_reload" not in head:
             offenders.append(head.split("(")[0])
     # the guard must be able to fail: prove it sees the calls at all
@@ -6122,6 +6128,101 @@ def test_every_reloading_test_contains_its_module_re_execution():
     assert not offenders, (
         "these tests re-exec modules process-wide without containing it; "
         "add the `contained_reload` fixture: %s" % ", ".join(offenders))
+
+def test_the_shipped_schema_files_still_mean_what_the_in_code_docs_mean():
+    """The on-disk file WINS over the in-code doc, so drift ships to builders.
+
+    lanedriver.py:3913 and vpdriver.py:933 both write `.vp/<NAME>_SCHEMA.json`
+    from `vp/schemas/<NAME>` when that file exists and fall back to the in-code
+    doc only when it does not. So a stale file is not a dormant copy -- it is
+    the copy every builder reads.
+
+    Measured 2026-09-22 before regenerating: RESULT_SCHEMA.json had drifted
+    SEMANTICALLY. It required a `name` key the doc makes optional, and carried
+    none of the doc's rule that a check which could not be run keeps `exit` null
+    and says why in `log`, never a fabricated exit code. Builders were being
+    handed a contract that contradicted the one the validator enforces.
+
+    The invariant is JSON equality, not text equality: FINDINGS_SCHEMA.json
+    differed only in whitespace at the same measurement and was not a defect.
+    Pinning bytes would red on a harmless reformat and teach the next reader to
+    regenerate without looking at what changed.
+
+    Deletion was considered and rejected: it would lean on the `else` branch at
+    :3913-3918 that no test covers, so if that fallback is wrong it breaks every
+    builder instead of the one row already affected.
+    """
+    import vpschema
+    schemas = Path(lanedriver.__file__).parent / "schemas"
+    for name, doc in (("RESULT_SCHEMA.json", vpschema.RESULT_SCHEMA_DOC),
+                      ("FINDINGS_SCHEMA.json", vpschema.FINDINGS_SCHEMA_DOC),
+                      ("REVIEW_SCHEMA.json", vpschema.REVIEW_SCHEMA_DOC)):
+        onfile = schemas / name
+        assert onfile.exists(), (
+            "%s is absent, so builders silently take the untested in-code "
+            "fallback at lanedriver.py:3913-3918" % name)
+        assert json.loads(onfile.read_text(encoding="utf-8")) == doc, (
+            "%s on disk no longer matches its in-code doc; regenerate it with "
+            "json.dumps(<DOC>, indent=2) rather than hand-editing" % name)
+
+
+def test_the_result_schema_states_the_unrun_check_rule():
+    """The specific thing whose absence caused this: a builder that cannot run a
+    check must record `exit: null` and explain in `log`, never invent a code.
+    Pinned as a property of the SHIPPED file, because that is the artifact the
+    builder actually reads."""
+    onfile = Path(lanedriver.__file__).parent / "schemas" / "RESULT_SCHEMA.json"
+    # Walk it defensively: against the pre-2026-09-22 file this navigation
+    # raised KeyError('properties'), which reads like a broken test rather than
+    # a stale artifact. A guard has to name the place it failed.
+    node, path = json.loads(onfile.read_text(encoding="utf-8")), []
+    for key in ("properties", "checks", "items", "properties", "exit"):
+        assert isinstance(node, dict) and key in node, (
+            "RESULT_SCHEMA.json has no %s -- the shipped file does not describe "
+            "per-check fields at all, so it cannot state the unrun-check rule"
+            % "/".join(path + [key]))
+        path.append(key)
+        node = node[key]
+    assert "null" in node.get("type", []), (
+        "`exit` is not nullable in the shipped schema: %s" % node)
+    assert "fabricate" in str(node.get("$comment", "")).lower(), (
+        "the shipped schema does not tell the builder never to fabricate an "
+        "exit code: %s" % node)
+
+def test_d200_the_default_benchmark_does_not_contradict_the_unrun_check_rule():
+    """The empty-criteria fallback in render_benchmark used to read "RESULT.json
+    records every check RUN with its command and exit code".
+
+    Two things wrong with that. "every check run" excuses omitting a check the
+    sandbox refused, and "its exit code" asks for a number where the schema wants
+    null. So the benchmark graded builders against a contract the validator does
+    not enforce, and invited a fabricated exit for anything unrunnable -- the same
+    defect as the stale RESULT_SCHEMA.json, in the prose half.
+    """
+    out = lanedriver.LaneDriver.render_benchmark({"verification": [], "acceptance": []})
+    assert "records every check run" not in out, out
+    assert "exit null" in out and "reason in log" in out, out
+    # and a contract WITH criteria is untouched -- the fallback is the only path fixed
+    real = lanedriver.LaneDriver.render_benchmark({"verification": ["the thing holds"]})
+    assert "the thing holds" in real and "exit null" not in real, real
+
+
+def test_d200_the_packet_states_the_two_fields_a_builder_cannot_derive():
+    """`commit` and `attempt` are BINDING in RESULT_SCHEMA but belong to the
+    driver, not the builder. Nothing in the packet said so: `commit` reads as
+    "the commit I made", so a no-op turn omits or invents it, and `attempt` reads
+    as the builder's own try count. Both are exactly the fields that went wrong
+    on live rows."""
+    pkt = lanedriver.LaneDriver.render_packet(
+        {"id": "R-X", "title": "t", "kind": "repair", "owned_paths": ["a/b.py"]},
+        "0" * 40)
+    assert "## Recording your result" in pkt, pkt
+    assert "HEAD" in pkt and "even when you changed nothing" in pkt, pkt
+    assert "driver's round number" in pkt, pkt
+    assert "Never fabricate an exit code." in pkt, pkt
+    # the prohibition section still survives ahead of it
+    assert pkt.index("## Prohibitions") < pkt.index("## Recording your result")
+
 
 @pytest.fixture
 def contained_reload():

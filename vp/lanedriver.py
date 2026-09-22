@@ -3875,6 +3875,17 @@ class LaneDriver(object):
             lines += ["", "## Parameters", "```json", json.dumps(params, indent=2, sort_keys=True), "```"]
         lines += ["", "## Prohibitions", "Change only owned_files. No migrations unless the packet "
                   "names the number. No pushes."]
+        # D200: two fields of RESULT.json that a builder cannot derive from its own
+        # work and had no way to learn. `commit` reads like "the commit I made", so a
+        # no-op turn omits it or invents one; `attempt` reads like the builder's own
+        # try count. Both are the driver's, and both are BINDING in the schema.
+        lines += ["", "## Recording your result",
+                  "`commit` is the worktree's HEAD — the same value even when you "
+                  "changed nothing, never blank and never invented.",
+                  "`attempt` is the driver's round number for this task, taken from "
+                  "the packet; it is not a count of your own tries.",
+                  "A check you could not run still gets a checks[] entry: exit null, "
+                  "and log says why. Never fabricate an exit code."]
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -3886,8 +3897,14 @@ class LaneDriver(object):
             rows.append("- B%d [evidence] %s — check: RESULT.json checks[] and the files it names"
                         % (i, c.replace("\n", " ")))
         if not rows:
-            rows.append("- B1 [evidence] RESULT.json records every check run with its command "
-                        "and exit code — check: RESULT.json")
+            # D200: "every check RUN ... and exit code" contradicted the schema's own
+            # rule. A check the sandbox refuses is still owed a checks[] entry, with
+            # exit null and the reason in log -- so the old wording graded a builder
+            # against something the validator does not ask for, and quietly invited a
+            # fabricated exit code for anything that could not be executed.
+            rows.append("- B1 [evidence] RESULT.json's checks[] accounts for every check this "
+                        "packet required: each with its command, and either its integer exit "
+                        "code or exit null with the reason in log — check: RESULT.json")
         return "\n".join(rows) + "\n"
 
     def write_vp_files(self, wt, task, contract, base, row=None):
@@ -6701,6 +6718,7 @@ class LaneDriver(object):
     # full-suite pass.  Two sessions measuring this population disagreed 31 vs 2
     # partly because of it.
     PROOF_FIELDS = ("proof_id", "kind", "route", "status", "only", "paths", "failed_nodes", "log")
+
 
     SCOPE_TAIL_RE = re.compile(r"-(?:R\d+|FIX-\d+|V13|HOSTED(?:-(?:DELIVERY-[1-5][AB]?|O[1-9]|CIRCLECI))?)$")
 
