@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import importlib
 import importlib.util
@@ -6541,8 +6542,16 @@ class LaneDriver(object):
         (wt / ".vp" / "REVIEW_REQUEST.json").write_text(json.dumps(req, indent=2, sort_keys=True),
                                                         encoding="utf-8")
         out_path = wt / ".vp" / "REVIEW.json"
+        # D-BENCHMARK-IDS-WIRED: req["benchmark_ids"] was computed above and
+        # written into REVIEW_REQUEST.json for the reviewer to read, but the
+        # validator call left it unbound -- vpschema.validate_review's own
+        # "every benchmark id has a verdict" check
+        # (`if benchmark_ids is not None: ...`) never ran, so a reviewer
+        # could APPROVE with verdicts: [] (or any subset of the ids graded)
+        # and the turn would still complete. Bind it so that check fires.
+        review_validator = functools.partial(vpschema.validate_review, benchmark_ids=req["benchmark_ids"])
         outcome = self._turn(task, attempt, row, server, runner, rcfg, wt, tdir, "reviewer",
-                             REVIEW_PROMPT, out_path, vpschema.validate_review, sid, 1)
+                             REVIEW_PROMPT, out_path, review_validator, sid, 1)
         if rp:
             (wt / ".vp" / "BENCHMARK.md").write_text(rp["packet_benchmark"], encoding="utf-8")
         if outcome.status != STATUS_DONE:
@@ -7207,18 +7216,65 @@ class LaneDriver(object):
         target = (row.get("parameters") or {}).get("parent_contract_id") or task
         tcon = self.control.contract(target)
         trow = (state.get("tasks") or {}).get(target) or {}
-        crit = list(dict.fromkeys((tcon.get("verification") or []) + (tcon.get("acceptance") or [])))
-        coverage = {target: {c: "PASS" for c in crit}}
-        for t in (targets or []):
-            coverage.setdefault(t, {c: "PASS" for c in (criteria or {}).get(t) or []})
+        # D-COVERAGE-HONEST: this used to stamp "PASS" for every criterion
+        # unconditionally, regardless of what the reviewer actually wrote in
+        # doc["verdicts"]. review_gate.validate then re-derived the same
+        # criteria list from the contract and checked coverage.get(c)=="PASS"
+        # -- a map the driver invented one call earlier, checked against
+        # itself. When targets/criteria are supplied (the _review_packet_plan
+        # path: SEC-REVIEW-S3/L29/L30/final_review), the benchmark rows it
+        # wrote are named B1, B2, ... in the exact order `for t in targets:
+        # for c in criteria[t]`. Re-walk that same order here so each B<n>
+        # lines up with the doc's verdicts[] entry of that id, and default a
+        # criterion with no matching entry (or a non-PASS one, including
+        # UNKNOWN) to "UNKNOWN" rather than asserting it passed.
+        verdict_by_id = {}
+        for v in (doc.get("verdicts") or []):
+            if isinstance(v, dict) and v.get("id"):
+                verdict_by_id[str(v["id"])] = v.get("verdict")
+        if targets:
+            coverage, n = {}, 0
+            for t in targets:
+                coverage[t] = {}
+                for c in (criteria or {}).get(t) or []:
+                    n += 1
+                    coverage[t][c] = verdict_by_id.get("B%d" % n, "UNKNOWN")
+        else:
+            # Plain (non-review-packet) turn: unchanged from before this fix.
+            # review_gate.validate never reads this branch's coverage (only
+            # the review-packet path below reaches review_gate -- confirmed
+            # by tracing every call site), so it is not part of the
+            # fabrication Advisor's report was about, and
+            # test_codex_review_is_one_fresh_turn_and_starts_with_its_thread_id
+            # already asserts PASS here as this path's contract. Left as-is
+            # rather than reinterpreted on my own initiative; whether this
+            # field should report something more honest for the plain path
+            # is a separate open question for Architect, not folded into
+            # this fix.
+            crit = list(dict.fromkeys((tcon.get("verification") or []) + (tcon.get("acceptance") or [])))
+            coverage = {target: {c: "PASS" for c in crit}}
         runtime = self._codex_rollout(outcome.session_id)
         authors = [a for a in (trow.get("child_id"), "lanedriver:%d" % os.getpid())
                    if a and a != outcome.session_id]
+        # Honest from doc["findings"]: same [medium+] + non-empty `reproduce`
+        # predicate vpschema.validate_review already used to gate verdict ==
+        # "APPROVE" (vpschema.py _validate_findings), so this cannot be
+        # stricter than what already let the turn reach here. NOTE: a
+        # critical/high finding with reproduce: null passes that upstream
+        # gate uncounted and will therefore NOT appear here either -- flagged
+        # to Architect as a separate, unresolved question (not folded into
+        # this fix): whether `blocking` should count severity alone. Left
+        # unchanged pending a ruling rather than silently redefining it.
+        unresolved = [{"id": str(f.get("id")), "severity": f.get("severity"),
+                       "reproduce": f.get("reproduce")}
+                      for f in (doc.get("findings") or [])
+                      if isinstance(f, dict) and f.get("severity") in ("medium", "high", "critical")
+                      and isinstance(f.get("reproduce"), str) and f.get("reproduce").strip()]
         packet = {"role": role, "verdict": "PASS", "candidate_sha": cand.get("sha"),
                   "tree_sha": cand.get("tree"), "catalog_sha256": (state.get("catalog") or {}).get("sha256"),
                   "review_task_id": task, "reviewer_session_id": outcome.session_id,
                   "author_session_ids": authors,
-                  "unresolved_blocking_findings": [],
+                  "unresolved_blocking_findings": unresolved,
                   "runtime_log": {"path": str(runtime) if runtime else "",
                                   "sha256": sha256_file(runtime) if runtime else ""},
                   "artifacts": [{"path": str(out_path), "sha256": sha256_file(out_path)}],

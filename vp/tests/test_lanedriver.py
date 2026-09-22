@@ -6092,3 +6092,126 @@ def test_d198_a_broken_git_never_fails_the_reload(tmp_path, monkeypatch):
     assert line, "the reload must still succeed"
     assert "sha=unknown" in line[-1], line[-1]
     assert any("could not read the code sha" in m for m in logs)
+
+
+def test_verdict_packet_reports_the_reviewers_actual_per_criterion_verdicts(tmp_path):
+    """D-COVERAGE-HONEST: _verdict_packet used to stamp coverage[t][c] = "PASS"
+    for every (target, criterion) pair unconditionally -- review_gate.validate
+    then re-derives the identical criteria list from the same contract and
+    checks coverage.get(c) == "PASS", so an APPROVE could never fail that
+    check regardless of what the reviewer actually wrote in doc["verdicts"].
+    Pins the fix: coverage must come from doc["verdicts"], keyed by the B<n>
+    id in the same order _review_packet_plan assigned them
+    (for t in targets: for c in criteria[t]), defaulting an absent or
+    non-PASS entry to UNKNOWN rather than PASS."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({})
+    row = {"child_id": "builder-abc", "parameters": {"parent_contract_id": "L02"}}
+    contract = {"kind": "final_review"}
+    state = {"candidate": {"sha": "c" * 40, "tree": "t" * 40},
+             "catalog": {"sha256": "deadbeef"},
+             "tasks": {"L02": {"child_id": "builder-abc"}}}
+    outcome = TurnOutcome(STATUS_DONE, "", session_id="reviewer-1", model_seen="opencode/ds")
+    out_path = tmp_path / "REVIEW.json"
+    out_path.write_text("{}\n")
+    tdir = tmp_path / "tdir"
+    tdir.mkdir()
+    targets = ["L02", "L03"]
+    criteria = {"L02": ["L02 verified", "L02 accepted"], "L03": ["L03 verified", "L03 accepted"]}
+    doc = {"summary": "s", "verdicts": [
+               {"id": "B1", "verdict": "PASS", "evidence": "f.py:1"},
+               {"id": "B2", "verdict": "FAIL", "evidence": "f.py:2"},
+               # B3 (L03 verified) has no entry at all -- must default UNKNOWN
+               {"id": "B4", "verdict": "UNKNOWN", "evidence": ""}],
+           "findings": []}
+    p = drv._verdict_packet("REV1", row, contract, state, outcome, out_path, tdir, doc,
+                            targets=targets, criteria=criteria)
+    packet = json.loads(p.read_text())
+    assert packet["coverage"] == {
+        "L02": {"L02 verified": "PASS", "L02 accepted": "FAIL"},
+        "L03": {"L03 verified": "UNKNOWN", "L03 accepted": "UNKNOWN"},
+    }, packet["coverage"]
+
+
+def test_verdict_packet_empty_verdicts_covers_nothing_as_pass(tmp_path):
+    """A reviewer who APPROVEs with verdicts: [] must not be recorded as
+    having covered anything -- every criterion defaults to UNKNOWN, which
+    review_gate.validate then correctly refuses (coverage != PASS)."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({})
+    row = {"child_id": "builder-abc", "parameters": {"parent_contract_id": "L02"}}
+    contract = {"kind": "final_review"}
+    state = {"candidate": {"sha": "c" * 40, "tree": "t" * 40}, "catalog": {"sha256": "d"},
+             "tasks": {"L02": {"child_id": "builder-abc"}}}
+    outcome = TurnOutcome(STATUS_DONE, "", session_id="reviewer-2", model_seen="opencode/ds")
+    out_path = tmp_path / "REVIEW.json"
+    out_path.write_text("{}\n")
+    tdir = tmp_path / "tdir2"
+    tdir.mkdir()
+    doc = {"summary": "s", "verdicts": [], "findings": []}
+    p = drv._verdict_packet("REV2", row, contract, state, outcome, out_path, tdir, doc,
+                            targets=["L02"], criteria={"L02": ["L02 verified", "L02 accepted"]})
+    packet = json.loads(p.read_text())
+    assert packet["coverage"] == {"L02": {"L02 verified": "UNKNOWN", "L02 accepted": "UNKNOWN"}}
+
+
+def test_verdict_packet_unresolved_blocking_findings_uses_vpschemas_own_predicate(tmp_path):
+    """unresolved_blocking_findings used to be hardcoded []. It must now list
+    the findings that ALREADY gated verdict == "APPROVE" in
+    vpschema.validate_review (severity medium+ with a non-empty `reproduce`),
+    so a reviewer's real findings survive into the packet review_gate reads.
+
+    KNOWN OPEN QUESTION (flagged to Architect, not resolved by this fix): a
+    critical finding with reproduce: null passes vpschema's own `blocking`
+    count uncounted, so it will NOT appear here either -- this test pins that
+    as the CURRENT documented behavior, not an endorsement of it."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({})
+    row = {"child_id": "builder-abc", "parameters": {"parent_contract_id": "L02"}}
+    contract = {"kind": "junior"}
+    state = {"candidate": {"sha": "c" * 40, "tree": "t" * 40}, "catalog": {"sha256": "d"},
+             "tasks": {"L02": {"child_id": "builder-abc"}}}
+    outcome = TurnOutcome(STATUS_DONE, "", session_id="reviewer-3", model_seen="opencode/ds")
+    out_path = tmp_path / "REVIEW.json"
+    out_path.write_text("{}\n")
+    tdir = tmp_path / "tdir3"
+    tdir.mkdir()
+    doc = {"summary": "s", "verdicts": [],
+           "findings": [
+               {"id": "F1", "severity": "critical", "reproduce": "pytest -k x"},
+               {"id": "F2", "severity": "critical", "reproduce": None},
+               {"id": "F3", "severity": "low", "reproduce": "pytest -k y"}]}
+    p = drv._verdict_packet("REV3", row, contract, state, outcome, out_path, tdir, doc)
+    packet = json.loads(p.read_text())
+    ids = [f["id"] for f in packet["unresolved_blocking_findings"]]
+    assert ids == ["F1"], ids
+
+
+def test_verdict_packet_plain_path_coverage_is_unchanged_by_this_fix(tmp_path):
+    """The plain (non-review-packet) path's coverage field is scoped OUT of
+    this fix on purpose: review_gate.validate never reads it (only the
+    review-packet path below reaches review_gate.validate -- confirmed by
+    tracing every call site), and
+    test_codex_review_is_one_fresh_turn_and_starts_with_its_thread_id already
+    locks in PASS as this path's contract. Whether that field should report
+    something more honest is a separate open question for Architect, not
+    folded into the coverage-fabrication fix here."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({})
+    row = {"child_id": "builder-abc", "parameters": {"parent_contract_id": "L02"}}
+    contract = {"kind": "junior"}
+    state = {"candidate": {"sha": "c" * 40, "tree": "t" * 40}, "catalog": {"sha256": "d"},
+             "tasks": {"L02": {"child_id": "builder-abc"}}}
+    outcome = TurnOutcome(STATUS_DONE, "", session_id="reviewer-4", model_seen="opencode/ds")
+    out_path = tmp_path / "REVIEW.json"
+    out_path.write_text("{}\n")
+    tdir = tmp_path / "tdir4"
+    tdir.mkdir()
+    doc = {"summary": "s", "verdicts": [{"id": "B1", "verdict": "PASS", "evidence": "x"}], "findings": []}
+    p = drv._verdict_packet("REV4", row, contract, state, outcome, out_path, tdir, doc)
+    packet = json.loads(p.read_text())
+    assert packet["coverage"] == {"L02": {"L02 verified": "PASS", "L02 accepted": "PASS"}}
