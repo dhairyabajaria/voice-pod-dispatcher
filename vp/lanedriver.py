@@ -4734,9 +4734,44 @@ class LaneDriver(object):
                     self._fail.pop(t, None)
             if lifted:
                 self.log("RELOAD lifted STUCK strikes for %s (fresh try on the new code)" % lifted)
-            rec.update({"ok": True, "module": new_name, "stuck_lifted": lifted})
-            self.log("RELOAD ok #%d %s -> %s changed=%s (%s)"
-                     % (self._reload_count, self._short(before), self._short(after), changed, reason))
+            # D198: record the sha the reload ACTUALLY loaded.
+            #
+            # A reload is armed against a reviewed commit, but `hot_reload` hashes
+            # and exec_modules the target files FROM DISK AT FIRE TIME.  Anything
+            # committed between arm and fire ships under the old label, silently.
+            # 2026-09-21: a reload armed against 1762a52 fired at 23:52:13Z and
+            # loaded b8188bf, whose lanedriver.py had been written at 23:49:07Z --
+            # three minutes earlier.  A peer reported the newer change as "missed
+            # the reload"; it had been live the whole time.  Establishing that took
+            # file mtimes, this line's own changed=[...] and a clean worktree,
+            # because nothing recorded what was read.
+            #
+            # The label records the DECISION; this records the ARTIFACT.  Never
+            # allowed to fail the reload -- a diagnostic that can take down the
+            # thing it describes is worse than no diagnostic.
+            code_sha = None
+            try:
+                code_sha = self.head_sha(own_path.parent)
+            except Exception as exc:              # noqa: BLE001 -- diagnostics never fail a reload
+                self.log("RELOAD: could not read the code sha (%s: %s)" % (type(exc).__name__, exc))
+            rec.update({"ok": True, "module": new_name, "stuck_lifted": lifted,
+                        "code_sha": code_sha})
+            drift = ""
+            if code_sha:
+                # Flag only when the reason names something that really parses as a
+                # sha and disagrees.  Requires a hex letter, so a bare date like
+                # "20260921" -- valid hex, not a sha -- cannot raise a false drift.
+                named = [t for t in re.findall(r"\b[0-9a-f]{7,40}\b", str(reason or ""))
+                         if any(c in "abcdef" for c in t)]
+                if named and not any(code_sha.startswith(t) or t.startswith(code_sha) for t in named):
+                    drift = " ARMED-AGAINST=%s DRIFTED" % ",".join(named[:3])
+                    self.alert("RELOAD_SHA_DRIFT",
+                               "reload armed naming %s but loaded %s from disk: anything committed "
+                               "between arm and fire shipped under the old label"
+                               % (",".join(named[:3]), code_sha[:12]))
+            self.log("RELOAD ok #%d %s -> %s sha=%s%s changed=%s (%s)"
+                     % (self._reload_count, self._short(before), self._short(after),
+                        (code_sha or "unknown")[:12], drift, changed, reason))
             self.alert("RELOAD", "code reloaded in place (#%d): %s; version %s -> %s"
                        % (self._reload_count, ", ".join(changed) or "no file changed",
                           self._short(before), self._short(after)))

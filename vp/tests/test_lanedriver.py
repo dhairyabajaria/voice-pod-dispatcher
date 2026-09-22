@@ -6036,3 +6036,59 @@ def test_d197_the_uninitialised_runner_would_have_keyerrored_in_try_acquire(tmp_
     with pytest.raises(KeyError):
         drv._try_acquire(None, "codx")
     assert drv._try_acquire(None, "codex") in (True, False)   # a real runner does not throw
+
+
+def test_d198_the_reload_records_the_sha_it_actually_loaded(tmp_path, monkeypatch):
+    """D198: the label records the DECISION, the sha records the ARTIFACT.
+
+    A reload armed against one commit loads whatever is on disk when it fires.
+    2026-09-21: armed on 1762a52, fired 23:52:13Z, loaded b8188bf (written
+    23:49:07Z). Nothing recorded what was read, so reconstructing it took file
+    mtimes and a clean worktree.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner()})
+    logs, alerts = [], []
+    monkeypatch.setattr(drv, "log", lambda m, *a, **kw: logs.append(m))
+    monkeypatch.setattr(drv, "alert", lambda kind, msg, *a, **kw: alerts.append((kind, msg)))
+    monkeypatch.setattr(drv, "head_sha", lambda p: "b8188bfaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+    # armed naming a DIFFERENT sha -> recorded, flagged, alerted
+    drv.hot_reload(reason="Fixer's reviewed candidate 1762a52")
+    line = [m for m in logs if m.startswith("RELOAD ok")]
+    assert line and "sha=b8188bfaaaaa" in line[-1], line
+    assert "DRIFTED" in line[-1] and "ARMED-AGAINST=1762a52" in line[-1], line[-1]
+    # the normal RELOAD alert fires after the drift one, so test membership not [-1]
+    assert [a for a in alerts if a[0] == "RELOAD_SHA_DRIFT"], alerts
+
+    # armed naming the SAME sha -> recorded, no drift
+    logs[:], alerts[:] = [], []
+    drv.hot_reload(reason="candidate b8188bf")
+    line = [m for m in logs if m.startswith("RELOAD ok")][-1]
+    assert "sha=b8188bfaaaaa" in line and "DRIFTED" not in line, line
+    assert not [a for a in alerts if a[0] == "RELOAD_SHA_DRIFT"]
+
+    # a bare date is valid hex but is NOT a sha -- it must not raise a false drift
+    logs[:], alerts[:] = [], []
+    drv.hot_reload(reason="armed 20260921 by the operator")
+    line = [m for m in logs if m.startswith("RELOAD ok")][-1]
+    assert "DRIFTED" not in line, line
+    assert not [a for a in alerts if a[0] == "RELOAD_SHA_DRIFT"]
+
+
+def test_d198_a_broken_git_never_fails_the_reload(tmp_path, monkeypatch):
+    """A diagnostic that can take down the thing it describes is worse than none."""
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner()})
+    logs = []
+    monkeypatch.setattr(drv, "log", lambda m, *a, **kw: logs.append(m))
+    def boom(_p):
+        raise OSError("git is not on this box")
+    monkeypatch.setattr(drv, "head_sha", boom)
+    drv.hot_reload(reason="no git here")
+    line = [m for m in logs if m.startswith("RELOAD ok")]
+    assert line, "the reload must still succeed"
+    assert "sha=unknown" in line[-1], line[-1]
+    assert any("could not read the code sha" in m for m in logs)
