@@ -6719,6 +6719,10 @@ class LaneDriver(object):
     # partly because of it.
     PROOF_FIELDS = ("proof_id", "kind", "route", "status", "only", "paths", "failed_nodes", "log")
 
+    #: D201: statuses that are a verdict ABOUT THE PRODUCT. Everything else
+    #: (BLOCKED_CAP, UNKNOWN, CANCELLED, FAIL_INFRA) describes the run, not the
+    #: code, and must never outrank a verdict when both sit at the same sha.
+    VERDICT_STATUSES = ("PASS", "FAIL_PRODUCT")
 
     SCOPE_TAIL_RE = re.compile(r"-(?:R\d+|FIX-\d+|V13|HOSTED(?:-(?:DELIVERY-[1-5][AB]?|O[1-9]|CIRCLECI))?)$")
 
@@ -6886,6 +6890,20 @@ class LaneDriver(object):
         tasks = state.get("tasks") or {}
         members = [str(m.get("task")) for m in ((union or {}).get("members") or []) if m.get("task")]
         member_sha = {str(m.get("task")): m.get("output_sha") for m in ((union or {}).get("members") or [])}
+        # D201: root -> every output sha any task of that root has produced, from
+        # BOTH sources, because neither is complete on its own: run-state carries
+        # generations the union never listed, and the union carries member shas for
+        # rows whose state row has since moved on.
+        root_shas = {}
+        for _name, _row in list((tasks or {}).items()) + [(k, {"output_sha": v})
+                                                          for k, v in member_sha.items()]:
+            _sha = (_row or {}).get("output_sha")
+            if _sha:
+                # LaneDriver.<fn>, not self.<fn>: `_review_proofs` is also reached
+                # unbound via a SimpleNamespace stub, exactly as the `best` closure
+                # notes. Second time in this one change -- `VERDICT_STATUSES` had it
+                # too -- so it is the shape of this function, not a one-off slip.
+                root_shas.setdefault(LaneDriver.task_root(_name), set()).add(str(_sha))
 
         def best(recs, task=None):
             # D170: filter BEFORE ranking.  Ranking first and filtering after would
@@ -6896,7 +6914,26 @@ class LaneDriver(object):
                 recs = [r for r in (recs or []) if LaneDriver.proof_answers(task, r)]
             if not recs:
                 return None
-            ranked = sorted(recs, key=lambda r: (r.get("status") == "PASS", str(r.get("ts") or "")))
+            # D201: rank verdict-ness ABOVE recency. `best` previously keyed on
+            # (is_PASS, ts), which protects PASS but leaves every non-PASS record
+            # ordered by ts alone, so a BLOCKED_CAP could outrank a real
+            # FAIL_PRODUCT at the same sha. BLOCKED_CAP is not a verdict about the
+            # product at all; it says the run never got capacity.
+            #
+            # MEASURED, and stated honestly because it was briefed to me as an
+            # active bug: it is LATENT in this run, not live. 39 BLOCKED_CAP
+            # records sit in the index across 15 shas, 14 of those shas also carry
+            # a strictly later PASS/FAIL_PRODUCT -- and `best` picks the capped
+            # record in 0 of 15, because PASS is structurally protected and every
+            # resolved FAIL_PRODUCT happens to carry the later ts. No gate root's
+            # frozen sha carries a BLOCKED_CAP at all. So this closes a hazard that
+            # is one status-list edit away from biting; it fixes no failing case,
+            # and nobody should read a changed number out of it.
+            # PASS-over-FAIL_PRODUCT is UNCHANGED -- that is D170's existing order
+            # and is not what this fixes.
+            ranked = sorted(recs, key=lambda r: (str(r.get("status") or "") in LaneDriver.VERDICT_STATUSES,
+                                                 r.get("status") == "PASS",
+                                                 str(r.get("ts") or "")))
             return ranked[-1]
 
         def _depends_on(t):
@@ -6929,8 +6966,31 @@ class LaneDriver(object):
                 circular.append(t)
                 continue
             sha = (tasks.get(t) or {}).get("output_sha") or member_sha.get(t)
-            rec = best(idx.get(sha), task=t) if sha else None
+            # D201: offer every sha belonging to the SAME ROOT, not just this row's
+            # frozen one. A root's PASS usually lives at a HOSTED twin's sha, and
+            # binding by the frozen sha alone left those roots reading UNKNOWN with
+            # a green proof sitting one row away.
+            #
+            # This widens the SHA SET ONLY. `proof_answers` is untouched and still
+            # runs on every candidate inside `best` -- its arm 1 admits these
+            # precisely because they share a root, and its arm 3 still refuses a
+            # SCOPED record belonging to another root. Relaxing that filter instead
+            # would also collapse the UNKNOWN count, and would look identical to
+            # this from the outside while being wrong (D170: 172 of 1179 bound
+            # entries were cross-root SCOPED records answering someone else's ask).
+            cands = list(idx.get(sha) or []) if sha else []
+            for _s in sorted(root_shas.get(LaneDriver.task_root(t), ())):
+                if _s != sha:
+                    cands.extend(idx.get(_s) or [])
+            rec = best(cands, task=t) if cands else None
             e = {"task": t, "output_sha": sha}
+            # The sha the proof ACTUALLY came from, whenever it is not the frozen
+            # one. Without this the entry would name output_sha beside a record
+            # drawn from elsewhere, which is the misattribution this fix exists to
+            # end, reintroduced one field over.
+            _rsha = str((rec or {}).get("sha") or "")
+            if rec is not None and _rsha and _rsha != str(sha or ""):
+                e["proof_sha"] = _rsha
             e.update({k: (rec or {}).get(k) for k in self.PROOF_FIELDS})
             # D168: carry the classification member_scope already computed, mapped by
             # the same scope_label the ledger cell uses -- never a second derivation.

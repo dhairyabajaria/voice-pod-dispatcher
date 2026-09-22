@@ -3777,12 +3777,18 @@ def test_d142_a_wedged_server_stays_parked_and_a_healthy_one_unparks_and_cleans_
 
 # -- D146: a scoped pass must not look like a full pass ------------------------
 
-def _write_proof(run_root, proof_id, status="PASS", only=None, pipeline_id="p1"):
+def _write_proof(run_root, proof_id, status="PASS", only=None, pipeline_id="p1",
+                 sha=None, ts=None):
+    # D201 added `sha` and `ts`. Both default to the previous hardcoded values so
+    # every existing caller is unchanged: binding across shas and ordering by ts
+    # cannot be expressed by a helper that can only write one sha and no clock.
     d = run_root / "proofs"
     d.mkdir(parents=True, exist_ok=True)
-    (d / ("%s.json" % proof_id)).write_text(json.dumps({
-        "proof_id": proof_id, "status": status, "only": only, "route": "gha",
-        "pipeline_id": pipeline_id, "sha": "a" * 40}), encoding="utf-8")
+    rec = {"proof_id": proof_id, "status": status, "only": only, "route": "gha",
+           "pipeline_id": pipeline_id, "sha": sha or ("a" * 40)}
+    if ts is not None:
+        rec["ts"] = ts
+    (d / ("%s.json" % proof_id)).write_text(json.dumps(rec), encoding="utf-8")
     return d / ("%s.json" % proof_id)
 
 
@@ -6223,6 +6229,93 @@ def test_d200_the_packet_states_the_two_fields_a_builder_cannot_derive():
     # the prohibition section still survives ahead of it
     assert pkt.index("## Prohibitions") < pkt.index("## Recording your result")
 
+def test_d201_a_root_binds_to_a_pass_at_its_hosted_twins_sha(tmp_path, monkeypatch):
+    """The whole defect: a root's PASS lives at a HOSTED twin's sha, while
+    `_review_proofs` looked only at the row's own frozen sha.
+
+    Measured on the live run before the fix, over the 31 INTEGRATED roots:
+    1 bound to a PASS, 3 to FAIL_INFRA, 27 to nothing at all. After widening the
+    candidate set to every sha in the same root: 27 PASS, 1 FAIL_INFRA, 3 nothing.
+    Nineteen of the 31 had ZERO records at their frozen sha.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner()})
+    root_sha, twin_sha = "a" * 40, "b" * 40
+    _write_proof(env.run_root, "proof-MINE-HOSTED-R1-60921T000900", status="PASS",
+                 sha=twin_sha, ts="2026-09-21T00:09:00Z")
+
+    state = {"tasks": {"MINE": {"output_sha": root_sha, "kind": "builder"},
+                       "MINE-HOSTED-R1": {"output_sha": twin_sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": "MINE", "output_sha": root_sha}]}
+    e = [x for x in drv._review_proofs([], state, union, root_sha, review=None)["entries"]
+         if x["task"] == "MINE"][0]
+    assert e["status"] == "PASS", e
+    assert e["proof_id"] == "proof-MINE-HOSTED-R1-60921T000900", e
+    # and it must SAY the proof came from elsewhere, or the entry silently claims
+    # the frozen sha was proven -- the same misattribution one field over
+    assert e["output_sha"] == root_sha, e
+    assert e.get("proof_sha") == twin_sha, (
+        "the entry does not record which sha the proof actually came from: %r" % e)
+
+
+def test_d201_widening_the_sha_set_still_refuses_a_cross_root_scoped_proof(tmp_path, monkeypatch):
+    """The non-negotiable negative control. Widening the SHA SET must not become
+    a way of relaxing `proof_answers`.
+
+    Relaxing the filter instead would collapse the UNKNOWN count exactly as this
+    fix does, and look identical from the outside while being wrong: D170 measured
+    172 of 1179 bound entries as cross-root SCOPED records answering someone
+    else's ask. Verified on the live run after the change: 0 cross-root scoped
+    records admitted across all 31 roots.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner()})
+    root_sha, twin_sha = "a" * 40, "b" * 40
+    # a GREEN scoped proof belonging to a DIFFERENT root, sitting at the twin sha
+    # this root now reaches. Before proof_answers it would rank top.
+    _write_proof(env.run_root, "proof-OTHER-THING-60921T001000", status="PASS",
+                 only="twin:3:platform/tests/test_other.py", sha=twin_sha,
+                 ts="2026-09-21T00:10:00Z")
+
+    state = {"tasks": {"MINE": {"output_sha": root_sha, "kind": "builder"},
+                       "MINE-HOSTED-R1": {"output_sha": twin_sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": "MINE", "output_sha": root_sha}]}
+    e = [x for x in drv._review_proofs([], state, union, root_sha, review=None)["entries"]
+         if x["task"] == "MINE"][0]
+    assert e["proof_id"] is None, (
+        "widening the sha set admitted another root's scoped PASS: %r" % e["proof_id"])
+    assert e.get("proof_sha") is None, e
+
+
+def test_d201_a_non_verdict_never_outranks_a_verdict_at_the_same_sha(tmp_path, monkeypatch):
+    """BLOCKED_CAP says the run never got capacity. It is not a verdict about the
+    product and must not win a sha from a real FAIL_PRODUCT merely by being later.
+
+    Stated honestly: this is LATENT in the live run, not a live bug. 39 BLOCKED_CAP
+    records sit across 15 shas, 14 of which carry a strictly later terminal verdict
+    -- and the old key picked the capped record in 0 of 15, because PASS is
+    structurally protected and every resolved FAIL_PRODUCT happened to carry the
+    later ts. No gate root's frozen sha carries a BLOCKED_CAP at all. This closes
+    the hazard; it does not move a number, and no one should expect it to.
+    """
+    env = Env(tmp_path)
+    env.activate()
+    drv = env.driver({"opencode": FakeRunner()})
+    sha = "a" * 40
+    _write_proof(env.run_root, "proof-MINE-60921T000100", status="FAIL_PRODUCT",
+                 sha=sha, ts="2026-09-21T00:01:00Z")
+    _write_proof(env.run_root, "proof-MINE-60921T000200", status="BLOCKED_CAP",
+                 sha=sha, ts="2026-09-21T99:99:99Z")      # strictly later
+
+    state = {"tasks": {"MINE": {"output_sha": sha, "kind": "builder"}}}
+    union = {"union": "u1", "members": [{"task": "MINE", "output_sha": sha}]}
+    e = [x for x in drv._review_proofs([], state, union, sha, review=None)["entries"]
+         if x["task"] == "MINE"][0]
+    assert e["status"] == "FAIL_PRODUCT", (
+        "a later BLOCKED_CAP displaced the real verdict: %r" % e["status"])
+    assert "BLOCKED_CAP" not in str(e)
 
 @pytest.fixture
 def contained_reload():
